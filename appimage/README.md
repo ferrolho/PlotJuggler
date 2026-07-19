@@ -14,9 +14,14 @@ The default app version, Qt version, and AppImage arch come from repo-root
 appimage/build_appimage.sh                       # app-only AppImage
 appimage/build_appimage.sh --plugins-dir <path>  # bundle a local plugin folder
 appimage/build_appimage.sh --plugins-registry    # bundle the official set (CI default)
+appimage/build_appimage.sh --commit-hash <hash>  # append .<hash> to the filename
 ```
 
-Output lands at `appimage/PlotJuggler-<version>-<arch>.AppImage`.
+Output lands at `appimage/PlotJuggler-<version>-<arch>.AppImage`, or
+`appimage/PlotJuggler-<version>-<arch>.<hash>.AppImage` with `--commit-hash`
+(release CI's workflow_dispatch/non-tag builds, so otherwise-identical-looking
+dev artifacts stay distinguishable — matches the Windows installer's default
+naming; tag builds omit it).
 
 ## Plugins
 

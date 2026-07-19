@@ -213,7 +213,15 @@ jobs:
         run: |
           set -euo pipefail
           ./build.sh
-          bash appimage/build_appimage.sh --plugins-registry
+          # --commit-hash only on non-tag (manual) builds: PJ_VERSION is already
+          # the unique identifier for a tag release, matching the Windows
+          # installer's -CleanReleaseName; dispatch builds need the hash so
+          # otherwise-identical-looking artifacts stay distinguishable.
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            bash appimage/build_appimage.sh --plugins-registry
+          else
+            bash appimage/build_appimage.sh --plugins-registry --commit-hash "${GITHUB_SHA:0:8}"
+          fi
           appimage_path="$(ls -1 appimage/PlotJuggler-*.AppImage | head -n 1)"
           if [[ -z "$appimage_path" ]]; then
             echo "::error::AppImage not produced under appimage/" >&2

@@ -2,9 +2,13 @@
 
 A self-contained Windows installer for PJ4, built with the **Qt Installer
 Framework** (IFW) — the same mechanism PlotJuggler 3 uses. Output is a single
-offline `<YYYY.MM.DD>.PlotJuggler-<version>-Windows-x64.<main-commit>.exe` (dated,
-and stamped with the `main` commit hash): a wizard that installs the app with a
-Start-Menu + Desktop shortcut and a maintenance/uninstall tool.
+offline `.exe`: a wizard that installs the app with a Start-Menu + Desktop
+shortcut and a maintenance/uninstall tool. Tag-triggered releases name it
+`PlotJuggler-<version>-Windows-x64.exe` (`-CleanReleaseName`, matching the
+Linux AppImage's plain `PlotJuggler-<version>-<arch>.AppImage`); other builds
+default to `PlotJuggler-<version>-Windows-x64.<short-commit>.exe`, stamped
+with the built commit's short hash so otherwise-identical-looking dev
+artifacts stay distinguishable.
 
 There is **no portable-zip path** — the deployment target is this installer.
 
@@ -140,7 +144,9 @@ The script:
 
 Options: `-SkipPlugins` (fast core-only installer), `-PluginIds a,b,c` (override
 the curated registry ids), `-PluginRegistryUrl <url-or-json-path>` (registry
-source), and `-PluginPlatform <key>` (defaults to `windows-x86_64`).
+source), `-PluginPlatform <key>` (defaults to `windows-x86_64`), and
+`-CleanReleaseName` (name the output `PlotJuggler-<Version>-Windows-x64.exe`
+instead of the commit-stamped default — used by release CI on tag builds).
 
 The default whitelist bundles these 13 published plugins:
 `mcap-loader`, `csv-loader`, `parquet-loader`, `ulog-loader`, `dummy-streamer`,

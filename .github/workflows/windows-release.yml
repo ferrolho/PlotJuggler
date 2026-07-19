@@ -51,7 +51,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0   # tags/describe need full history
 
       - name: Read versions.env
         # PJ_QT_VERSION / PJ_APP_VERSION are the single source of truth.
@@ -312,25 +311,29 @@ jobs:
         # the registry, verifies checksums + manifests, loads every whitelisted DLL
         # through the real host runtime, then runs binarycreator. Any plugin failure
         # fails the release; there are no best-effort skips.
+        # -CleanReleaseName only on a tag build: -Version is already the unique,
+        # meaningful name there (matches the AppImage's plain naming); dispatch
+        # builds keep the date + main-commit stamp to stay distinguishable.
         shell: pwsh
         run: |
           .\installer\build_windows_installer.ps1 `
             -QtDir ".qt\$env:PJ_QT_VERSION\msvc2022_64" `
             -PluginRegistryUrl "https://raw.githubusercontent.com/PlotJuggler/pj-plugin-registry/refs/heads/development/registry.json" `
             -Version $env:PJ_VERSION `
-            -OutDir dist
+            -OutDir dist `
+            -CleanReleaseName:($env:GITHUB_REF_TYPE -eq "tag")
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: PlotJuggler-${{ env.PJ_VERSION }}-Windows-x64
-          path: dist/*.PlotJuggler-*-Windows-x64.*.exe
+          path: dist/*.exe
           if-no-files-found: error
 
       - name: Attach installer to the GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*.PlotJuggler-*-Windows-x64.*.exe
+          files: dist/*.exe
           generate_release_notes: true
           fail_on_unmatched_files: true

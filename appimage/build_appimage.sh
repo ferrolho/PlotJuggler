@@ -25,6 +25,11 @@
 #                                                    #   from the plugin registry,
 #                                                    #   verify checksums, unpack
 #
+# --commit-hash <hash> appends .<hash> to the output filename (PlotJuggler-
+# <version>-<arch>.<hash>.AppImage) — used by release CI on workflow_dispatch
+# (non-tag) builds, where <version> alone would collide across builds. Tag
+# builds omit it, matching the Windows installer's -CleanReleaseName.
+#
 # Bundled plugins land at usr/lib/plotjuggler/plugins. The app never scans that
 # dir directly — at startup it seeds its contents into the writable per-user
 # extensions dir (copying new ids, refreshing ones whose bundled version is
@@ -90,9 +95,10 @@ BUNDLE_IDS=(
 
 PLUGINS_MODE="none"        # none | local | registry
 PLUGINS_LOCAL_DIR=""
+COMMIT_HASH=""
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -104,6 +110,8 @@ while [[ $# -gt 0 ]]; do
       # Optional URL argument (anything not starting with '-').
       if [[ -n "${2:-}" && "${2}" != -* ]]; then REGISTRY_URL="$2"; shift; fi
       shift ;;
+    --commit-hash)
+      COMMIT_HASH="${2:?--commit-hash needs a value}"; shift 2 ;;
     -h | --help)
       usage; exit 0 ;;
     *)
@@ -284,7 +292,11 @@ else
   echo "WARNING: ${PY_HOME_FILE} missing — cannot bundle Python stdlib (Python Data Processors will fail)" >&2
 fi
 
-OUTPUT="${SCRIPT_DIR}/PlotJuggler-${VERSION}-${ARCH}.AppImage"
+if [[ -n "${COMMIT_HASH}" ]]; then
+  OUTPUT="${SCRIPT_DIR}/PlotJuggler-${VERSION}-${ARCH}.${COMMIT_HASH}.AppImage"
+else
+  OUTPUT="${SCRIPT_DIR}/PlotJuggler-${VERSION}-${ARCH}.AppImage"
+fi
 ARCH="${ARCH}" "./${AT}" "${APPDIR}" "${OUTPUT}"
 
 echo ""

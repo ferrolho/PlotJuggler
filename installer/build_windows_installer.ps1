@@ -21,7 +21,8 @@
     6. load every whitelisted plugin through the staged app and require an exact
        id/version match with no loader errors
     7. render config.xml / package.xml from templates into the stage tree
-    8. binarycreator --offline-only -> <YYYY.MM.DD>.PlotJuggler-<Version>-Windows-x64.<main-commit>.exe
+    8. binarycreator --offline-only -> PlotJuggler-<Version>-Windows-x64.exe
+       (or, without -CleanReleaseName, PlotJuggler-<Version>-Windows-x64.<short-commit>.exe)
 
   This does NOT build the app or any plugins. Run it AFTER a Windows build of
   the app, e.g.
@@ -69,6 +70,14 @@
 .PARAMETER OutDir
   Where to write the installer .exe (default: current directory).
 
+.PARAMETER CleanReleaseName
+  Name the output PlotJuggler-<Version>-Windows-x64.exe instead of the default
+  commit-stamped name, matching the Linux AppImage's plain
+  PlotJuggler-<version>-<arch>.AppImage naming. Use for tag-triggered releases,
+  where -Version is already the unique identifier; leave off for
+  workflow_dispatch/dev builds, where the built commit's short hash
+  disambiguates otherwise-identical-looking artifacts.
+
 .PARAMETER StageDir
   Scratch directory for the staged package tree (default: $env:TEMP\pj4-installer-stage).
   Wiped at the start of every run.
@@ -99,7 +108,8 @@ param(
   [string]$ConanHome  = "$env:USERPROFILE\.conan2",
   [string]$Version    = "",
   [string]$OutDir     = ".",
-  [string]$StageDir   = ""
+  [string]$StageDir   = "",
+  [switch]$CleanReleaseName
 )
 
 $ErrorActionPreference = "Stop"
@@ -479,19 +489,21 @@ foreach ($f in Get-ChildItem (Join-Path $pkgSrc "meta") -File | Where-Object { $
 
 # --- build the installer ---------------------------------------------------
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
-# Artifact name: <YYYY.MM.DD>.PlotJuggler-<Version>-Windows-x64.<main-commit>.exe
-# The commit hash is deliberately taken from MAIN (not the current/checked-out
-# branch), so the name pins the artifact to the mainline commit. Resolve local
-# `main`, falling back to the `origin/main` tracking ref. (EAP='Continue' so a
-# failed rev-parse falls through instead of aborting under the script's 'Stop'.)
-$dateStamp = Get-Date -Format 'yyyy.MM.dd'
-$prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-$mainHash = (& git -C $repoRoot rev-parse --short --verify main 2>$null | Select-Object -First 1)
-if (-not $mainHash) { $mainHash = (& git -C $repoRoot rev-parse --short --verify origin/main 2>$null | Select-Object -First 1) }
-$ErrorActionPreference = $prevEAP
-if (-not $mainHash) { Die "Could not resolve the 'main' commit hash (tried 'main' and 'origin/main' in $repoRoot). Fetch main first: git fetch origin main." }
-$mainHash = "$mainHash".Trim()
-$outExe = Join-Path (Resolve-Path $OutDir) "$dateStamp.PlotJuggler-$Version-Windows-x64.$mainHash.exe"
+if ($CleanReleaseName) {
+  # Tag releases: -Version is already the unique identifier, so name the
+  # artifact to match the Linux AppImage's plain PlotJuggler-<version>-<arch>.
+  $outExe = Join-Path (Resolve-Path $OutDir) "PlotJuggler-$Version-Windows-x64.exe"
+} else {
+  # Dev/dispatch builds: stamp with the built commit's short hash so
+  # otherwise-identical-looking artifacts stay distinguishable. Matches the
+  # AppImage's -commit-hash suffix convention.
+  $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  $shortHash = (& git -C $repoRoot rev-parse --short HEAD 2>$null | Select-Object -First 1)
+  $ErrorActionPreference = $prevEAP
+  if (-not $shortHash) { Die "Could not resolve the built commit's hash in $repoRoot." }
+  $shortHash = "$shortHash".Trim()
+  $outExe = Join-Path (Resolve-Path $OutDir) "PlotJuggler-$Version-Windows-x64.$shortHash.exe"
+}
 Info "running binarycreator -> $outExe"
 & $binarycreator --offline-only -c (Join-Path $StageDir "config.xml") -p $stagePackages $outExe
 if ($LASTEXITCODE -ne 0) { Die "binarycreator failed (exit $LASTEXITCODE)." }
