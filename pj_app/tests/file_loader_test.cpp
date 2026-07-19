@@ -16,9 +16,14 @@
 #include <QAbstractButton>
 #include <QApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
+#include <QList>
 #include <QMutex>
 #include <QSet>
 #include <QSettings>
@@ -27,17 +32,27 @@
 #include <QWidget>
 #include <QtGlobal>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "FileLoader.h"
+#include "pj_base/sdk/data_source_plugin_base.hpp"
 #include "pj_datastore/engine.hpp"
 #include "pj_datastore/reader.hpp"
 #include "pj_plugins/sdk/object_ingest_policy.hpp"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/ExtensionCatalogService.h"
+#include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/SessionManager.h"
+#include "pj_widgets/MessageBox.h"
 using namespace Qt::StringLiterals;
 
 #ifndef PJ_MOCK_FILE_SOURCE_PLUGIN_PATH
@@ -48,7 +63,280 @@ using namespace Qt::StringLiterals;
 #error "PJ_MSGBOX_MOCK_SOURCE_PLUGIN_PATH must be defined"
 #endif
 
+#ifndef PJ_DIALOG_PROBE_SOURCE_PLUGIN_PATH
+#error "PJ_DIALOG_PROBE_SOURCE_PLUGIN_PATH must be defined"
+#endif
+
 namespace {
+
+// Read a probe file's newline-separated markers (see dialog_probe_source.cpp /
+// msgbox_mock_source.cpp), skipping blank lines. Missing file → empty vector.
+std::vector<std::string> readProbeLines(const QString& path) {
+  std::vector<std::string> out;
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    return out;
+  }
+  while (!file.atEnd()) {
+    const QByteArray line = file.readLine().trimmed();
+    if (!line.isEmpty()) {
+      out.emplace_back(line.constData(), static_cast<size_t>(line.size()));
+    }
+  }
+  return out;
+}
+
+// Reuse the real mock source implementation behind a second catalog identity.
+// The copied vtable has static storage because registerStaticDataSource keeps a
+// non-owning pointer to it for the catalog lifetime.
+const PJ_data_source_vtable_t* alternateMockSourceVtable(const PJ_data_source_vtable_t* source) {
+  static PJ_data_source_vtable_t alternate;
+  alternate = *source;
+  alternate.manifest_json =
+      R"({"id":"alternate-mock-file-source","name":"Alternate Mock File Source","version":"1.0.0","file_extensions":[".mock"]})";
+  return &alternate;
+}
+
+// In-process DataSource used to put fanout cancellation at an exact point:
+// entry 1 has completed, entry 2 has appended one row, and entry 3 has not
+// started. Keeping the probe in this executable makes the GUI/worker handoff a
+// condition-variable rendezvous instead of a timing-dependent plugin delay.
+struct FanoutProbeCall {
+  std::string slot;
+  std::string suffix;
+  std::thread::id thread;
+};
+
+struct FanoutProbeState {
+  std::mutex mutex;
+  std::condition_variable release_cv;
+  bool release_cancel_entry = false;
+  int released_progress_step = 0;
+  std::thread::id main_thread;
+  std::vector<FanoutProbeCall> calls;
+};
+
+FanoutProbeState& fanoutProbeState() {
+  static FanoutProbeState state;
+  return state;
+}
+
+void resetFanoutProbe() {
+  FanoutProbeState& state = fanoutProbeState();
+  const std::lock_guard lock(state.mutex);
+  state.release_cancel_entry = false;
+  state.released_progress_step = 0;
+  state.main_thread = std::this_thread::get_id();
+  state.calls.clear();
+}
+
+void recordFanoutProbeCall(std::string slot, std::string suffix = {}) {
+  FanoutProbeState& state = fanoutProbeState();
+  const std::lock_guard lock(state.mutex);
+  state.calls.push_back(
+      FanoutProbeCall{.slot = std::move(slot), .suffix = std::move(suffix), .thread = std::this_thread::get_id()});
+}
+
+void releaseFanoutProbeCancelEntry() {
+  FanoutProbeState& state = fanoutProbeState();
+  {
+    const std::lock_guard lock(state.mutex);
+    state.release_cancel_entry = true;
+  }
+  state.release_cv.notify_all();
+}
+
+bool waitForFanoutProbeCancelRelease() {
+  FanoutProbeState& state = fanoutProbeState();
+  std::unique_lock lock(state.mutex);
+  return state.release_cv.wait_for(lock, std::chrono::seconds(5), [&state]() { return state.release_cancel_entry; });
+}
+
+void releaseFanoutProbeProgressStep(int step) {
+  FanoutProbeState& state = fanoutProbeState();
+  {
+    const std::lock_guard lock(state.mutex);
+    state.released_progress_step = std::max(state.released_progress_step, step);
+  }
+  state.release_cv.notify_all();
+}
+
+bool waitForFanoutProbeProgressStep(int step) {
+  FanoutProbeState& state = fanoutProbeState();
+  std::unique_lock lock(state.mutex);
+  return state.release_cv.wait_for(
+      lock, std::chrono::seconds(5), [&state, step]() { return state.released_progress_step >= step; });
+}
+
+std::vector<std::string> fanoutProbeStartedSuffixes() {
+  FanoutProbeState& state = fanoutProbeState();
+  const std::lock_guard lock(state.mutex);
+  std::vector<std::string> out;
+  for (const FanoutProbeCall& call : state.calls) {
+    if (call.slot == "start") {
+      out.push_back(call.suffix);
+    }
+  }
+  return out;
+}
+
+std::vector<std::string> fanoutProbeControlCallsOffMain() {
+  FanoutProbeState& state = fanoutProbeState();
+  const std::lock_guard lock(state.mutex);
+  std::vector<std::string> out;
+  for (const FanoutProbeCall& call : state.calls) {
+    // Finite-import start() is a separate ABI decision: its current blocking
+    // shape cannot simply move to the GUI thread. This assertion covers the
+    // newly shifted control slots that the published SDK unambiguously marks
+    // main-thread; start's contract must be reconciled independently.
+    if (call.slot == "start" || call.thread == state.main_thread) {
+      continue;
+    }
+    out.push_back(call.suffix.empty() ? call.slot : call.slot + ':' + call.suffix);
+  }
+  return out;
+}
+
+std::string joinFanoutProbeCalls(const std::vector<std::string>& calls) {
+  std::string out;
+  for (const std::string& call : calls) {
+    if (!out.empty()) {
+      out += ", ";
+    }
+    out += call;
+  }
+  return out;
+}
+
+std::string fanoutProbeSuffix(std::string_view config) {
+  const QJsonDocument document =
+      QJsonDocument::fromJson(QByteArray(config.data(), static_cast<qsizetype>(config.size())));
+  return document.isObject() ? document.object().value(u"display_suffix"_s).toString().toStdString() : std::string{};
+}
+
+class FanoutProbeSource final : public PJ::DataSourcePluginBase {
+ public:
+  FanoutProbeSource() {
+    recordFanoutProbeCall("create");
+  }
+
+  ~FanoutProbeSource() override {
+    recordFanoutProbeCall("destroy", suffix_);
+  }
+
+  uint64_t capabilities() const override {
+    recordFanoutProbeCall("capabilities", suffix_);
+    return PJ::kCapabilityFiniteImport | PJ::kCapabilityDirectIngest;
+  }
+
+  PJ::Status bind(PJ::sdk::ServiceRegistry services) override {
+    recordFanoutProbeCall("bind", suffix_);
+    return PJ::DataSourcePluginBase::bind(services);
+  }
+
+  std::string saveConfig() const override {
+    recordFanoutProbeCall("save_config", suffix_);
+    return config_;
+  }
+
+  PJ::Status loadConfig(std::string_view config_json) override {
+    config_.assign(config_json);
+    suffix_ = fanoutProbeSuffix(config_json);
+    recordFanoutProbeCall("load_config", suffix_);
+    return PJ::okStatus();
+  }
+
+  PJ::Status start() override {
+    recordFanoutProbeCall("start", suffix_);
+    state_ = PJ::DataSourceState::kStarting;
+    runtimeHost().notifyState(state_);
+
+    const auto fail = [this](std::string reason) -> PJ::Status {
+      runtimeHost().progressFinish();
+      state_ = PJ::DataSourceState::kFailed;
+      runtimeHost().notifyState(state_);
+      return PJ::unexpected(std::move(reason));
+    };
+
+    const std::string title = "fanout-probe:" + suffix_;
+    if (auto status = runtimeHost().progressStart(title, 3, true); !status) {
+      return fail(status.error());
+    }
+
+    auto topic = writeHost().ensureTopic("fanout_probe/value");
+    if (!topic) {
+      return fail(topic.error());
+    }
+    const auto append = [this, &topic](uint64_t index) -> PJ::Status {
+      return writeHost().appendRecord(
+          *topic, PJ::Timestamp{static_cast<int64_t>(index * 100)},
+          {{.name = "value", .value = static_cast<double>(index)}});
+    };
+
+    if (suffix_ == "cancel") {
+      if (auto status = append(1); !status) {
+        return fail(status.error());
+      }
+      if (!waitForFanoutProbeCancelRelease()) {
+        return fail("timed out waiting for the GUI cancellation rendezvous");
+      }
+      // Match real finite-import plugins: cancellation is reported as a failed
+      // start after the host's progress callback returns false. FileLoader must
+      // inspect its cancellation mode before classifying that status as a
+      // normal plugin failure.
+      if (!runtimeHost().progressUpdate(1)) {
+        return fail("cancelled via progress");
+      }
+      return fail("the host did not deliver the requested cancellation");
+    }
+
+    for (uint64_t index = 1; index <= 3; ++index) {
+      if (suffix_ == "progressive" && !waitForFanoutProbeProgressStep(static_cast<int>(index))) {
+        return fail("timed out waiting for the progressive flush rendezvous");
+      }
+      if (auto status = append(index); !status) {
+        return fail(status.error());
+      }
+      if (!runtimeHost().progressUpdate(index)) {
+        return fail("cancelled via progress");
+      }
+    }
+
+    runtimeHost().progressFinish();
+    state_ = PJ::DataSourceState::kStopped;
+    runtimeHost().notifyState(state_);
+    runtimeHost().requestStop(PJ::DataSourceState::kStopped, "import complete");
+    return PJ::okStatus();
+  }
+
+  void stop() override {
+    recordFanoutProbeCall("stop", suffix_);
+    state_ = PJ::DataSourceState::kStopped;
+  }
+
+  PJ::DataSourceState currentState() const override {
+    return state_;
+  }
+
+ private:
+  std::string config_ = "{}";
+  std::string suffix_;
+  PJ::DataSourceState state_ = PJ::DataSourceState::kIdle;
+};
+
+const PJ_data_source_vtable_t* fanoutProbeVtable() {
+  static const PJ_data_source_vtable_t* vtable = PJ::DataSourcePluginBase::vtableWithCreate(
+      []() noexcept -> void* {
+        try {
+          return new FanoutProbeSource();
+        } catch (...) {
+          return nullptr;
+        }
+      },
+      R"({"id":"fanout-probe-source","name":"Fanout Probe Source","version":"1.0.0",)"
+      R"("file_extensions":[".fanoutprobe"]})");
+  return vtable;
+}
 
 class FileLoaderTest : public ::testing::Test {
  protected:
@@ -84,6 +372,20 @@ class FileLoaderTest : public ::testing::Test {
     return app_session_->catalogModel();
   }
 
+  [[nodiscard]] bool installFanoutProbe() {
+    resetFanoutProbe();
+    return app_session_->extensionCatalog().pluginCatalog().registerStaticDataSource(fanoutProbeVtable());
+  }
+
+  [[nodiscard]] PJ::LoadHints fanoutProbeHints(const QString& config) {
+    PJ::LoadHints hints;
+    hints.expected_plugin_id = u"Fanout Probe Source"_s;
+    hints.preset_config_json = config;
+    hints.skip_dialog = true;
+    hints.require_expected_plugin = true;
+    return hints;
+  }
+
   [[nodiscard]] QString makeMockFile(const QString& name) {
     const QString path = data_dir_.filePath(name);
     QFile file(path);
@@ -110,10 +412,10 @@ class FileLoaderTest : public ::testing::Test {
   }
 
   // Enqueue a load and pump the event loop until it completes. Single-instance
-  // loads run progressively on a worker thread, so completion is asynchronous
-  // (fileLoaded/fileLoadFailed); fanout / layout-reuse / failure complete
-  // synchronously inside loadFile (the signal fires before exec(), so done is
-  // already set and we skip the loop).
+  // loads and fanout run on a worker thread, so completion is asynchronous
+  // (fileLoaded/fileLoadFailed). Layout reuse and early failures may still
+  // complete synchronously (the signal fires before exec(), so done is already
+  // set and we skip the loop).
   [[nodiscard]] bool loadAndWait(const QString& path, const PJ::LoadHints& hints) {
     QEventLoop loop;
     bool ok = false;
@@ -206,6 +508,131 @@ TEST_F(FileLoaderTest, ReloadingSameFileReplacesDatasetInPlace) {
   EXPECT_EQ(datasetNamed("sensors.mock"), dataset_id) << "reload must keep the DatasetId stable";
   EXPECT_EQ(singleTopicRowCount(dataset_id), 3) << "reload wiped, duplicated, or re-appended the dataset's topics";
   EXPECT_EQ(catalog().items().size(), 1u) << "curve tree must survive a same-file reload";
+}
+
+TEST_F(FileLoaderTest, RequiredLayoutPluginFailsInsteadOfFallingBackToFirstExtensionMatch) {
+  PJ::LoadHints hints = loadHints();
+  hints.expected_plugin_id = u"Missing Layout Plugin"_s;
+  hints.require_expected_plugin = true;
+
+  EXPECT_FALSE(loadAndWait(mock_path_, hints));
+  EXPECT_TRUE(session().createReader().listDatasets().empty())
+      << "a missing exact layout plugin must fail before creating a dataset shell";
+}
+
+TEST_F(FileLoaderTest, ExactPluginOptInSelectsRequestedNonFirstExtensionMatch) {
+  auto& extensions = app_session_->extensionCatalog();
+  const auto original_matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(original_matches.size(), 1u);
+  ASSERT_TRUE(extensions.pluginCatalog().registerStaticDataSource(
+      alternateMockSourceVtable(original_matches.front()->library.vtable())));
+
+  const auto matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(matches.size(), 2u);
+  ASSERT_EQ(QString::fromStdString(matches.front()->name), u"Mock File Source"_s);
+  ASSERT_EQ(QString::fromStdString(matches.back()->name), u"Alternate Mock File Source"_s)
+      << "the requested plugin must be a genuine non-first extension match";
+
+  const auto load_and_capture_plugin = [this](const QString& path, const PJ::LoadHints& hints) {
+    QString selected_plugin;
+    const auto loaded = QObject::connect(
+        loader_.get(), &PJ::FileLoader::fileLoaded,
+        [&selected_plugin](const QString&, const QString&, const QString& plugin_id, const QString&) {
+          selected_plugin = plugin_id;
+        });
+    const bool succeeded = loadAndWait(path, hints);
+    QObject::disconnect(loaded);
+    return std::pair{succeeded, selected_plugin};
+  };
+
+  PJ::LoadHints desktop_hints;
+  ASSERT_FALSE(desktop_hints.require_expected_plugin);
+  const auto [desktop_succeeded, desktop_plugin] =
+      load_and_capture_plugin(makeMockFile(u"default-selection.mock"_s), desktop_hints);
+  ASSERT_TRUE(desktop_succeeded);
+  EXPECT_EQ(desktop_plugin, u"Mock File Source"_s) << "the desktop/default path must preserve first-match selection";
+
+  PJ::LoadHints exact_hints = loadHints();
+  exact_hints.expected_plugin_id = u"Alternate Mock File Source"_s;
+  exact_hints.require_expected_plugin = true;
+  const auto [exact_succeeded, exact_plugin] =
+      load_and_capture_plugin(makeMockFile(u"exact-selection.mock"_s), exact_hints);
+  ASSERT_TRUE(exact_succeeded);
+  EXPECT_EQ(exact_plugin, u"Alternate Mock File Source"_s)
+      << "exact layout replay must select the requested non-first match";
+}
+
+TEST_F(FileLoaderTest, BrowserLayoutPresetRewritesOnlyFilepathToFreshBackingPath) {
+  const QString stale_path = u"/pj_uploads/expired/1/sensors.mock"_s;
+  PJ::LoadHints hints =
+      loadHints(uR"({"filepath":"/pj_uploads/expired/1/sensors.mock","delimiter":";","nested":{"keep":7}})"_s);
+  hints.require_expected_plugin = true;
+  hints.rewrite_preset_filepath = true;
+
+  QString emitted_config;
+  bool done = false;
+  bool succeeded = false;
+  QEventLoop loop;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, &loop,
+      [&](const QString&, const QString&, const QString&, const QString& config) {
+        emitted_config = config;
+        succeeded = true;
+        done = true;
+        loop.quit();
+      });
+  const auto failed =
+      QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, &loop, [&](const QString&, const QString&) {
+        done = true;
+        loop.quit();
+      });
+  PJ::LoadInput browser_input{
+      .display_name = u"sensors.mock"_s,
+      .backing_path = mock_path_,
+      .source_identity = u"pj-upload://fresh/2/sensors.mock"_s,
+      .content_sha256 = {},
+      .lease = {},
+  };
+  ASSERT_TRUE(loader_->loadFile(std::move(browser_input), nullptr, hints));
+  if (!done) {
+    QTimer::singleShot(10000, &loop, [&loop]() { loop.quit(); });
+    loop.exec();
+  }
+  QObject::disconnect(loaded);
+  QObject::disconnect(failed);
+  ASSERT_TRUE(done);
+  ASSERT_TRUE(succeeded);
+
+  const QJsonDocument parsed = QJsonDocument::fromJson(emitted_config.toUtf8());
+  ASSERT_TRUE(parsed.isObject());
+  const QJsonObject config = parsed.object();
+  EXPECT_EQ(config.value(u"filepath"_s).toString(), mock_path_);
+  EXPECT_NE(config.value(u"filepath"_s).toString(), stale_path);
+  EXPECT_EQ(config.value(u"delimiter"_s).toString(), u";"_s);
+  EXPECT_EQ(config.value(u"nested"_s).toObject().value(u"keep"_s).toInt(), 7);
+}
+
+TEST_F(FileLoaderTest, DesktopPresetBytesRemainUntouchedWithoutRewriteOptIn) {
+  const QString preset = uR"({"filepath":"desktop-layout-value","marker":"byte-exact"})"_s;
+  PJ::LoadHints hints = loadHints(preset);
+
+  QString emitted_config;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded,
+      [&](const QString&, const QString&, const QString&, const QString& config) { emitted_config = config; });
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+  QObject::disconnect(loaded);
+  EXPECT_EQ(emitted_config, preset);
+}
+
+TEST_F(FileLoaderTest, BrowserLayoutEmptyPresetCanStillInjectFreshBackingPathAndSkipDialog) {
+  PJ::LoadHints hints = loadHints(QString());
+  hints.skip_dialog = true;
+  hints.require_expected_plugin = true;
+  hints.rewrite_preset_filepath = true;
+
+  EXPECT_TRUE(loadAndWait(mock_path_, hints));
+  EXPECT_NE(datasetNamed("sensors.mock"), 0u);
 }
 
 // With several files loaded, reloading ONE of them must replace only that
@@ -385,7 +812,7 @@ TEST_F(FileLoaderTest, FanoutReloadErasesOldDatasetBeforePreferReuseReload) {
 
   PJ::LoadHints fanout_hints =
       loadHints(uR"({"__pj_fanout":["{\"display_suffix\":\"left\"}","{\"display_suffix\":\"right\"}"]})"_s);
-  ASSERT_TRUE(loader_->loadFile(path, nullptr, fanout_hints));
+  ASSERT_TRUE(loadAndWait(path, fanout_hints));
 
   EXPECT_FALSE(engineHasDataset(old_id)) << "fanout reload must erase the tombstoned old dataset from the engine";
   EXPECT_EQ(datasetNamed("fanout.mock"), 0u) << "prefer_reuse must not find the old basename after fanout reload";
@@ -399,6 +826,156 @@ TEST_F(FileLoaderTest, FanoutReloadErasesOldDatasetBeforePreferReuseReload) {
   EXPECT_NE(reloaded, 0u) << "prefer_reuse after fanout reload must ingest a fresh dataset";
   EXPECT_NE(reloaded, old_id) << "the old fanout-replaced DatasetId must not be reused";
   EXPECT_EQ(singleTopicRowCount(reloaded), 3) << "fresh prefer_reuse load must ingest rows";
+}
+
+TEST_F(FileLoaderTest, FanoutRemoveAllStopsAtCancelledEntryAndDropsCompletedEntries) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"cancel.fanoutprobe"_s);
+  const PJ::LoadHints hints = fanoutProbeHints(
+      uR"({"__pj_fanout":["{\"display_suffix\":\"complete\"}","{\"display_suffix\":\"cancel\"}","{\"display_suffix\":\"must-not-start\"}"]})"_s);
+
+  bool cancel_sent = false;
+  const auto cancel_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestStarted, loader_.get(),
+      [this, &cancel_sent](const QString& title, int, int, bool) {
+        if (title != u"fanout-probe:cancel"_s || cancel_sent) {
+          return;
+        }
+        cancel_sent = true;
+        loader_->cancelCurrent(/*keep_partial=*/false);
+        releaseFanoutProbeCancelEntry();
+      });
+
+  // Discard may reasonably terminate through either fileLoaded or
+  // fileLoadFailed; this test pins the dataset/cancellation contract instead of
+  // coupling it to that separate signal-policy decision.
+  (void)loadAndWait(path, hints);
+  QObject::disconnect(cancel_connection);
+
+  ASSERT_TRUE(cancel_sent) << "the second fanout entry never reached its cancellation rendezvous";
+  EXPECT_FALSE(loader_->isBusy());
+  const std::vector<std::string> expected_starts{"complete", "cancel"};
+  EXPECT_EQ(fanoutProbeStartedSuffixes(), expected_starts)
+      << "a progress cancellation must stop fanout instead of being classified as a recoverable plugin failure";
+  EXPECT_TRUE(session().createReader().listDatasets().empty())
+      << "Remove All must also delete fanout entries that completed before cancellation";
+  EXPECT_EQ(datasetNamed("cancel/complete"), 0u);
+  EXPECT_EQ(datasetNamed("cancel/cancel"), 0u);
+  EXPECT_EQ(datasetNamed("cancel/must-not-start"), 0u);
+}
+
+TEST_F(FileLoaderTest, FanoutStopAndKeepStopsAtCancelledEntryAndKeepsPartialEntry) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"keep.fanoutprobe"_s);
+  const PJ::LoadHints hints = fanoutProbeHints(
+      uR"({"__pj_fanout":["{\"display_suffix\":\"complete\"}","{\"display_suffix\":\"cancel\"}","{\"display_suffix\":\"must-not-start\"}"]})"_s);
+
+  bool cancel_sent = false;
+  const auto cancel_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestStarted, loader_.get(),
+      [this, &cancel_sent](const QString& title, int, int, bool) {
+        if (title != u"fanout-probe:cancel"_s || cancel_sent) {
+          return;
+        }
+        cancel_sent = true;
+        loader_->cancelCurrent(/*keep_partial=*/true);
+        releaseFanoutProbeCancelEntry();
+      });
+
+  (void)loadAndWait(path, hints);
+  QObject::disconnect(cancel_connection);
+
+  ASSERT_TRUE(cancel_sent) << "the second fanout entry never reached its cancellation rendezvous";
+  EXPECT_FALSE(loader_->isBusy());
+  const std::vector<std::string> expected_starts{"complete", "cancel"};
+  EXPECT_EQ(fanoutProbeStartedSuffixes(), expected_starts)
+      << "Stop and Keep must not continue into the next fanout entry";
+  EXPECT_EQ(session().createReader().listDatasets().size(), 2u)
+      << "Stop and Keep must retain completed entries plus the in-flight partial entry";
+
+  const PJ::DatasetId complete = datasetNamed("keep/complete");
+  const PJ::DatasetId partial = datasetNamed("keep/cancel");
+  ASSERT_NE(complete, 0u);
+  ASSERT_NE(partial, 0u);
+  EXPECT_EQ(singleTopicRowCount(complete), 3);
+  EXPECT_EQ(singleTopicRowCount(partial), 1);
+  EXPECT_EQ(datasetNamed("keep/must-not-start"), 0u);
+}
+
+TEST_F(FileLoaderTest, FanoutControlLifecycleStaysOnSdkMainThread) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"threads.fanoutprobe"_s);
+  const PJ::LoadHints hints =
+      fanoutProbeHints(uR"({"__pj_fanout":["{\"display_suffix\":\"left\"}","{\"display_suffix\":\"right\"}"]})"_s);
+
+  ASSERT_TRUE(loadAndWait(path, hints));
+  const std::vector<std::string> expected_starts{"left", "right"};
+  ASSERT_EQ(fanoutProbeStartedSuffixes(), expected_starts) << "the lifecycle assertion must not pass vacuously";
+
+  const std::vector<std::string> off_main = fanoutProbeControlCallsOffMain();
+  EXPECT_TRUE(off_main.empty()) << "SDK [main-thread] DataSource control slots ran on the fanout worker: "
+                                << joinFanoutProbeCalls(off_main);
+}
+
+TEST_F(FileLoaderTest, ProgressiveFlushNotifiesStableTopicAndRefreshesRangeEachTime) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"progressive.fanoutprobe"_s);
+  const PJ::LoadHints hints = fanoutProbeHints(uR"({"display_suffix":"progressive"})"_s);
+
+  int notification_count = 0;
+  std::vector<int> progress_steps;
+  std::vector<int64_t> committed_rows;
+  std::vector<int> notifications_at_step;
+  std::vector<double> playback_max_at_step;
+
+  const auto ingest_connection = QObject::connect(
+      &session(), &PJ::SessionManager::samplesIngested, loader_.get(),
+      [this, &notification_count](const QVector<PJ::TopicId>&, bool live) {
+        if (live) {
+          return;
+        }
+        ++notification_count;
+        // Mirrors MainWindow's non-live samplesIngested handler: progressive
+        // notifications are what make the playback/timeline range grow.
+        app_session_->recomputeRange();
+      });
+  const auto start_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestStarted, loader_.get(), [](const QString& title, int, int, bool) {
+        if (title == u"fanout-probe:progressive"_s) {
+          QTimer::singleShot(100, []() { releaseFanoutProbeProgressStep(1); });
+        }
+      });
+  const auto progress_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestProgress, loader_.get(),
+      [this, &notification_count, &progress_steps, &committed_rows, &notifications_at_step, &playback_max_at_step](
+          int current, int) {
+        const PJ::DatasetId dataset_id = loader_->activeLoadDatasetId();
+        progress_steps.push_back(current);
+        committed_rows.push_back(singleTopicRowCount(dataset_id));
+        notifications_at_step.push_back(notification_count);
+        playback_max_at_step.push_back(app_session_->playbackEngine().rangeMax().value);
+        if (current < 3) {
+          QTimer::singleShot(100, [current]() { releaseFanoutProbeProgressStep(current + 1); });
+        }
+      });
+
+  const bool loaded = loadAndWait(path, hints);
+  QObject::disconnect(ingest_connection);
+  QObject::disconnect(start_connection);
+  QObject::disconnect(progress_connection);
+
+  ASSERT_TRUE(loaded);
+  const std::vector<int> expected_steps{1, 2, 3};
+  const std::vector<int64_t> expected_rows{1, 2, 3};
+  EXPECT_EQ(progress_steps, expected_steps);
+  EXPECT_EQ(committed_rows, expected_rows)
+      << "the fixture must prove that all three append-only flushes committed data";
+  EXPECT_EQ(notifications_at_step, expected_steps)
+      << "samplesIngested must fire for every flush even after the topic count stabilizes";
+  ASSERT_EQ(playback_max_at_step.size(), 3U);
+  EXPECT_DOUBLE_EQ(playback_max_at_step[0], 100.0e-9);
+  EXPECT_DOUBLE_EQ(playback_max_at_step[1], 200.0e-9);
+  EXPECT_DOUBLE_EQ(playback_max_at_step[2], 300.0e-9);
 }
 
 TEST_F(FileLoaderTest, FailedFirstLoadErasesAbandonedLiveDatasetBeforePreferReuseReload) {
@@ -445,6 +1022,242 @@ TEST_F(FileLoaderTest, QueueProcessesEnqueuedLoadsSequentially) {
   EXPECT_FALSE(loader_->isBusy());
   EXPECT_EQ(session().createReader().listDatasets().size(), 3u) << "all three queued files must load";
   EXPECT_EQ(drained, 1) << "queueDrained fires once when the queue empties";
+}
+
+// The stop-confirmation dialog binds to loadGeneration() and must auto-dismiss
+// when its load stops being the current one. fileLoaded/fileLoadFailed cannot
+// signal that hand-over — they fire while the finished load is still the
+// current generation — and queueDrained stays silent while a next load is
+// queued. Pin the covering signal: every queued takeover emits
+// loadGenerationAdvanced with a fresh generation, before queueDrained.
+TEST_F(FileLoaderTest, QueuedNextLoadEmitsLoadGenerationAdvanced) {
+  const QString a = makeMockFile(u"gen_a.mock"_s);
+  const QString b = makeMockFile(u"gen_b.mock"_s);
+
+  std::vector<std::uint64_t> advances;
+  int drained = 0;
+  int drained_at_second_advance = -1;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadGenerationAdvanced, loader_.get(),
+      [&advances, &drained, &drained_at_second_advance](std::uint64_t generation) {
+        advances.push_back(generation);
+        if (advances.size() == 2) {
+          drained_at_second_advance = drained;
+        }
+      });
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, loader_.get(), [&drained]() { ++drained; });
+
+  EXPECT_TRUE(loader_->loadFile(a, nullptr, skipDialogHints()));
+  const std::uint64_t first_generation = loader_->loadGeneration();
+  ASSERT_NE(first_generation, 0u);
+  EXPECT_TRUE(loader_->loadFile(b, nullptr, skipDialogHints()));  // queued behind a
+
+  ASSERT_EQ(advances.size(), 1u) << "the first load advances the generation as it starts";
+  EXPECT_EQ(advances[0], first_generation);
+
+  QEventLoop loop;
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, &loop, &QEventLoop::quit);
+  if (loader_->isBusy()) {
+    QTimer::singleShot(15000, &loop, [&loop]() { loop.quit(); });
+    loop.exec();
+  }
+
+  ASSERT_EQ(advances.size(), 2u) << "the queued load's takeover must advance the generation";
+  EXPECT_GT(advances[1], first_generation);
+  EXPECT_EQ(drained_at_second_advance, 0)
+      << "the takeover advance must arrive while the queue is still draining — it is the only "
+         "dismissal signal a stale stop dialog gets between back-to-back loads";
+}
+
+// A fan-out load finishes its coroutine frame (active_load_ false) one event-loop
+// hop BEFORE the queued startNext advances the generation. A generation-gated
+// cancel landing in that hop still matches the finished load's generation — it
+// must be rejected, or the latched cancel_mode_ silently kills the queued NEXT
+// load at its prologue. The Qt::QueuedConnection below runs exactly in that hop
+// (posted during the fan-out's fileLoaded emit, ahead of the queued startNext).
+TEST_F(FileLoaderTest, StaleGenerationCancelInFanoutEpilogueHopIsNoOp) {
+  const QString a = makeMockFile(u"hop_a.mock"_s);
+  const QString b = makeMockFile(u"hop_b.mock"_s);
+
+  std::uint64_t stale_generation = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [this, &stale_generation](const QString&, const QString&, const QString&, const QString&) {
+        if (stale_generation == 0) {
+          stale_generation = loader_->loadGeneration();
+          loader_->cancelCurrent(stale_generation, /*keep_partial=*/false);  // must be a no-op
+        }
+      },
+      Qt::QueuedConnection);
+  int failed_count = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(),
+      [&failed_count](const QString&, const QString&) { ++failed_count; });
+
+  PJ::LoadHints fanout_hints =
+      loadHints(uR"({"__pj_fanout":["{\"display_suffix\":\"left\"}","{\"display_suffix\":\"right\"}"]})"_s);
+  EXPECT_TRUE(loader_->loadFile(a, nullptr, fanout_hints));
+  EXPECT_TRUE(loader_->loadFile(b, nullptr, skipDialogHints()));
+
+  QEventLoop loop;
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, &loop, &QEventLoop::quit);
+  if (loader_->isBusy()) {
+    QTimer::singleShot(15000, &loop, [&loop]() { loop.quit(); });
+    loop.exec();
+  }
+
+  ASSERT_NE(stale_generation, 0u) << "the hop probe never ran";
+  EXPECT_EQ(failed_count, 0) << "the stale cancel leaked into a load";
+  EXPECT_NE(datasetNamed("hop_b.mock"), 0u) << "the stale-generation cancel must not kill the queued next load";
+}
+
+// Two browser uploads sharing a display name and a backing-file basename carry
+// DISTINCT opaque pj-upload:// identities: the reload-match loop must key on
+// the identity (literal compare), never collapse them by filesystem-path shape
+// — and reloading one identity must replace exactly that dataset in place.
+TEST_F(FileLoaderTest, BrowserUploadsSharingBasenameStayDistinctAndReloadInPlace) {
+  ASSERT_TRUE(QDir(data_dir_.path()).mkpath(u"u1"_s));
+  ASSERT_TRUE(QDir(data_dir_.path()).mkpath(u"u2"_s));
+  const QString backing_a = makeMockFile(u"u1/run.mock"_s);
+  const QString backing_b = makeMockFile(u"u2/run.mock"_s);
+  const QString identity_a = u"pj-upload://session/1/run.mock"_s;
+  const QString identity_b = u"pj-upload://session/2/run.mock"_s;
+
+  const auto upload_input = [](const QString& backing, const QString& identity) {
+    return PJ::LoadInput{
+        .display_name = u"run.mock"_s,
+        .backing_path = backing,
+        .source_identity = identity,
+        .content_sha256 = {},
+        .lease = {},
+    };
+  };
+  const auto load_upload = [this, &upload_input](const QString& backing, const QString& identity) {
+    QEventLoop loop;
+    bool ok = false;
+    bool done = false;
+    const auto loaded = QObject::connect(
+        loader_.get(), &PJ::FileLoader::fileLoaded, &loop,
+        [&](const QString&, const QString&, const QString&, const QString&) {
+          ok = true;
+          done = true;
+          loop.quit();
+        });
+    const auto failed =
+        QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, &loop, [&](const QString&, const QString&) {
+          done = true;
+          loop.quit();
+        });
+    EXPECT_TRUE(loader_->loadFile(upload_input(backing, identity), nullptr, skipDialogHints()));
+    if (!done) {
+      QTimer::singleShot(10000, &loop, [&loop]() { loop.quit(); });
+      loop.exec();
+    }
+    QObject::disconnect(loaded);
+    QObject::disconnect(failed);
+    return ok;
+  };
+  const auto datasetWithIdentity = [this](const QString& identity) -> PJ::DatasetId {
+    for (const PJ::DatasetId id : session().createReader().listDatasets()) {
+      if (loader_->sourcePathForDataset(id) == identity) {
+        return id;
+      }
+    }
+    return 0;
+  };
+
+  ASSERT_TRUE(load_upload(backing_a, identity_a));
+  ASSERT_TRUE(load_upload(backing_b, identity_b));
+  EXPECT_EQ(session().createReader().listDatasets().size(), 2u)
+      << "same-basename uploads with distinct identities must stay distinct datasets";
+  const PJ::DatasetId id_a = datasetWithIdentity(identity_a);
+  const PJ::DatasetId id_b = datasetWithIdentity(identity_b);
+  ASSERT_NE(id_a, 0u);
+  ASSERT_NE(id_b, 0u);
+  ASSERT_NE(id_a, id_b);
+
+  // Reload the FIRST identity: an in-place replace of that dataset only.
+  ASSERT_TRUE(load_upload(backing_a, identity_a));
+  EXPECT_EQ(session().createReader().listDatasets().size(), 2u) << "reloading one identity must not add a dataset";
+  EXPECT_EQ(datasetWithIdentity(identity_a), id_a) << "reload must replace the matching dataset in place";
+  EXPECT_EQ(datasetWithIdentity(identity_b), id_b) << "the sibling upload must be untouched";
+}
+
+// V10: an unusable LoadInput (a trailing-slash directory path → empty fileName,
+// so display_name is empty) must NOT fail silently. loadFile returns false AND
+// emits fileLoadFailed exactly once with a user-visible reason — MainWindow's
+// layout replay relies on that contract ("FileLoader shows its own error on
+// failure").
+TEST_F(FileLoaderTest, InvalidLoadInputEmitsFileLoadFailedOnce) {
+  int failed_count = 0;
+  QString failed_path;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString& path, const QString&) {
+        ++failed_count;
+        failed_path = path;
+      });
+
+  // A directory path with a trailing slash: QFileInfo::fileName() is empty, so
+  // LoadInput::fromNativePath produces an empty display_name.
+  const QString dir_path = data_dir_.path() + u"/"_s;
+  const bool accepted = loader_->loadFile(dir_path, nullptr);
+
+  EXPECT_FALSE(accepted) << "an unusable input must be rejected (return false)";
+  EXPECT_EQ(failed_count, 1) << "the failure must surface via exactly one fileLoadFailed";
+  EXPECT_FALSE(failed_path.isEmpty()) << "the failure must name the offending path";
+  EXPECT_FALSE(loader_->isBusy()) << "nothing was enqueued";
+}
+
+// V9: two failing loads (unmatched extension → synchronous prologue fail) that
+// share a parent must aggregate into ONE warning dialog whose body mentions both
+// failures and whose title reads "2 loads failed" — not two overlapping boxes.
+TEST_F(FileLoaderTest, ConsecutiveFailuresAggregateIntoOneWarningDialog) {
+  QWidget parent;  // owns the aggregated warning dialog (a MessageBox child)
+
+  const QString bad_a = makeMockFile(u"broken_a.unhandledext"_s);
+  const QString bad_b = makeMockFile(u"broken_b.unhandledext"_s);
+
+  int failed_count = 0;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString&) {
+    ++failed_count;
+  });
+
+  // Both extensions have no matching plugin → the prologue's fail() runs
+  // synchronously (before any dialog await) and routes through reportLoadWarning.
+  EXPECT_TRUE(loader_->loadFile(bad_a, &parent));
+  EXPECT_TRUE(loader_->loadFile(bad_b, &parent));
+
+  // The second load is dequeued via a queued startNext; pump until both fail.
+  QEventLoop loop;
+  QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, &loop, &QEventLoop::quit);
+  if (loader_->isBusy()) {
+    loop.exec();
+  }
+  EXPECT_EQ(failed_count, 2) << "both loads must fail";
+
+  // Exactly one warning dialog (a MessageBox), parented to `parent`, showing both.
+  QList<PJ::MessageBox*> warnings;
+  for (PJ::MessageBox* box : parent.findChildren<PJ::MessageBox*>()) {
+    if (box->isVisible()) {
+      warnings << box;
+    }
+  }
+  ASSERT_EQ(warnings.size(), 1) << "N failures must yield ONE aggregated dialog, not N stacked boxes";
+
+  PJ::MessageBox* warning = warnings.front();
+  // setTitle() mirrors onto windowTitle(); "2 loads failed" reflects the count.
+  EXPECT_TRUE(warning->windowTitle().contains(u"2"_s))
+      << "aggregated title must reflect two failures, got: " << warning->windowTitle().toStdString();
+
+  // The aggregated body (a QLabel) must mention BOTH failing extensions.
+  QString body;
+  for (QLabel* label : warning->findChildren<QLabel*>()) {
+    body += label->text();
+  }
+  EXPECT_TRUE(body.contains(u".unhandledext"_s)) << "body must name the failed loads";
+
+  warning->reject();  // dismiss so the fixture tears down cleanly
 }
 
 // Tearing the loader down mid-load (the closeEvent path) must join the worker
@@ -503,6 +1316,186 @@ TEST_F(FileLoaderTest, JoinForShutdownDuringReplacingReloadRestoresPriorData) {
   // The loader recovers: a fresh load after shutdown still completes.
   EXPECT_TRUE(load());
   EXPECT_NE(datasetNamed("sensors.mock"), 0u);
+}
+
+// Fixture for the shutdown-while-suspended-at-the-plugin-config-dialog path.
+// Stages the test-only dialog_probe_source plugin (kCapabilityHasDialog, embedded
+// dialog that records onRejected/destroy order to PJ_DIALOG_PROBE_FILE) and drives
+// a real FileLoader against it WITHOUT skip_dialog, so the prologue coroutine
+// suspends on DataSourceDialogAwaiter with the dialog open.
+class DialogShutdownTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_TRUE(extensions_dir_.isValid());
+    ASSERT_TRUE(data_dir_.isValid());
+    ASSERT_TRUE(probe_dir_.isValid());
+
+    const QString src = QString::fromUtf8(PJ_DIALOG_PROBE_SOURCE_PLUGIN_PATH);
+    const QString dst = extensions_dir_.filePath(QFileInfo(src).fileName());
+    ASSERT_TRUE(QFile::copy(src, dst)) << "could not stage " << src.toStdString();
+
+    probe_path_ = probe_dir_.filePath(u"dialog_probe.log"_s);
+    qputenv("PJ_DIALOG_PROBE_FILE", probe_path_.toUtf8());
+
+    app_session_ = std::make_unique<PJ::AppSession>(extensions_dir_.path());
+    ASSERT_FALSE(app_session_->extensionCatalog().findSourcesForExtension(u".dlgprobe"_s).empty())
+        << "dialog_probe_source_plugin did not load from the staged extensions dir";
+
+    loader_ = std::make_unique<PJ::FileLoader>(
+        app_session_->sessionManager(), app_session_->extensionCatalog(), app_session_->catalogModel());
+  }
+
+  void TearDown() override {
+    qunsetenv("PJ_DIALOG_PROBE_FILE");
+  }
+
+  // A visible plugin-config QDialog owned by `parent`, or nullptr.
+  [[nodiscard]] static QDialog* visibleDialog(QWidget* parent) {
+    for (QDialog* dialog : parent->findChildren<QDialog*>()) {
+      if (dialog->isVisible()) {
+        return dialog;
+      }
+    }
+    return nullptr;
+  }
+
+  QTemporaryDir extensions_dir_;
+  QTemporaryDir data_dir_;
+  QTemporaryDir probe_dir_;
+  QString probe_path_;
+  std::unique_ptr<PJ::AppSession> app_session_;
+  std::unique_ptr<PJ::FileLoader> loader_;
+};
+
+// Tearing the loader down while a load is suspended on its plugin config dialog
+// must reject the plugin EXACTLY ONCE and BEFORE the embedded dialog (and its
+// plugin ctx) is destroyed — a UAF/ordering bug shows up as a missing/duplicate
+// "rejected" or a "destroyed" that precedes it (recorded across the DSO boundary
+// via the probe file). joinForShutdown must also return without hanging.
+TEST_F(DialogShutdownTest, ShutdownWhileSuspendedAtDialogRejectsBeforeDestroy) {
+  QWidget parent;  // real GUI-thread parent so the dialog actually opens (no skip_dialog)
+
+  const QString path = data_dir_.filePath(u"probe.dlgprobe"_s);
+  {
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+  }
+
+  // No hints → skip_dialog stays false → the prologue awaits the plugin dialog.
+  ASSERT_TRUE(loader_->loadFile(path, &parent, PJ::LoadHints{}));
+
+  // Pump the event loop until the plugin config dialog is actually shown.
+  QEventLoop wait_for_dialog;
+  QTimer poll;
+  poll.setInterval(5);
+  QObject::connect(&poll, &QTimer::timeout, &wait_for_dialog, [&]() {
+    if (visibleDialog(&parent) != nullptr) {
+      wait_for_dialog.quit();
+    }
+  });
+  QTimer::singleShot(3000, &wait_for_dialog, &QEventLoop::quit);
+  poll.start();
+  wait_for_dialog.exec();
+  poll.stop();
+  ASSERT_NE(visibleDialog(&parent), nullptr) << "the plugin config dialog never opened";
+
+  // Nothing recorded yet: the load's dialog is open, not rejected, not destroyed.
+  ASSERT_TRUE(readProbeLines(probe_path_).empty());
+
+  // Destroy the suspended prologue frame. The DataSourceDialogAwaiter dtor cancels
+  // the dialog (reject → onRejected), THEN the frame's DataSourceHandle destroys
+  // the embedded dialog.
+  loader_->joinForShutdown();
+  EXPECT_FALSE(loader_->isBusy());
+  EXPECT_EQ(visibleDialog(&parent), nullptr) << "shutdown must close the plugin dialog";
+
+  const std::vector<std::string> markers = readProbeLines(probe_path_);
+  const auto rejected_count = std::count(markers.begin(), markers.end(), std::string("rejected"));
+  const auto destroyed_count = std::count(markers.begin(), markers.end(), std::string("destroyed"));
+  EXPECT_EQ(rejected_count, 1) << "plugin must be rejected exactly once at shutdown";
+  EXPECT_EQ(destroyed_count, 1) << "the embedded dialog must be destroyed exactly once";
+
+  const auto first_reject = std::find(markers.begin(), markers.end(), std::string("rejected"));
+  const auto first_destroy = std::find(markers.begin(), markers.end(), std::string("destroyed"));
+  ASSERT_NE(first_reject, markers.end());
+  ASSERT_NE(first_destroy, markers.end());
+  EXPECT_LT(first_reject, first_destroy) << "on_rejected must reach the plugin BEFORE its ctx is destroyed (UAF guard)";
+
+  // The loader recovers after shutdown.
+  EXPECT_FALSE(loader_->isBusy());
+}
+
+// V12a: a cancel issued while the prologue sits suspended at its config dialog
+// must be HONORED when the prologue resumes — not silently wiped by the
+// cancel_mode_.store(0) that precedes the worker. The user accepts the dialog
+// AFTER cancelling; the load must still roll back (fileLoadFailed, no dataset
+// created, no worker started).
+TEST_F(DialogShutdownTest, CancelWhileSuspendedAtDialogIsHonoredOnResume) {
+  QWidget parent;
+
+  const QString path = data_dir_.filePath(u"cancel_probe.dlgprobe"_s);
+  {
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+  }
+
+  int failed_count = 0;
+  int loaded_count = 0;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString&) {
+    ++failed_count;
+  });
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [&](const QString&, const QString&, const QString&, const QString&) { ++loaded_count; });
+
+  ASSERT_TRUE(loader_->loadFile(path, &parent, PJ::LoadHints{}));
+
+  // Pump until the plugin config dialog is shown (prologue suspended).
+  QEventLoop wait_for_dialog;
+  QTimer poll;
+  poll.setInterval(5);
+  QObject::connect(&poll, &QTimer::timeout, &wait_for_dialog, [&]() {
+    if (visibleDialog(&parent) != nullptr) {
+      wait_for_dialog.quit();
+    }
+  });
+  QTimer::singleShot(3000, &wait_for_dialog, &QEventLoop::quit);
+  poll.start();
+  wait_for_dialog.exec();
+  poll.stop();
+  QDialog* dialog = visibleDialog(&parent);
+  ASSERT_NE(dialog, nullptr) << "the plugin config dialog never opened";
+
+  // The prologue created a dataset SHELL before opening the dialog (bind() needs
+  // it), but no worker has run, so it holds no rows yet.
+  const std::size_t datasets_while_suspended = app_session_->sessionManager().createReader().listDatasets().size();
+
+  // Issue the cancel WHILE suspended (the title-bar Stop → Remove All path), then
+  // let the user "accept" the dialog. The pending cancel must win.
+  loader_->cancelCurrent(/*keep_partial=*/false);
+  dialog->accept();
+
+  // Pump until the prologue resumes and the load resolves.
+  QEventLoop settle;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, &settle, &QEventLoop::quit);
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoaded, &settle, &QEventLoop::quit);
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, &settle, &QEventLoop::quit);
+  QTimer::singleShot(5000, &settle, &QEventLoop::quit);
+  if (loader_->isBusy()) {
+    settle.exec();
+  }
+
+  EXPECT_FALSE(loader_->isBusy());
+  EXPECT_EQ(loaded_count, 0) << "a load cancelled while suspended must NOT complete";
+  EXPECT_EQ(failed_count, 1) << "the honored cancel must surface as one fileLoadFailed";
+  // The dataset shell created before the dialog must be rolled back: the count
+  // returns to whatever it was BEFORE this load began (0 here).
+  EXPECT_EQ(app_session_->sessionManager().createReader().listDatasets().size(), datasets_while_suspended - 1)
+      << "the cancelled load's dataset shell must be erased on rollback";
+  EXPECT_EQ(app_session_->sessionManager().createReader().listDatasets().size(), 0u)
+      << "no dataset may survive a cancel honored at prologue resume";
 }
 
 // Images and depth images must ingest PURE-LAZY (like point clouds) so their raw
@@ -596,10 +1589,10 @@ class MessageBoxMarshalTest : public ::testing::Test {
   std::unique_ptr<PJ::FileLoader> loader_;
 };
 
-// REGRESSION (CSV-load segfault, cross-thread QMessageBox): a DataSource plugin
+// REGRESSION (CSV-load segfault, cross-thread message box): a DataSource plugin
 // may call the runtime host's message box from the import worker thread (the
 // SDK contract tags show_message_box [main-thread] and promises the host
-// marshals it). Pre-fix, FileLoader's setMessageBoxHandler built the QMessageBox
+// marshals it). Pre-fix, FileLoader's setMessageBoxHandler built the message box
 // directly on the worker → "QObject::setParent: ... different thread" + a
 // paint-engine segfault. Here we pass a real GUI-thread dialog_parent (the
 // handler is only installed when non-null), trigger a worker-thread askContinue,
@@ -621,10 +1614,9 @@ TEST_F(MessageBoxMarshalTest, WorkerThreadMessageBoxIsMarshaledToGuiThread) {
   hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
   hints.skip_dialog = true;
 
-  // The marshaled dialog is an app-styled PJ::Dialog (execScrollableMessageDialog),
-  // shown modal via exec(); its exec() spins a nested event loop on the GUI thread.
-  // This timer fires inside it, finds the modal, and clicks its "Continue" button
-  // so askContinue returns true and the load proceeds.
+  // The GUI thread opens the message box asynchronously while only the ingest
+  // worker waits. This timer clicks Continue so askContinue returns true and
+  // the load proceeds without a nested GUI event loop.
   QTimer dismiss;
   dismiss.setInterval(20);
   QObject::connect(&dismiss, &QTimer::timeout, [&]() {
@@ -679,6 +1671,186 @@ TEST_F(MessageBoxMarshalTest, WorkerThreadMessageBoxIsMarshaledToGuiThread) {
   EXPECT_FALSE(capture.sawText(u"different thread"_s))
       << "a cross-thread Qt warning was emitted during the worker-thread message box";
   EXPECT_TRUE(ok) << "the marshaled askContinue must return Continue and complete the load";
+}
+
+// REGRESSION (desktop plugin contract): FileLoader calls loadConfig() on the
+// GUI thread after bind(). show_message_box is nevertheless a synchronous ABI:
+// it must block until the user answers and return that exact button. The current
+// GUI-thread branch opens the dialog asynchronously and immediately returns -1,
+// so the plugin observes Abort even though this test clicks Continue.
+TEST_F(MessageBoxMarshalTest, GuiThreadLoadConfigReceivesClickedMessageBoxAnswer) {
+  QTemporaryDir probe_dir;
+  ASSERT_TRUE(probe_dir.isValid());
+  const QString probe_path = probe_dir.filePath(u"msgbox_probe.log"_s);
+  qputenv("PJ_MSGBOX_PROBE_FILE", probe_path.toUtf8());
+  const auto cleanup_env = qScopeGuard([]() { qunsetenv("PJ_MSGBOX_PROBE_FILE"); });
+
+  QWidget parent;
+  const QString path = data_dir_.filePath(u"gui_load_config.msgboxmock"_s);
+  QFile file(path);
+  ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+  file.close();
+
+  PJ::LoadHints hints;
+  hints.expected_plugin_id = u"Msgbox Mock Source"_s;
+  hints.preset_config_json = uR"({"ask_msgbox_in_load_config":true})"_s;
+  hints.skip_dialog = true;
+
+  QEventLoop loop;
+  bool ok = false;
+  bool done = false;
+  bool clicked_continue = false;
+  const auto maybe_finish = [&]() {
+    if (done && clicked_continue) {
+      loop.quit();
+    }
+  };
+
+  QTimer dismiss;
+  dismiss.setInterval(5);
+  QObject::connect(&dismiss, &QTimer::timeout, [&]() {
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+      auto* message_box = qobject_cast<PJ::MessageBox*>(widget);
+      if (message_box == nullptr || !message_box->isVisible()) {
+        continue;
+      }
+      for (QAbstractButton* button : message_box->findChildren<QAbstractButton*>()) {
+        if (button->text() == u"Continue"_s) {
+          clicked_continue = true;
+          button->click();
+          maybe_finish();
+          return;
+        }
+      }
+    }
+  });
+  dismiss.start();
+
+  const auto on_loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, &loop,
+      [&](const QString&, const QString&, const QString&, const QString&) {
+        ok = true;
+        done = true;
+        maybe_finish();
+      });
+  const auto on_failed =
+      QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, &loop, [&](const QString&, const QString&) {
+        ok = false;
+        done = true;
+        maybe_finish();
+      });
+
+  loader_->loadFile(path, &parent, hints);
+  if (!done || !clicked_continue) {
+    QTimer::singleShot(10000, &loop, [&loop]() { loop.quit(); });
+    loop.exec();
+  }
+  QObject::disconnect(on_loaded);
+  QObject::disconnect(on_failed);
+  dismiss.stop();
+
+  ASSERT_TRUE(clicked_continue) << "the test never clicked the visible Continue button";
+  ASSERT_TRUE(done) << "the load never completed after answering the plugin message box";
+  EXPECT_TRUE(ok) << "loadConfig must receive Continue instead of the host's premature -1";
+
+  const std::vector<std::string> markers = readProbeLines(probe_path);
+  EXPECT_EQ(std::count(markers.begin(), markers.end(), std::string("load_config_continued")), 1)
+      << "the plugin must synchronously observe the clicked Continue answer";
+  EXPECT_EQ(std::count(markers.begin(), markers.end(), std::string("load_config_aborted")), 0)
+      << "the plugin observed -1/Abort before the user's click was delivered";
+}
+
+TEST_F(MessageBoxMarshalTest, ShutdownRejectsWorkerMessageBeforeJoining) {
+  QWidget parent;
+  const QString path = data_dir_.filePath(u"shutdown.msgboxmock"_s);
+  QFile file(path);
+  ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+  file.close();
+
+  PJ::LoadHints hints;
+  hints.expected_plugin_id = u"Msgbox Mock Source"_s;
+  hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
+  hints.skip_dialog = true;
+  ASSERT_TRUE(loader_->loadFile(path, &parent, hints));
+
+  QEventLoop wait_for_dialog;
+  QTimer poll;
+  poll.setInterval(5);
+  QObject::connect(&poll, &QTimer::timeout, &wait_for_dialog, [&]() {
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+      if (qobject_cast<PJ::MessageBox*>(widget) != nullptr && widget->isVisible()) {
+        wait_for_dialog.quit();
+        return;
+      }
+    }
+  });
+  QTimer::singleShot(2000, &wait_for_dialog, &QEventLoop::quit);
+  poll.start();
+  wait_for_dialog.exec();
+  poll.stop();
+
+  bool found = false;
+  for (QWidget* widget : QApplication::topLevelWidgets()) {
+    found = found || (qobject_cast<PJ::MessageBox*>(widget) != nullptr && widget->isVisible());
+  }
+  ASSERT_TRUE(found) << "worker never opened its asynchronous message box";
+
+  // Must return: joinForShutdown rejects the dialog first, releasing the worker
+  // from the synchronous plugin ABI, and only then waits for QThread::finished.
+  loader_->joinForShutdown();
+  EXPECT_FALSE(loader_->isBusy());
+}
+
+// The harder shutdown race: the worker posts its message-box request but the GUI
+// thread never dispatches it (we never pump the event loop before joining). The
+// gate must still unblock the worker with -1 so joinForShutdown returns without
+// hanging, and the queued GUI open — if it ever runs — is a no-op. We assert the
+// join is bounded and the plugin's askContinue observed -1 (recorded "aborted",
+// never "continued") via the probe file.
+TEST_F(MessageBoxMarshalTest, ShutdownAnswersQueuedWorkerMessageWithMinusOne) {
+  QTemporaryDir probe_dir;
+  ASSERT_TRUE(probe_dir.isValid());
+  const QString probe_path = probe_dir.filePath(u"msgbox_probe.log"_s);
+  qputenv("PJ_MSGBOX_PROBE_FILE", probe_path.toUtf8());
+  const auto cleanup_env = qScopeGuard([]() { qunsetenv("PJ_MSGBOX_PROBE_FILE"); });
+
+  QWidget parent;
+  const QString path = data_dir_.filePath(u"queued_shutdown.msgboxmock"_s);
+  QFile file(path);
+  ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+  file.close();
+
+  PJ::LoadHints hints;
+  hints.expected_plugin_id = u"Msgbox Mock Source"_s;
+  hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
+  hints.skip_dialog = true;
+  ASSERT_TRUE(loader_->loadFile(path, &parent, hints));
+
+  // Deliberately do NOT pump the event loop: the worker's queued GUI open sits
+  // unserved. joinForShutdown must shut the gate (answering the worker -1) BEFORE
+  // waiting on the worker, or it would deadlock against that unserved queue entry.
+  QElapsedTimer timer;
+  timer.start();
+  loader_->joinForShutdown();
+  const qint64 elapsed_ms = timer.elapsed();
+
+  EXPECT_FALSE(loader_->isBusy());
+  EXPECT_LT(elapsed_ms, 5000) << "joinForShutdown must return promptly, not block on the unserved GUI open";
+
+  // No visible message box was ever dispatched (we never ran the event loop).
+  for (QWidget* widget : QApplication::topLevelWidgets()) {
+    EXPECT_FALSE(qobject_cast<PJ::MessageBox*>(widget) != nullptr && widget->isVisible())
+        << "the queued message box must not have opened";
+  }
+
+  // The worker (joined by joinForShutdown) recorded its askContinue outcome: the
+  // gate answered -1, so askContinue was false and the plugin aborted.
+  const std::vector<std::string> markers = readProbeLines(probe_path);
+  ASSERT_FALSE(markers.empty()) << "the worker never reached askContinue";
+  EXPECT_EQ(std::count(markers.begin(), markers.end(), std::string("aborted")), 1)
+      << "the shutdown gate must answer the worker -1 (askContinue == false)";
+  EXPECT_EQ(std::count(markers.begin(), markers.end(), std::string("continued")), 0)
+      << "the worker must not have been told to continue during shutdown";
 }
 
 }  // namespace

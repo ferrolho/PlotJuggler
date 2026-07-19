@@ -16,6 +16,11 @@ add_library(pj_app_shell OBJECT
     src/DialogPresenter.h
     src/FanoutConfig.cpp
     src/FanoutConfig.h
+    src/BrowserFileStore.cpp
+    src/BrowserFileStore.h
+    src/FileSelectionService.cpp
+    src/FileSelectionService.h
+    src/LoadInput.h
     src/FileLoader.cpp
     src/FileLoader.h
     src/PendingDisplayBinder.cpp
@@ -161,6 +166,30 @@ endif()
 
 if(PJ_BUILD_TESTS)
     find_package(GTest REQUIRED)
+
+    add_executable(browser_file_store_test
+        tests/browser_file_store_test.cpp
+        src/BrowserFileStore.cpp
+        src/BrowserFileStore.h
+        src/LoadInput.h)
+    target_include_directories(browser_file_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(browser_file_store_test PRIVATE Qt6::Core GTest::gtest_main)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(browser_file_store_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME BrowserFileStoreTest COMMAND browser_file_store_test)
+
+    add_executable(file_selection_service_test
+        tests/file_selection_service_test.cpp
+        src/BrowserFileStore.cpp
+        src/FileSelectionService.cpp
+        src/FileSelectionService.h)
+    target_include_directories(file_selection_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(file_selection_service_test PRIVATE Qt6::Widgets GTest::gtest_main)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(file_selection_service_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME FileSelectionServiceTest COMMAND file_selection_service_test)
 
     # A GUI test binary that drives the real MainWindow through a friend peer: it
     # links the whole shell (pj_app_shell) and compiles resources.qrc (AUTORCC) so
@@ -364,13 +393,35 @@ if(PJ_BUILD_TESTS)
     add_test(NAME RasterKeyMap COMMAND raster_key_map_test)
 
     # Test-only DataSource plugin that calls the runtime host's message box from
-    # the import worker thread (guards the cross-thread-QMessageBox regression).
-    # Built like the SDK's mock plugins: a SHARED lib linking only pj_base.
+    # the import worker thread (guards the cross-thread-QMessageBox regression;
+    # also records its askContinue outcome to PJ_MSGBOX_PROBE_FILE so a test can
+    # observe the shutdown gate's -1 answer). Built like the SDK's mock plugins:
+    # a SHARED lib linking only pj_base.
     add_library(msgbox_mock_source_plugin SHARED tests/msgbox_mock_source.cpp)
     target_compile_features(msgbox_mock_source_plugin PRIVATE cxx_std_20)
     target_link_libraries(msgbox_mock_source_plugin PRIVATE pj_base)
     if(DEFINED PJ_WARNING_FLAGS)
         target_compile_options(msgbox_mock_source_plugin PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+
+    # Test-only DataSource plugin that deterministically leaves a single-load
+    # progress metacall queued while FileLoader joins its worker for shutdown.
+    add_library(progress_shutdown_source_plugin SHARED tests/progress_shutdown_source.cpp)
+    target_compile_features(progress_shutdown_source_plugin PRIVATE cxx_std_20)
+    target_link_libraries(progress_shutdown_source_plugin PRIVATE pj_base)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(progress_shutdown_source_plugin PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+
+    # Test-only DataSource plugin with an embedded config dialog (kCapabilityHasDialog).
+    # Drives FileLoader's shutdown-while-suspended-at-the-plugin-dialog path so the
+    # reject-before-destroy ordering (the UAF guard) can be asserted deterministically.
+    # Links pj_dialog_sdk for the DialogPluginTyped/WidgetData symbols.
+    add_library(dialog_probe_source_plugin SHARED tests/dialog_probe_source.cpp)
+    target_compile_features(dialog_probe_source_plugin PRIVATE cxx_std_20)
+    target_link_libraries(dialog_probe_source_plugin PRIVATE pj_base pj_dialog_sdk)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(dialog_probe_source_plugin PRIVATE ${PJ_WARNING_FLAGS})
     endif()
 
     # End-to-end FileLoader pipeline test (same-file reload semantics + the
@@ -381,8 +432,14 @@ if(PJ_BUILD_TESTS)
     # dir at runtime.
     add_executable(file_loader_test
         tests/file_loader_test.cpp
+        tests/file_loader_shutdown_progress_test.cpp
         src/FileLoader.cpp
         src/FileLoader.h
+        src/BrowserFileStore.cpp
+        src/BrowserFileStore.h
+        src/FileSelectionService.cpp
+        src/FileSelectionService.h
+        src/LoadInput.h
         src/DialogPresenter.cpp
         src/DialogPresenter.h
         src/FanoutConfig.cpp
@@ -397,10 +454,17 @@ if(PJ_BUILD_TESTS)
     target_compile_definitions(file_loader_test PRIVATE
         PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
         PJ_MSGBOX_MOCK_SOURCE_PLUGIN_PATH="$<TARGET_FILE:msgbox_mock_source_plugin>"
+        PJ_DIALOG_PROBE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:dialog_probe_source_plugin>"
+        PJ_PROGRESS_SHUTDOWN_SOURCE_PLUGIN_PATH="$<TARGET_FILE:progress_shutdown_source_plugin>"
     )
     # $<TARGET_FILE:...> in a compile definition does not create a build-order
     # dependency; the plugins must exist when the test runs.
-    add_dependencies(file_loader_test mock_file_source_plugin msgbox_mock_source_plugin)
+    add_dependencies(file_loader_test
+        mock_file_source_plugin
+        msgbox_mock_source_plugin
+        dialog_probe_source_plugin
+        progress_shutdown_source_plugin
+    )
     target_link_libraries(file_loader_test PRIVATE
         pj_runtime
         pj_widgets

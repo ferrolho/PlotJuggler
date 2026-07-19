@@ -77,6 +77,13 @@ class ExtensionCatalogService : public QObject {
     return *extension_manager_;
   }
 
+  // Direct access to the loaded plugin catalog (reference valid for the
+  // service's lifetime). Tests use it to register in-process mock plugins
+  // without standing up DSO scanning.
+  PluginRuntimeCatalog& pluginCatalog() {
+    return *plugin_catalog_;
+  }
+
   // Returns the directory where extension DSOs are loaded from.
   QString extensionsDir() const {
     return extensions_dir_;

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QtCore/QtGlobal>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -18,6 +20,7 @@ QT_END_NAMESPACE
 namespace PJ {
 
 class DataSourceHandle;
+class BrowserFileStore;
 
 namespace dialog_presenter {
 
@@ -55,14 +58,15 @@ struct DataSourceResult {
 //   * Any runtime-host callbacks the plugin needs (message-box, etc.) are
 //     installed on the runtime host before bind() — see RuntimeHost in
 //     FileLoader.cpp for the pattern.
-// Synchronous; helper does not extend `handle` or `catalog` lifetime past
-// return. A future modeless caller would have to revisit both.
+// The async helper does not own `handle` or `catalog`; both must outlive its
+// completion. FileLoader keeps them in its pending-load context.
 struct DataSourceRequest {
   const LoadedDataSource& source;
   DataSourceHandle& handle;
   const ExtensionCatalogService& catalog;
   QWidget* parent = nullptr;
   std::string_view initial_parser_config{};
+  std::shared_ptr<BrowserFileStore> browser_file_store = {};
   // The app's live chrome metrics, used to size any SectionHeaderBand in the
   // plugin dialog to the canonical band height. Leave unset for callers whose
   // dialogs have no bands (e.g. file loaders) or that lack live app metrics.
@@ -71,6 +75,21 @@ struct DataSourceRequest {
 
 // Caller decides what to persist and whether to re-loadConfig before start().
 DataSourceResult showDataSourceDialog(const DataSourceRequest& req);
+
+using DataSourceCompletion = std::function<void(DataSourceResult)>;
+
+// Cancels the pending dialog of one showDataSourceDialogAsync call:
+// synchronously closes it, delivers exactly one on_rejected to the plugin, and
+// runs the completion with kRejected before returning. Callers invoke it to
+// tear the dialog down while the plugin context is still alive (shutdown). Safe
+// to invoke after the dialog completed (no-op) and to default-construct/skip
+// when empty (the no-dialog / contract-error paths return an empty functor).
+using DialogCancelFn = std::function<void()>;
+
+// Browser-safe presentation path. Returns immediately and completes after the
+// dialog is accepted, rejected, destroyed with its parent, or cancelled via the
+// returned functor.
+[[nodiscard]] DialogCancelFn showDataSourceDialogAsync(const DataSourceRequest& req, DataSourceCompletion completion);
 
 }  // namespace dialog_presenter
 

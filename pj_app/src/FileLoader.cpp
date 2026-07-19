@@ -4,6 +4,7 @@
 #include "FileLoader.h"
 
 #include <QCoreApplication>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
@@ -14,16 +15,22 @@
 #include <QLoggingCategory>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScopeGuard>
+#include <QSemaphore>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
 #include <QStyle>
 #include <QThread>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <algorithm>
+#include <chrono>
+#include <coroutine>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -31,13 +38,15 @@
 #include <utility>
 #include <vector>
 
+#include "BrowserFileStore.h"
 #include "DialogPresenter.h"
 #include "FanoutConfig.h"
+#include "FileSelectionService.h"
 #include "LayoutXml.h"
 #include "pj_base/data_source_protocol.h"
 #include "pj_base/dataset.hpp"
 #include "pj_datastore/engine.hpp"
-#include "pj_marketplace/extension.hpp"
+#include "pj_datastore/reader.hpp"
 #include "pj_plugins/host/data_source_handle.hpp"
 #include "pj_plugins/host/data_source_library.hpp"
 #include "pj_plugins/host/message_parser_handle.hpp"
@@ -51,22 +60,307 @@
 #include "pj_widgets/FileDialog.h"
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/MessageBox.h"
-#include "pj_widgets/ProgressDialog.h"
 #include "pj_widgets/SvgUtil.h"
 using namespace Qt::StringLiterals;
 
 namespace PJ {
 
+// Rendezvous between an import worker parked in the synchronous message-box ABI
+// and the GUI thread that answers it. Deliberately NOT FileLoader state: the
+// queued GUI lambda that would open the dialog and the worker blocked on the
+// answer can both outlive joinForShutdown — and even the FileLoader — so all
+// parties hold this by shared_ptr. A shut gate answers every request -1 and
+// never opens UI.
+struct PluginMessageGate {
+  // One worker question. finish() is release-once: the first answer (a button,
+  // dialog destruction, or shutdown) wins; later answers are ignored.
+  struct Request {
+    QSemaphore ready;
+
+    void finish(int answer) {
+      bool expected = false;
+      if (!finished_.compare_exchange_strong(expected, true)) {
+        return;
+      }
+      value_.store(answer);
+      ready.release();
+    }
+
+    // Valid once ready.acquire() succeeded (release/acquire orders value_).
+    [[nodiscard]] int result() const {
+      return value_.load();
+    }
+
+   private:
+    std::atomic<int> value_{-1};
+    std::atomic<bool> finished_{false};
+  };
+
+  // Worker: register a request about to block. False when the gate is already
+  // shut — the caller must answer -1 itself and must not post any GUI work.
+  [[nodiscard]] bool beginRequest(const std::shared_ptr<Request>& request) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutting_down_) {
+      return false;
+    }
+    pending_.push_back(request);
+    return true;
+  }
+
+  void endRequest(const std::shared_ptr<Request>& request) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::erase(pending_, request);
+  }
+
+  [[nodiscard]] bool isShutDown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutting_down_;
+  }
+
+  // GUI: refuse future requests and release every parked worker with -1, so
+  // joinForShutdown can join the worker without pumping the event queue the
+  // worker's dialog request may still be sitting in.
+  void shutdown() {
+    std::vector<std::shared_ptr<Request>> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      shutting_down_ = true;
+      pending.swap(pending_);
+    }
+    for (const auto& request : pending) {
+      request->finish(-1);
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  bool shutting_down_ = false;
+  std::vector<std::shared_ptr<Request>> pending_;
+};
+
 namespace {
 
 Q_LOGGING_CATEGORY(lcFileLoader, "pj.app.fileloader")
 
+// Await the callback-style dialog presenter while also handling its synchronous
+// no-dialog/contract-error completion paths. The shared state prevents a late
+// QDialog callback from touching a coroutine frame destroyed during shutdown,
+// and the destructor cancels a still-open dialog so the plugin is rejected
+// while its context is alive.
+class DataSourceDialogAwaiter {
+ public:
+  explicit DataSourceDialogAwaiter(dialog_presenter::DataSourceRequest request)
+      : request_(std::move(request)), state_(std::make_shared<State>()) {}
+
+  DataSourceDialogAwaiter(const DataSourceDialogAwaiter&) = delete;
+  DataSourceDialogAwaiter& operator=(const DataSourceDialogAwaiter&) = delete;
+
+  ~DataSourceDialogAwaiter() {
+    // Runs either after normal resumption (the cancel below is then a no-op) or
+    // while the suspended frame is being destroyed at shutdown. Neuter the
+    // completion FIRST — resuming a frame mid-destruction is UB — then close a
+    // dialog still open so the plugin receives its one on_rejected while the
+    // frame's DataSourceHandle (declared before this awaiter, hence destroyed
+    // after it) still owns a live plugin context.
+    state_->alive = false;
+    if (cancel_dialog_) {
+      cancel_dialog_();
+    }
+  }
+
+  [[nodiscard]] bool await_ready() const noexcept {
+    return false;
+  }
+
+  bool await_suspend(std::coroutine_handle<> continuation) {
+    state_->continuation = continuation;
+    state_->inside_await_suspend = true;
+    const std::shared_ptr<State> state = state_;
+    cancel_dialog_ = dialog_presenter::showDataSourceDialogAsync(
+        request_, [state](dialog_presenter::DataSourceResult result) mutable {
+          if (!state->alive) {
+            return;
+          }
+          state->result = std::move(result);
+          state->completed = true;
+          if (!state->inside_await_suspend) {
+            state->continuation.resume();
+          }
+        });
+    state_->inside_await_suspend = false;
+    return !state_->completed;
+  }
+
+  dialog_presenter::DataSourceResult await_resume() {
+    return std::move(*state_->result);
+  }
+
+ private:
+  struct State {
+    std::optional<dialog_presenter::DataSourceResult> result;
+    std::coroutine_handle<> continuation;
+    bool inside_await_suspend = false;
+    bool completed = false;
+    bool alive = true;
+  };
+
+  dialog_presenter::DataSourceRequest request_;
+  std::shared_ptr<State> state_;
+  // Synchronous teardown hook for the pending dialog; empty when the presenter
+  // completed without opening one.
+  dialog_presenter::DialogCancelFn cancel_dialog_;
+};
+
+// Runs a blocking importer body on QThread and resumes its owning coroutine on
+// the GUI thread after QThread::finished. The FileLoader owns both the QThread
+// and coroutine frame, so shutdown can join first and then cancel continuation.
+class GuiResumingWorkerAwaiter {
+ public:
+  GuiResumingWorkerAwaiter(QObject* context, std::unique_ptr<QThread>& worker, std::function<void()> job)
+      : context_(context), worker_(worker), state_(std::make_shared<State>()) {
+    state_->job = std::move(job);
+  }
+
+  GuiResumingWorkerAwaiter(const GuiResumingWorkerAwaiter&) = delete;
+  GuiResumingWorkerAwaiter& operator=(const GuiResumingWorkerAwaiter&) = delete;
+
+  ~GuiResumingWorkerAwaiter() {
+    state_->alive.store(false);
+  }
+
+  [[nodiscard]] bool await_ready() const noexcept {
+    return false;
+  }
+
+  void await_suspend(std::coroutine_handle<> continuation) {
+    state_->continuation = continuation;
+    const std::shared_ptr<State> state = state_;
+    worker_ = std::unique_ptr<QThread>(QThread::create([state]() { state->job(); }));
+    QObject::connect(
+        worker_.get(), &QThread::finished, context_,
+        [state]() {
+          if (state->alive.load()) {
+            state->continuation.resume();
+          }
+        },
+        Qt::QueuedConnection);
+    worker_->start();
+  }
+
+  void await_resume() {
+    // The continuation resumes only after QThread::finished, so wait() returns
+    // near-instantly here; it still closes the window where reset() could
+    // destroy the QThread object while it is mid-teardown from emitting that
+    // very signal, matching every other worker teardown site in this file.
+    worker_->wait();
+    worker_.reset();
+  }
+
+ private:
+  struct State {
+    std::function<void()> job;
+    std::coroutine_handle<> continuation;
+    std::atomic_bool alive = true;
+  };
+
+  QPointer<QObject> context_;
+  std::unique_ptr<QThread>& worker_;
+  std::shared_ptr<State> state_;
+};
+
+#ifndef PJ_TARGET_WASM
 constexpr const char* kLastDirKey = "FileLoader/lastDir";
+#endif
 constexpr const char* kPluginConfigKeyPrefix = "PluginConfig/";
+
+struct LoadKeepalive {
+  std::shared_ptr<void> plugin_library;
+  StorageLease storage;
+};
+
+std::shared_ptr<void> combineKeepalive(std::shared_ptr<void> plugin_library, StorageLease storage) {
+  if (!plugin_library) {
+    return storage;
+  }
+  if (!storage) {
+    return plugin_library;
+  }
+  return std::make_shared<LoadKeepalive>(
+      LoadKeepalive{.plugin_library = std::move(plugin_library), .storage = std::move(storage)});
+}
+
+bool sameSourceIdentity(const QString& lhs, const QString& rhs) {
+  if (isBrowserUploadIdentity(lhs) || isBrowserUploadIdentity(rhs)) {
+    return lhs == rhs;
+  }
+  return layout_xml::isSamePath(lhs, rhs);
+}
 
 QString normalizeExtension(const QString& path) {
   const QString suffix = QFileInfo(path).suffix();
   return suffix.isEmpty() ? QString() : u"."_s + suffix.toLower();
+}
+
+void logSuccessfulLoad(
+    const DataEngine& engine, const CatalogModel& catalog, const QString& source_identity, const QString& plugin_name,
+    const std::vector<DatasetId>& dataset_ids) {
+  // The catalog walk + up to kMaxLoggedSeries DataReader::series() reads below
+  // are pure diagnostic cost on the GUI thread; skip all of it when the
+  // category won't actually emit.
+  if (!lcFileLoader().isInfoEnabled()) {
+    return;
+  }
+  if (dataset_ids.empty()) {
+    // No datasets — the filter below would degenerate to match-all and log a
+    // "success" enumerating the whole unrelated catalog.
+    return;
+  }
+
+  constexpr qsizetype kMaxLoggedSeries = 32;
+  QStringList scalar_series;
+  QStringList series_samples;
+  const DataReader reader(engine);
+  std::size_t catalog_items = 0;
+  std::size_t scalar_count = 0;
+  std::vector<DatasetId> sorted_dataset_ids(dataset_ids);
+  std::sort(sorted_dataset_ids.begin(), sorted_dataset_ids.end());
+  for (const CatalogItem& item : catalog.items()) {
+    if (!sorted_dataset_ids.empty() &&
+        !std::binary_search(sorted_dataset_ids.begin(), sorted_dataset_ids.end(), item.dataset_id)) {
+      continue;
+    }
+    ++catalog_items;
+    if (const ScalarFieldPayload* field = asScalarField(item); field != nullptr) {
+      ++scalar_count;
+      if (scalar_series.size() >= kMaxLoggedSeries) {
+        continue;
+      }
+      const QString series_name = item.topic_name + u"/"_s + field->field_path;
+      scalar_series.push_back(series_name);
+      if (!field->is_string) {
+        auto series_or = reader.series(field->topic_id, field->column_index);
+        if (series_or.has_value() && !series_or->empty()) {
+          const auto first = series_or->sampleAt(0);
+          const auto last = series_or->sampleAt(series_or->size() - 1);
+          if (first.has_value() && last.has_value()) {
+            series_samples.push_back(u"%1:%2@%3..%4=%5..%6"_s.arg(series_name)
+                                         .arg(series_or->size())
+                                         .arg(first->timestamp)
+                                         .arg(last->timestamp)
+                                         .arg(first->value, 0, 'g', 17)
+                                         .arg(last->value, 0, 'g', 17));
+          }
+        }
+      }
+    }
+  }
+  scalar_series.sort();
+  series_samples.sort();
+  qCInfo(lcFileLoader).noquote() << "PJ_FILE_LOAD_OK" << u"plugin=%1"_s.arg(plugin_name)
+                                 << u"identity=%1"_s.arg(source_identity) << u"catalog_items=%1"_s.arg(catalog_items)
+                                 << u"scalar_count=%1"_s.arg(scalar_count)
+                                 << u"scalar_series=%1"_s.arg(scalar_series.join(u","_s))
+                                 << u"series_samples=%1"_s.arg(series_samples.join(u","_s));
 }
 
 // Merge the file path into the (possibly empty) saved JSON config. Saved
@@ -104,11 +398,29 @@ QString pluginConfigKey(const std::string& plugin_id) {
 // that lambda chain (bogus C3493 "'this' cannot be implicitly captured" /
 // C2065 '__this'), so the dialog construction lives here.
 //
-// Returns the PJ_MSG_BTN_* mask of the clicked button; a window-close (✕ /
-// Esc) returns -1, i.e. neither Continue nor OK — the caller treats that as
-// "do not proceed".
-int execScrollableMessageDialog(
-    QWidget* dialog_parent, const QString& q_title, const QString& q_text, int type, int buttons) {
+// Completes with the PJ_MSG_BTN_* mask of the clicked button; a window-close
+// (✕ / Esc) completes with -1, i.e. "do not proceed".
+using PluginMessageCompletion = std::function<void(int)>;
+
+struct PluginMessageState {
+  PluginMessageCompletion completion;
+  bool completed = false;
+
+  void finish(int result) {
+    if (completed) {
+      return;
+    }
+    completed = true;
+    completion(result);
+  }
+};
+
+// `active_dialog` is heap-shared FileLoader state (see FileLoader.h): the
+// WA_DeleteOnClose dialog can outlive the loader, so its finished/destroyed
+// hooks capture the shared_ptr, never a pointer into FileLoader.
+void openScrollableMessageDialog(
+    QWidget* dialog_parent, const QString& q_title, const QString& q_text, int type, int buttons,
+    const std::shared_ptr<QPointer<QDialog>>& active_dialog, PluginMessageCompletion completion) {
   // Keep the first line as the summary (the non-scrolling label) and
   // route everything else into the bounded scroll view. Producers put
   // a one-line summary first; anything longer must scroll, never
@@ -126,10 +438,17 @@ int execScrollableMessageDialog(
     icon_path = u":/resources/svg/diag_warning.svg"_s;
   }
 
-  Dialog dlg(dialog_parent);
-  dlg.setDialogTitle(q_title);
-  dlg.setMinimumSize(520, 360);
-  dlg.resize(560, 480);
+  auto* dlg = new Dialog(dialog_parent);
+  if (active_dialog != nullptr) {
+    *active_dialog = dlg;
+  }
+  dlg->setAttribute(Qt::WA_DeleteOnClose);
+  // App-modal (not window-modal) restores the pre-branch exec() semantics:
+  // window-modality would leave floating ADS dock tool-windows interactive.
+  dlg->setWindowModality(Qt::ApplicationModal);
+  dlg->setDialogTitle(q_title);
+  dlg->setMinimumSize(520, 360);
+  dlg->resize(560, 480);
 
   auto* body_widget = new QWidget;
   auto* vbox = new QVBoxLayout(body_widget);
@@ -142,7 +461,7 @@ int execScrollableMessageDialog(
   header->setSpacing(PJ::theme::space(theme::Space::Section));
   auto* icon_label = new QLabel(body_widget);
   // Use the (already-shown) parent's DPR; the dialog has no screen yet.
-  const qreal dpr = dialog_parent != nullptr ? dialog_parent->devicePixelRatioF() : dlg.devicePixelRatioF();
+  const qreal dpr = dialog_parent != nullptr ? dialog_parent->devicePixelRatioF() : dlg->devicePixelRatioF();
   QPixmap icon_pm = renderSvgPixmap(icon_path, currentTheme(), QSize(32, 32), dpr);
   if (icon_pm.isNull()) {
     // A missing bundled resource shouldn't drop the severity cue.
@@ -152,7 +471,7 @@ int execScrollableMessageDialog(
     } else if (type == PJ_MESSAGE_BOX_WARNING || type == PJ_MESSAGE_BOX_QUESTION) {
       sp = QStyle::SP_MessageBoxWarning;
     }
-    icon_pm = dlg.style()->standardIcon(sp).pixmap(32, 32);
+    icon_pm = dlg->style()->standardIcon(sp).pixmap(32, 32);
   }
   icon_label->setPixmap(icon_pm);
   header->addWidget(icon_label, 0, Qt::AlignTop);
@@ -204,7 +523,8 @@ int execScrollableMessageDialog(
 
   auto* footer = new QHBoxLayout();
   footer->addStretch(1);
-  int chosen = -1;
+  auto state = std::make_shared<PluginMessageState>(PluginMessageState{.completion = std::move(completion)});
+  auto chosen = std::make_shared<int>(-1);
   for (const auto& s : specs) {
     if ((wanted & s.mask) == 0) {
       continue;
@@ -215,17 +535,169 @@ int execScrollableMessageDialog(
     btn->setAutoDefault(false);
     btn->setDefault(std::strcmp(s.role, "primary") == 0);
     const int code = s.mask;
-    QObject::connect(btn, &QPushButton::clicked, &dlg, [&chosen, code, &dlg]() {
-      chosen = code;
-      dlg.accept();
+    QObject::connect(btn, &QPushButton::clicked, dlg, [chosen, code, dlg]() {
+      *chosen = code;
+      dlg->accept();
     });
     footer->addWidget(btn);
   }
   vbox->addLayout(footer);
 
-  dlg.contentLayout()->addWidget(body_widget);
-  dlg.exec();
-  return chosen;
+  dlg->contentLayout()->addWidget(body_widget);
+  QObject::connect(dlg, &QDialog::finished, qApp, [state, chosen, active_dialog, dlg](int) {
+    if (active_dialog != nullptr && active_dialog->data() == dlg) {
+      active_dialog->clear();
+    }
+    state->finish(*chosen);
+  });
+  QObject::connect(dlg, &QObject::destroyed, qApp, [state, active_dialog, dlg]() {
+    if (active_dialog != nullptr && active_dialog->data() == dlg) {
+      active_dialog->clear();
+    }
+    state->finish(-1);
+  });
+  // show(), not open(): QDialog::open() force-downgrades ApplicationModal back to
+  // WindowModal. show() honors the app-modality set above and still fires finished.
+  dlg->show();
+}
+
+void openPluginMessageBox(
+    QWidget* dialog_parent, const QString& q_title, const QString& q_text, int type, int buttons,
+    const std::shared_ptr<QPointer<QDialog>>& active_dialog, PluginMessageCompletion completion) {
+  constexpr int kInlineLineLimit = 12;
+  if (q_text.count(QLatin1Char('\n')) >= kInlineLineLimit) {
+    openScrollableMessageDialog(dialog_parent, q_title, q_text, type, buttons, active_dialog, std::move(completion));
+    return;
+  }
+
+  auto* msg_box = new PJ::MessageBox(dialog_parent);
+  if (active_dialog != nullptr) {
+    *active_dialog = msg_box;
+  }
+  msg_box->setAttribute(Qt::WA_DeleteOnClose);
+  // App-modal (not window-modal) restores the pre-branch exec() semantics; see
+  // openScrollableMessageDialog.
+  msg_box->setWindowModality(Qt::ApplicationModal);
+  msg_box->setTitle(q_title);
+  msg_box->setText(q_text);
+  Q_UNUSED(type);
+
+  std::vector<int> results;
+  QPointer<QPushButton> acknowledgment;
+  const auto add_button = [&](int mask, const QString& label, PJ::MessageBox::ButtonRole role) {
+    if ((buttons & mask) != 0) {
+      auto* button = msg_box->addButton(label, role);
+      results.push_back(mask);
+      if (mask == PJ_MSG_BTN_OK) {
+        acknowledgment = button;
+      }
+    }
+  };
+  add_button(PJ_MSG_BTN_OK, QObject::tr("OK"), PJ::MessageBox::kPrimaryRole);
+  add_button(PJ_MSG_BTN_CANCEL, QObject::tr("Cancel"), PJ::MessageBox::kCancelRole);
+  add_button(PJ_MSG_BTN_YES, QObject::tr("Yes"), PJ::MessageBox::kPrimaryRole);
+  add_button(PJ_MSG_BTN_NO, QObject::tr("No"), PJ::MessageBox::kNeutralRole);
+  add_button(PJ_MSG_BTN_CONTINUE, QObject::tr("Continue"), PJ::MessageBox::kPrimaryRole);
+  add_button(PJ_MSG_BTN_ABORT, QObject::tr("Abort"), PJ::MessageBox::kDestructiveRole);
+  if (results.empty()) {
+    acknowledgment = msg_box->addButton(QObject::tr("OK"), PJ::MessageBox::kPrimaryRole);
+    results.push_back(PJ_MSG_BTN_OK);
+  }
+
+  auto state = std::make_shared<PluginMessageState>(PluginMessageState{.completion = std::move(completion)});
+  QObject::connect(msg_box, &QDialog::finished, qApp, [state, msg_box, results, active_dialog](int) {
+    if (active_dialog != nullptr && active_dialog->data() == msg_box) {
+      active_dialog->clear();
+    }
+    const int clicked = msg_box->clickedIndex();
+    state->finish(
+        clicked >= 0 && clicked < static_cast<int>(results.size()) ? results[static_cast<std::size_t>(clicked)] : -1);
+  });
+  QObject::connect(msg_box, &QObject::destroyed, qApp, [state, active_dialog, msg_box]() {
+    if (active_dialog != nullptr && active_dialog->data() == msg_box) {
+      active_dialog->clear();
+    }
+    state->finish(-1);
+  });
+  // show(), not open(): open() force-downgrades ApplicationModal to WindowModal.
+  msg_box->show();
+}
+
+DataSourceRuntimeHost::MessageBoxHandler makePluginMessageBoxHandler(
+    QPointer<QWidget> message_parent, std::shared_ptr<QPointer<QDialog>> active_dialog,
+    std::shared_ptr<PluginMessageGate> gate) {
+  return [message_parent, active_dialog = std::move(active_dialog), gate = std::move(gate)](
+             int type, std::string_view title, std::string_view message, int buttons) -> int {
+    const QString q_title = QString::fromUtf8(title.data(), static_cast<int>(title.size()));
+    const QString q_text = QString::fromUtf8(message.data(), static_cast<int>(message.size()));
+
+    // The ABI is synchronous for the plugin, but browser UI is not. For a
+    // worker-originated question, sleep only that worker while the GUI keeps
+    // dispatching events; the WASM path below never nests a Qt event loop.
+    if (QThread::currentThread() == qApp->thread()) {
+      if (gate->isShutDown()) {
+        return -1;  // shutdown in progress: never open UI or spin a nested loop
+      }
+#ifdef PJ_TARGET_WASM
+      qCWarning(lcFileLoader) << "plugin message box requested from the GUI thread; rejecting synchronous answer";
+      openPluginMessageBox(message_parent.data(), q_title, q_text, type, buttons, active_dialog, [](int) {});
+      return -1;
+#else
+      // Native Qt can satisfy the plugin's synchronous ABI even when a
+      // main-thread lifecycle callback asks the question. Keep the nested loop
+      // out of WASM, where browser event-loop re-entry is unsupported.
+      //
+      // Heap-shared completion state: exec() can unwind WITHOUT an answer
+      // (QCoreApplication::exit() terminates nested loops), and the dialog's
+      // finished/destroyed hooks may deliver the completion afterwards — it
+      // must then write into live storage, not this frame's dead stack.
+      struct SyncAnswer {
+        QEventLoop loop;
+        int answer = -1;
+        bool answered = false;
+      };
+      auto state = std::make_shared<SyncAnswer>();
+      openPluginMessageBox(message_parent.data(), q_title, q_text, type, buttons, active_dialog, [state](int value) {
+        state->answer = value;
+        state->answered = true;
+        if (state->loop.isRunning()) {
+          state->loop.quit();
+        }
+      });
+      if (!state->answered) {
+        state->loop.exec();
+      }
+      return state->answer;
+#endif
+    }
+
+    auto request = std::make_shared<PluginMessageGate::Request>();
+    if (!gate->beginRequest(request)) {
+      return -1;  // shutdown already in progress: never park on the semaphore
+    }
+    const bool posted = QMetaObject::invokeMethod(
+        qApp,
+        [gate, request, message_parent, q_title, q_text, type, buttons, active_dialog]() {
+          // Can run after joinForShutdown — and after the FileLoader died —
+          // since the GUI event queue outlives both. Everything captured here
+          // is shared state, and a shut gate answers -1 without opening UI.
+          if (gate->isShutDown() || message_parent.isNull()) {
+            request->finish(-1);
+            return;
+          }
+          openPluginMessageBox(
+              message_parent.data(), q_title, q_text, type, buttons, active_dialog,
+              [request](int value) { request->finish(value); });
+        },
+        Qt::QueuedConnection);
+    if (!posted) {
+      gate->endRequest(request);
+      return -1;
+    }
+    request->ready.acquire();
+    gate->endRequest(request);
+    return request->result();
+  };
 }
 
 }  // namespace
@@ -264,6 +736,13 @@ void FileLoader::applyDefaultIngestPolicies(PJ::sdk::ObjectIngestPolicyResolver&
   resolver.setForType(BuiltinObjectType::kSceneEntities, ObjectIngestPolicy::kPureLazy);
   resolver.setForType(BuiltinObjectType::kImageAnnotations, ObjectIngestPolicy::kPureLazy);
   resolver.setForType(BuiltinObjectType::kVideoFrame, ObjectIngestPolicy::kPureLazy);
+#ifdef PJ_TARGET_WASM
+  // The browser RobotModel consumes std_msgs/String through the object parser.
+  // That parser intentionally has no scalar handler, so keep its payload lazy
+  // until the layer requests the selected description. Fence this to WASM so
+  // the desktop application's ingest policy remains exactly unchanged.
+  resolver.setForType(BuiltinObjectType::kRobotDescription, ObjectIngestPolicy::kPureLazy);
+#endif
 }
 
 // Per-load state for a single-instance worker load. Holds the bound plugin
@@ -298,18 +777,79 @@ struct FileLoader::LoadContext {
   QString start_error;
 };
 
+struct FileLoader::BeginLoadTask {
+  struct promise_type {
+    BeginLoadTask get_return_object() {
+      return BeginLoadTask{std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+    std::suspend_never initial_suspend() const noexcept {
+      return {};
+    }
+    std::suspend_always final_suspend() const noexcept {
+      return {};
+    }
+    void return_void() const noexcept {}
+    void unhandled_exception() const noexcept {
+      std::terminate();
+    }
+  };
+
+  explicit BeginLoadTask(std::coroutine_handle<promise_type> handle) : handle_(handle) {}
+  // Move ctor only: BeginLoadTask lives exclusively in a std::unique_ptr
+  // (make_unique + reset), which never move-assigns the pointee itself.
+  BeginLoadTask(BeginLoadTask&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+  BeginLoadTask& operator=(BeginLoadTask&&) = delete;
+  BeginLoadTask(const BeginLoadTask&) = delete;
+  BeginLoadTask& operator=(const BeginLoadTask&) = delete;
+  ~BeginLoadTask() {
+    if (handle_) {
+      handle_.destroy();
+    }
+  }
+
+ private:
+  std::coroutine_handle<promise_type> handle_;
+};
+
 FileLoader::FileLoader(
     SessionManager& session, ExtensionCatalogService& extensions, CatalogModel& catalog, QObject* parent)
-    : QObject(parent), session_(session), extensions_(extensions), catalog_(catalog) {}
+    : QObject(parent),
+      session_(session),
+      extensions_(extensions),
+      catalog_(catalog),
+      browser_file_store_(std::make_shared<BrowserFileStore>()),
+      active_plugin_message_dialog_(std::make_shared<QPointer<QDialog>>()),
+      message_gate_(std::make_shared<PluginMessageGate>()) {}
 
 FileLoader::~FileLoader() {
   joinForShutdown();
 }
 
 void FileLoader::openFromDialog(QWidget* dialog_parent) {
+#ifdef PJ_TARGET_WASM
+  // Qt's getOpenFileContent is the browser-native, non-blocking API.
+  // It must be invoked directly from this user-activation turn; no nested
+  // QEventLoop/exec() is involved.
+  QPointer<FileLoader> self(this);
+  QPointer<QWidget> guarded_parent(dialog_parent);
+  selectBrowserInput(dialog_parent, [self, guarded_parent](BrowserSelectionResult staged) mutable {
+    if (self.isNull() || (!staged.input.has_value() && staged.error.isEmpty())) {
+      return;  // loader destroyed, or picker cancelled.
+    }
+    if (!staged.input.has_value()) {
+      const QString reason = staged.error.isEmpty() ? self->tr("Could not stage the selected file.") : staged.error;
+      qCWarning(lcFileLoader).noquote() << reason;
+      self->reportLoadWarning(guarded_parent.data(), reason);
+      emit self->fileLoadFailed(staged.browser_name, reason);
+      return;
+    }
+    self->loadFile(std::move(*staged.input), guarded_parent);
+  });
+  return;
+#else
+  const QString filter = extensions_.buildFileFilter();
   QSettings settings;
   const QString last_dir = settings.value(kLastDirKey, QString()).toString();
-  const QString filter = extensions_.buildFileFilter();
 
   // PJ::FileDialog wraps a non-native QFileDialog in our frameless
   // chrome — see pj_widgets/FileDialog.h. The native GTK dialog also
@@ -332,11 +872,40 @@ void FileLoader::openFromDialog(QWidget* dialog_parent) {
   for (const QString& path : paths) {
     loadFile(path, dialog_parent);
   }
+#endif
 }
 
-bool FileLoader::beginLoad(const LoadRequest& request) {
-  const QString& path = request.path;
-  QWidget* const dialog_parent = request.dialog_parent.data();
+#ifdef PJ_TARGET_WASM
+void FileLoader::selectBrowserInput(QWidget* dialog_parent, BrowserSelectionCallback callback) {
+  const QString filter = extensions_.buildFileFilter();
+  qCInfo(lcFileLoader).noquote() << "Opening browser file picker with filter:" << filter;
+  FileSelectionService::selectAndStageFile(
+      dialog_parent, filter, browser_file_store_,
+      [callback = std::move(callback)](FileSelectionService::StagedSelection staged) mutable {
+        callback({
+            .browser_name = std::move(staged.browser_name),
+            .input = std::move(staged.input),
+            .error = std::move(staged.error),
+        });
+      });
+}
+
+QString FileLoader::browserContentSha256(const QString& source_identity) const {
+  return browser_content_sha256_.value(source_identity);
+}
+#endif
+
+FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
+  bool worker_handoff = false;
+  const auto complete_prologue = qScopeGuard([this, &worker_handoff]() {
+    if (!worker_handoff) {
+      finishPrologue();
+    }
+  });
+
+  const LoadInput& input = request.input;
+  const QString& source_identity = input.source_identity;
+  const QPointer<QWidget> dialog_parent = request.dialog_parent;
   const LoadHints& hints = request.hints;
 
   // Restore same-source datasets if a replacement load is cancelled or fails.
@@ -353,54 +922,81 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       return;
     }
     // Non-replacing loads create directly in the live engine. If they fail
-    // before commit, drop any emitted catalog items before erasing the engine
-    // dataset so no reader/adapter can keep a dangling TopicStorage pointer.
-    session_.evictDatasetObjects(created_live_dataset_id);
-    catalog_.removeDataset(created_live_dataset_id, /*tombstone=*/false);
-    // Route through SessionManager::removeDataset (not dataEngine directly) so the
-    // dataset's pinned time-origin is invalidated and the global reframe fires if
-    // dropping it moved the earliest sample across the surviving datasets.
-    session_.removeDataset(created_live_dataset_id);
+    // before commit, drop any emitted catalog items (and TF state) before
+    // erasing the engine dataset so no reader/adapter can keep a dangling
+    // TopicStorage pointer.
+    removeCreatedDataset(created_live_dataset_id);
     created_live_dataset_id = 0;
   };
+  bool rollback_armed = true;
+  const auto rollback_on_cancel = qScopeGuard([&]() {
+    if (rollback_armed) {
+      erase_created_live_dataset();
+      rollback_tombstones();
+    }
+  });
 
   // One unified failure path — log, optionally pop a dialog, emit signal.
   const auto fail = [&](const QString& reason) -> bool {
     erase_created_live_dataset();
     rollback_tombstones();
     qCWarning(lcFileLoader).noquote() << reason;
-    if (dialog_parent != nullptr) {
-      MessageBox::warning(dialog_parent, tr("Load failed"), reason);
-    }
-    emit fileLoadFailed(path, reason);
+    reportLoadWarning(dialog_parent.data(), reason);
+    emit fileLoadFailed(source_identity, reason);
     return false;
   };
 
-  const QString ext = normalizeExtension(path);
+  const QString ext = normalizeExtension(input.display_name);
   if (ext.isEmpty()) {
-    return fail(tr("File has no extension; cannot pick a plugin."));
+    (void)fail(tr("File has no extension; cannot pick a plugin."));
+    co_return;
   }
 
   const auto matches = extensions_.findSourcesForExtension(ext);
   if (matches.empty()) {
-    return fail(tr("No DataSource plugin handles %1 files. Install one from the Marketplace.").arg(ext));
+    (void)fail(tr("No DataSource plugin handles %1 files. Install one from the Marketplace.").arg(ext));
+    co_return;
   }
 
-  // v1 picks the first match; M3+ can add a chooser when multiple plugins
-  // claim the same extension.
+  // Interactive/native loads keep the established first-match behavior. A
+  // browser source-bound replay opts into the exact plugin saved in its layout:
+  // silently choosing another extension match could parse the same bytes with
+  // different semantics.
+  // GUI-thread catalog pointer. The async presenter resolves the dialog vtable
+  // synchronously before suspension; the created source handle pins its DSO for
+  // the rest of this coroutine/worker load.
   const LoadedDataSource* source = matches.front();
+  if (hints.require_expected_plugin) {
+    const auto expected = std::find_if(matches.begin(), matches.end(), [&hints](const LoadedDataSource* candidate) {
+      return candidate != nullptr && QString::fromStdString(candidate->name) == hints.expected_plugin_id;
+    });
+    if (hints.expected_plugin_id.isEmpty() || expected == matches.end()) {
+      (void)fail(tr("The layout requires DataSource plugin '%1', but it is not installed for %2 files.")
+                     .arg(hints.expected_plugin_id.isEmpty() ? tr("(unspecified)") : hints.expected_plugin_id, ext));
+      co_return;
+    }
+    source = *expected;
+  }
   const QString source_name = QString::fromStdString(source->name);
 
   DataSourceHandle handle = source->library.createHandle();
   if (!handle.valid()) {
-    return fail(tr("Plugin '%1': createHandle failed.").arg(source_name));
+    (void)fail(tr("Plugin '%1': createHandle failed.").arg(source_name));
+    co_return;
   }
+  // Snapshot everything needed after an asynchronous dialog. The handle owner
+  // pins the DSO even if a later desktop marketplace reload reallocates the
+  // GUI-owned catalog vector.
+  const PJ_data_source_vtable_t* const source_vtable = source->library.vtable();
+  const std::shared_ptr<void> source_library_owner = handle.libraryOwner();
+  const std::string source_id = source->id;
+  const std::string source_plugin_name = source->name;
 
   // The v4 DataSource protocol resolves host services during bind(), so the
   // target dataset must exist before loadConfig() and start().
   DataEngine& engine = session_.dataEngine();
 
-  const QString display_name = QFileInfo(path).fileName();
+  const QString display_name = input.display_name;
   const std::string display_name_utf8 = display_name.toStdString();
 
   // One TimeDomain per loaded source so each is independently time-shiftable
@@ -408,7 +1004,8 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // replace path below mints its own; the live first-load uses this one.
   auto td_or = engine.createTimeDomain(display_name_utf8);
   if (!td_or.has_value()) {
-    return fail(tr("Could not create the time domain for %1.").arg(display_name));
+    (void)fail(tr("Could not create the time domain for %1.").arg(display_name));
+    co_return;
   }
   const TimeDomainId td_id = *td_or;
 
@@ -427,7 +1024,7 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     // recorded path (created outside FileLoader, e.g. streaming/test data)
     // keeps the legacy basename-only behavior.
     if (const QString tracked_path = session_.datasetSourcePath(existing_id);
-        !tracked_path.isEmpty() && !layout_xml::isSamePath(tracked_path, path)) {
+        !tracked_path.isEmpty() && !sameSourceIdentity(tracked_path, source_identity)) {
       continue;
     }
     if (hints.prefer_reuse) {
@@ -440,16 +1037,17 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
         // loadedSources() paths are stored normalized; compare canonically so a
         // symlink/relative alias of a tracked file still recovers its config.
         const auto& prior = session_.loadedSources();
-        const auto it = std::find_if(
-            prior.begin(), prior.end(), [&path](const auto& src) { return layout_xml::isSamePath(src.path, path); });
+        const auto it = std::find_if(prior.begin(), prior.end(), [&source_identity](const auto& src) {
+          return sameSourceIdentity(src.path, source_identity);
+        });
         if (it != prior.end()) {
           emit_config = it->plugin_config_json;
         }
       }
       catalog_.restoreDataset(existing_id);
-      session_.setDatasetSourcePath(existing_id, path);
-      emit fileLoaded(path, QString(), source_name, emit_config);
-      return false;  // layout-replay reuse: done synchronously, no worker
+      session_.setDatasetSourcePath(existing_id, source_identity);
+      emit fileLoaded(source_identity, QString(), source_name, emit_config);
+      co_return;  // layout-replay reuse: done synchronously, no worker
     }
     // Tombstone is deferred to the post-ingest swap (single-instance) or the fanout fallback below: don't disturb
     // the live dataset until the staged ingest has succeeded.
@@ -470,7 +1068,8 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     auto dataset_or =
         engine.createDataset(DatasetDescriptor{.source_name = display_name_utf8, .time_domain_id = td_id});
     if (!dataset_or.has_value()) {
-      return fail(tr("createDataset failed: %1").arg(QString::fromStdString(dataset_or.error())));
+      (void)fail(tr("createDataset failed: %1").arg(QString::fromStdString(dataset_or.error())));
+      co_return;
     }
     dataset_id = static_cast<DatasetId>(*dataset_or);
   }
@@ -496,37 +1095,13 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // The reference stays valid across that move (unique_ptr move transfers
   // ownership; the object's address does not change).
   auto ingest_session_ptr = std::make_unique<DataSourceRuntimeHost>(
-      engine, extensions_, dataset_id, source_handle, session_.objectStore(), source->id,
-      std::move(object_parser_registrar), nullptr, nullptr, handle.libraryOwner());
+      engine, extensions_, dataset_id, source_handle, session_.objectStore(), source_id,
+      std::move(object_parser_registrar), nullptr, nullptr, combineKeepalive(handle.libraryOwner(), input.lease));
   DataSourceRuntimeHost& ingest_session = *ingest_session_ptr;
+  DataSourceRuntimeHost::MessageBoxHandler message_box_handler;
   if (dialog_parent != nullptr) {
-    ingest_session.setMessageBoxHandler(
-        [dialog_parent](int type, std::string_view title, std::string_view message, int buttons) -> int {
-          const QString q_title = QString::fromUtf8(title.data(), static_cast<int>(title.size()));
-          const QString q_text = QString::fromUtf8(message.data(), static_cast<int>(message.size()));
-
-          // The C-ABI contract (data_source_protocol.h: show_message_box is tagged
-          // [main-thread]) promises the host marshals this to the GUI thread. On the
-          // single-instance load path importData() runs on a worker QThread, so building or
-          // exec'ing the QMessageBox directly here would touch a GUI-thread-owned parent
-          // off-thread -- a Qt thread-affinity violation that segfaults in the font engine
-          // while painting. Build/run the dialog on the GUI thread and block the worker until
-          // the user closes the modal (the documented blocking semantics). On the fanout path
-          // we are already on the GUI thread, so call directly to avoid a self-deadlock.
-          auto show = [&]() -> int {
-            // Every host-shown plugin message uses the app-styled dialog (PJ::Dialog,
-            // no system/GNOME chrome): it scrolls long detail (per-row lists of
-            // thousands of skipped CSV lines) and stays compact for short text.
-            return execScrollableMessageDialog(dialog_parent, q_title, q_text, type, buttons);
-          };
-
-          if (QThread::currentThread() == qApp->thread()) {
-            return show();  // already on the GUI thread (fanout path)
-          }
-          int result = -1;
-          QMetaObject::invokeMethod(qApp, [&]() { result = show(); }, Qt::BlockingQueuedConnection);
-          return result;
-        });
+    message_box_handler = makePluginMessageBoxHandler(dialog_parent, active_plugin_message_dialog_, message_gate_);
+    ingest_session.setMessageBoxHandler(message_box_handler);
   }
   applyDefaultIngestPolicies(ingest_session.policyResolver());
 
@@ -534,7 +1109,8 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   ingest_session.registerServices(registry);
 
   if (auto status = handle.bind(registry.view()); !status) {
-    return fail(tr("Plugin '%1': bind failed: %2").arg(source_name, QString::fromStdString(status.error())));
+    (void)fail(tr("Plugin '%1': bind failed: %2").arg(source_name, QString::fromStdString(status.error())));
+    co_return;
   }
 
   // Pre-populate the dialog with last-used settings so users don't re-pick
@@ -543,16 +1119,20 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // entirely; we fall back to the dialog with the QSettings pre-fill if
   // either the id mismatches or loadConfig rejects the preset.
   QSettings persisted_settings;
-  const QString config_key = pluginConfigKey(source->name);
+  const QString config_key = pluginConfigKey(source_plugin_name);
   const std::string saved_config = persisted_settings.value(config_key, QString()).toString().toStdString();
 
   std::string config;
   bool skip_dialog = false;
 
-  const bool hint_eligible =
-      hints.skip_dialog && !hints.preset_config_json.isEmpty() && hints.expected_plugin_id == source_name;
+  const bool hint_eligible = hints.skip_dialog &&
+                             (!hints.preset_config_json.isEmpty() || hints.rewrite_preset_filepath) &&
+                             hints.expected_plugin_id == source_name;
   if (hint_eligible) {
-    const std::string preset = hints.preset_config_json.toStdString();
+    const std::string preset =
+        hints.rewrite_preset_filepath
+            ? detail::rewriteReplayFilepaths(hints.preset_config_json.toStdString(), input.backing_path)
+            : hints.preset_config_json.toStdString();
     if (auto status = handle.loadConfig(preset); status) {
       config = preset;
       skip_dialog = true;
@@ -562,15 +1142,17 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       // skip; if not, ask."
       qCInfo(lcFileLoader).noquote() << tr("Layout preset rejected by '%1': %2 — falling back to dialog")
                                             .arg(source_name, QString::fromStdString(status.error()));
-      config = buildLoadConfig(saved_config, path);
+      config = buildLoadConfig(saved_config, input.backing_path);
       if (auto retry = handle.loadConfig(config); !retry) {
-        return fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(retry.error())));
+        (void)fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(retry.error())));
+        co_return;
       }
     }
   } else {
-    config = buildLoadConfig(saved_config, path);
+    config = buildLoadConfig(saved_config, input.backing_path);
     if (auto status = handle.loadConfig(config); !status) {
-      return fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(status.error())));
+      (void)fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(status.error())));
+      co_return;
     }
   }
 
@@ -585,20 +1167,33 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       }
     }
 
-    const auto dlg = dialog_presenter::showDataSourceDialog({
+    // Named frame local, deliberately NOT a co_await temporary: GCC 11.4 (the
+    // linux-ci / AppImage compiler) mishandles awaiter temporaries inside
+    // co_await expressions — as a temporary this segfaulted the
+    // DialogShutdownTest pair on CI while newer GCC/MSVC were fine. A named
+    // local keeps the same declaration order relative to `handle` (so frame
+    // destruction still rejects the dialog before the plugin context dies).
+    DataSourceDialogAwaiter dialog_awaiter({
         .source = *source,
         .handle = handle,
         .catalog = extensions_,
         .parent = dialog_parent,
         .initial_parser_config = initial_parser_config,
+        .browser_file_store = browser_file_store_,
     });
+    const auto dlg = co_await std::move(dialog_awaiter);
     if (dlg.outcome == dialog_presenter::Outcome::kPluginContractViolation) {
-      return fail(tr("Plugin contract violation: %1. Reinstall the plugin from the Marketplace.")
-                      .arg(QString::fromStdString(dlg.error)));
+      (void)fail(tr("Plugin contract violation: %1. Reinstall the plugin from the Marketplace.")
+                     .arg(QString::fromStdString(dlg.error)));
+      co_return;
     }
     if (dlg.outcome == dialog_presenter::Outcome::kRejected) {
+      // Diagnostic marker: the reject path completed with no dataset committed
+      // (automation greps for it on every platform).
+      qCInfo(lcFileLoader).noquote() << "PJ_FILE_LOAD_REJECTED" << u"plugin=%1"_s.arg(source_name)
+                                     << u"identity=%1"_s.arg(source_identity);
       rollback_tombstones();
-      return false;
+      co_return;
     }
     if (dlg.payload.has_value()) {
       config = dlg.payload->saved_config;
@@ -616,10 +1211,25 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       // but for plugins that split dialog state from source state the explicit
       // reload keeps the contract uniform.
       if (auto status = handle.loadConfig(config); !status) {
-        return fail(tr("Plugin '%1': loadConfig (post-dialog) failed: %2")
-                        .arg(source_name, QString::fromStdString(status.error())));
+        (void)fail(tr("Plugin '%1': loadConfig (post-dialog) failed: %2")
+                       .arg(source_name, QString::fromStdString(status.error())));
+        co_return;
       }
     }
+  }
+
+  // A cancel ("Remove All" / "Stop") issued while this prologue sat suspended at
+  // its config dialog set cancel_mode_ but had no worker to observe it. Honor it
+  // here rather than letting the cancel_mode_.store(0) below silently wipe it:
+  // roll back any partial state and abandon the load. (shutting_down_ is handled
+  // separately by joinForShutdown, which destroys the frame outright.)
+  if (cancel_mode_.load() != 0) {
+    qCInfo(lcFileLoader) << "[FileLoader] load cancelled while suspended at its config dialog";
+    cancel_mode_.store(0);
+    erase_created_live_dataset();
+    rollback_tombstones();
+    emit fileLoadFailed(source_identity, tr("Load cancelled"));
+    co_return;
   }
 
   // Persist before start() so dialog choices stick even if ingest fails.
@@ -629,66 +1239,6 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   if (!skip_dialog) {
     persisted_settings.setValue(config_key, QString::fromStdString(config));
   }
-
-  // Progress dialog — shown when the plugin calls progressStart().
-  // The import runs synchronously on the main thread, so we drive the dialog
-  // with processEvents() inside the update callback.
-  // Two-way stop semantics: both interrupt the ingest, they differ in what
-  // happens to the data parsed before the click.
-  //   - Keep:    stop reading; flush the partial data so it appears in the
-  //              tree (button labelled "Cancel" in the UI).
-  //   - Discard: stop reading and throw the partial data away (no flush,
-  //              evict ObjectStore payloads, drop the dataset).
-  // None  = no user request, the import ran to completion.
-  enum class CancelAction { kNone, kKeep, kDiscard };
-  CancelAction user_action = CancelAction::kNone;
-
-  // App-styled progress dialog with two stop buttons. It is domain-neutral:
-  // it reports Primary / Secondary and we map those to CancelAction here
-  // (Primary = Cancel/keep, Secondary = Discard).
-  ProgressDialog progress_dlg(dialog_parent);
-  progress_dlg.setPrimaryButton(
-      tr("Cancel"), u":/resources/svg/cancel_keep.svg"_s, tr("Stop reading; keep the data parsed so far."));
-  progress_dlg.setSecondaryButton(
-      tr("Discard"), u":/resources/svg/cancel_discard.svg"_s, tr("Stop reading and discard the partial data."));
-
-  // Progress callbacks are re-wired per ingest_session (once for single-instance,
-  // N times in fanout mode) — the dialog itself is shared.
-  auto wire_progress = [&](DataSourceRuntimeHost& session) {
-    session.on_progress_start = [&](std::string_view label, uint64_t total, bool cancellable) {
-      const QString title = QString::fromUtf8(label.data(), static_cast<int>(label.size()));
-      progress_dlg.setDialogTitle(title);
-      progress_dlg.setMessage(QString{});
-      progress_dlg.setRange(0, total > 0 ? static_cast<int>(total) : 0);
-      progress_dlg.setValue(0);
-      progress_dlg.setStopButtonsVisible(cancellable);
-      if (!progress_dlg.isVisible()) {
-        progress_dlg.show();
-      }
-      QCoreApplication::processEvents();
-    };
-    session.on_progress_update = [&](uint64_t current) -> bool {
-      progress_dlg.setValue(static_cast<int>(current));
-      QCoreApplication::processEvents();
-      switch (progress_dlg.action()) {
-        case ProgressDialog::Action::kPrimary:
-          user_action = CancelAction::kKeep;
-          break;
-        case ProgressDialog::Action::kSecondary:
-          user_action = CancelAction::kDiscard;
-          break;
-        case ProgressDialog::Action::kNone:
-          return true;
-      }
-      session.requestStop(
-          user_action == CancelAction::kKeep ? "cancelled by user (keep partial)" : "cancelled by user (discard)");
-      return false;
-    };
-    session.on_progress_finish = [&]() {
-      progress_dlg.setValue(progress_dlg.maximum());
-      QCoreApplication::processEvents();
-    };
-  };
 
   // Detect multi-instance fanout. A DataSource plugin emits a `__pj_fanout`
   // array on accept when one selection should expand into several independent
@@ -702,6 +1252,24 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // replacing fanout its id is staged-engine-scoped (it may alias an unrelated
   // live dataset).
   std::vector<DatasetId> fanout_loaded_ids;
+  std::vector<DatasetId> fanout_created_ids;
+  bool fanout_committed = false;
+  const auto rollback_fanout_on_cancel = qScopeGuard([&]() {
+    if (fanout_committed) {
+      return;
+    }
+    for (const DatasetId created_id : fanout_created_ids) {
+      removeCreatedDataset(created_id);
+    }
+  });
+
+  // Fan-out entry outcomes, declared here so the shared epilogue below the
+  // branch can route a user-discarded or fully-failed fan-out away from the
+  // success tail. The single-instance arm never touches them.
+  std::size_t completed = 0;
+  std::size_t failed = 0;
+  bool discarded = false;  // The stop was "Remove All" (mode 2): drop even completed entries.
+  QStringList failed_labels;
 
   if (fanouts.size() == 1) {
     // --- Single-instance load: run the read loop on a worker thread, filling
@@ -719,7 +1287,7 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     // this prologue into the worker. The `ingest_session` reference stays valid
     // (the move transfers ownership without relocating the heap object).
     ctx_ = std::make_unique<LoadContext>(std::move(handle), std::move(ingest_session_ptr));
-    ctx_->path = path;
+    ctx_->path = source_identity;
     ctx_->dialog_parent = request.dialog_parent;
     ctx_->source_name = source_name;
     ctx_->config = config;
@@ -743,8 +1311,9 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     // Worker-driven progress. on_progress_* run on the WORKER; they touch only
     // ctx_ (set before the thread starts, not mutated by the GUI until join) and
     // the atomic cancel flag, and marshal every GUI access via invokeMethod.
+    const std::uint64_t generation = load_generation_;
     DataSourceRuntimeHost& host = *ctx_->ingest;
-    host.on_progress_start = [this](std::string_view label, uint64_t total, bool /*cancellable*/) {
+    host.on_progress_start = [this, generation](std::string_view label, uint64_t total, bool /*cancellable*/) {
       ctx_->progress_total = total;
       const QString title = QString::fromUtf8(label.data(), static_cast<int>(label.size()));
       const bool determinate = total > 0;
@@ -752,12 +1321,15 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       const int file_total = ctx_->file_total;
       QMetaObject::invokeMethod(
           this,
-          [this, title, determinate, file_index, file_total]() {
+          [this, generation, title, determinate, file_index, file_total]() {
+            if (generation != load_generation_) {
+              return;
+            }
             emit ingestStarted(title, file_index, file_total, determinate);
           },
           Qt::QueuedConnection);
     };
-    host.on_progress_update = [this](uint64_t current) -> bool {
+    host.on_progress_update = [this, generation](uint64_t current) -> bool {
       if (cancel_mode_.load() != 0) {
         return false;  // user asked to stop; the read loop exits cooperatively
       }
@@ -771,20 +1343,13 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       const int max = static_cast<int>(ctx_->progress_total);
       QMetaObject::invokeMethod(
           this,
-          [this, notify_dataset, cur, max]() {
-            // GUI: recompute the topic-id set here (never capture it from the
-            // worker — the parser registrar may add topics concurrently).
-            const auto ids = session_.dataEngine().listTopics(notify_dataset);
-            session_.notifyIngest(QVector<TopicId>(ids.begin(), ids.end()), /*live=*/false);
-            // Fold the FrameTransforms loaded so far into the TF buffer incrementally
-            // (cursor-based — each call ingests only what is new). Otherwise TF is
-            // ingested in a single pass at completion (finishLoadOnGui) and 3D scenes
-            // stay empty until the load finishes. This emits datasetTransformsReady,
-            // which 3D docks observe to re-render at the playhead as the file loads.
-            if (transform_service_ != nullptr) {
-              transform_service_->ingestFrameTransformsForDataset(notify_dataset);
+          [this, generation, notify_dataset, cur, max]() {
+            // A queued tick can survive shutdown and the loader can then be
+            // reused. Reject it unless it still belongs to this exact context.
+            if (generation != load_generation_ || ctx_ == nullptr || ctx_->dataset_id != notify_dataset) {
+              return;
             }
-            emit ingestProgress(cur, max);
+            publishIngestProgress(notify_dataset, cur, max);
           },
           Qt::QueuedConnection);
       return true;
@@ -793,16 +1358,19 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
 
     cancel_mode_.store(0);
     ctx_->flush_clock.start();
-    worker_ = std::unique_ptr<QThread>(QThread::create([this]() { runIngestOnWorker(); }));
+    worker_ = std::unique_ptr<QThread>(QThread::create([this, generation]() { runIngestOnWorker(generation); }));
     worker_->start();
-    return true;  // worker running; onWorkerFinished resumes the queue
+    rollback_armed = false;   // LoadContext/onWorkerFinished owns rollback now.
+    fanout_committed = true;  // No fanout datasets exist on this path.
+    worker_handoff = true;
+    co_return;  // worker running; onWorkerFinished resumes the queue
   } else {
     // A same-source reload that fans out cannot refill in place (one source becomes N datasets). Fall back to
     // remove-then-fresh: tombstone the existing dataset now (objects evicted past the rollback point below) and let
     // the fanout create fresh datasets on the live engine. The handle bound to existing_primary_id above is never
     // start()ed here (fanout mints its own per-entry handles), so the dataset takes no data before its removal.
     if (replacing) {
-      emit sourceReplacementAboutToCommit(path);
+      emit sourceReplacementAboutToCommit(source_identity);
     }
     if (replacing && catalog_.removeDataset(existing_primary_id)) {
       tombstoned_for_replace.push_back(existing_primary_id);
@@ -816,54 +1384,69 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     // throws it away. Both stop the outer loop.
     enum class EntryOutcome { kCompleted, kFailed, kKept, kDiscarded };
 
-    const QString basename = QFileInfo(path).completeBaseName();
+    const QString basename = QFileInfo(display_name).completeBaseName();
     // issue #98: let the plugin name the dataset root. `display_name` (if the
     // plugin emitted it in the accepted config) replaces the file basename as
     // the shared prefix; the per-episode `display_suffix` still forms the leaf.
     const QString fanout_name = detail::parseDisplayName(config);
     const QString base = fanout_name.isEmpty() ? basename : fanout_name;
-    std::size_t completed = 0;
-    std::size_t failed = 0;
     bool stopped = false;  // Cancel or Abort by the user during the loop.
-    QStringList failed_labels;
 
-    // Per-fanout-iteration runner. Creates a fresh dataset + handle + ingest
-    // host, binds, loadConfig's the per-entry cfg, then runs the import. Logs a
-    // context-rich warning on every failure mode so partial imports are
-    // diagnosable from the log alone. Returns Failed before the import starts,
-    // Cancelled if the user cancelled during it, else Completed.
-    auto run_fanout_entry = [&](std::size_t idx, const std::string& cfg_i,
-                                const QString& iter_display) -> EntryOutcome {
+    // Keep SDK control slots on the GUI thread. Only the finite import's
+    // blocking start() call runs on a worker; the coroutine frame keeps the
+    // handle and host alive until that worker has joined, then destroys them
+    // back here on the GUI thread.
+    cancel_mode_.store(0);
+    const std::uint64_t fanout_generation = load_generation_;
+    for (std::size_t idx = 0; idx < fanouts.size(); ++idx) {
+      const std::string& cfg_i = fanouts[idx];
+      const QString suffix = detail::parseDisplaySuffix(cfg_i, QString::number(idx + 1));
+      const QString iter_display = base + QChar('/') + suffix;
+
       // Each fanned dataset gets its own TimeDomain so it is independently
       // draggable on the Source Timeline (rather than sharing the primary's).
       auto iter_td = engine.createTimeDomain(iter_display.toStdString());
       if (!iter_td.has_value()) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
                                 << "]: createTimeDomain failed:" << QString::fromStdString(iter_td.error());
-        return EntryOutcome::kFailed;
+        ++failed;
+        failed_labels << iter_display;
+        continue;
       }
       auto iter_dataset_or = engine.createDataset(
           DatasetDescriptor{.source_name = iter_display.toStdString(), .time_domain_id = *iter_td});
       if (!iter_dataset_or.has_value()) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
                                 << "]: createDataset failed:" << QString::fromStdString(iter_dataset_or.error());
-        return EntryOutcome::kFailed;
+        ++failed;
+        failed_labels << iter_display;
+        continue;
       }
       const auto iter_dataset_id = static_cast<DatasetId>(*iter_dataset_or);
+      fanout_created_ids.push_back(iter_dataset_id);
       const PJ_data_source_handle_t iter_source_handle{static_cast<uint32_t>(iter_dataset_id)};
 
-      DataSourceHandle iter_handle = source->library.createHandle();
+      // Construct from the pinned vtable/owner snapshot rather than reading the
+      // GUI-owned catalog while start() is on the worker. A marketplace reload
+      // may reallocate the catalog, while source_library_owner keeps the DSO
+      // mapped.
+      DataSourceHandle iter_handle(source_vtable, source_library_owner);
       if (!iter_handle.valid()) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx << "]: createHandle failed";
-        return EntryOutcome::kFailed;
+        ++failed;
+        failed_labels << iter_display;
+        continue;
       }
 
       DataSourceRuntimeHost iter_ingest(
-          engine, extensions_, iter_dataset_id, iter_source_handle, session_.objectStore(), source->id,
+          engine, extensions_, iter_dataset_id, iter_source_handle, session_.objectStore(), source_id,
           [this](ObjectTopicId id, std::unique_ptr<MessageParserHandle> parser) {
             session_.registerObjectTopicParser(id, std::move(parser));
           },
-          nullptr, nullptr, iter_handle.libraryOwner());
+          nullptr, nullptr, combineKeepalive(iter_handle.libraryOwner(), input.lease));
+      if (message_box_handler) {
+        iter_ingest.setMessageBoxHandler(message_box_handler);
+      }
       applyDefaultIngestPolicies(iter_ingest.policyResolver());
 
       ServiceRegistryBuilder iter_registry;
@@ -872,51 +1455,105 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
       if (auto status = iter_handle.bind(iter_registry.view()); !status) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
                                 << "]: bind failed:" << QString::fromStdString(status.error());
-        return EntryOutcome::kFailed;
+        ++failed;
+        failed_labels << iter_display;
+        continue;
       }
       if (auto status = iter_handle.loadConfig(cfg_i); !status) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
                                 << "]: loadConfig failed:" << QString::fromStdString(status.error());
-        return EntryOutcome::kFailed;
+        ++failed;
+        failed_labels << iter_display;
+        continue;
       }
 
-      wire_progress(iter_ingest);
-      progress_dlg.setMessage(tr("Importing %1 (%2/%3)").arg(iter_display).arg(idx + 1).arg(fanouts.size()));
+      uint64_t progress_total = 0;
+      QElapsedTimer flush_clock;
+      flush_clock.start();
+      iter_ingest.on_progress_start = [this, fanout_generation, &progress_total, idx, fanout_count = fanouts.size()](
+                                          std::string_view label, uint64_t total, bool /*cancellable*/) {
+        progress_total = total;
+        const QString title = QString::fromUtf8(label.data(), static_cast<int>(label.size()));
+        QMetaObject::invokeMethod(
+            this,
+            [this, fanout_generation, title, idx, fanout_count, determinate = total > 0]() {
+              if (fanout_generation != load_generation_) {
+                return;
+              }
+              emit ingestStarted(title, static_cast<int>(idx + 1), static_cast<int>(fanout_count), determinate);
+            },
+            Qt::QueuedConnection);
+      };
+      iter_ingest.on_progress_update = [this, fanout_generation, &iter_ingest, &flush_clock, &progress_total,
+                                        iter_dataset_id](uint64_t current) -> bool {
+        if (cancel_mode_.load() != 0) {
+          iter_ingest.requestStop();
+          return false;
+        }
+        if (flush_clock.elapsed() < flush_throttle_ms_) {
+          return true;
+        }
+        iter_ingest.flushPending();
+        flush_clock.restart();
+        const int cur = static_cast<int>(current);
+        const int max = static_cast<int>(progress_total);
+        QMetaObject::invokeMethod(
+            this,
+            [this, fanout_generation, iter_dataset_id, cur, max]() {
+              if (fanout_generation != load_generation_) {
+                return;
+              }
+              publishIngestProgress(iter_dataset_id, cur, max);
+            },
+            Qt::QueuedConnection);
+        return true;
+      };
+      iter_ingest.on_progress_finish = [] {};
 
-      if (auto status = iter_handle.start(); !status) {
-        progress_dlg.hide();
+      // start() runs off-GUI although the SDK doc-tags it [main-thread]: a
+      // finite importer's start() blocks for the whole read loop, which would
+      // freeze the UI and deadlock the message-box marshal (it posts to the GUI
+      // thread and blocks the caller). Same accepted host-side deviation as the
+      // single-instance path's runIngestOnWorker; every other lifecycle slot
+      // (create/bind/loadConfig/destroy) stays on the GUI thread.
+      Status start_status = okStatus();
+      // Published so cancelCurrent/joinForShutdown can requestStop() a
+      // progress-silent plugin (one that polls is_stop_requested but rarely
+      // reports progress) — the coroutine-frame-local host is otherwise
+      // unreachable from the GUI-side cancel paths. GUI-thread writes only;
+      // the worker never reads this pointer.
+      active_fanout_ingest_ = &iter_ingest;
+      {
+        // Named local, not a co_await temporary — see dialog_awaiter above
+        // (GCC 11.4 awaiter-temporary miscompile).
+        GuiResumingWorkerAwaiter start_awaiter(
+            this, worker_, [&iter_handle, &start_status]() { start_status = iter_handle.start(); });
+        co_await std::move(start_awaiter);
+      }
+      active_fanout_ingest_ = nullptr;
+
+      // Cancellation takes precedence over the plugin's status: finite
+      // importers commonly report a rejected progress update as start failure.
+      // Treating that as a recoverable plugin error would incorrectly continue
+      // into the next fanout entry.
+      const int cancel_action = cancel_mode_.load();
+      EntryOutcome outcome = EntryOutcome::kCompleted;
+      if (cancel_action == 2) {
+        outcome = EntryOutcome::kDiscarded;
+      } else if (cancel_action == 1) {
+        iter_ingest.flushAll();
+        fanout_loaded_ids.push_back(iter_dataset_id);
+        outcome = EntryOutcome::kKept;
+      } else if (!start_status) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
-                                << "]: start failed:" << QString::fromStdString(status.error());
-        return EntryOutcome::kFailed;
+                                << "]: start failed:" << QString::fromStdString(start_status.error());
+        outcome = EntryOutcome::kFailed;
+      } else {
+        iter_ingest.flushAll();
+        fanout_loaded_ids.push_back(iter_dataset_id);
       }
-      // Discard = drop this entry entirely. Skip flushAll() so its buffered
-      // scalar rows never become visible, then evict the immediately-written
-      // ObjectStore payloads and drop the dataset — no half-written remnant.
-      // user_action can only have flipped during this entry's import, since
-      // the loop breaks on Keep/Discard. Entries that already Completed stay
-      // loaded.
-      if (user_action == CancelAction::kDiscard) {
-        session_.evictDatasetObjects(iter_dataset_id);
-        catalog_.removeDataset(iter_dataset_id);
-        return EntryOutcome::kDiscarded;
-      }
-      // Cancel(Keep) = keep what was already parsed for this entry
-      // (flushAll), then stop the outer loop so subsequent entries are
-      // skipped.
-      iter_ingest.flushAll();
-      fanout_loaded_ids.push_back(iter_dataset_id);
-      if (user_action == CancelAction::kKeep) {
-        return EntryOutcome::kKept;
-      }
-      return EntryOutcome::kCompleted;
-    };
 
-    for (std::size_t i = 0; i < fanouts.size(); ++i) {
-      const std::string& cfg_i = fanouts[i];
-      const QString suffix = detail::parseDisplaySuffix(cfg_i, QString::number(i + 1));
-      const QString iter_display = base + QChar('/') + suffix;
-
-      switch (run_fanout_entry(i, cfg_i, iter_display)) {
+      switch (outcome) {
         case EntryOutcome::kCompleted:
           ++completed;
           break;
@@ -925,25 +1562,53 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
           failed_labels << iter_display;
           break;
         case EntryOutcome::kKept:
-          // Cancel: this entry kept its partial flush; the remaining entries
-          // are skipped.
           ++completed;
           stopped = true;
           break;
         case EntryOutcome::kDiscarded:
-          // Discard: this entry is dropped; the remaining entries are skipped.
           stopped = true;
+          discarded = true;
           break;
       }
       if (stopped) {
-        qCInfo(lcFileLoader) << "[FileLoader] fanout: user stopped (" << static_cast<int>(user_action) << ") at entry"
-                             << (i + 1) << "of" << fanouts.size();
+        qCInfo(lcFileLoader) << "[FileLoader] fanout: user stopped with cancellation mode" << cancel_action
+                             << "at entry" << (idx + 1) << "of" << fanouts.size();
         break;
       }
     }
-    // Summary so a partial fanout import is diagnosable from the log alone.
     qCInfo(lcFileLoader) << "[FileLoader] fanout complete:" << completed << "ok," << failed << "failed"
                          << (failed > 0 ? failed_labels : QStringList{});
+    cancel_mode_.store(0);
+
+    // "Remove All" (discard) drops the WHOLE fanout load, not just the in-flight
+    // entry: entries that already Completed live in fanout_loaded_ids and would
+    // otherwise survive the cancel. Clear the loaded list so (a) the unified
+    // cleanup loop below real-deletes every created dataset (completed ones no
+    // longer match the keep-list), and (b) the downstream TF-ingest /
+    // source-path / time-reference loops skip them. "Stop and Keep" (mode 1)
+    // keeps them, so this arm is discard-only. TF is invalidated in the same
+    // loop, so nothing extra is needed here.
+    if (discarded) {
+      fanout_loaded_ids.clear();
+    }
+
+    // GUI-owned cleanup after the worker has stopped touching the datastore.
+    // Every created dataset NOT in the keep-list is real-deleted. A
+    // completed-then-discarded entry may have ingested FrameTransforms, which
+    // removeCreatedDataset invalidates before eviction empties its topic list.
+    for (const DatasetId created_id : fanout_created_ids) {
+      if (std::find(fanout_loaded_ids.begin(), fanout_loaded_ids.end(), created_id) != fanout_loaded_ids.end()) {
+        continue;
+      }
+      removeCreatedDataset(created_id);
+    }
+    if (!replacing && created_live_dataset_id != 0) {
+      // The initial handle binds against a scratch dataset before the dialog
+      // reveals fanout. It never receives rows; remove the shell now that all
+      // real fanout datasets have been created — no objects to evict.
+      removeCreatedDataset(created_live_dataset_id, /*evict_objects=*/false);
+      created_live_dataset_id = 0;
+    }
   }
 
   // Past the last rollback point: the load committed in place (no staging swap).
@@ -954,18 +1619,13 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // to (#249's real-delete, fanout face). Deferred to here (not the tombstone site)
   // because a mid-load failure rolls the tombstones back.
   for (const DatasetId tombstoned_id : tombstoned_for_replace) {
-    // Invalidate BEFORE eviction: invalidateDataset's cursor cleanup walks
-    // listTopics(tombstoned_id), so the topics must still resolve. Evicting
-    // first would empty that list and leak every per-topic cursor key.
-    if (transform_service_ != nullptr) {
-      transform_service_->invalidateDataset(tombstoned_id);
-    }
-    session_.evictDatasetObjects(tombstoned_id);
-    // Via SessionManager::removeDataset for the origin invalidate + reframe (see the
-    // non-replacing cleanup lambda near the top of loadFile).
-    session_.removeDataset(tombstoned_id);
+    // Already tombstoned above (catalog_.removeDataset(existing_primary_id));
+    // skip the redundant catalog call here.
+    removeCreatedDataset(tombstoned_id, /*evict_objects=*/true, /*remove_from_catalog=*/false);
   }
   tombstoned_for_replace.clear();
+  rollback_armed = false;
+  fanout_committed = true;
 
   catalog_.rebuildFromDatastore();  // reload: same keys ⇒ no spurious itemsRemoved
 
@@ -1002,10 +1662,10 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
   // id (existing on reload, else the fresh one). Fanout: each dataset that took
   // data.
   if (fanouts.size() == 1) {
-    session_.setDatasetSourcePath(dataset_id, path);
+    session_.setDatasetSourcePath(dataset_id, source_identity);
   } else {
     for (const DatasetId loaded_id : fanout_loaded_ids) {
-      session_.setDatasetSourcePath(loaded_id, path);
+      session_.setDatasetSourcePath(loaded_id, source_identity);
     }
   }
 
@@ -1022,33 +1682,94 @@ bool FileLoader::beginLoad(const LoadRequest& request) {
     }
   }
 
-  emit fileLoaded(path, QString(), source_name, QString::fromStdString(captured_config));
-  return false;  // fanout ran synchronously to completion; no worker — process the next request
+  if (discarded) {
+    // "Remove All": every dataset of this load was just deleted above. Surface
+    // it as a discarded load, mirroring the single-instance discard — recording
+    // it (recents, loadedSources, layout data-source entries) or logging a
+    // success would resurrect a source the user explicitly removed.
+    emit fileLoadFailed(source_identity, tr("Import discarded"));
+    co_return;
+  }
+  if (completed == 0 && failed > 0) {
+    // Every fan-out entry failed: report the aggregate as a failure instead of
+    // announcing a dataset-less success.
+    const QString reason =
+        tr("All %1 entries of '%2' failed to load:\n%3").arg(failed).arg(display_name, failed_labels.join(u"\n"_s));
+    reportLoadWarning(dialog_parent, reason);
+    emit fileLoadFailed(source_identity, reason);
+    co_return;
+  }
+
+  logSuccessfulLoad(engine, catalog_, source_identity, source_name, fanout_loaded_ids);
+  emit fileLoaded(source_identity, QString(), source_name, QString::fromStdString(captured_config));
+  co_return;  // fanout completed; process the next queued request
 }
 
 bool FileLoader::loadFile(const QString& path, QWidget* dialog_parent, const LoadHints& hints) {
-  queue_.push_back(LoadRequest{.path = path, .dialog_parent = dialog_parent, .hints = hints});
+  return loadFile(LoadInput::fromNativePath(path), dialog_parent, hints);
+}
+
+bool FileLoader::loadFile(LoadInput input, QWidget* dialog_parent, const LoadHints& hints) {
+  if (input.display_name.isEmpty() || input.backing_path.isEmpty() || input.source_identity.isEmpty()) {
+    // An unusable input (e.g. a trailing-slash directory path whose fileName() is
+    // empty) must surface the same user-visible failure as any other load error,
+    // not fail silently — MainWindow's layout replay relies on that contract.
+    const QString path = !input.source_identity.isEmpty() ? input.source_identity
+                         : !input.backing_path.isEmpty()  ? input.backing_path
+                                                          : input.display_name;
+    const QString reason = tr("Cannot load '%1': not a readable file.").arg(path);
+    qCWarning(lcFileLoader).noquote() << reason;
+    reportLoadWarning(dialog_parent, reason);
+    emit fileLoadFailed(path, reason);
+    return false;
+  }
+#ifdef PJ_TARGET_WASM
+  if (!input.content_sha256.isEmpty()) {
+    browser_content_sha256_.insert(input.source_identity, input.content_sha256);
+  }
+#endif
+  queue_.push_back(LoadRequest{.input = std::move(input), .dialog_parent = dialog_parent, .hints = hints});
   startNext();
   return true;  // accepted/enqueued — completion is async (fileLoaded/fileLoadFailed)
 }
 
 void FileLoader::startNext() {
   if (active_load_) {
-    return;  // a prologue or worker load is in progress; it resumes the queue when done
+    return;  // a suspended prologue or worker resumes the queue when done
   }
-  while (!queue_.empty()) {
-    const LoadRequest request = queue_.front();
-    queue_.pop_front();
-    active_load_ = true;  // guards re-entrancy, incl. while the modal dialog pumps events
-    if (beginLoad(request)) {
-      return;  // single-instance worker running; onWorkerFinished resumes the queue
-    }
-    active_load_ = false;  // fanout / reuse / fail / reject completed synchronously
+  // Any prior task is now at final_suspend. Destroy it before installing the
+  // next frame; finishPrologue always schedules this method rather than calling
+  // it recursively from inside that frame.
+  begin_load_task_.reset();
+  if (queue_.empty()) {
+    load_generation_ = 0;  // idle: no load to bind a stop-dialog to
+    emit queueDrained();
+    return;
   }
-  emit queueDrained();
+  LoadRequest request = std::move(queue_.front());
+  queue_.pop_front();
+  active_load_ = true;
+  ++next_load_generation_;
+  if (next_load_generation_ == 0) {
+    ++next_load_generation_;  // reserve zero for idle, even after wraparound
+  }
+  // Old queued callbacks can never match a reused loader.
+  load_generation_ = next_load_generation_;
+  // Before the coroutine runs: stale-generation UI must be gone before this
+  // load can raise its own (application-modal) dialogs.
+  emit loadGenerationAdvanced(load_generation_);
+  begin_load_task_ = std::make_unique<BeginLoadTask>(beginLoad(std::move(request)));
 }
 
-void FileLoader::runIngestOnWorker() {
+void FileLoader::finishPrologue() {
+  if (shutting_down_) {
+    return;
+  }
+  active_load_ = false;
+  QMetaObject::invokeMethod(this, [this]() { startNext(); }, Qt::QueuedConnection);
+}
+
+void FileLoader::runIngestOnWorker(std::uint64_t generation) {
   // WORKER thread. ctx_ is set on the GUI thread before this thread starts and
   // is not mutated by the GUI until after we post onWorkerFinished, so reading
   // it here races nothing. start() blocks until the plugin finishes (or stops
@@ -1058,12 +1779,12 @@ void FileLoader::runIngestOnWorker() {
   if (!status) {
     ctx_->start_error = QString::fromStdString(status.error());
   }
-  QMetaObject::invokeMethod(this, [this]() { onWorkerFinished(); }, Qt::QueuedConnection);
+  QMetaObject::invokeMethod(this, [this, generation]() { onWorkerFinished(generation); }, Qt::QueuedConnection);
 }
 
-void FileLoader::onWorkerFinished() {
-  if (!ctx_) {
-    return;  // joinForShutdown already tore the load down
+void FileLoader::onWorkerFinished(std::uint64_t generation) {
+  if (generation != load_generation_ || !ctx_) {
+    return;  // shutdown/reuse already tore down or replaced this load
   }
   if (worker_) {
     worker_->wait();  // the worker posted us as its last act, so this returns promptly
@@ -1080,16 +1801,12 @@ void FileLoader::onWorkerFinished() {
     qCWarning(lcFileLoader) << "[FileLoader] import discarded by user; partial data dropped";
     if (!replacing) {
       // Real-delete the abandoned first-load shell: evict its objects, drop catalog
-      // items WITHOUT a tombstone, and erase the engine's scalar storage, so a later
-      // prefer_reuse layout replay mints a fresh dataset instead of reattaching to an
-      // empty one. The eviction MUST stay on this !replacing arm — on the replacing
+      // items WITHOUT a tombstone, invalidate any TF it ingested before the
+      // discard, and erase the engine's scalar storage, so a later prefer_reuse
+      // layout replay mints a fresh dataset instead of reattaching to an empty
+      // one. The eviction MUST stay on this !replacing arm — on the replacing
       // path it would wipe the objects the guard is about to restore.
-      session_.evictDatasetObjects(dataset_id);
-      catalog_.removeDataset(dataset_id, /*tombstone=*/false);
-      // Via SessionManager::removeDataset for the origin invalidate + reframe (see the
-      // non-replacing cleanup lambda near the top of loadFile) — a discarded partial
-      // load may have progress-flushed EARLIER data than any prior dataset.
-      session_.removeDataset(dataset_id);
+      removeCreatedDataset(dataset_id);
       ctx_.reset();
       emit fileLoadFailed(path, tr("Import discarded"));
     } else {
@@ -1101,14 +1818,11 @@ void FileLoader::onWorkerFinished() {
     const QString reason = tr("Plugin '%1': start failed: %2").arg(source_name, ctx_->start_error);
     qCWarning(lcFileLoader).noquote() << reason;
     if (!replacing) {
-      // Real-delete the abandoned first-load shell (no tombstone) + erase its engine
-      // storage, so a later prefer_reuse layout replay re-ingests instead of
-      // reattaching to the empty dataset a failed start() left behind.
-      session_.evictDatasetObjects(dataset_id);
-      catalog_.removeDataset(dataset_id, /*tombstone=*/false);
-      // Via SessionManager::removeDataset for the origin invalidate + reframe (see the
-      // non-replacing cleanup lambda near the top of loadFile).
-      session_.removeDataset(dataset_id);
+      // Real-delete the abandoned first-load shell (no tombstone), invalidating
+      // any TF it ingested before failing, then erase its engine storage, so a
+      // later prefer_reuse layout replay re-ingests instead of reattaching to
+      // the empty dataset a failed start() left behind.
+      removeCreatedDataset(dataset_id);
       ctx_.reset();
       emit fileLoadFailed(path, reason);
     } else {
@@ -1154,6 +1868,35 @@ void FileLoader::onWorkerFinished() {
   cancel_mode_.store(0);
   active_load_ = false;
   startNext();
+}
+
+void FileLoader::publishIngestProgress(DatasetId dataset_id, int current, int maximum) {
+  // Every flush may append samples without adding a topic. Notify on every
+  // committed batch so plots and the playback range grow progressively.
+  // listTopics() takes the engine lock; do not inspect DatasetInfo::topic_ids
+  // directly while the worker may mutate it.
+  const auto ids = session_.dataEngine().listTopics(dataset_id);
+  session_.notifyIngest(QVector<TopicId>(ids.begin(), ids.end()), /*live=*/false);
+  // Fold the FrameTransforms loaded so far into the TF buffer incrementally
+  // (cursor-based — each call ingests only what is new). Otherwise TF is
+  // ingested in one pass at completion and 3D scenes stay empty until then.
+  if (transform_service_ != nullptr) {
+    transform_service_->ingestFrameTransformsForDataset(dataset_id);
+  }
+  emit ingestProgress(current, maximum);
+}
+
+void FileLoader::removeCreatedDataset(DatasetId dataset_id, bool evict_objects, bool remove_from_catalog) {
+  if (transform_service_ != nullptr) {
+    transform_service_->invalidateDataset(dataset_id);
+  }
+  if (evict_objects) {
+    session_.evictDatasetObjects(dataset_id);
+  }
+  if (remove_from_catalog) {
+    catalog_.removeDataset(dataset_id, /*tombstone=*/false);
+  }
+  session_.removeDataset(dataset_id);
 }
 
 // Shared failure exit for a REPLACING reload: destroy the guard (its dtor
@@ -1210,21 +1953,86 @@ void FileLoader::finishLoadOnGui() {
   session_.refreshDatasetTimeReference(dataset_id);
   const QString path = ctx_->path;
   const QString source_name = ctx_->source_name;
+  logSuccessfulLoad(session_.dataEngine(), catalog_, path, source_name, {dataset_id});
   ctx_.reset();  // drop the handle/host before notifying — the load is complete
   emit fileLoaded(path, QString(), source_name, QString::fromStdString(captured_config));
 }
 
+void FileLoader::reportLoadWarning(QWidget* parent, const QString& reason) {
+  if (parent == nullptr) {
+    // Headless / no-UI load: the warning already went to the log. Accumulating
+    // it here would resurface it (with an inflated count) in the next PARENTED
+    // failure's dialog, since only a dialog ever clears the list.
+    return;
+  }
+  load_warning_lines_ << reason;
+
+  // Reuse the still-open dialog: append this reason and retitle so N stacked
+  // failures read as one aggregated report instead of N overlapping boxes.
+  const auto refresh_body = [this](MessageBox* box) {
+    const int count = static_cast<int>(load_warning_lines_.size());
+    box->setTitle(count > 1 ? tr("%1 loads failed").arg(count) : tr("Load failed"));
+    box->setText(load_warning_lines_.join(u"\n\n"_s));
+  };
+
+  if (!active_load_warning_.isNull()) {
+    refresh_body(qobject_cast<MessageBox*>(active_load_warning_.data()));
+    return;
+  }
+
+  auto* dialog = new MessageBox(parent);
+  active_load_warning_ = dialog;
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  // App-modal (not window-modal) restores the pre-branch exec() semantics.
+  dialog->setWindowModality(Qt::ApplicationModal);
+  refresh_body(dialog);
+  dialog->addButton(tr("OK"), MessageBox::kPrimaryRole);
+  // Drop the aggregation state the moment the user dismisses it (finished
+  // fires before WA_DeleteOnClose's deferred deletion), so a failure arriving
+  // in that gap opens a fresh dialog instead of appending to the dying one —
+  // where the new reason would never be seen.
+  QObject::connect(dialog, &QDialog::finished, this, [this]() {
+    active_load_warning_.clear();
+    load_warning_lines_.clear();
+  });
+  // show(), not open(): open() force-downgrades ApplicationModal to WindowModal.
+  dialog->show();
+}
+
 void FileLoader::cancelCurrent(bool keep_partial) {
-  if (ctx_ == nullptr) {
-    return;  // no worker load in progress (fanout cancellation flows through its modal dialog)
+  if (!active_load_) {
+    // No load is processing. Latching cancel_mode_ now would silently kill the
+    // NEXT load at its prologue check instead of cancelling anything current.
+    return;
   }
   cancel_mode_.store(keep_partial ? 1 : 2);
+  if (ctx_ == nullptr) {
+    // Fanout has no single-instance LoadContext. The active entry's worker-side
+    // progress callback observes cancel_mode_ directly; wake a progress-silent
+    // plugin through the documented is_stop_requested channel too.
+    if (active_fanout_ingest_ != nullptr) {
+      active_fanout_ingest_->requestStop();
+    }
+    return;
+  }
   if (ctx_->ingest) {
     // Flag-only stop: cancelCurrent runs on the GUI thread while the worker may be in a
     // host callback, so writing a reason here would race the worker's last_error_. The
     // cooperative stop only needs the atomic flag; the reason is unused on this path.
     ctx_->ingest->requestStop();
   }
+}
+
+void FileLoader::cancelCurrent(std::uint64_t generation, bool keep_partial) {
+  if (generation == 0 || generation != load_generation_ || !active_load_) {
+    // The load this cancel was raised for already finished (and possibly a next
+    // one began): cancelling now would stop the wrong load. The !active_load_
+    // arm covers the fan-out epilogue's one-event-loop hop, where the finished
+    // load's generation is still current but startNext has not yet advanced it
+    // — a click landing there must not poison the queued next load.
+    return;
+  }
+  cancelCurrent(keep_partial);
 }
 
 bool FileLoader::isBusy() const {
@@ -1236,7 +2044,28 @@ DatasetId FileLoader::activeLoadDatasetId() const {
 }
 
 void FileLoader::joinForShutdown() {
+  shutting_down_ = true;
+  // Invalidate every queued callback before waiting. next_load_generation_
+  // remains untouched, so a subsequent load cannot reuse this token.
+  load_generation_ = 0;
   cancel_mode_.store(2);  // discard whatever is mid-flight
+  if (active_fanout_ingest_ != nullptr) {
+    // A fan-out entry's host lives in the coroutine frame; without this nudge a
+    // plugin that polls is_stop_requested but never reports progress would keep
+    // the worker (and the wait below) running to natural completion.
+    active_fanout_ingest_->requestStop();
+  }
+  // Unblock a worker parked in the synchronous message-box ABI BEFORE waiting
+  // on it: a pending question answers -1, and a request still queued on the GUI
+  // thread (i.e. behind this very call) becomes a no-op when it eventually runs
+  // — without this, wait() below deadlocks against the unserved queue entry.
+  message_gate_->shutdown();
+  if (!active_plugin_message_dialog_->isNull()) {
+    // finished is delivered synchronously on this GUI thread; its completion is
+    // release-once, so the gate release above cannot double-answer the worker.
+    (*active_plugin_message_dialog_)->reject();
+    active_plugin_message_dialog_->clear();
+  }
   if (ctx_ != nullptr && ctx_->ingest) {
     ctx_->ingest->requestStop();  // flag-only: worker may be mid-ingest, avoid racing last_error_
   }
@@ -1244,19 +2073,25 @@ void FileLoader::joinForShutdown() {
     worker_->wait();
     worker_.reset();
   }
+  // A fanout worker captures locals in this coroutine frame, so cancel it only
+  // after the worker has joined. Destroying a prologue suspended on its plugin
+  // config dialog synchronously closes that dialog and rejects the plugin while
+  // the frame's DataSourceHandle still owns a live plugin context (the
+  // DataSourceDialogAwaiter destructor does both), so no tick or late resume
+  // can ever touch a freed ctx.
+  begin_load_task_.reset();
   // The worker has joined; the queued onWorkerFinished will no-op once ctx_ is reset, so
   // run the abandoned-load cleanup here. Capture the reload identity BEFORE ctx_.reset()
   // destroys the guard. A discarded mid-flight NON-replacing first load created a dataset
-  // in the live engine — erase it (objects + catalog without a tombstone + engine storage)
-  // so a later prefer_reuse layout replay re-ingests instead of reattaching to the empty
-  // shell (matches onWorkerFinished's discard path). A REPLACING reload instead rolls back
-  // via the guard's destructor when ctx_ is reset, restoring the pre-reload data.
+  // in the live engine — erase it (objects + TF state + catalog without a tombstone +
+  // engine storage) so a later prefer_reuse layout replay re-ingests instead of
+  // reattaching to the empty shell (matches onWorkerFinished's discard path). A REPLACING
+  // reload instead rolls back via the guard's destructor when ctx_ is reset, restoring the
+  // pre-reload data.
   const bool was_replacing = (ctx_ != nullptr && ctx_->replacing);
   const DatasetId reload_id = (ctx_ != nullptr) ? ctx_->dataset_id : 0;
   if (ctx_ != nullptr && !was_replacing) {
-    session_.evictDatasetObjects(reload_id);
-    catalog_.removeDataset(reload_id, /*tombstone=*/false);
-    session_.removeDataset(reload_id);
+    removeCreatedDataset(reload_id);
   }
   ctx_.reset();  // guard dtor rolls back a replacing reload; any queued onWorkerFinished no-ops
   if (was_replacing) {
@@ -1264,6 +2099,15 @@ void FileLoader::joinForShutdown() {
   }
   queue_.clear();
   active_load_ = false;
+  // Clear the shutdown's discard flag so the NEXT load's prologue does not
+  // mistake it for a user cancel issued while suspended (the V12a check reads
+  // cancel_mode_ at prologue resume).
+  cancel_mode_.store(0);
+  // Leave the loader reusable (a fresh load after shutdown must work): mint a
+  // new gate — the shut one keeps neutering any straggler queued message-box
+  // lambdas — and re-enable prologue completion.
+  message_gate_ = std::make_shared<PluginMessageGate>();
+  shutting_down_ = false;
 }
 
 QString FileLoader::sourcePathForDataset(DatasetId dataset_id) const {

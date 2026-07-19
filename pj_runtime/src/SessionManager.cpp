@@ -34,6 +34,12 @@ QString SessionManager::normalizedSourcePath(const QString& path) {
   if (path.isEmpty()) {
     return {};
   }
+  // Non-file source identities (for example a browser upload lease) are
+  // already logical, session-scoped identifiers. Treating them as QFileInfo
+  // paths would prepend the process working directory and destroy identity.
+  if (path.contains(u"://"_s)) {
+    return path;
+  }
   const QFileInfo info(path);
   const QString canonical = info.canonicalFilePath();
   return QDir::cleanPath(canonical.isEmpty() ? info.absoluteFilePath() : canonical);

@@ -63,6 +63,7 @@ class DiagnosticHistory;
 class DockWidget;
 class FileLoader;
 class IDataWidget;
+class MessageBox;
 class PanelEngine;
 class PlotDocker;
 class PlotWidget;
@@ -931,6 +932,10 @@ class MainWindow : public QMainWindow {
   // flash it; hidden a moment after the load queue drains.
   IngestProgressWidget* ingest_progress_ = nullptr;
   QTimer* ingest_show_timer_ = nullptr;
+  // The strip's "Stop loading?" confirmation, alive only while shown (heap +
+  // WA_DeleteOnClose, continued from finished — never a nested exec()). Tracked
+  // so a second stop-click re-raises it instead of stacking a duplicate.
+  QPointer<MessageBox> ingest_stop_dialog_;
   // Help ▸ Installed Extensions — informational, rebuilt on aboutToShow.
   QMenu* installed_extensions_menu_ = nullptr;
   // Local-panel header bands (grey "Curve Width" / "Curve Style" labels).

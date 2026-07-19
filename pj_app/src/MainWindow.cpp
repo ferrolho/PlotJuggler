@@ -70,6 +70,7 @@
 #include "DebugUi.h"
 #include "FileLoader.h"
 #include "LayoutXml.h"
+#include "LoadInput.h"
 #include "PendingDisplayBinder.h"
 #include "PreferencesDialog.h"
 #include "RasterKeyMap.h"
@@ -1184,6 +1185,11 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       [this](
           const QString& path, const QString& /*prefix*/, const QString& /*plugin_id*/,
           const QString& /*plugin_config_json*/) {
+        // A browser upload token and its MEMFS backing file both expire with
+        // the page; keep such identities out of the desktop-style recent list.
+        if (isBrowserUploadIdentity(path)) {
+          return;
+        }
         QSettings recent_settings;
         QStringList recent = recent_settings.value(u"File/recent"_s).toStringList();
         recent.removeAll(path);
@@ -1230,29 +1236,60 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       ingest_progress_->setActive(false);
       return;
     }
-    // Instance (not the static question()) so it can be closed programmatically.
-    MessageBox dialog(this);
-    dialog.setTitle(tr("Stop loading?"));
-    dialog.setText(tr("This data is still loading. Keep what has loaded so far, remove all of it, or keep loading?"));
-    dialog.addButton(tr("Remove All"), MessageBox::kDestructiveRole);  // index 0 — stop and discard
-    dialog.addButton(tr("Stop and Keep"), MessageBox::kPrimaryRole);   // index 1 — stop, keep partial
-    dialog.addButton(tr("Cancel"), MessageBox::kCancelRole);           // index 2 — resume loading
-    // If the load completes while the dialog is open, its premise is gone and
-    // its actions would be misleading no-ops, so auto-dismiss it as a no-op.
-    const QMetaObject::Connection drained =
-        connect(file_loader_.get(), &FileLoader::queueDrained, &dialog, [&dialog]() { dialog.reject(); });
-    dialog.exec();
-    QObject::disconnect(drained);
-    switch (dialog.clickedIndex()) {
-      case 0:
-        file_loader_->cancelCurrent(/*keep_partial=*/false);  // Remove All — stop and discard
-        break;
-      case 1:
-        file_loader_->cancelCurrent(/*keep_partial=*/true);  // Stop and Keep
-        break;
-      default:
-        break;  // Cancel, or auto-dismissed on completion — leave the load alone
+    if (!ingest_stop_dialog_.isNull()) {
+      ingest_stop_dialog_->raise();
+      ingest_stop_dialog_->activateWindow();
+      return;
     }
+
+    // Heap instance continued from its finished signal: the load keeps
+    // progressing while the question is up, so completion must be able to
+    // dismiss it — which a nested exec() would make fragile to unwind.
+    auto* dialog = new MessageBox(this);
+    ingest_stop_dialog_ = dialog;
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    // App-modal (not window-modal): window-modality leaves floating ADS dock
+    // tool-windows interactive. show() below honors it without a nested loop.
+    dialog->setWindowModality(Qt::ApplicationModal);
+    dialog->setTitle(tr("Stop loading?"));
+    dialog->setText(tr("This data is still loading. Keep what has loaded so far, remove all of it, or keep loading?"));
+    dialog->addButton(tr("Remove All"), MessageBox::kDestructiveRole);  // index 0 — stop and discard
+    dialog->addButton(tr("Stop and Keep"), MessageBox::kPrimaryRole);   // index 1 — stop, keep partial
+    dialog->addButton(tr("Cancel"), MessageBox::kCancelRole);           // index 2 — resume loading
+
+    // Bind this confirmation to the SPECIFIC load it was raised for. If that
+    // load finishes, its premise is gone: either the queue drains (queueDrained)
+    // or a queued next load takes over (loadGenerationAdvanced) — auto-dismiss
+    // on both so the dialog can never act on, or block, the wrong load.
+    const std::uint64_t tracked_generation = file_loader_->loadGeneration();
+    const QMetaObject::Connection advanced = connect(
+        file_loader_.get(), &FileLoader::loadGenerationAdvanced, dialog,
+        [dialog, tracked_generation](std::uint64_t generation) {
+          if (generation != tracked_generation) {
+            dialog->reject();
+          }
+        });
+    const QMetaObject::Connection drained =
+        connect(file_loader_.get(), &FileLoader::queueDrained, dialog, [dialog]() { dialog->reject(); });
+    connect(dialog, &QDialog::finished, this, [this, dialog, tracked_generation, advanced, drained](int) {
+      QObject::disconnect(advanced);
+      QObject::disconnect(drained);
+      const int clicked = dialog->clickedIndex();
+      ingest_stop_dialog_.clear();
+      switch (clicked) {
+        case 0:
+          file_loader_->cancelCurrent(tracked_generation, /*keep_partial=*/false);  // Remove All — stop and discard
+          break;
+        case 1:
+          file_loader_->cancelCurrent(tracked_generation, /*keep_partial=*/true);  // Stop and Keep
+          break;
+        default:
+          break;  // Cancel or window-close — leave the load alone
+      }
+    });
+    // show(), not open(): QDialog::open() force-downgrades ApplicationModal to
+    // WindowModal. show() honors the app-modality set above and still fires finished.
+    dialog->show();
   });
   connect(
       file_loader_.get(), &FileLoader::ingestStarted, this,
@@ -1697,7 +1734,12 @@ void MainWindow::onFileLoaded(
   // recording the source (incl. plugin id + json) and seeding playback are
   // pj_runtime concerns; we just relay. Prefix is empty in v1 until the
   // load dialog gains a prefix input.
-  session_->sessionManager().recordLoadedSource(path, prefix, plugin_id, plugin_config_json);
+  // A browser upload is backed by ephemeral MEMFS and cannot be replayed after
+  // refresh, so never expose its logical identity as a recent/reloadable path.
+  // The dataset itself still carries that identity for same-session disambiguation.
+  if (!isBrowserUploadIdentity(path)) {
+    session_->sessionManager().recordLoadedSource(path, prefix, plugin_id, plugin_config_json);
+  }
   // Feed the loaded source path to every existing 3D dock so its URDF package
   // resolver can key per-source remembered roots and auto-seed search roots from
   // the file's directory (M.2/M.16). Docks created later pick it up from

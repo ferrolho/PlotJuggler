@@ -39,4 +39,15 @@ QString parseDisplaySuffix(std::string_view cfg, const QString& fallback);
 // that don't emit it are unaffected (back-compat).
 QString parseDisplayName(std::string_view cfg);
 
+// Browser source replay stages a fresh backing file, so every filepath that
+// belongs to that source must be rebound before the plugin sees its saved
+// config. Besides the top-level field, fan-out configs carry complete child
+// configs as JSON strings inside `__pj_fanout`; rewrite those recursively while
+// leaving unrelated nested objects and malformed/non-string fan-out entries
+// byte-for-byte equivalent at the value level. An empty/malformed outer config
+// retains FileLoader's historical behavior and becomes a minimal filepath
+// object. Callers must opt in explicitly; native/ordinary preset bytes never
+// pass through this helper.
+std::string rewriteReplayFilepaths(std::string_view config, const QString& fresh_path);
+
 }  // namespace PJ::detail

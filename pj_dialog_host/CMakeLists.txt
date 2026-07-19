@@ -71,6 +71,7 @@ if(PJ_BUILD_TESTS)
             pj_dialog_engine_qt
             pj_dialog_sdk
             GTest::gtest
+            Qt6::Test
     )
     add_test(NAME dialog_engine_test COMMAND dialog_engine_test)
     set_tests_properties(dialog_engine_test PROPERTIES

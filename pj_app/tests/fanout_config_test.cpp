@@ -3,6 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include <QByteArray>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QString>
 #include <string>
 #include <vector>
@@ -15,6 +19,7 @@ namespace {
 using PJ::detail::extractFanout;
 using PJ::detail::parseDisplayName;
 using PJ::detail::parseDisplaySuffix;
+using PJ::detail::rewriteReplayFilepaths;
 using Vec = std::vector<std::string>;
 
 // --- extractFanout: fallback-to-single-instance paths -----------------------
@@ -116,6 +121,54 @@ TEST(ParseDisplayName, EmptyStringValueReturnsEmpty) {
 
 TEST(ParseDisplayName, PresentValueReturnsName) {
   EXPECT_EQ(parseDisplayName(R"({"display_name":"pusht_v21"})").toStdString(), std::string("pusht_v21"));
+}
+
+// --- rewriteReplayFilepaths -------------------------------------------------
+
+TEST(RewriteReplayFilepaths, RewritesTopLevelAndRecursiveFanoutChildren) {
+  const std::string nested =
+      R"({"filepath":"old-inner","display_suffix":"left","__pj_fanout":["{\"filepath\":\"old-leaf\",\"keep\":3}"]})";
+  QJsonObject input;
+  input.insert(u"filepath"_s, u"old-top"_s);
+  input.insert(u"keep"_s, QJsonObject{{u"filepath"_s, u"not-a-source"_s}});
+  input.insert(u"__pj_fanout"_s, QJsonArray{QString::fromStdString(nested), 7});
+  const std::string config = QJsonDocument(input).toJson(QJsonDocument::Compact).toStdString();
+
+  const QJsonDocument rewritten =
+      QJsonDocument::fromJson(QByteArray::fromStdString(rewriteReplayFilepaths(config, u"/fresh/source.mcap"_s)));
+  ASSERT_TRUE(rewritten.isObject());
+  const QJsonObject root = rewritten.object();
+  EXPECT_EQ(root.value(u"filepath"_s).toString(), u"/fresh/source.mcap"_s);
+  EXPECT_EQ(root.value(u"keep"_s).toObject().value(u"filepath"_s).toString(), u"not-a-source"_s)
+      << "only explicit __pj_fanout children belong to the source replay contract";
+
+  const QJsonArray first_fanout = root.value(u"__pj_fanout"_s).toArray();
+  ASSERT_EQ(first_fanout.size(), 2);
+  EXPECT_EQ(first_fanout[1].toInt(), 7);
+  const QJsonObject child = QJsonDocument::fromJson(first_fanout[0].toString().toUtf8()).object();
+  EXPECT_EQ(child.value(u"filepath"_s).toString(), u"/fresh/source.mcap"_s);
+  EXPECT_EQ(child.value(u"display_suffix"_s).toString(), u"left"_s);
+  const QJsonObject leaf =
+      QJsonDocument::fromJson(child.value(u"__pj_fanout"_s).toArray()[0].toString().toUtf8()).object();
+  EXPECT_EQ(leaf.value(u"filepath"_s).toString(), u"/fresh/source.mcap"_s);
+  EXPECT_EQ(leaf.value(u"keep"_s).toInt(), 3);
+}
+
+TEST(RewriteReplayFilepaths, PreservesMalformedNestedFanoutString) {
+  const std::string config = R"({"filepath":"old","__pj_fanout":["not json"]})";
+  const QJsonObject rewritten =
+      QJsonDocument::fromJson(QByteArray::fromStdString(rewriteReplayFilepaths(config, u"fresh.csv"_s))).object();
+  EXPECT_EQ(rewritten.value(u"filepath"_s).toString(), u"fresh.csv"_s);
+  EXPECT_EQ(rewritten.value(u"__pj_fanout"_s).toArray()[0].toString(), u"not json"_s);
+}
+
+TEST(RewriteReplayFilepaths, EmptyOrMalformedOuterConfigBecomesMinimalObject) {
+  for (const std::string input : {std::string{}, std::string{"not json"}}) {
+    const QJsonObject rewritten =
+        QJsonDocument::fromJson(QByteArray::fromStdString(rewriteReplayFilepaths(input, u"fresh.csv"_s))).object();
+    EXPECT_EQ(rewritten.size(), 1);
+    EXPECT_EQ(rewritten.value(u"filepath"_s).toString(), u"fresh.csv"_s);
+  }
 }
 
 }  // namespace

@@ -87,10 +87,11 @@ class SessionManager : public QObject {
   /// Associates a file-backed dataset with the normalized full path from which
   /// FileLoader created it. DatasetInfo::source_name is intentionally only a
   /// display/raw-source label (often a basename), so it cannot distinguish two
-  /// files with the same name in different directories. The path is normalized
-  /// on store (canonicalFilePath, falling back to absoluteFilePath) so lookups
-  /// match regardless of symlink/relative aliasing. Empty `path` removes the
-  /// association. GUI-thread only.
+  /// files with the same name in different directories. Native paths are
+  /// normalized on store (canonicalFilePath, falling back to absoluteFilePath)
+  /// so lookups match regardless of symlink/relative aliasing. Non-file URI
+  /// identities are retained verbatim. Empty `path` removes the association.
+  /// GUI-thread only.
   void setDatasetSourcePath(DatasetId dataset_id, QString path);
 
   /// Normalized full source path registered for `dataset_id`, or empty for a

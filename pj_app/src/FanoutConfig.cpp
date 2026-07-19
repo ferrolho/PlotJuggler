@@ -9,12 +9,53 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLoggingCategory>
+#include <optional>
+#include <utility>
 using namespace Qt::StringLiterals;
 
 namespace PJ::detail {
 
 namespace {
 Q_LOGGING_CATEGORY(lcFanout, "pj.app.fileloader")
+
+std::optional<QJsonObject> parseObject(std::string_view config) {
+  if (config.empty()) {
+    return std::nullopt;
+  }
+  const QByteArray bytes(config.data(), static_cast<qsizetype>(config.size()));
+  const QJsonDocument doc = QJsonDocument::fromJson(bytes);
+  return doc.isObject() ? std::optional<QJsonObject>{doc.object()} : std::nullopt;
+}
+
+QJsonObject rewriteObjectFilepaths(QJsonObject object, const QString& fresh_path) {
+  object.insert(u"filepath"_s, fresh_path);
+  const QJsonValue fanout_value = object.value(u"__pj_fanout"_s);
+  if (!fanout_value.isArray()) {
+    return object;
+  }
+
+  QJsonArray rewritten;
+  const QJsonArray fanout = fanout_value.toArray();
+  for (const QJsonValue& entry : fanout) {
+    if (!entry.isString()) {
+      rewritten.push_back(entry);
+      continue;
+    }
+    const std::string nested = entry.toString().toStdString();
+    const std::optional<QJsonObject> nested_object = parseObject(nested);
+    if (!nested_object.has_value()) {
+      // extractFanout will diagnose/reject this config later. Do not hide the
+      // plugin's malformed child by turning it into a different valid object.
+      rewritten.push_back(entry);
+      continue;
+    }
+    const QByteArray bytes =
+        QJsonDocument(rewriteObjectFilepaths(*nested_object, fresh_path)).toJson(QJsonDocument::Compact);
+    rewritten.push_back(QString::fromUtf8(bytes));
+  }
+  object.insert(u"__pj_fanout"_s, rewritten);
+  return object;
+}
 }  // namespace
 
 std::vector<std::string> extractFanout(std::string_view config) {
@@ -84,6 +125,13 @@ QString parseDisplayName(std::string_view cfg) {
   }
   const QJsonValue v = doc.object().value(u"display_name"_s);
   return v.isString() ? v.toString() : QString{};
+}
+
+std::string rewriteReplayFilepaths(std::string_view config, const QString& fresh_path) {
+  QJsonObject object = parseObject(config).value_or(QJsonObject{});
+  const QByteArray bytes =
+      QJsonDocument(rewriteObjectFilepaths(std::move(object), fresh_path)).toJson(QJsonDocument::Compact);
+  return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
 }
 
 }  // namespace PJ::detail
