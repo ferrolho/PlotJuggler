@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 
+#include "mock_data_source_vtable.h"
 #include "pj_marketplace/extension_manager.hpp"
 #include "pj_runtime/ExtensionCatalogService.h"
 #include "plugin_test_utils.h"
@@ -174,6 +175,31 @@ TEST_F(ExtensionCatalogSeedTest, OverrideDirOutranksNewerMarketplaceCopy) {
       << "--plugin-dir is authoritative: its copy wins even against a newer marketplace version";
   int mock_count = 0;
   for (const LoadedDataSource& plugin : service->dataSources()) {
+    mock_count += plugin.id == kMockId ? 1 : 0;
+  }
+  EXPECT_EQ(mock_count, 1);
+}
+
+// The service hop of static registration: a StaticPluginSet handed to the
+// constructor must reach the catalog (registered before the scan) and shadow a
+// same-id DSO installed in the marketplace dir — pinning the pass-through that
+// the delegating overloads (empty set) cannot observe.
+TEST_F(ExtensionCatalogSeedTest, ConstructorStaticPluginsRegisterAndShadowSameIdDso) {
+  static const PJ_data_source_vtable_t vt =
+      pj_mock::makeMockDataSourceVtable(R"({"id":"mock-data-source","name":"Static Mock","version":"0.1.0"})");
+  placePlugin(marketplace_.path(), PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH, pluginFileName("installed"));
+
+  StaticPluginSet static_set;
+  static_set.data_sources.push_back({&vt, nullptr});
+  const ExtensionCatalogService service(
+      ExtensionCatalogService::Paths{{}, marketplace_.path(), bundled_.path()}, DiagnosticSink{}, std::move(static_set),
+      nullptr);
+
+  const LoadedDataSource* mock = findMock(service);
+  ASSERT_NE(mock, nullptr) << "the constructor set must reach the catalog";
+  EXPECT_EQ(mock->version, "0.1.0") << "the static plugin must shadow the same-id marketplace DSO";
+  int mock_count = 0;
+  for (const LoadedDataSource& plugin : service.dataSources()) {
     mock_count += plugin.id == kMockId ? 1 : 0;
   }
   EXPECT_EQ(mock_count, 1);

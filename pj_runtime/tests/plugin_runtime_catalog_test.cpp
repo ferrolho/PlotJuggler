@@ -12,7 +12,12 @@
 #include <vector>
 
 #include "mock_data_source_vtable.h"
+#include "mock_message_parser_vtable.h"
+#include "mock_toolbox_vtable.h"
+#include "pj_base/data_source_protocol.h"
+#include "pj_base/toolbox_protocol.h"
 #include "pj_marketplace/version_compare.hpp"
+#include "pj_plugins/dialog_protocol.h"
 #include "pj_plugins/host/plugin_catalog.hpp"
 #include "pj_runtime/PluginRuntimeCatalog.h"
 #include "plugin_test_utils.h"
@@ -21,6 +26,54 @@ namespace PJ {
 namespace {
 
 using test::pluginFileName;
+
+void* createStaticDialog() noexcept {
+  return new int(0);
+}
+void destroyStaticDialog(void* ctx) noexcept {
+  delete static_cast<int*>(ctx);
+}
+const char* staticDialogManifest(void*) noexcept {
+  return R"({"id":"static-dialog","name":"Static Dialog","version":"1.0.0"})";
+}
+const char* staticDialogUi(void*) noexcept {
+  return "";
+}
+const char* staticDialogData(void*) noexcept {
+  return "{}";
+}
+bool staticDialogEvent(void*, const char*, const char*, PJ_error_t*) noexcept {
+  return false;
+}
+bool staticDialogTick(void*, PJ_error_t*) noexcept {
+  return false;
+}
+void staticDialogAccepted(void*, const char*) noexcept {}
+void staticDialogRejected(void*) noexcept {}
+bool staticDialogSave(void*, PJ_string_view_t* out, PJ_error_t*) noexcept {
+  *out = PJ_string_view_t{"{}", 2};
+  return true;
+}
+bool staticDialogLoad(void*, PJ_string_view_t, PJ_error_t*) noexcept {
+  return true;
+}
+
+const PJ_dialog_vtable_t kStaticDialogVtable = {
+    .protocol_version = PJ_DIALOG_PROTOCOL_VERSION,
+    .struct_size = sizeof(PJ_dialog_vtable_t),
+    .create = createStaticDialog,
+    .destroy = destroyStaticDialog,
+    .get_manifest = staticDialogManifest,
+    .get_ui_content = staticDialogUi,
+    .get_widget_data = staticDialogData,
+    .on_widget_event = staticDialogEvent,
+    .on_tick = staticDialogTick,
+    .on_accepted = staticDialogAccepted,
+    .on_rejected = staticDialogRejected,
+    .save_config = staticDialogSave,
+    .load_config = staticDialogLoad,
+    .manifest_json = R"({"id":"static-dialog","name":"Static Dialog","version":"1.0.0"})",
+};
 
 class PluginCatalogTest : public ::testing::Test {
  protected:
@@ -326,6 +379,38 @@ TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationSurvivesScanAndReload)
   }));
 }
 
+TEST_F(PluginCatalogTest, StaticPluginSetParticipatesInFilteringAndHandleCreation) {
+  // The application supplies entry points as data; the runtime owns the
+  // registration policy. Prove the composed path, rather than only the
+  // individual registerStaticDataSource() primitive.
+  static const PJ_data_source_vtable_t vt = [] {
+    auto value = pj_mock::makeMockDataSourceVtable(
+        R"({"id":"static-file","name":"Static File","version":"1.0.0","file_extensions":[".probe"]})");
+    value.capabilities = [](void*) noexcept -> uint64_t {
+      return PJ_DATA_SOURCE_CAPABILITY_FINITE_IMPORT | PJ_DATA_SOURCE_CAPABILITY_DIRECT_INGEST;
+    };
+    return value;
+  }();
+
+  PluginRuntimeCatalog catalog;
+  StaticPluginSet plugins;
+  plugins.data_sources.emplace_back(&vt, &kStaticDialogVtable);
+  ASSERT_TRUE(catalog.registerStaticPlugins(plugins));
+
+  const auto matches = catalog.findSourcesForExtension(".PROBE");
+  ASSERT_EQ(matches.size(), 1U);
+  EXPECT_EQ(matches.front()->id, "static-file");
+  EXPECT_TRUE(matches.front()->library.createHandle().valid());
+  const auto dialog = matches.front()->library.resolveDialogVtable();
+  ASSERT_TRUE(dialog.has_value());
+  EXPECT_EQ(*dialog, &kStaticDialogVtable);
+  EXPECT_NE(catalog.buildFileFilter().find("*.probe"), std::string::npos);
+
+  catalog.scanDirectory();
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+  EXPECT_EQ(catalog.dataSources().front().path, "static://static-file");
+}
+
 TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationShadowsDsoWithSameId) {
   // A statically registered id outranks every scan folder: the DSO sharing the
   // id ("mock-data-source") must be skipped by scanDirectory(), and a later
@@ -356,6 +441,40 @@ TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationShadowsDsoWithSameId) 
   // A second static registration of the same id is a caller bug: rejected.
   EXPECT_FALSE(catalog_dso_first.registerStaticDataSource(&vt));
   EXPECT_EQ(catalog_dso_first.dataSources().size(), 1U);
+
+  // reload() rescans the folders; the same-id DSO on disk must stay shadowed
+  // and the unchanged catalog must report "no change".
+  EXPECT_FALSE(catalog_dso_first.reload());
+  ASSERT_EQ(catalog_dso_first.dataSources().size(), 1U);
+  EXPECT_EQ(catalog_dso_first.dataSources()[0].version, "0.1.0");
+}
+
+TEST_F(PluginCatalogTest, RejectedStaticRegistrationKeepsSameIdDsoLoaded) {
+  // Replacing a DSO with a static plugin is a transaction: the incumbent must
+  // remain usable unless the static candidate passes all validation. In
+  // particular, a candidate whose create() probe fails must not evict the DSO.
+  std::filesystem::copy_file(PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH, dir_ / pluginFileName("ds"));
+
+  PluginRuntimeCatalog catalog;
+  catalog.setPluginDir(dir_);
+  catalog.scanDirectory();
+
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+  ASSERT_EQ(catalog.dataSources().front().id, "mock-data-source");
+  ASSERT_EQ(catalog.dataSources().front().version, "2.0.0");
+  const auto original_path = catalog.dataSources().front().path;
+
+  static const PJ_data_source_vtable_t invalid_static = pj_mock::makeMockDataSourceVtable(
+      R"({"id":"mock-data-source","name":"Invalid Static","version":"3.0.0"})", pj_mock::detail::createNull);
+
+  EXPECT_FALSE(catalog.registerStaticDataSource(&invalid_static));
+
+  ASSERT_EQ(catalog.dataSources().size(), 1U)
+      << "rejecting an invalid static replacement must not evict the same-id DSO";
+  EXPECT_EQ(catalog.dataSources().front().id, "mock-data-source");
+  EXPECT_EQ(catalog.dataSources().front().version, "2.0.0");
+  EXPECT_EQ(catalog.dataSources().front().path, original_path);
+  EXPECT_TRUE(catalog.dataSources().front().library.createHandle().valid());
 }
 
 TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationRejectsMistypedManifest) {
@@ -385,15 +504,169 @@ TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationRejectsNullCreate) {
 }
 
 TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationRequiresManifestId) {
-  // The manifest id is the only identity a static plugin has (its synthetic
-  // path derives from it), so an id-less manifest is rejected with a diagnostic.
-  static const PJ_data_source_vtable_t vt = pj_mock::makeMockDataSourceVtable(R"({"name":"No Id","version":"1.0.0"})");
+  // Static registration shares the DSO scan's full required-key set (the SDK's
+  // decodeManifest): id — the only identity a static plugin has, its synthetic
+  // path derives from it — plus name and version, each a non-empty string.
+  static const PJ_data_source_vtable_t no_id =
+      pj_mock::makeMockDataSourceVtable(R"({"name":"No Id","version":"1.0.0"})");
+  static const PJ_data_source_vtable_t no_name = pj_mock::makeMockDataSourceVtable(R"({"id":"x","version":"1.0.0"})");
+  static const PJ_data_source_vtable_t no_version = pj_mock::makeMockDataSourceVtable(R"({"id":"x","name":"X"})");
 
   std::vector<std::string> messages;
   PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { messages.push_back(d.message); });
-  EXPECT_FALSE(catalog.registerStaticDataSource(&vt));
+  EXPECT_FALSE(catalog.registerStaticDataSource(&no_id));
+  EXPECT_FALSE(catalog.registerStaticDataSource(&no_name));
+  EXPECT_FALSE(catalog.registerStaticDataSource(&no_version));
   EXPECT_TRUE(catalog.dataSources().empty());
-  EXPECT_FALSE(messages.empty());
+  EXPECT_EQ(messages.size(), 3U);
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticDataSourceRejectsHasDialogWithoutVtable) {
+  // Fail-fast parity with the dynamic (DSO) path: a plugin that advertises
+  // HAS_DIALOG but has no resolvable dialog vtable must be rejected with a
+  // kError diagnostic, never silently registered as "no dialog".
+  static const PJ_data_source_vtable_t vt = [] {
+    auto value = pj_mock::makeMockDataSourceVtable(R"({"id":"lying-dialog","name":"Lying Dialog","version":"1.0.0"})");
+    value.capabilities = [](void*) noexcept -> uint64_t { return PJ_DATA_SOURCE_CAPABILITY_HAS_DIALOG; };
+    return value;
+  }();
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  EXPECT_FALSE(catalog.registerStaticDataSource(&vt, /*dialog_vtable=*/nullptr));
+  EXPECT_TRUE(catalog.dataSources().empty());
+  EXPECT_TRUE(std::ranges::any_of(diagnostics, [](const Diagnostic& d) {
+    return d.level == DiagnosticLevel::kError && d.message.find("HasDialog") != std::string::npos;
+  })) << "expected a kError diagnostic mentioning the HasDialog capability";
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticDataSourceAcceptsHasDialogWithVtable) {
+  // Mirror of the above with a valid dialog vtable supplied: registration
+  // succeeds and no error diagnostic is recorded.
+  static const PJ_data_source_vtable_t vt = [] {
+    auto value =
+        pj_mock::makeMockDataSourceVtable(R"({"id":"honest-dialog","name":"Honest Dialog","version":"1.0.0"})");
+    value.capabilities = [](void*) noexcept -> uint64_t { return PJ_DATA_SOURCE_CAPABILITY_HAS_DIALOG; };
+    return value;
+  }();
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  EXPECT_TRUE(catalog.registerStaticDataSource(&vt, &kStaticDialogVtable));
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+  EXPECT_EQ(catalog.dataSources()[0].id, "honest-dialog");
+  EXPECT_TRUE(
+      std::ranges::none_of(diagnostics, [](const Diagnostic& d) { return d.level == DiagnosticLevel::kError; }));
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticToolboxRejectsHasDialogWithoutVtable) {
+  // Same fail-fast contract as DataSource, for the Toolbox static path.
+  static const PJ_toolbox_vtable_t vt = [] {
+    auto value =
+        pj_mock::makeMockToolboxVtable(R"({"id":"lying-dialog-toolbox","name":"Lying Dialog","version":"1.0.0"})");
+    value.capabilities = [](void*) noexcept -> uint64_t { return PJ_TOOLBOX_CAPABILITY_HAS_DIALOG; };
+    return value;
+  }();
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  EXPECT_FALSE(catalog.registerStaticToolbox(&vt, /*dialog_vtable=*/nullptr));
+  EXPECT_TRUE(catalog.toolboxes().empty());
+  EXPECT_TRUE(std::ranges::any_of(diagnostics, [](const Diagnostic& d) {
+    return d.level == DiagnosticLevel::kError && d.message.find("HasDialog") != std::string::npos;
+  })) << "expected a kError diagnostic mentioning the HasDialog capability";
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticToolboxAcceptsHasDialogWithVtable) {
+  static const PJ_toolbox_vtable_t vt = [] {
+    auto value =
+        pj_mock::makeMockToolboxVtable(R"({"id":"honest-dialog-toolbox","name":"Honest Dialog","version":"1.0.0"})");
+    value.capabilities = [](void*) noexcept -> uint64_t { return PJ_TOOLBOX_CAPABILITY_HAS_DIALOG; };
+    return value;
+  }();
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  EXPECT_TRUE(catalog.registerStaticToolbox(&vt, &kStaticDialogVtable));
+  ASSERT_EQ(catalog.toolboxes().size(), 1U);
+  EXPECT_EQ(catalog.toolboxes()[0].id, "honest-dialog-toolbox");
+  const auto dialog = catalog.toolboxes()[0].library.resolveDialogVtable();
+  ASSERT_TRUE(dialog.has_value()) << "the companion dialog vtable must resolve through the loaded library";
+  EXPECT_EQ(*dialog, &kStaticDialogVtable);
+  EXPECT_TRUE(
+      std::ranges::none_of(diagnostics, [](const Diagnostic& d) { return d.level == DiagnosticLevel::kError; }));
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticRegistrationRejectsBadVtable) {
+  // The loadStatic gate runs before any manifest work: a null vtable and a
+  // protocol-version mismatch must both fail with a diagnostic, not register.
+  static const PJ_data_source_vtable_t wrong_protocol = [] {
+    auto value = pj_mock::makeMockDataSourceVtable(R"({"id":"bad","name":"Bad","version":"1.0.0"})");
+    value.protocol_version = 999;
+    return value;
+  }();
+
+  std::vector<std::string> messages;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { messages.push_back(d.message); });
+  EXPECT_FALSE(catalog.registerStaticDataSource(nullptr));
+  EXPECT_FALSE(catalog.registerStaticDataSource(&wrong_protocol));
+  EXPECT_TRUE(catalog.dataSources().empty());
+  EXPECT_EQ(messages.size(), 2U);
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticMessageParserRequiresEncoding) {
+  // The manifest contract (message_parser_protocol.h) requires a non-empty
+  // "encoding" array — it is how binding requests find a parser, so an
+  // encoding-less static parser is useless. The SDK's shared decodeManifest
+  // enforces this identically for DSO and static registration; a laxer static
+  // path would let such a parser evict a working same-id DSO parser.
+  static const PJ_message_parser_vtable_t no_encoding =
+      pj_mock::makeMockMessageParserVtable(R"({"id":"static-parser","name":"Static Parser","version":"1.0.0"})");
+  static const PJ_message_parser_vtable_t empty_encoding = pj_mock::makeMockMessageParserVtable(
+      R"({"id":"static-parser","name":"Static Parser","version":"1.0.0","encoding":[]})");
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  EXPECT_FALSE(catalog.registerStaticMessageParser(&no_encoding));
+  EXPECT_FALSE(catalog.registerStaticMessageParser(&empty_encoding));
+  EXPECT_TRUE(catalog.messageParsers().empty());
+  EXPECT_TRUE(std::ranges::any_of(diagnostics, [](const Diagnostic& d) {
+    return d.level == DiagnosticLevel::kError && d.message.find("encoding") != std::string::npos;
+  })) << "expected a kError diagnostic naming the missing encoding array";
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogStaticMessageParserRegistersWithEncodings) {
+  static const PJ_message_parser_vtable_t vt = pj_mock::makeMockMessageParserVtable(
+      R"({"id":"static-parser","name":"Static Parser","version":"1.0.0","encoding":["ros2","cdr"]})");
+
+  PluginRuntimeCatalog catalog;
+  EXPECT_TRUE(catalog.registerStaticMessageParser(&vt));
+  ASSERT_EQ(catalog.messageParsers().size(), 1U);
+  EXPECT_EQ(catalog.messageParsers()[0].id, "static-parser");
+  EXPECT_EQ(catalog.messageParsers()[0].encodings, (std::vector<std::string>{"ros2", "cdr"}));
+}
+
+TEST_F(PluginCatalogTest, RegisterStaticPluginsContinuesPastFailedEntryAndKeepsSuccesses) {
+  // One bad entry in a StaticPluginSet must not abort the batch: the composed
+  // application still gets every valid plugin, and the batch reports failure.
+  static const PJ_data_source_vtable_t good_source =
+      pj_mock::makeMockDataSourceVtable(R"({"id":"good-source","name":"Good Source","version":"1.0.0"})");
+  static const PJ_data_source_vtable_t bad_source =
+      pj_mock::makeMockDataSourceVtable(R"({"name":"No Id","version":"1.0.0"})");
+  static const PJ_message_parser_vtable_t good_parser = pj_mock::makeMockMessageParserVtable(
+      R"({"id":"good-parser","name":"Good Parser","version":"1.0.0","encoding":["ros2"]})");
+
+  StaticPluginSet set;
+  set.data_sources.push_back({&bad_source, nullptr});
+  set.data_sources.push_back({&good_source, nullptr});
+  set.message_parsers.push_back({&good_parser, nullptr});
+
+  PluginRuntimeCatalog catalog;
+  EXPECT_FALSE(catalog.registerStaticPlugins(set)) << "the failed entry must surface in the batch result";
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+  EXPECT_EQ(catalog.dataSources()[0].id, "good-source");
+  ASSERT_EQ(catalog.messageParsers().size(), 1U);
+  EXPECT_EQ(catalog.messageParsers()[0].id, "good-parser");
 }
 
 // ─── compareSemver (pj_marketplace/version_compare.hpp — the shared version

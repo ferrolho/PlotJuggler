@@ -156,9 +156,18 @@ ExtensionCatalogService::ExtensionCatalogService(QString extensions_dir, QObject
     : ExtensionCatalogService(std::move(extensions_dir), DiagnosticSink{}, parent) {}
 
 ExtensionCatalogService::ExtensionCatalogService(QString extensions_dir, DiagnosticSink sink, QObject* parent)
-    : ExtensionCatalogService(Paths{std::move(extensions_dir), {}, {}}, std::move(sink), parent) {}
+    : ExtensionCatalogService(Paths{std::move(extensions_dir), {}, {}}, std::move(sink), StaticPluginSet{}, parent) {}
 
 ExtensionCatalogService::ExtensionCatalogService(Paths paths, DiagnosticSink sink, QObject* parent)
+    : ExtensionCatalogService(std::move(paths), std::move(sink), StaticPluginSet{}, parent) {}
+
+ExtensionCatalogService::ExtensionCatalogService(
+    QString extensions_dir, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent)
+    : ExtensionCatalogService(
+          Paths{std::move(extensions_dir), {}, {}}, std::move(sink), std::move(static_plugins), parent) {}
+
+ExtensionCatalogService::ExtensionCatalogService(
+    Paths paths, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent)
     : QObject(parent), sink_(std::move(sink)) {
   default_mode_ = paths.install_dir.isEmpty();
   const bool default_marketplace = paths.marketplace_dir.isEmpty();
@@ -188,12 +197,14 @@ ExtensionCatalogService::ExtensionCatalogService(Paths paths, DiagnosticSink sin
   // pending staged installs above, so a staged upgrade is promoted before the
   // seed's version comparison sees it.
   seedBundledPlugins();
-
   plugin_catalog_ = std::make_unique<PluginRuntimeCatalog>(std::filesystem::path{}, sink_, "ExtensionCatalogService");
   // Gauge each plugin's min_plotjuggler_version against the version the app
   // advertises. Only breaks ties between duplicate plugin ids (see
   // PluginRuntimeCatalog::setHostVersion).
   plugin_catalog_->setHostVersion(QCoreApplication::applicationVersion().toStdString());
+  if (!plugin_catalog_->registerStaticPlugins(static_plugins)) {
+    qCWarning(lcCatalog) << "One or more statically linked plugins failed to register";
+  }
 
   // Scan the ordered folder hierarchy (--plugin-dir override first, then custom
   // folders, then the marketplace dir; the catalog de-duplicates by plugin id —

@@ -60,6 +60,28 @@ struct RuntimeToolboxPlugin {
   std::filesystem::file_time_type loaded_mtime;
 };
 
+// Declarative set of plugin entry points compiled into a static application.
+// The application owns composition (which archives are linked); the runtime
+// owns registration, validation, diagnostics, and duplicate handling. Keeping
+// this as data avoids a second app-side catalog/registry implementation.
+template <typename PluginVtable>
+struct StaticPluginEntry {
+  const PluginVtable* plugin = nullptr;
+  // Optional companion UI exported from the same DSO on desktop. Static builds
+  // cannot dlsym it, so composition passes the unique class-keyed getter here.
+  const PJ_dialog_vtable_t* dialog = nullptr;
+
+  StaticPluginEntry() = default;
+  StaticPluginEntry(const PluginVtable* plugin_vtable, const PJ_dialog_vtable_t* dialog_vtable = nullptr)
+      : plugin(plugin_vtable), dialog(dialog_vtable) {}
+};
+
+struct StaticPluginSet {
+  std::vector<StaticPluginEntry<PJ_data_source_vtable_t>> data_sources;
+  std::vector<StaticPluginEntry<PJ_message_parser_vtable_t>> message_parsers;
+  std::vector<StaticPluginEntry<PJ_toolbox_vtable_t>> toolboxes;
+};
+
 // One scan folder plus its duplicate-resolution tier. Authoritative folders
 // (the host's user-explicit tiers: custom folders + --plugin-dir) are a hard
 // override when the same plugin id appears in several folders; managed folders
@@ -85,12 +107,14 @@ class PluginRuntimeCatalog {
 
   // Replaces the ordered list of directories scanned by scanDirectory() and
   // reload(). Directories are scanned in descending priority order and
-  // de-duplicated by manifest id: when the same plugin id appears in more than
-  // one directory, the highest-priority *authoritative* entry wins outright
-  // (ignoring version and compatibility of every other copy); among managed
-  // entries the winner is chosen by compatibility first (see setHostVersion),
-  // then by higher version, then by directory priority. Losers are skipped
-  // with an info diagnostic. Empty entries are ignored.
+  // de-duplicated by manifest id: a statically registered plugin
+  // (registerStatic*) outranks every folder tier — even an authoritative one,
+  // so --plugin-dir cannot override a compiled-in plugin; otherwise the
+  // highest-priority *authoritative* entry wins outright (ignoring version and
+  // compatibility of every other copy); among managed entries the winner is
+  // chosen by compatibility first (see setHostVersion), then by higher version,
+  // then by directory priority. Losers are skipped with an info diagnostic.
+  // Empty entries are ignored.
   void setPluginDirs(std::vector<PluginDirEntry> plugin_dirs);
 
   // Replaces the optional diagnostic sink.
@@ -128,9 +152,16 @@ class PluginRuntimeCatalog {
   // every scan folder: a DSO sharing the id is skipped by scans, an
   // already-loaded one is evicted, and a second static registration of the
   // same id is rejected.
-  bool registerStaticDataSource(const PJ_data_source_vtable_t* vtable);
-  bool registerStaticMessageParser(const PJ_message_parser_vtable_t* vtable);
-  bool registerStaticToolbox(const PJ_toolbox_vtable_t* vtable);
+  bool registerStaticDataSource(
+      const PJ_data_source_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable = nullptr);
+  bool registerStaticMessageParser(
+      const PJ_message_parser_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable = nullptr);
+  bool registerStaticToolbox(const PJ_toolbox_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable = nullptr);
+
+  // Registers one application-composed static set. Attempts every entry so a
+  // bad optional plugin does not hide diagnostics for the remaining entries.
+  // Returns true only when every entry registered successfully.
+  bool registerStaticPlugins(const StaticPluginSet& plugins);
 
   // Returns loaded DataSource plugins.
   [[nodiscard]] const std::vector<RuntimeDataSourcePlugin>& dataSources() const {
@@ -181,9 +212,9 @@ class PluginRuntimeCatalog {
  private:
   // Scans every entry in plugin_dirs_ (in priority order) and returns the
   // loadable descriptors de-duplicated by manifest id, choosing each id's winner
-  // by authoritative tier, then compatibility, then version, then directory
-  // priority (see setPluginDirs / setHostVersion). Reports scan diagnostics and
-  // one info diagnostic per skipped duplicate.
+  // by static-registration tier, then authoritative tier, then compatibility,
+  // then version, then directory priority (see setPluginDirs / setHostVersion).
+  // Reports scan diagnostics and one info diagnostic per skipped duplicate.
   [[nodiscard]] std::vector<PluginDescriptor> collectDeduplicatedPlugins() const;
 
   // Loads a descriptor using the family-specific loader.
@@ -201,9 +232,10 @@ class PluginRuntimeCatalog {
   // True if id is provided by a statically registered plugin in any family.
   [[nodiscard]] bool isStaticallyRegisteredId(const std::string& id) const;
 
-  // Enforces the static-registration id policy: rejects id (with an error
-  // diagnostic) when another static registration holds it, evicting any
-  // DSO-backed plugin with the same id first. Returns true when id is claimed.
+  // Commits a validated static registration's id claim: rejects id (with an
+  // error diagnostic) when another static registration holds it, otherwise
+  // evicts any DSO-backed plugin with the same id. Call only after all candidate
+  // validation succeeds so a rejected replacement leaves the DSO intact.
   bool claimStaticId(const std::string& id, const char* family);
 
   // Removes any loaded plugin whose path matches path.

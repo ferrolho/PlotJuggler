@@ -86,10 +86,12 @@ class DataSourceRuntimeHost {
   // show_message_box, which (per data_source_protocol.h) may be a worker/stream
   // thread — importData() runs on a background QThread on the single-instance
   // load path. The handler MUST therefore marshal any QWidget construction/use
-  // to the GUI thread (e.g. QMetaObject::invokeMethod(qApp, ...,
-  // Qt::BlockingQueuedConnection)); building a QMessageBox directly here would
-  // be a Qt thread-affinity violation that segfaults in the paint engine. Same
-  // requirement as the on_progress_* hooks below.
+  // to the GUI thread: open the dialog asynchronously there and block only this
+  // calling worker thread for the answer (e.g. a semaphore the GUI completion
+  // releases).
+  // Building a QMessageBox directly here is a Qt thread-affinity violation, and
+  // blocking the GUI thread instead would deadlock hosts whose event loop must
+  // never wait. Same requirement as the on_progress_* hooks below.
   using MessageBoxHandler = std::function<int(int type, std::string_view title, std::string_view message, int buttons)>;
   void setMessageBoxHandler(MessageBoxHandler handler) {
     message_box_handler_ = std::move(handler);

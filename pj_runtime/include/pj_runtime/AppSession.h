@@ -25,6 +25,7 @@ class ExtensionCatalogService;
 class PlaybackEngine;
 class SessionManager;
 class TopicDemandTracker;
+struct StaticPluginSet;
 
 struct ObjectMergeConflict {
   std::string topic_name;
@@ -47,6 +48,11 @@ class AppSession : public QObject {
 
   // Creates a session with an explicit extension directory and diagnostics.
   AppSession(QString extensions_dir, DiagnosticSink sink, QObject* parent = nullptr);
+
+  // Creates a session with application-composed statically linked plugins.
+  // The vtable/dialog pointers inside the set must have static storage
+  // duration — the catalog retains them for its lifetime.
+  AppSession(QString extensions_dir, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent = nullptr);
 
   // Releases all long-lived application services.
   ~AppSession() override;

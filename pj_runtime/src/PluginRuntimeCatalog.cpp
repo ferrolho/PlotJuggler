@@ -164,6 +164,16 @@ std::vector<PluginDescriptor> PluginRuntimeCatalog::collectDeduplicatedPlugins()
     }
     reportScanDiagnostics(*scan);
     for (const PluginDescriptor& descriptor : scan->plugins) {
+      // Statically registered plugins (registerStatic*) outrank every folder
+      // tier: they are compiled into the host on purpose, so a scanned DSO with
+      // the same id never even competes.
+      if (isStaticallyRegisteredId(descriptor.id)) {
+        report(
+            DiagnosticLevel::kInfo, descriptor.id,
+            descriptor.dso_path.string() + ": ignoring duplicate plugin id \"" + descriptor.id +
+                "\" (statically registered plugin takes precedence)");
+        continue;
+      }
       const auto it = winner_index.find(descriptor.id);
       if (it == winner_index.end()) {
         winner_index.emplace(descriptor.id, winners.size());
@@ -226,19 +236,6 @@ std::vector<PluginDescriptor> PluginRuntimeCatalog::collectDeduplicatedPlugins()
       }
     }
   }
-  // Statically registered plugins (registerStatic*) outrank every folder tier:
-  // they are compiled into the host on purpose, so a scanned DSO with the same
-  // id must not load alongside them.
-  std::erase_if(winners, [&](const PluginDescriptor& descriptor) {
-    if (!isStaticallyRegisteredId(descriptor.id)) {
-      return false;
-    }
-    report(
-        DiagnosticLevel::kInfo, descriptor.id,
-        descriptor.dso_path.string() + ": ignoring duplicate plugin id \"" + descriptor.id +
-            "\" (statically registered plugin takes precedence)");
-    return true;
-  });
   return winners;
 }
 
@@ -320,92 +317,65 @@ bool PluginRuntimeCatalog::reload() {
 
 namespace {
 
-// Parse a plugin's embedded manifest JSON. Returns false on invalid JSON.
-bool parseStaticManifest(const char* manifest_json, nlohmann::json& out) {
-  try {
-    out = nlohmann::json::parse(manifest_json ? manifest_json : "");
-    return out.is_object();
-  } catch (const std::exception&) {
-    return false;
-  }
-}
-
-std::vector<std::string> readManifestStringArray(const nlohmann::json& j, const char* key) {
-  std::vector<std::string> values;
-  if (auto it = j.find(key); it != j.end() && it->is_array()) {
-    for (const auto& v : *it) {
-      if (v.is_string()) {
-        values.push_back(v.get<std::string>());
-      }
-    }
-  }
-  return values;
-}
-
 // Shared body for the three registerStatic* methods: load the static vtable,
 // parse the embedded manifest, fill the common Runtime*Plugin fields, and push.
-// `claim_id` enforces the catalog-wide id policy (reject duplicate statics,
-// supersede a DSO-backed entry); `fill` adds the family-specific fields
-// (capabilities / extensions / encodings) and may veto the registration;
-// `report` bridges to the catalog's private diagnostic sink.
-template <typename LibraryT, typename RuntimeT, typename ReportFn, typename ClaimFn, typename FillFn>
+// `fill` adds the family-specific fields (capabilities / extensions /
+// encodings) and may veto the registration; `claim_id` then enforces the
+// catalog-wide id policy (reject duplicate statics, supersede a DSO-backed
+// entry). Keeping the mutating claim after every validation step makes a
+// DSO-to-static replacement transactional: a rejected candidate leaves the
+// incumbent DSO loaded. `report` bridges to the catalog's private diagnostic
+// sink.
+template <typename RuntimeT, typename LoadFn, typename ReportFn, typename ClaimFn, typename FillFn>
 bool registerStaticPlugin(
-    const auto* vtable, std::vector<RuntimeT>& out, const char* family, const ReportFn& report, const ClaimFn& claim_id,
-    const FillFn& fill) {
-  auto result = LibraryT::loadStatic(vtable);
+    const auto* vtable, std::vector<RuntimeT>& out, PluginFamily family, const ReportFn& report,
+    const ClaimFn& claim_id, const FillFn& fill, const LoadFn& load) {
+  const std::string family_name{toString(family)};
+  auto result = load(vtable);
   if (!result) {
-    report(DiagnosticLevel::kError, std::string{}, "static " + std::string(family) + ": " + result.error());
+    report(DiagnosticLevel::kError, std::string{}, "static " + family_name + ": " + result.error());
     return false;
   }
-  nlohmann::json j;
-  if (!parseStaticManifest(vtable->manifest_json, j)) {
-    report(DiagnosticLevel::kError, std::string{}, "static " + std::string(family) + ": invalid manifest JSON");
+  // The SDK's canonical decoder — the same validation the DSO scan applies
+  // (required non-empty id/name/version, typed fields, parser encoding array).
+  // A second, laxer decoder here would let a malformed static plugin pass
+  // validation and evict a working DSO plugin at the claim below.
+  auto descriptor = decodeManifest(
+      std::filesystem::path{std::string(kStaticPathPrefix) + family_name}, family,
+      vtable->manifest_json != nullptr ? std::string_view{vtable->manifest_json} : std::string_view{});
+  if (!descriptor) {
+    report(DiagnosticLevel::kError, std::string{}, "static " + family_name + ": " + descriptor.error());
     return false;
   }
   RuntimeT loaded;
   loaded.library = std::move(*result);
-  // The typed reads throw on a well-formed manifest with mistyped fields
-  // (e.g. "id":123); honor the false-plus-diagnostic contract instead.
-  try {
-    loaded.id = j.value("id", std::string{});
-    loaded.name = j.value("name", std::string{});
-    loaded.version = j.value("version", std::string{});
-  } catch (const std::exception& e) {
-    report(
-        DiagnosticLevel::kError, std::string{},
-        "static " + std::string(family) + ": invalid manifest field types: " + e.what());
-    return false;
-  }
-  // A non-empty id is required: it is the only identity a static plugin has
-  // (its synthetic path is derived from it), so an empty id would make two
-  // static registrations indistinguishable to evictByPath/loadedMtimeForPath.
-  if (loaded.id.empty()) {
-    report(
-        DiagnosticLevel::kError, std::string{},
-        "static " + std::string(family) + ": manifest is missing a non-empty \"id\"");
+  loaded.id = descriptor->id;
+  loaded.name = descriptor->name;
+  loaded.version = descriptor->version;
+  // The id is the only identity a static plugin has: its synthetic path is
+  // derived from it so evictByPath/loadedMtimeForPath can address it.
+  loaded.path = std::string(kStaticPathPrefix) + loaded.id;
+  loaded.loaded_mtime = std::filesystem::file_time_type{};
+  if (!fill(loaded, *descriptor)) {
     return false;
   }
   if (!claim_id(loaded.id)) {
     return false;
   }
-  loaded.path = std::string(kStaticPathPrefix) + loaded.id;
-  loaded.loaded_mtime = std::filesystem::file_time_type{};
-  if (!fill(loaded, j)) {
-    return false;
-  }
-  report(DiagnosticLevel::kInfo, loaded.id, "Registered static " + std::string(family) + " " + loaded.name);
+  report(DiagnosticLevel::kInfo, loaded.id, "Registered static " + family_name + " " + loaded.name);
   out.push_back(std::move(loaded));
   return true;
 }
 
 }  // namespace
 
-bool PluginRuntimeCatalog::registerStaticDataSource(const PJ_data_source_vtable_t* vtable) {
-  return registerStaticPlugin<DataSourceLibrary>(
-      vtable, data_sources_, "DataSource",
+bool PluginRuntimeCatalog::registerStaticDataSource(
+    const PJ_data_source_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable) {
+  return registerStaticPlugin(
+      vtable, data_sources_, PluginFamily::kDataSource,
       [this](DiagnosticLevel level, const std::string& id, std::string msg) { report(level, id, std::move(msg)); },
       [this](const std::string& id) { return claimStaticId(id, "DataSource"); },
-      [this](RuntimeDataSourcePlugin& loaded, const nlohmann::json& j) {
+      [this](RuntimeDataSourcePlugin& loaded, const PluginDescriptor& descriptor) {
         const auto capabilities = probeCapabilities(loaded.library);
         if (!capabilities) {
           report(
@@ -414,30 +384,51 @@ bool PluginRuntimeCatalog::registerStaticDataSource(const PJ_data_source_vtable_
           return false;
         }
         loaded.capabilities = *capabilities;
-        for (auto& ext : readManifestStringArray(j, "file_extensions")) {
-          loaded.file_extensions.push_back(normalizeExtension(std::move(ext)));
+        // Fail-fast parity with the dynamic path: a plugin that advertises
+        // kCapabilityHasDialog without a resolvable dialog vtable would
+        // otherwise reach the host's dialog flow and silently degrade to "no
+        // dialog".
+        if ((loaded.capabilities & PJ_DATA_SOURCE_CAPABILITY_HAS_DIALOG) != 0) {
+          auto vt = loaded.library.resolveDialogVtable();
+          if (!vt) {
+            report(
+                DiagnosticLevel::kError, loaded.id,
+                "static DataSource \"" + loaded.id + "\": advertises kCapabilityHasDialog but " + vt.error());
+            return false;
+          }
+        }
+        for (const auto& ext : descriptor.file_extensions) {
+          loaded.file_extensions.push_back(normalizeExtension(ext));
         }
         return true;
+      },
+      [dialog_vtable](const PJ_data_source_vtable_t* source_vtable) {
+        return DataSourceLibrary::loadStatic(source_vtable, dialog_vtable);
       });
 }
 
-bool PluginRuntimeCatalog::registerStaticMessageParser(const PJ_message_parser_vtable_t* vtable) {
-  return registerStaticPlugin<MessageParserLibrary>(
-      vtable, message_parsers_, "MessageParser",
+bool PluginRuntimeCatalog::registerStaticMessageParser(
+    const PJ_message_parser_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable) {
+  return registerStaticPlugin(
+      vtable, message_parsers_, PluginFamily::kMessageParser,
       [this](DiagnosticLevel level, const std::string& id, std::string msg) { report(level, id, std::move(msg)); },
       [this](const std::string& id) { return claimStaticId(id, "MessageParser"); },
-      [](RuntimeMessageParserPlugin& loaded, const nlohmann::json& j) {
-        loaded.encodings = readManifestStringArray(j, "encoding");
+      [](RuntimeMessageParserPlugin& loaded, const PluginDescriptor& descriptor) {
+        loaded.encodings = descriptor.encoding;
         return true;
+      },
+      [dialog_vtable](const PJ_message_parser_vtable_t* parser_vtable) {
+        return MessageParserLibrary::loadStatic(parser_vtable, dialog_vtable);
       });
 }
 
-bool PluginRuntimeCatalog::registerStaticToolbox(const PJ_toolbox_vtable_t* vtable) {
-  return registerStaticPlugin<ToolboxLibrary>(
-      vtable, toolbox_plugins_, "Toolbox",
+bool PluginRuntimeCatalog::registerStaticToolbox(
+    const PJ_toolbox_vtable_t* vtable, const PJ_dialog_vtable_t* dialog_vtable) {
+  return registerStaticPlugin(
+      vtable, toolbox_plugins_, PluginFamily::kToolbox,
       [this](DiagnosticLevel level, const std::string& id, std::string msg) { report(level, id, std::move(msg)); },
       [this](const std::string& id) { return claimStaticId(id, "Toolbox"); },
-      [this](RuntimeToolboxPlugin& loaded, const nlohmann::json& /*j*/) {
+      [this](RuntimeToolboxPlugin& loaded, const PluginDescriptor& /*descriptor*/) {
         const auto capabilities = probeCapabilities(loaded.library);
         if (!capabilities) {
           report(
@@ -446,8 +437,36 @@ bool PluginRuntimeCatalog::registerStaticToolbox(const PJ_toolbox_vtable_t* vtab
           return false;
         }
         loaded.capabilities = *capabilities;
+        // Same fail-fast contract as DataSource above: kToolboxCapabilityHasDialog
+        // requires a resolvable dialog vtable.
+        if ((loaded.capabilities & PJ_TOOLBOX_CAPABILITY_HAS_DIALOG) != 0) {
+          auto vt = loaded.library.resolveDialogVtable();
+          if (!vt) {
+            report(
+                DiagnosticLevel::kError, loaded.id,
+                "static Toolbox \"" + loaded.id + "\": advertises kToolboxCapabilityHasDialog but " + vt.error());
+            return false;
+          }
+        }
         return true;
+      },
+      [dialog_vtable](const PJ_toolbox_vtable_t* toolbox_vtable) {
+        return ToolboxLibrary::loadStatic(toolbox_vtable, dialog_vtable);
       });
+}
+
+bool PluginRuntimeCatalog::registerStaticPlugins(const StaticPluginSet& plugins) {
+  bool ok = true;
+  for (const auto& entry : plugins.data_sources) {
+    ok = registerStaticDataSource(entry.plugin, entry.dialog) && ok;
+  }
+  for (const auto& entry : plugins.message_parsers) {
+    ok = registerStaticMessageParser(entry.plugin, entry.dialog) && ok;
+  }
+  for (const auto& entry : plugins.toolboxes) {
+    ok = registerStaticToolbox(entry.plugin, entry.dialog) && ok;
+  }
+  return ok;
 }
 
 bool PluginRuntimeCatalog::loadAndRegister(const PluginDescriptor& descriptor) {

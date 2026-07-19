@@ -40,12 +40,17 @@ AppSession::AppSession(QString extensions_dir, QObject* parent)
     : AppSession(std::move(extensions_dir), DiagnosticSink{}, parent) {}
 
 AppSession::AppSession(QString extensions_dir, DiagnosticSink sink, QObject* parent)
+    : AppSession(std::move(extensions_dir), std::move(sink), StaticPluginSet{}, parent) {}
+
+AppSession::AppSession(QString extensions_dir, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent)
     : QObject(parent),
       session_manager_(std::make_unique<SessionManager>()),
       playback_engine_(std::make_unique<PlaybackEngine>()),
       catalog_model_(std::make_unique<CatalogModel>(session_manager_.get())),
       topic_demand_tracker_(std::make_unique<TopicDemandTracker>()),
-      extension_catalog_(std::make_unique<ExtensionCatalogService>(std::move(extensions_dir), std::move(sink))) {
+      extension_catalog_(
+          std::make_unique<ExtensionCatalogService>(
+              std::move(extensions_dir), std::move(sink), std::move(static_plugins))) {
   // Forget remembered curve colors whenever the catalog empties (data cleared
   // or replaced), matching PJ3's per-PlotData COLOR_HINT lifetime so reopening
   // fresh data restarts palette rotation from the first color. The registry is

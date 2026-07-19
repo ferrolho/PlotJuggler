@@ -63,6 +63,17 @@ class ExtensionCatalogService : public QObject {
   // Creates a service with every directory root injectable (test seam).
   ExtensionCatalogService(Paths paths, DiagnosticSink sink, QObject* parent = nullptr);
 
+  // Creates a service and registers application-composed static plugins before
+  // the first directory scan. This is the startup seam used by static/WASM
+  // binaries; desktop callers normally use the overload above.
+  ExtensionCatalogService(
+      QString extensions_dir, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent = nullptr);
+
+  // Combines the directory-root test seam with application-composed static
+  // plugins. The vtable/dialog pointers inside the set must have static storage
+  // duration — the catalog retains them for its lifetime.
+  ExtensionCatalogService(Paths paths, DiagnosticSink sink, StaticPluginSet static_plugins, QObject* parent = nullptr);
+
   // Releases marketplace and loaded plugin resources.
   ~ExtensionCatalogService() override;
 
@@ -72,14 +83,18 @@ class ExtensionCatalogService : public QObject {
   // ExtensionCatalogService owns loaded plugin libraries and cannot be assigned.
   ExtensionCatalogService& operator=(const ExtensionCatalogService&) = delete;
 
-  // Reference valid for the service's lifetime.
+  // Reference valid for the service's lifetime. Browser builds have no dynamic
+  // marketplace; their plugins are registered statically through pluginCatalog.
   ExtensionManager& extensionManager() const {
     return *extension_manager_;
   }
 
   // Direct access to the loaded plugin catalog (reference valid for the
-  // service's lifetime). Tests use it to register in-process mock plugins
-  // without standing up DSO scanning.
+  // service's lifetime). Tests use it to register in-process plugins without
+  // standing up DSO scanning. Do NOT register plugins through it after
+  // streaming has started: unlike reload(), a raw registration takes no
+  // catalog lock, and poll threads walk the parser set concurrently —
+  // application-composed static plugins belong in the constructor set.
   PluginRuntimeCatalog& pluginCatalog() {
     return *plugin_catalog_;
   }
