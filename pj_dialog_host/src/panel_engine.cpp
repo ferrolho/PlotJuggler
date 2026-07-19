@@ -55,6 +55,22 @@ struct PanelEngine::Impl {
   // re-apply (see PanelEngine::eventFilter).
   QString applied_theme;
 
+  // Single wiring point for the session/catalog pair: every panel-family apply
+  // must route here so a session-backed chart never silently degrades to the
+  // preview widget because one call site forgot the arguments.
+  void applyPanelData(QWidget* target, const WidgetDataView& view) {
+    applyWidgetData(target, view, config.session, config.catalog);
+  }
+
+  void restartTickTimerAfterEvent() {
+    // isActive() keeps this a pure deadline restart: applyAndDiff deliberately
+    // stops the timer around a modal sub-dialog exec() to block re-entrant
+    // ticks, and an event forwarded during that window must not re-arm it.
+    if (config.restart_tick_timer_on_event && tick_timer != nullptr && tick_timer->isActive() && !closed) {
+      tick_timer->start();
+    }
+  }
+
   // Route one widget event to the plugin, then apply any resulting widget-data
   // update. Shared by the main panel, its drop filter, and the interactive
   // sub-panel so all three reach the plugin through the same path.
@@ -72,6 +88,7 @@ struct PanelEngine::Impl {
           request_owner_close();
         }
       }
+      restartTickTimerAfterEvent();
     }
   }
 
@@ -127,7 +144,7 @@ struct PanelEngine::Impl {
     dlg->contentLayout()->addWidget(loaded);
     forwardEmbeddedDialogClose(loaded, dlg);
     dlg->setWindowModality(Qt::ApplicationModal);
-    applyWidgetData(loaded, full_view, config.session, config.catalog);
+    applyPanelData(loaded, full_view);
     connectWidgetSignals(loaded, [this](const std::string& n, const std::string& j) { forwardEvent(n, j); });
     if (auto* button_box = loaded->findChild<QDialogButtonBox*>(QStringLiteral("buttonBox"))) {
       QObject::connect(button_box, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
@@ -197,22 +214,22 @@ struct PanelEngine::Impl {
       if (!diff.empty()) {
         WidgetDataView diff_view(diff.dump());
         if (root != nullptr) {
-          applyWidgetData(root, diff_view, config.session, config.catalog);
+          applyPanelData(root, diff_view);
           ++stats.diff_apply_count;
         }
         // Mirror the same update into the live sub-panel so its preview/list/etc.
         // track the plugin's state; names it doesn't own are simply skipped.
         if (sub_panel != nullptr) {
-          applyWidgetData(sub_panel, diff_view, config.session, config.catalog);
+          applyPanelData(sub_panel, diff_view);
         }
       }
     } else {
       if (root != nullptr) {
-        applyWidgetData(root, view, config.session, config.catalog);
+        applyPanelData(root, view);
         ++stats.diff_apply_count;
       }
       if (sub_panel != nullptr) {
-        applyWidgetData(sub_panel, view, config.session, config.catalog);
+        applyPanelData(sub_panel, view);
       }
     }
     prev_data = std::move(new_data);
@@ -254,7 +271,7 @@ struct PanelEngine::Impl {
         // Pre-fill the sub-dialog from the current widget data so it opens
         // populated. Names that don't exist in the sub-dialog are simply
         // skipped, so the panel's own widget values don't leak in.
-        applyWidgetData(sub_dialog, view, config.session, config.catalog);
+        applyPanelData(sub_dialog, view);
         // exec() spins a nested modal event loop. Pause our tick timer for its
         // duration so a timer-driven applyAndDiff() can't re-enter on the same
         // Impl while the sub-dialog is open — a re-entrant tick could observe a
@@ -351,7 +368,7 @@ QWidget* PanelEngine::openPanel() {
       initial_data.erase("__request_sub_dialog");
       initial_data.erase("__request_accept");
       WidgetDataView view(initial_raw);
-      applyWidgetData(loaded, view, impl_->config.session, impl_->config.catalog);
+      impl_->applyPanelData(loaded, view);
       impl_->prev_data = std::move(initial_data);
       impl_->prev_raw = initial_raw;
     }
@@ -379,6 +396,7 @@ QWidget* PanelEngine::openPanel() {
           }
           this->close();
         }
+        impl_->restartTickTimerAfterEvent();
       }
     };
     forward(name, event_json);
@@ -452,6 +470,7 @@ QWidget* PanelEngine::openPanel() {
             }
             this->close();
           }
+          impl_->restartTickTimerAfterEvent();
         }
       });
       for (const auto& t : targets) {
@@ -537,7 +556,13 @@ bool PanelEngine::eventFilter(QObject* watched, QEvent* event) {
     if (theme != impl_->applied_theme && impl_->root != nullptr && !impl_->prev_raw.empty()) {
       impl_->applied_theme = theme;
       WidgetDataView view(impl_->prev_raw);
-      applyWidgetData(impl_->root, view);
+      impl_->applyPanelData(impl_->root, view);
+      // The interactive sub-panel is themed through the same apply path at open
+      // and on every tick — without this mirror its icons and chart colors
+      // would be the one surface left stale after a theme switch.
+      if (impl_->sub_panel != nullptr) {
+        impl_->applyPanelData(impl_->sub_panel, view);
+      }
     }
   }
   // A panel revealed after being hidden (tab switch back to a pinned toolbox)

@@ -14,6 +14,7 @@
 struct MockPanelState {
   std::string text;
   std::string label = "Hello";
+  bool chart_enabled = false;
 
   bool close_on_next_tick = false;
   std::string close_reason;

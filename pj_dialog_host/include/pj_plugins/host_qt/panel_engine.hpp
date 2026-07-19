@@ -34,6 +34,16 @@ struct PanelEngineConfig {
   /// matching the FilterEditorPanel preview quality. Right-click menu is disabled.
   AppSession* session = nullptr;
   CatalogModel* catalog = nullptr;
+
+  // Restart the periodic tick deadline after each UI event the plugin accepts.
+  // This is a debounce for panels whose expensive work happens in on_tick, and
+  // also gives browser event dispatch an explicit post-edit timer arm. Off by
+  // default so existing native panel cadence is unchanged; declared last so
+  // positional initializers predating it stay valid. Trade-off for opting in: a
+  // sustained event stream (e.g. a continuous slider drag) postpones on_tick for
+  // its whole duration — event-driven widget updates still apply per event, but
+  // plugin-internal periodic work waits for the first quiet tick interval.
+  bool restart_tick_timer_on_event = false;
 };
 
 /// Hosts a long-lived interactive panel built from a plugin's typed-dialog UI.

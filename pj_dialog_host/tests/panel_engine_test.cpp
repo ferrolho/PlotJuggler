@@ -1,12 +1,15 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 #include <gtest/gtest.h>
+#include <pj_plotting/PlotWidget.h>
+#include <pj_runtime/AppSession.h>
 
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDialogButtonBox>
 #include <QEvent>
 #include <QEventLoop>
+#include <QFrame>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -15,6 +18,7 @@
 #include <QWidget>
 #include <memory>
 #include <pj_plugins/host/dialog_handle.hpp>
+#include <pj_plugins/host_qt/chart_preview_widget.hpp>
 #include <pj_plugins/host_qt/panel_engine.hpp>
 
 #include "mock_panel_plugin.hpp"
@@ -141,6 +145,39 @@ TEST_F(PanelEngineTest, ThemeChangeReappliesWidgetData) {
   delete panel;
 }
 
+TEST_F(PanelEngineTest, ThemeChangeKeepsSessionBackedChart) {
+  const QString saved_theme = QSettings().value(u"StyleSheet::theme"_s).toString();
+  QSettings().setValue(u"StyleSheet::theme"_s, u"light"_s);
+
+  PJ::AppSession session;
+  mockPanelState().chart_enabled = true;
+  PJ::PanelEngineConfig config;
+  config.session = &session;
+  config.catalog = &session.catalogModel();
+  PJ::PanelEngine engine(makeMockHandle(), config);
+  QWidget* panel = engine.openPanel();
+  ASSERT_NE(panel, nullptr);
+
+  auto* frame = panel->findChild<QFrame*>(u"chartPreview"_s);
+  ASSERT_NE(frame, nullptr);
+  ASSERT_EQ(frame->findChildren<PJ::PlotWidget*>().size(), 1);
+  ASSERT_TRUE(frame->findChildren<PJ::ChartPreviewWidget*>().isEmpty());
+
+  QSettings().setValue(u"StyleSheet::theme"_s, u"dark"_s);
+  QEvent style_change(QEvent::StyleChange);
+  QApplication::sendEvent(panel, &style_change);
+
+  EXPECT_EQ(frame->findChildren<PJ::PlotWidget*>().size(), 1);
+  EXPECT_TRUE(frame->findChildren<PJ::ChartPreviewWidget*>().isEmpty());
+
+  if (saved_theme.isEmpty()) {
+    QSettings().remove(u"StyleSheet::theme"_s);
+  } else {
+    QSettings().setValue(u"StyleSheet::theme"_s, saved_theme);
+  }
+  delete panel;
+}
+
 TEST_F(PanelEngineTest, TickPropagatesPluginStateChanges) {
   PJ::PanelEngine engine(
       makeMockHandle(), {/*tick_interval_ms=*/10, /*enable_diff=*/true, /*catalog_key_resolver=*/{}});
@@ -247,6 +284,38 @@ TEST_F(PanelEngineTest, WidgetEventReachesPlugin) {
   pumpEventLoop(30);
 
   EXPECT_EQ(mockPanelState().text, "typed by test");
+  EXPECT_GT(engine.stats().event_count, 0);
+
+  delete panel;
+}
+
+TEST_F(PanelEngineTest, ConfiguredWidgetEventRestartsTickDeadline) {
+  PJ::PanelEngineConfig config;
+  config.tick_interval_ms = 1000;
+  config.restart_tick_timer_on_event = true;
+  PJ::PanelEngine engine(makeMockHandle(), config);
+  QWidget* panel = engine.openPanel();
+  ASSERT_NE(panel, nullptr);
+  auto* timer = engine.findChild<QTimer*>();
+  auto* text = panel->findChild<QLineEdit*>("textBox");
+  ASSERT_NE(timer, nullptr);
+  ASSERT_NE(text, nullptr);
+
+  // A coarse 1 s QTimer may round every restart down by as much as 5%, so its
+  // reported remaining time can stay near 950 ms before and after a real
+  // restart. Make only this timing observation precise; production keeps the
+  // default timer type and the behavior under test is still PanelEngine's
+  // event-driven start().
+  timer->stop();
+  timer->setTimerType(Qt::PreciseTimer);
+  timer->start();
+  pumpEventLoop(100);
+  const int before_event = timer->remainingTime();
+  text->setText("restart deadline");
+  const int after_event = timer->remainingTime();
+
+  EXPECT_GT(before_event, 0);
+  EXPECT_GT(after_event, before_event + 20);
   EXPECT_GT(engine.stats().event_count, 0);
 
   delete panel;

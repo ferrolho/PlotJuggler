@@ -23,6 +23,7 @@ constexpr const char* kUiContent = R"(<?xml version="1.0" encoding="UTF-8"?>
   <layout class="QVBoxLayout">
    <item><widget class="QLabel" name="labelHello"><property name="text"><string>Hello</string></property></widget></item>
    <item><widget class="QLineEdit" name="textBox"/></item>
+   <item><widget class="QFrame" name="chartPreview"/></item>
    <item><widget class="QPushButton" name="buttonClose"><property name="text"><string>Close</string></property></widget></item>
    <item><widget class="QDialogButtonBox" name="buttonBox"><property name="standardButtons"><set>QDialogButtonBox::Close</set></property></widget></item>
   </layout>
@@ -54,6 +55,9 @@ class MockPanelPlugin : public PJ::DialogPluginTyped {
     PJ::WidgetData wd;
     wd.setText("textBox", g_state.text);
     wd.setLabel("labelHello", g_state.label);
+    if (g_state.chart_enabled) {
+      wd.setChartSeries("chartPreview", {{"input", {{0.0, 1.0}, {1.0, 2.0}, {2.0, 3.0}}, "#4c9aff", false}});
+    }
     if (g_state.close_on_next_tick) {
       wd.requestClose(g_state.close_reason);
       g_state.close_on_next_tick = false;

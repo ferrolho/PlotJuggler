@@ -88,6 +88,8 @@ if(PJ_BUILD_TESTS)
         PRIVATE
             pj_dialog_engine_qt
             pj_dialog_sdk
+            pj_plotting
+            pj_runtime
             GTest::gtest
             GTest::gtest_main
     )
