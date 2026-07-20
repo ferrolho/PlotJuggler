@@ -1002,20 +1002,31 @@ void SceneViewWidget::mousePressEvent(QMouseEvent* event) {
   }
 }
 
+void SceneViewWidget::endActiveGesture() {
+  active_button_ = Qt::NoButton;
+  if (camera_gesture_changed_) {
+    camera_gesture_changed_ = false;
+    emit presentationChanged();
+  }
+}
+
 void SceneViewWidget::mouseReleaseEvent(QMouseEvent* event) {
   // Clear the active-gesture latch when its button is released so a chorded
   // drag (e.g. press LMB then MMB, release MMB, keep dragging LMB) doesn't keep
   // applying the released button's gesture.
   if (event->button() == active_button_) {
-    active_button_ = Qt::NoButton;
-    if (camera_gesture_changed_) {
-      camera_gesture_changed_ = false;
-      emit presentationChanged();
-    }
+    endActiveGesture();
   }
 }
 
 void SceneViewWidget::mouseMoveEvent(QMouseEvent* event) {
+  if (active_button_ != Qt::NoButton && !(event->buttons() & active_button_)) {
+    // Qt's own live button state disagrees with our latch: the matching release
+    // was never delivered (e.g. swallowed by a right-click context menu's nested
+    // QMenu::exec() event loop — see pj_scene3D/CLAUDE.md). Self-heal so a stray
+    // hover move doesn't keep applying the gesture forever.
+    endActiveGesture();
+  }
   if (active_button_ == Qt::NoButton) {
     // No gesture in progress: this is a hover. Update the TF frame label.
     updateHoverFrame(event->position());

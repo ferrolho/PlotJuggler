@@ -451,6 +451,20 @@ if(PJ_BUILD_TESTS)
   target_compile_options(poses_in_frame_layer_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
   add_test(NAME poses_in_frame_layer_test COMMAND poses_in_frame_layer_test)
 
+  # Right-click on the 3D view shows a context menu via DockWidget's event filter
+  # (see CLAUDE.md); its QMenu::exec() nested loop can swallow the mouseRelease
+  # that would clear SceneViewWidget's own gesture latch. Drives a bare
+  # SceneViewWidget with synthetic QMouseEvents to pin the self-heal.
+  add_executable(scene_view_widget_mouse_gesture_test
+    tests/scene_view_widget_mouse_gesture_test.cpp
+  )
+  target_link_libraries(scene_view_widget_mouse_gesture_test PRIVATE
+    pj_scene3d_widgets
+    GTest::gtest
+  )
+  target_compile_options(scene_view_widget_mouse_gesture_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
+  add_test(NAME scene_view_widget_mouse_gesture_test COMMAND scene_view_widget_mouse_gesture_test)
+
   add_executable(scene3d_layer_xml_validation_test
     tests/scene3d_layer_xml_validation_test.cpp
   )

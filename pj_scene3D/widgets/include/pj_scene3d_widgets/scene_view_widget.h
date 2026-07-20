@@ -320,6 +320,11 @@ class SceneViewWidget : public QOpenGLWidget {
   void keyPressEvent(QKeyEvent* event) override;
 
  private:
+  // Clears the active-gesture latch (and commits a pending camera change via
+  // presentationChanged, same as a normal matching release). Shared by
+  // mouseReleaseEvent and mouseMoveEvent's defensive check for a lost release.
+  void endActiveGesture();
+
   // Per-tick "follow a frame" application (called from setTrackerTime). Resolves
   // the follow target's origin in the fixed frame at render_time_ and shifts the
   // active camera by the delta vs the previous tick's origin (camera_->followShift),
