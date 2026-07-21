@@ -102,6 +102,7 @@ class MainWindow : public QMainWindow {
   friend class MainWindowFanoutAmbiguousTestPeer;
   friend class MainWindowViewportReframeTestPeer;
   friend class MainWindowHistoryTestPeer;
+  friend class MainWindowPanelGeometryTestPeer;
 
  public:
   // Creates the main window using the default extension directory.

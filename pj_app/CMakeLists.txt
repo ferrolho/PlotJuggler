@@ -232,6 +232,11 @@ if(PJ_BUILD_TESTS)
     add_pj_app_gui_test(main_window_history_test MainWindowHistoryTest
         tests/main_window_history_test.cpp)
 
+    # The left column's width belongs to the user: neither a window resize nor a
+    # chart-area takeover may move the separator they dragged.
+    add_pj_app_gui_test(main_window_panel_geometry_test MainWindowPanelGeometryTest
+        tests/main_window_panel_geometry_test.cpp)
+
     # Pure config-parsing logic (no GUI), compiled standalone so it's linkable
     # from a plain gtest binary. FanoutConfig.cpp is also part of pj_app itself.
     add_executable(fanout_config_test

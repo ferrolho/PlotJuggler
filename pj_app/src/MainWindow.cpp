@@ -436,6 +436,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   ui_->timelineSplitter->setStretchFactor(1, 0);
   ui_->timelineSplitter->setSizes({1000, ui_->timelineWidget->minimumHeight()});
 
+  // The left column's width belongs to the user: whatever width the row gains
+  // or loses — a window resize, a side panel folding away, a toolbox panel
+  // whose size hint grows the window — is absorbed by the chart pane alone.
+  // Without these factors QSplitter shares the change between both panes and
+  // the sidebar creeps out toward its 600-px cap on its own.
+  ui_->mainSplitter->setStretchFactor(0, 0);
+  ui_->mainSplitter->setStretchFactor(1, 1);
+
   // Horizontal splitter with two panes — the plots-and-global-column
   // container (left sidebar + plot area + fixed 24-px global icon
   // column, separated by a static
@@ -5752,6 +5760,11 @@ bool MainWindow::presentPanel(QWidget* panel) {
   }
   chart->hide();
   panel->show();
+  // The incoming panel inherits the chart's role as the pane that absorbs every
+  // width change, not just its slot. Without this the sidebar starts growing
+  // again the moment the window is resized with a panel open — replaceWidget
+  // carries no stretch factor over from the widget it displaced.
+  splitter->setStretchFactor(panel_layout_index_, 1);
   splitter->setSizes(saved_sizes);
   current_panel_ = panel;
   return true;
@@ -5762,16 +5775,20 @@ QWidget* MainWindow::releaseCentralPanel() {
     return nullptr;
   }
   auto* splitter = qobject_cast<QSplitter*>(panel_parent_);
-  if (splitter != nullptr && panel_layout_index_ >= 0) {
+  if (splitter == nullptr || panel_layout_index_ < 0) {
+    qWarning("MainWindow::releaseCentralPanel: panel_parent_ is no longer a splitter; chart not restored to slot");
+    ui_->tabbedPlotWidget->show();
+  } else {
     // Swap the chart back into its slot; replaceWidget removes the panel and
     // hands it back reparented out of the splitter.
     const QList<int> saved_sizes = splitter->sizes();
     splitter->replaceWidget(panel_layout_index_, ui_->tabbedPlotWidget);
+    // Show the chart before restoring the sizes: a hidden pane is left out of
+    // the splitter's layout, so sizes applied while the chart is still hidden
+    // are recomputed the instant it appears — and the sidebar keeps the slack.
+    ui_->tabbedPlotWidget->show();
     splitter->setSizes(saved_sizes);
-  } else {
-    qWarning("MainWindow::releaseCentralPanel: panel_parent_ is no longer a splitter; chart not restored to slot");
   }
-  ui_->tabbedPlotWidget->show();
   QWidget* released = current_panel_;
   released->hide();
   released->setParent(nullptr);
