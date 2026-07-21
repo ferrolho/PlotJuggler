@@ -82,6 +82,7 @@ class Theme;
 class TitleBar;
 class ToastManager;
 class UpdateChecker;
+class TelemetryPing;
 class CoalescingTrigger;
 
 // Legend corner placement. Four corner buttons in the right toolbar act
@@ -149,6 +150,12 @@ class MainWindow : public QMainWindow {
   // true = the manual Help ▸ Check for Updates action, which also toasts the
   // "you're up to date" and "couldn't check" outcomes.
   void checkForUpdates(bool interactive);
+
+  // Sends the anonymous daily-user ping (lazily creating the TelemetryPing).
+  // Fully silent — no user-facing notification. `installation` is the
+  // PJ_INSTALLATION build stamp, passed by main.cpp (the only pj_version.h
+  // consumer). The opt-out gate lives at the call site, not here.
+  void sendTelemetryPing(const QString& installation);
 
   // Presents the embedded external-process view in the central area (via
   // presentPanel) and restores the chart when the session ends. Idempotent:
@@ -895,6 +902,7 @@ class MainWindow : public QMainWindow {
   DiagnosticHistory* diagnostic_history_ = nullptr;
   ToastManager* toast_manager_ = nullptr;
   UpdateChecker* update_checker_ = nullptr;
+  TelemetryPing* telemetry_ping_ = nullptr;
   // Outcome handlers are rebound on each checkForUpdates() call so the check's
   // interactivity (silent startup vs. noisy Help ▸ Check for Updates) is captured
   // per-request rather than living in shared mutable state.

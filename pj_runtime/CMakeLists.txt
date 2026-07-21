@@ -19,6 +19,7 @@ add_library(pj_runtime STATIC
     src/PlaybackEngine.cpp
     src/QSettingsBackend.cpp
     src/SessionManager.cpp
+    src/TelemetryPing.cpp
     src/ToolboxRuntimeHost.cpp
     src/TopicDemandTracker.cpp
     src/UpdateChecker.cpp
@@ -36,6 +37,7 @@ add_library(pj_runtime STATIC
     include/pj_runtime/PlaybackEngine.h
     include/pj_runtime/QSettingsBackend.h
     include/pj_runtime/SessionManager.h
+    include/pj_runtime/TelemetryPing.h
     include/pj_runtime/ToolboxRuntimeHost.h
     include/pj_runtime/TopicDemandTracker.h
     include/pj_runtime/UpdateChecker.h
@@ -137,6 +139,21 @@ if(PJ_BUILD_TESTS)
         GTest::gtest
     )
     add_test(NAME UpdateCheckerTest COMMAND update_checker_test)
+
+    # Drives TelemetryPing's POST + reply handling against a local capturing
+    # QTcpServer — enforces the payload privacy contract on the wire (the
+    # allowed-key set + salted-hash user id), no real network.
+    add_executable(telemetry_ping_test
+        tests/telemetry_ping_test.cpp
+    )
+    set_target_properties(telemetry_ping_test PROPERTIES AUTOMOC ON)
+    target_compile_options(telemetry_ping_test PRIVATE ${PJ_WARNING_FLAGS})
+    target_link_libraries(telemetry_ping_test PRIVATE
+        pj_runtime
+        Qt6::Test
+        GTest::gtest
+    )
+    add_test(NAME TelemetryPingTest COMMAND telemetry_ping_test)
 
     add_executable(app_session_test
         tests/app_session_test.cpp

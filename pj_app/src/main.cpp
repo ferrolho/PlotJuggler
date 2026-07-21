@@ -342,6 +342,13 @@ int main(int argc, char* argv[]) {
     QTimer::singleShot(0, &window, [&window]() { window.checkForUpdates(/*interactive=*/false); });
   }
 
+  // Anonymous daily-user ping (see docs/TELEMETRY.md): opt-out via Preferences
+  // (default on) and skipped for headless --screenshot runs. Deferred like the
+  // update check; all failures are silent.
+  if (!parser.isSet(screenshot_option) && QSettings().value(u"Preferences::send_anonymous_stats"_s, true).toBool()) {
+    QTimer::singleShot(0, &window, [&window]() { window.sendTelemetryPing(QStringLiteral(PJ_INSTALLATION_STRING)); });
+  }
+
   if (parser.isSet(screenshot_option)) {
     const QString path = parser.value(screenshot_option);
     const int delay_ms = parser.value(screenshot_delay_option).toInt();

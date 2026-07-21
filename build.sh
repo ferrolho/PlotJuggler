@@ -111,6 +111,7 @@ cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_PREFIX_PATH="${QT_DIR}" \
   -DPJ_VERSION="${PJ_VERSION:-${PJ_APP_VERSION}}" \
+  -DPJ_INSTALLATION="${PJ_INSTALLATION:-source}" \
   "${CMAKE_CCACHE_ARGS[@]+"${CMAKE_CCACHE_ARGS[@]}"}" "${PJ_FLAG_ARGS[@]+"${PJ_FLAG_ARGS[@]}"}"
 
 # Surface the compile DB (CMAKE_EXPORT_COMPILE_COMMANDS writes it under build/) at

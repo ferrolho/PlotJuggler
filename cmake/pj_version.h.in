@@ -1,3 +1,4 @@
 #pragma once
 
 #define PJ_VERSION_STRING "@PJ_VERSION@"
+#define PJ_INSTALLATION_STRING "@PJ_INSTALLATION@"

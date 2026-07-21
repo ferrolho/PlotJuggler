@@ -209,6 +209,7 @@ jobs:
         env:
           PJ_BUILD_TESTS: "OFF"
           PJ_BUILD_DEMOS: "OFF"
+          PJ_INSTALLATION: "appimage"
         shell: bash
         run: |
           set -euo pipefail

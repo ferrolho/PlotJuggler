@@ -110,6 +110,7 @@
 #include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/QSettingsBackend.h"
 #include "pj_runtime/SessionManager.h"
+#include "pj_runtime/TelemetryPing.h"
 #include "pj_runtime/Time.h"
 #include "pj_runtime/ToolboxRuntimeHost.h"
 #include "pj_runtime/TopicDemandTracker.h"
@@ -2129,6 +2130,13 @@ void MainWindow::checkForUpdates(bool interactive) {
 
 void MainWindow::onCheckForUpdates() {
   checkForUpdates(/*interactive=*/true);
+}
+
+void MainWindow::sendTelemetryPing(const QString& installation) {
+  if (!telemetry_ping_) {
+    telemetry_ping_ = new TelemetryPing(this);
+  }
+  telemetry_ping_->send(installation);
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event) {

@@ -4,14 +4,16 @@
 
 /**
  * @file HttpGet.h
- * @brief One-shot async HTTP GET with a transfer timeout.
+ * @brief One-shot async HTTP GET/POST with a transfer timeout.
  *
- * The shared core of every "probe a URL and react to the outcome" caller
+ * The shared core of every "hit a URL once and react to the outcome" caller
  * (UpdateChecker's release check, the Preferences registry-URL reachability
- * probe): issue the GET, deliver the finished reply to a callback on the
- * caller's thread, and own the reply's cleanup.
+ * probe, TelemetryPing's launch beacon): issue the request, deliver the
+ * finished reply to a callback on the caller's thread, and own the reply's
+ * cleanup.
  */
 
+#include <QByteArray>
 #include <QNetworkRequest>
 #include <chrono>
 #include <functional>
@@ -31,5 +33,13 @@ namespace PJ {
 QNetworkReply* httpGetWithTimeout(
     QNetworkAccessManager& network, QNetworkRequest request, std::chrono::milliseconds timeout, QObject* context,
     std::function<void(QNetworkReply&)> on_finished);
+
+// POST sibling of httpGetWithTimeout with the identical callback/lifetime
+// contract: `body` is sent with the caller-configured request (set the
+// Content-Type header yourself), on_finished fires on `context`'s thread for
+// every outcome, and the reply is deleteLater'd right after it returns.
+QNetworkReply* httpPostWithTimeout(
+    QNetworkAccessManager& network, QNetworkRequest request, const QByteArray& body, std::chrono::milliseconds timeout,
+    QObject* context, std::function<void(QNetworkReply&)> on_finished);
 
 }  // namespace PJ

@@ -214,6 +214,9 @@ PreferencesDialog::PreferencesDialog(Theme& theme, QWidget* parent)
     ui_->checkUpdatesToggle->setChecked(
         settings.value(u"Preferences::check_updates_on_startup"_s, true).toBool(),
         /*animate=*/false);
+    ui_->telemetryToggle->setChecked(
+        settings.value(u"Preferences::send_anonymous_stats"_s, true).toBool(),
+        /*animate=*/false);
     ui_->splashMode->setSelectedIndex(
         settings.value(kSplashModeKey, kSplashModeMemes).toString() == kSplashModeSerious ? 1 : 0);
   }
@@ -432,6 +435,7 @@ PreferencesDialog::PreferencesDialog(Theme& theme, QWidget* parent)
     settings.setValue(u"Preferences::precision"_s, ui_->scrubberFloatPrecision->value());
     settings.setValue(u"Preferences::use_opengl"_s, ui_->openglToggle->isChecked());
     settings.setValue(u"Preferences::check_updates_on_startup"_s, ui_->checkUpdatesToggle->isChecked());
+    settings.setValue(u"Preferences::send_anonymous_stats"_s, ui_->telemetryToggle->isChecked());
     settings.setValue(u"Preferences::curve_color_global"_s, ui_->curveColorMode->selectedIndex() == 0);
     settings.setValue(kSplashModeKey, ui_->splashMode->selectedIndex() == 1 ? kSplashModeSerious : kSplashModeMemes);
     settings.setValue(u"Preferences::auto_zoom_plots"_s, ui_->autoZoomToggle->isChecked());

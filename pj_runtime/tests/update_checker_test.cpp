@@ -10,69 +10,17 @@
 
 #include <gtest/gtest.h>
 
-#include <QByteArray>
 #include <QCoreApplication>
-#include <QDeadlineTimer>
-#include <QEventLoop>
 #include <QHostAddress>
 #include <QSignalSpy>
 #include <QTcpServer>
-#include <QTcpSocket>
 #include <QUrl>
 
+#include "http_test_utils.h"
 #include "pj_runtime/UpdateChecker.h"
 using namespace Qt::StringLiterals;
-
-namespace {
-
-// Spins the event loop until `spy` receives a signal or the timeout expires.
-bool waitForSignal(QSignalSpy& spy, int timeout_ms = 5000) {
-  QDeadlineTimer deadline(timeout_ms);
-  while (spy.isEmpty() && !deadline.hasExpired()) {
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-  }
-  return !spy.isEmpty();
-}
-
-// Minimal loopback HTTP/1.1 server that replies to every request with a
-// configurable status line + body. No external network required.
-class LocalHttpServer {
- public:
-  LocalHttpServer() {
-    server_.listen(QHostAddress::LocalHost, 0);
-    QObject::connect(&server_, &QTcpServer::newConnection, [this]() {
-      QTcpSocket* socket = server_.nextPendingConnection();
-      socket->setParent(&server_);
-      QObject::connect(socket, &QTcpSocket::readyRead, [this, socket]() {
-        socket->readAll();  // consume the request
-        socket->write(response_);
-        socket->flush();
-        socket->disconnectFromHost();
-      });
-    });
-  }
-
-  QUrl url() const {
-    return QUrl(u"http://127.0.0.1:%1/"_s.arg(server_.serverPort()));
-  }
-
-  void setResponse(const QByteArray& status_line, const QByteArray& body) {
-    response_ = "HTTP/1.1 " + status_line +
-                "\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: " +
-                QByteArray::number(body.size()) +
-                "\r\n"
-                "Connection: close\r\n\r\n" +
-                body;
-  }
-
- private:
-  QTcpServer server_;
-  QByteArray response_;
-};
-
-}  // namespace
+using PJ::test::LocalHttpServer;
+using PJ::test::waitForSignal;
 
 TEST(UpdateCheckerTest, NewerReleaseEmitsUpdateAvailable) {
   LocalHttpServer server;
