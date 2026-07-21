@@ -26,6 +26,7 @@
 #include <QLoggingCategory>
 #include <QMenu>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QPalette>
 #include <QPixmap>
 #include <QPointer>
@@ -361,15 +362,21 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
 
   ui_->setupUi(this);
 
-  // Hard-zero contents margins on the QMainWindow itself, the central
-  // widget, and every intermediate container down to the chrome rows.
-  // Qt's main-window layout or platform style can otherwise add a tiny
-  // implicit gap below the menuWidget (TitleBar), which the user sees
-  // as a strip of titlebar-background between the title bar and the
-  // first chrome row of the central area.
-  setContentsMargins(
-      PJ::theme::space(theme::Space::None), PJ::theme::space(theme::Space::None), PJ::theme::space(theme::Space::None),
-      PJ::theme::space(theme::Space::None));
+  // Hard-zero contents margins on the central widget and every
+  // intermediate container down to the chrome rows. Qt's main-window
+  // layout or platform style can otherwise add a tiny implicit gap below
+  // the menuWidget (TitleBar), which the user sees as a strip of
+  // titlebar-background between the title bar and the first chrome row
+  // of the central area.
+  //
+  // The QMainWindow's own contentsMargins are the one exception: they're
+  // set to the border stroke width (not zero) so paintEvent()'s 1-px
+  // border has a reserved band to paint into. Child widgets (TitleBar,
+  // dock panels) are laid out inside contentsRect and are painted after
+  // paintEvent() runs, so without this reservation they'd sit flush with
+  // the window edge and paint over the border on every side they touch.
+  const int chrome_border_width = PJ::theme::stroke(theme::Stroke::Hairline);
+  setContentsMargins(chrome_border_width, chrome_border_width, chrome_border_width, chrome_border_width);
   ui_->centralWidget->setContentsMargins(
       PJ::theme::space(theme::Space::None), PJ::theme::space(theme::Space::None), PJ::theme::space(theme::Space::None),
       PJ::theme::space(theme::Space::None));
@@ -2081,6 +2088,26 @@ void MainWindow::resizeEvent(QResizeEvent* event) {
   if (toast_manager_) {
     toast_manager_->updatePosition();
   }
+}
+
+void MainWindow::paintEvent(QPaintEvent* event) {
+  QMainWindow::paintEvent(event);
+  if (isMaximized() || isFullScreen()) {
+    return;  // The window fills the screen — no edge to outline.
+  }
+
+  const theme::Theme t = theme::appTheme();
+  const int border_width = PJ::theme::stroke(theme::Stroke::Hairline);
+
+  QPainter painter(this);
+  painter.setRenderHint(QPainter::Antialiasing);
+
+  // 1-px border flush with the window edge.
+  QPen border_pen(PJ::theme::outline(theme::OutlineRole::Default, theme::OutlineState::Rest, t));
+  border_pen.setWidthF(border_width);
+  painter.setPen(border_pen);
+  const qreal half_border = border_width / 2.0;
+  painter.drawRect(QRectF(rect()).adjusted(half_border, half_border, -half_border, -half_border));
 }
 
 void MainWindow::onThemeChanged(const QString& theme) {

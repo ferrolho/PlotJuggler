@@ -40,6 +40,7 @@ class QAction;
 class QButtonGroup;
 class QCloseEvent;
 class QMenu;
+class QPaintEvent;
 class QPushButton;
 class QSettings;
 class QStackedWidget;
@@ -788,6 +789,12 @@ class MainWindow : public QMainWindow {
   // any descendant widget, updates the cursor near edges, and starts a
   // system-resize on press.
   bool eventFilter(QObject* watched, QEvent* event) override;
+
+  // Paints a 1-px border flush with the window edge. Self-painted via
+  // PJ::theme:: token accessors — FrameworkTokens.h is built for exactly this
+  // case (a top-level widget QSS can't reach). No-op while maximized/
+  // fullscreen, where the window fills the screen and has no edge to outline.
+  void paintEvent(QPaintEvent* event) override;
 
  private:
   // Swaps the chart area (ui_->tabbedPlotWidget) out and presents `panel` in
