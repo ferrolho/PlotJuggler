@@ -1175,10 +1175,20 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // toolbar icon size and keeps it in step via chromeMetricsChanged. Injected
   // here so FileLoader itself never links MainWindow (keeps it testable).
   file_loader_->setFilePicker(
-      [](QWidget* dialog_parent, const QString& caption, const QString& dir, const QString& filter) {
+      [](QWidget* dialog_parent, const QString& caption, const QString& dir, const QString& filter, bool multi) {
         auto* metrics_source = dialog_parent != nullptr ? qobject_cast<MainWindow*>(dialog_parent->window()) : nullptr;
-        return FileDialog::getOpenFileNames(dialog_parent, caption, dir, filter, metrics_source);
+        if (multi) {
+          return FileDialog::getOpenFileNames(dialog_parent, caption, dir, filter, metrics_source);
+        }
+        const QString path = FileDialog::getOpenFileName(dialog_parent, caption, dir, filter, metrics_source);
+        return path.isEmpty() ? QStringList{} : QStringList{path};
       });
+  // Gates the per-dataset Reload/Replace context-menu items to file-backed
+  // datasets (a streaming/test dataset has no source path to re-read).
+  ui_->curveListPanel->setDatasetSourcePathResolver(
+      [this](DatasetId dataset_id) { return file_loader_->sourcePathForDataset(dataset_id); });
+  connect(ui_->curveListPanel, &CurveListPanel::reloadDatasetRequested, this, &MainWindow::onReloadDatasetRequested);
+  connect(ui_->curveListPanel, &CurveListPanel::replaceDatasetRequested, this, &MainWindow::onReplaceDatasetRequested);
   connect(ui_->leftPanel, &LeftPanel::loadDataRequested, this, &MainWindow::onLoadDataRequested);
   connect(ui_->leftPanel, &LeftPanel::reloadDataRequested, this, &MainWindow::onReloadDataRequested);
   connect(ui_->leftPanel, &LeftPanel::cloudToolboxRequested, this, [this](const QString& id) { launchToolbox(id); });
@@ -1186,14 +1196,25 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   scene_undo_debounce_.setInterval(kSceneUndoDebounceMs);
   connect(&scene_undo_debounce_, &QTimer::timeout, this, [this]() { onUndoableChange(); });
 
-  connect(file_loader_.get(), &FileLoader::sourceReplacementAboutToCommit, this, [this](const QString& path) {
-    if (progressive_layout_in_flight_) {
-      return;
-    }
-    pending_source_replacement_ =
-        PendingSourceReplacement{.workspace = capturePortableWorkspace(), .path = QFileInfo(path).absoluteFilePath()};
-  });
+  connect(
+      file_loader_.get(), &FileLoader::sourceReplacementAboutToCommit, this,
+      [this](const QString& path, DatasetId replaced_id) {
+        if (progressive_layout_in_flight_) {
+          return;
+        }
+        // Stamp the retiring dataset with the INCOMING path (a "Replace
+        // dataset" load points it at a different file) so the post-load rebind
+        // maps its charts onto the replacement datasets.
+        const QString incoming = QFileInfo(path).absoluteFilePath();
+        pending_source_replacement_ =
+            PendingSourceReplacement{.workspace = capturePortableWorkspace(replaced_id, incoming), .path = incoming};
+      });
   connect(file_loader_.get(), &FileLoader::fileLoaded, this, &MainWindow::onFileLoaded);
+  // A reload disables the Reload button until completion (reloadSource); only
+  // onFileLoaded re-enables it, so a FAILED load would leave it stuck disabled.
+  connect(file_loader_.get(), &FileLoader::fileLoadFailed, this, [this](const QString&, const QString&) {
+    ui_->leftPanel->setReloadEnabled(session_->sessionManager().lastLoadedSource().has_value());
+  });
   // Track successful loads for the recent-files popup.
   connect(
       file_loader_.get(), &FileLoader::fileLoaded, this,
@@ -1644,14 +1665,41 @@ void MainWindow::onReloadDataRequested() {
   if (!src.has_value()) {
     return;
   }
+  reloadSource(src->path, src->plugin_id, src->plugin_config_json);
+}
+
+void MainWindow::reloadSource(const QString& path, const QString& plugin_id, const QString& plugin_config_json) {
   // Prevent re-entry; success re-enables via onFileLoaded.
   ui_->leftPanel->setReloadEnabled(false);
   LoadHints hints{
-      .expected_plugin_id = src->plugin_id,
-      .preset_config_json = src->plugin_config_json,
-      .skip_dialog = !src->plugin_id.isEmpty() && !src->plugin_config_json.isEmpty(),
+      .expected_plugin_id = plugin_id,
+      .preset_config_json = plugin_config_json,
+      .skip_dialog = !plugin_id.isEmpty() && !plugin_config_json.isEmpty(),
   };
-  file_loader_->loadFile(src->path, this, hints);
+  file_loader_->loadFile(path, this, hints);
+}
+
+void MainWindow::onReloadDatasetRequested(DatasetId dataset_id) {
+  const QString path = file_loader_->sourcePathForDataset(dataset_id);
+  if (path.isEmpty()) {
+    return;  // not file-backed; the menu item should have been disabled
+  }
+  // Recover the plugin + config recorded when THIS path was loaded (not just the
+  // most recent load) so a multi-file session reloads each source with its own
+  // settings. An untracked path (e.g. record pruned) reloads through the dialog.
+  const auto& sources = session_->sessionManager().loadedSources();
+  const auto recorded = std::find_if(sources.begin(), sources.end(), [&path](const auto& src) {
+    return FileLoader::sameSourceIdentity(src.path, path);
+  });
+  if (recorded != sources.end()) {
+    reloadSource(recorded->path, recorded->plugin_id, recorded->plugin_config_json);
+  } else {
+    reloadSource(path, QString(), QString());
+  }
+}
+
+void MainWindow::onReplaceDatasetRequested(DatasetId dataset_id) {
+  file_loader_->replaceFromDialog(dataset_id, this);
 }
 
 QSet<QString> MainWindow::captureHistoryDataUniverse() const {
@@ -4147,11 +4195,15 @@ MainWindow::CapturedWorkspace MainWindow::captureWorkspace() const {
   return CapturedWorkspace{.xml = xmlSaveState().toByteArray(2), .timeline = captureTimelineState()};
 }
 
-MainWindow::CapturedWorkspace MainWindow::capturePortableWorkspace() const {
+MainWindow::CapturedWorkspace MainWindow::capturePortableWorkspace(
+    DatasetId stamp_override_id, const QString& stamp_override_path) const {
   QDomDocument doc = xmlSaveState();
   const TimelineState timeline = captureTimelineState();
   const QByteArray unstamped = doc.toByteArray(2);
-  layout_xml::stampDatasetSourcePaths(doc, [this](std::uint32_t dataset_id) {
+  layout_xml::stampDatasetSourcePaths(doc, [this, stamp_override_id, &stamp_override_path](std::uint32_t dataset_id) {
+    if (stamp_override_id != 0 && static_cast<DatasetId>(dataset_id) == stamp_override_id) {
+      return stamp_override_path;
+    }
     return file_loader_->sourcePathForDataset(static_cast<DatasetId>(dataset_id));
   });
   const QByteArray stamped = doc.toByteArray(2);

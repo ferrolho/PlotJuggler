@@ -676,18 +676,35 @@ void CurveListPanel::onTreeContextMenu(const QPoint& pos) {
     return button;
   };
 
-  // Merge first (needs ≥2 datasets), then Remove (destructive → purple).
+  // Merge first (needs ≥2 datasets), then Reload/Replace (exactly one dataset,
+  // and only one loaded from a file — a streaming/test dataset has no source to
+  // re-read), then Remove (destructive → purple). The menu targets a dataset
+  // selection, so the labels drop the noun.
+  const bool single_file_backed = dataset_ids.size() == 1 && source_path_resolver_ != nullptr &&
+                                  !source_path_resolver_(dataset_ids.front()).isEmpty();
   QPushButton* merge_button = add_item(u":/resources/svg/merge.svg"_s, tr("Merge"), false, dataset_ids.size() >= 2);
-  QPushButton* remove_button = add_item(
-      u":/resources/svg/trash.svg"_s, dataset_ids.size() > 1 ? tr("Remove datasets") : tr("Remove dataset"),
-      /*destructive=*/true, /*enabled=*/true);
+  QPushButton* reload_button = add_item(u":/resources/svg/replay.svg"_s, tr("Reload"), false, single_file_backed);
+  QPushButton* replace_button =
+      add_item(u":/resources/svg/compare_arrows.svg"_s, tr("Replace"), false, single_file_backed);
+  QPushButton* remove_button =
+      add_item(u":/resources/svg/trash.svg"_s, tr("Remove"), /*destructive=*/true, /*enabled=*/true);
 
   // QWidgetAction buttons don't dismiss the menu on click — close it ourselves and
   // record the choice (exec blocks, so capturing by reference is safe).
   bool do_merge = false;
+  bool do_reload = false;
+  bool do_replace = false;
   bool do_remove = false;
   connect(merge_button, &QPushButton::clicked, &menu, [&]() {
     do_merge = true;
+    menu.close();
+  });
+  connect(reload_button, &QPushButton::clicked, &menu, [&]() {
+    do_reload = true;
+    menu.close();
+  });
+  connect(replace_button, &QPushButton::clicked, &menu, [&]() {
+    do_replace = true;
     menu.close();
   });
   connect(remove_button, &QPushButton::clicked, &menu, [&]() {
@@ -698,6 +715,10 @@ void CurveListPanel::onTreeContextMenu(const QPoint& pos) {
   menu.exec(tree_view_->viewport()->mapToGlobal(pos));
   if (do_merge) {
     emit mergeDatasetsRequested(dataset_ids);
+  } else if (do_reload) {
+    emit reloadDatasetRequested(dataset_ids.front());
+  } else if (do_replace) {
+    emit replaceDatasetRequested(dataset_ids.front());
   } else if (do_remove) {
     emit removeDatasetsRequested(dataset_ids);
   }

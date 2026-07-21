@@ -466,6 +466,17 @@ class FileLoaderTest : public ::testing::Test {
     return 0;
   }
 
+  // The catalog's user-facing name for `dataset_id` (display override applied),
+  // or empty when the catalog does not list it.
+  [[nodiscard]] QString datasetDisplayName(PJ::DatasetId dataset_id) {
+    for (const auto& [id, name] : catalog().datasets()) {
+      if (id == dataset_id) {
+        return name;
+      }
+    }
+    return {};
+  }
+
   // Row count of the dataset's single topic, or -1 when the topic set is not
   // exactly {mock/file_data} (wiped or duplicated).
   [[nodiscard]] int64_t singleTopicRowCount(PJ::DatasetId dataset_id) {
@@ -508,6 +519,80 @@ TEST_F(FileLoaderTest, ReloadingSameFileReplacesDatasetInPlace) {
   EXPECT_EQ(datasetNamed("sensors.mock"), dataset_id) << "reload must keep the DatasetId stable";
   EXPECT_EQ(singleTopicRowCount(dataset_id), 3) << "reload wiped, duplicated, or re-appended the dataset's topics";
   EXPECT_EQ(catalog().items().size(), 1u) << "curve tree must survive a same-file reload";
+}
+
+// "Replace dataset": the replace hint targets a dataset BY ID, so a different
+// file refills it in place — same DatasetId (curve keys survive for matching
+// topic names), display name and source path repointed to the new file.
+TEST_F(FileLoaderTest, ReplaceHintRefillsTargetedDatasetFromDifferentFile) {
+  ASSERT_TRUE(load());  // sensors.mock, 3 rows
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  ASSERT_EQ(singleTopicRowCount(dataset_id), 3);
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints hints = loadHints();
+  hints.replace_dataset_id = dataset_id;
+  ASSERT_TRUE(loadAndWait(other_path, hints));
+
+  EXPECT_EQ(session().createReader().listDatasets().size(), 1u) << "replace must not mint a second dataset";
+  EXPECT_EQ(singleTopicRowCount(dataset_id), 3) << "the replaced dataset must hold the new file's rows";
+  EXPECT_EQ(datasetDisplayName(dataset_id), u"other.mock"_s) << "commit must rename the dataset to the new file";
+  EXPECT_EQ(loader_->sourcePathForDataset(dataset_id), other_path) << "source path must repoint to the new file";
+  EXPECT_EQ(catalog().items().size(), 1u);
+}
+
+// A failed replace must be invisible: prior data, name, and source path all
+// survive (the rename is deferred to commit precisely for this rollback).
+TEST_F(FileLoaderTest, FailedReplaceRollsBackDataNameAndSourcePath) {
+  ASSERT_TRUE(load());  // sensors.mock, 3 rows
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints hints = loadHints(uR"({"fail_start":true})"_s);
+  hints.replace_dataset_id = dataset_id;
+  EXPECT_FALSE(loadAndWait(other_path, hints));
+
+  EXPECT_EQ(singleTopicRowCount(dataset_id), 3) << "prior data restored, NOT left empty";
+  EXPECT_EQ(datasetDisplayName(dataset_id), u"sensors.mock"_s) << "a rolled-back replace must keep the prior name";
+  EXPECT_EQ(loader_->sourcePathForDataset(dataset_id), mock_path_) << "a rolled-back replace must keep the prior path";
+  EXPECT_EQ(catalog().items().size(), 1u) << "curve tree restored after the failed replace";
+}
+
+// After a replace, the dataset's engine source_name still carries the ORIGINAL
+// basename (there is no engine-level rename) — only the tracked source path
+// identifies it. A later load of the new path must therefore match by path and
+// refill in place, not mint a duplicate dataset.
+TEST_F(FileLoaderTest, ReloadOfNewPathAfterReplaceRefillsInsteadOfDuplicating) {
+  ASSERT_TRUE(load());  // sensors.mock
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints replace_hints = loadHints();
+  replace_hints.replace_dataset_id = dataset_id;
+  ASSERT_TRUE(loadAndWait(other_path, replace_hints));
+
+  ASSERT_TRUE(load(other_path));  // plain reload of the dataset's NEW source
+
+  EXPECT_EQ(session().createReader().listDatasets().size(), 1u)
+      << "reloading a replaced dataset's new path must refill it, not duplicate it";
+  EXPECT_EQ(singleTopicRowCount(dataset_id), 3);
+  EXPECT_EQ(datasetDisplayName(dataset_id), u"other.mock"_s);
+}
+
+// A replace whose target vanished while the picker/config dialog was open must
+// degrade to a plain fresh load instead of failing or refilling a stranger.
+TEST_F(FileLoaderTest, ReplaceHintWithVanishedTargetLoadsFresh) {
+  PJ::LoadHints hints = loadHints();
+  hints.replace_dataset_id = 424242;  // never existed
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  EXPECT_EQ(singleTopicRowCount(dataset_id), 3);
+  EXPECT_EQ(catalog().items().size(), 1u);
 }
 
 TEST_F(FileLoaderTest, RequiredLayoutPluginFailsInsteadOfFallingBackToFirstExtensionMatch) {

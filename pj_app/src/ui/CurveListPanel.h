@@ -11,6 +11,7 @@
 #include <QSet>
 #include <QStringList>
 #include <QWidget>
+#include <functional>
 #include <vector>
 
 #include "pj_base/types.hpp"
@@ -53,6 +54,15 @@ class CurveListPanel : public QWidget {
   // double-click peek is a no-op.
   void setTopicDemandController(TopicDemandController* controller);
 
+  // Resolves a dataset's tracked on-disk source path (empty when the dataset was
+  // not loaded from a file, e.g. streaming/test data). Gates the per-dataset
+  // Reload/Replace context-menu items to file-backed datasets. Optional —
+  // without it both items stay disabled.
+  using DatasetSourcePathResolver = std::function<QString(DatasetId)>;
+  void setDatasetSourcePathResolver(DatasetSourcePathResolver resolver) {
+    source_path_resolver_ = std::move(resolver);
+  }
+
   void refreshValues(double tracker_time);
 
   /// Add a curve to the Custom Series panel. `catalog_key` is the drag key;
@@ -86,13 +96,19 @@ class CurveListPanel : public QWidget {
   void trashRequested(QStringList names, bool covers_all);
   // Emitted when the user picks "Clear All" from the datasets menu.
   void clearAllCurvesRequested();
-  // The user chose "Remove dataset(s)" on a dataset selection. The panel resolved
+  // The user chose "Remove" on a dataset selection. The panel resolved
   // the selected dataset nodes to ids; MainWindow confirms (one combined dialog)
   // and performs the removal.
   void removeDatasetsRequested(const QList<DatasetId>& dataset_ids);
   // The user chose "Merge" on a multi-dataset selection (≥2). MainWindow shows the
   // shared destructive-merge confirmation and performs the merge.
   void mergeDatasetsRequested(const QList<DatasetId>& dataset_ids);
+  // The user chose "Reload" on a single file-backed dataset: reload it from its
+  // recorded source (per-dataset variant of the global reload).
+  void reloadDatasetRequested(DatasetId dataset_id);
+  // The user chose "Replace" on a single file-backed dataset: pick a different
+  // file and transactionally replace this dataset's data with it.
+  void replaceDatasetRequested(DatasetId dataset_id);
 
  public slots:
   void onStylesheetChanged(QString theme);
@@ -122,9 +138,10 @@ class CurveListPanel : public QWidget {
   void onShowValuesToggled(bool show);
   void onPreserveTopicNameToggled(bool checked);
   void onTrashClicked();
-  // Right-click on a dataset node → Merge (≥2 selected) + Remove dataset(s) menu,
-  // operating on the selected top-level dataset nodes. Emits intents; MainWindow
-  // confirms + performs.
+  // Right-click on a dataset node → Merge (≥2 selected) / Reload / Replace
+  // (exactly one file-backed dataset) / Remove dataset(s) menu, operating on the
+  // selected top-level dataset nodes. Emits intents; MainWindow confirms +
+  // performs.
   void onTreeContextMenu(const QPoint& pos);
 
  private:
@@ -163,6 +180,7 @@ class CurveListPanel : public QWidget {
   CatalogModel* catalog_ = nullptr;
   TopicDemandTracker* tracker_ = nullptr;
   TopicDemandController* controller_ = nullptr;
+  DatasetSourcePathResolver source_path_resolver_;
   CurveTreeView* tree_view_ = nullptr;
   CurveTreeView* custom_view_ = nullptr;
   // Catalog keys routed to the Custom Series panel (plugin-created transforms).

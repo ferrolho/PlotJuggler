@@ -68,6 +68,14 @@ struct LoadHints {
   // Rewrite only that field to LoadInput::backing_path before loadConfig().
   // Default false preserves desktop preset bytes exactly.
   bool rewrite_preset_filepath = false;
+  // Non-zero -> this load REPLACES the given dataset regardless of source
+  // identity (the dataset "Replace" action: the incoming file is usually a
+  // different path). Rides the transactional reload machinery — the in-place
+  // refill keeps DatasetId/TopicIds (and so curve keys) stable where topic
+  // names match, cancel/failure restores the prior data, and the dataset is
+  // renamed to the new source only on commit. A vanished target degrades to a
+  // plain fresh load.
+  DatasetId replace_dataset_id = 0;
 };
 
 // Drives the file-import path: pick a file, find the matching DataSource
@@ -90,6 +98,12 @@ class FileLoader : public QObject {
   // is persisted in QSettings under "FileLoader/lastDir".
   void openFromDialog(QWidget* dialog_parent);
 
+  // The dataset "Replace" entry point: same plugin-extension filter and lastDir
+  // persistence as openFromDialog, but single-select, and the chosen file loads
+  // with replace_dataset_id set so it transactionally replaces `dataset_id`'s
+  // data (see LoadHints::replace_dataset_id).
+  void replaceFromDialog(DatasetId dataset_id, QWidget* dialog_parent);
+
 #ifdef PJ_TARGET_WASM
   struct BrowserSelectionResult {
     QString browser_name;
@@ -111,13 +125,14 @@ class FileLoader : public QObject {
   [[nodiscard]] QString browserContentSha256(const QString& source_identity) const;
 #endif
 
-  // Resolves the "pick file(s)" interaction inside openFromDialog(). Returns the
-  // selected paths (empty on cancel). The shell injects one that threads
+  // Resolves the "pick file(s)" interaction inside openFromDialog() /
+  // replaceFromDialog(). Returns the selected paths (empty on cancel; at most
+  // one entry when `multi` is false). The shell injects one that threads
   // MainWindow's chrome metrics into PJ::FileDialog, keeping FileLoader free of a
   // MainWindow link (which also makes it testable headlessly). Unset -> plain
-  // PJ::FileDialog::getOpenFileNames, no metrics.
-  using FilePicker =
-      std::function<QStringList(QWidget* parent, const QString& caption, const QString& dir, const QString& filter)>;
+  // PJ::FileDialog::getOpenFileName(s), no metrics.
+  using FilePicker = std::function<QStringList(
+      QWidget* parent, const QString& caption, const QString& dir, const QString& filter, bool multi)>;
   void setFilePicker(FilePicker picker) {
     file_picker_ = std::move(picker);
   }
@@ -181,6 +196,12 @@ class FileLoader : public QObject {
   // call for unknown ids.
   void untrackDataset(DatasetId dataset_id);
 
+  // True when two source strings name the same loaded source: exact match for
+  // opaque browser-upload identities, canonical filesystem-path identity
+  // otherwise. The single comparison rule for matching recorded sources —
+  // callers must use this instead of raw path equality.
+  [[nodiscard]] static bool sameSourceIdentity(const QString& lhs, const QString& rhs);
+
   // Configure the object-ingest policy every load uses: scalars eager, objects
   // lazy-on-pull by default, and the heavy / scalar-less payloads (point clouds,
   // compressed point clouds, video frames, images, depth images, scene entities,
@@ -191,10 +212,12 @@ class FileLoader : public QObject {
   static void applyDefaultIngestPolicies(PJ::sdk::ObjectIngestPolicyResolver& resolver);
 
  signals:
-  /// A same-source fan-out replacement is about to retire a DatasetId. The
-  /// shell captures path-qualified workspace state before the old catalog item
-  /// is hidden, then rebinds it after fileLoaded exposes the reminted datasets.
-  void sourceReplacementAboutToCommit(const QString& path);
+  /// A fan-out replacement is about to retire `dataset_id`. The shell captures
+  /// path-qualified workspace state — stamping the retiring dataset with `path`,
+  /// which on a dataset "Replace" load is a DIFFERENT file than it was loaded
+  /// from — before the old catalog item is hidden, then rebinds it after
+  /// fileLoaded exposes the reminted datasets.
+  void sourceReplacementAboutToCommit(const QString& path, DatasetId dataset_id);
 
   void fileLoaded(
       const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json);
@@ -217,6 +240,14 @@ class FileLoader : public QObject {
   void loadGenerationAdvanced(std::uint64_t generation);
 
  private:
+#ifdef PJ_TARGET_WASM
+  // Shared browser-picker completion for openFromDialog / replaceFromDialog:
+  // stages the selection via selectBrowserInput, reports failures, and enqueues
+  // the staged input through loadFile with `hints` (the entry points differ
+  // only in the hints they pass). Must be called from a user-activation turn.
+  void loadFromBrowserPicker(QWidget* dialog_parent, LoadHints hints);
+#endif
+
   // One queued load request (a single loadFile call).
   struct LoadRequest {
     LoadInput input;

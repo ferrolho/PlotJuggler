@@ -83,6 +83,7 @@
     <file alias="color_background.svg">svg/color_background.svg</file>
     <file alias="colored_charts.svg">svg/colored_charts.svg</file>
     <file alias="combine_columns.svg">svg/combine_columns.svg</file>
+    <file alias="compare_arrows.svg">svg/compare_arrows.svg</file>
     <file alias="contract.svg">svg/contract.svg</file>
     <file alias="copy.svg">svg/copy.svg</file>
     <file alias="copy_all.svg">svg/copy_all.svg</file>
@@ -192,6 +193,7 @@
     <file alias="reload_light.svg">svg/reload_light.svg</file>
     <file alias="remove_list.svg">svg/remove_list.svg</file>
     <file alias="remove_red.svg">svg/remove_red.svg</file>
+    <file alias="replay.svg">svg/replay.svg</file>
     <file alias="restart_alt.svg">svg/restart_alt.svg</file>
     <file alias="restore_page.svg">svg/restore_page.svg</file>
     <file alias="right-arrow.svg">svg/right-arrow.svg</file>

@@ -118,6 +118,10 @@ LeftPanel::LeftPanel(QWidget* parent) : QWidget(parent), ui_(new Ui::LeftPanel) 
 
   connect(ui_->buttonLoadDatafile, &QPushButton::clicked, this, &LeftPanel::loadDataRequested);
   connect(ui_->buttonReloadData, &QPushButton::clicked, this, &LeftPanel::reloadDataRequested);
+  // Reload moved to the dataset context menu ("Reload"), which covers
+  // per-dataset reload in multi-file sessions; the global button is hidden
+  // rather than removed while that arrangement is trialed.
+  ui_->buttonReloadData->setVisible(false);
 
   // No data loaded yet -> nothing to reload, no recent entries.
   ui_->buttonReloadData->setEnabled(false);

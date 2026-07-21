@@ -289,13 +289,6 @@ std::shared_ptr<void> combineKeepalive(std::shared_ptr<void> plugin_library, Sto
       LoadKeepalive{.plugin_library = std::move(plugin_library), .storage = std::move(storage)});
 }
 
-bool sameSourceIdentity(const QString& lhs, const QString& rhs) {
-  if (isBrowserUploadIdentity(lhs) || isBrowserUploadIdentity(rhs)) {
-    return lhs == rhs;
-  }
-  return layout_xml::isSamePath(lhs, rhs);
-}
-
 QString normalizeExtension(const QString& path) {
   const QString suffix = QFileInfo(path).suffix();
   return suffix.isEmpty() ? QString() : u"."_s + suffix.toLower();
@@ -759,6 +752,10 @@ struct FileLoader::LoadContext {
   std::string config;
   DatasetId dataset_id = 0;
   bool replacing = false;
+  // REPLACING loads only: display name applied at commit (plugin-supplied name,
+  // else the incoming file's basename). Deferred so a rollback keeps the prior
+  // dataset's name — a replace may point the dataset at a different file.
+  QString commit_display_name;
   // Engaged only on a REPLACING reload: the RAII transaction that detached the
   // prior data up front. Committed on success/keep (onWorkerFinished); otherwise
   // its destructor — fired by ctx_.reset()/destruction — rolls the dataset back.
@@ -825,26 +822,16 @@ FileLoader::~FileLoader() {
   joinForShutdown();
 }
 
+bool FileLoader::sameSourceIdentity(const QString& lhs, const QString& rhs) {
+  if (isBrowserUploadIdentity(lhs) || isBrowserUploadIdentity(rhs)) {
+    return lhs == rhs;
+  }
+  return layout_xml::isSamePath(lhs, rhs);
+}
+
 void FileLoader::openFromDialog(QWidget* dialog_parent) {
 #ifdef PJ_TARGET_WASM
-  // Qt's getOpenFileContent is the browser-native, non-blocking API.
-  // It must be invoked directly from this user-activation turn; no nested
-  // QEventLoop/exec() is involved.
-  QPointer<FileLoader> self(this);
-  QPointer<QWidget> guarded_parent(dialog_parent);
-  selectBrowserInput(dialog_parent, [self, guarded_parent](BrowserSelectionResult staged) mutable {
-    if (self.isNull() || (!staged.input.has_value() && staged.error.isEmpty())) {
-      return;  // loader destroyed, or picker cancelled.
-    }
-    if (!staged.input.has_value()) {
-      const QString reason = staged.error.isEmpty() ? self->tr("Could not stage the selected file.") : staged.error;
-      qCWarning(lcFileLoader).noquote() << reason;
-      self->reportLoadWarning(guarded_parent.data(), reason);
-      emit self->fileLoadFailed(staged.browser_name, reason);
-      return;
-    }
-    self->loadFile(std::move(*staged.input), guarded_parent);
-  });
+  loadFromBrowserPicker(dialog_parent, {});
   return;
 #else
   const QString filter = extensions_.buildFileFilter();
@@ -859,7 +846,7 @@ void FileLoader::openFromDialog(QWidget* dialog_parent) {
   // metrics into the dialog (toolbar icon size, kept in step via
   // chromeMetricsChanged) — see setFilePicker().
   const QStringList paths = file_picker_ != nullptr
-                                ? file_picker_(dialog_parent, tr("Load Data"), last_dir, filter)
+                                ? file_picker_(dialog_parent, tr("Load Data"), last_dir, filter, /*multi=*/true)
                                 : FileDialog::getOpenFileNames(dialog_parent, tr("Load Data"), last_dir, filter);
   if (paths.isEmpty()) {
     return;
@@ -875,7 +862,54 @@ void FileLoader::openFromDialog(QWidget* dialog_parent) {
 #endif
 }
 
+void FileLoader::replaceFromDialog(DatasetId dataset_id, QWidget* dialog_parent) {
+  LoadHints hints;
+  hints.replace_dataset_id = dataset_id;
 #ifdef PJ_TARGET_WASM
+  loadFromBrowserPicker(dialog_parent, hints);
+#else
+  const QString filter = extensions_.buildFileFilter();
+  QSettings settings;
+  const QString last_dir = settings.value(kLastDirKey, QString()).toString();
+  // Single-select: the pick replaces exactly one dataset.
+  QString path;
+  if (file_picker_ != nullptr) {
+    const QStringList picked = file_picker_(dialog_parent, tr("Replace Data"), last_dir, filter, /*multi=*/false);
+    path = picked.isEmpty() ? QString() : picked.first();
+  } else {
+    path = FileDialog::getOpenFileName(dialog_parent, tr("Replace Data"), last_dir, filter);
+  }
+  if (path.isEmpty()) {
+    return;
+  }
+  settings.setValue(kLastDirKey, QFileInfo(path).absolutePath());
+  loadFile(path, dialog_parent, hints);
+#endif
+}
+
+#ifdef PJ_TARGET_WASM
+void FileLoader::loadFromBrowserPicker(QWidget* dialog_parent, LoadHints hints) {
+  // Qt's getOpenFileContent is the browser-native, non-blocking API.
+  // It must be invoked directly from this user-activation turn; no nested
+  // QEventLoop/exec() is involved.
+  QPointer<FileLoader> self(this);
+  QPointer<QWidget> guarded_parent(dialog_parent);
+  selectBrowserInput(
+      dialog_parent, [self, guarded_parent, hints = std::move(hints)](BrowserSelectionResult staged) mutable {
+        if (self.isNull() || (!staged.input.has_value() && staged.error.isEmpty())) {
+          return;  // loader destroyed, or picker cancelled.
+        }
+        if (!staged.input.has_value()) {
+          const QString reason = staged.error.isEmpty() ? self->tr("Could not stage the selected file.") : staged.error;
+          qCWarning(lcFileLoader).noquote() << reason;
+          self->reportLoadWarning(guarded_parent.data(), reason);
+          emit self->fileLoadFailed(staged.browser_name, reason);
+          return;
+        }
+        self->loadFile(std::move(*staged.input), guarded_parent, hints);
+      });
+}
+
 void FileLoader::selectBrowserInput(QWidget* dialog_parent, BrowserSelectionCallback callback) {
   const QString filter = extensions_.buildFileFilter();
   qCInfo(lcFileLoader).noquote() << "Opening browser file picker with filter:" << filter;
@@ -1011,49 +1045,72 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
 
   // Same-source handling: layout replay reuses the existing DatasetId; an interactive load/reload replaces the
   // dataset's data in place, keeping its DatasetId/TopicIds (and so all curve keys) stable. The engine names
-  // datasets by basename, so the basename match is only a pre-filter — reuse is gated on full-path identity
-  // below, so two different files that share a basename (e.g. log.mcap in separate run dirs) stay distinct
-  // datasets instead of the second silently aliasing the first.
+  // datasets by basename, so the basename match is only a pre-filter — reuse is gated on full-path identity,
+  // so two different files that share a basename (e.g. log.mcap in separate run dirs) stay distinct datasets
+  // instead of the second silently aliasing the first.
   DatasetId existing_primary_id = 0;
-  for (const auto existing_id : engine.listDatasets()) {
-    const DatasetInfo* info = engine.getDataset(existing_id);
-    if (info == nullptr || info->source_name != display_name_utf8) {
-      continue;
-    }
-    // Basename matches; require the same file on disk too. A dataset with no
-    // recorded path (created outside FileLoader, e.g. streaming/test data)
-    // keeps the legacy basename-only behavior.
-    if (const QString tracked_path = session_.datasetSourcePath(existing_id);
-        !tracked_path.isEmpty() && !sameSourceIdentity(tracked_path, source_identity)) {
-      continue;
-    }
-    if (hints.prefer_reuse) {
-      // Reuse the id referenced by the layout; keep the recorded config
-      // when legacy XML has no preset. Match the recorded source by path
-      // (not just the most-recent one) so a multi-file session recovers the
-      // right file's config when reloading any of its sources.
-      QString emit_config = hints.preset_config_json;
-      if (emit_config.isEmpty()) {
-        // loadedSources() paths are stored normalized; compare canonically so a
-        // symlink/relative alias of a tracked file still recovers its config.
-        const auto& prior = session_.loadedSources();
-        const auto it = std::find_if(prior.begin(), prior.end(), [&source_identity](const auto& src) {
-          return sameSourceIdentity(src.path, source_identity);
-        });
-        if (it != prior.end()) {
-          emit_config = it->plugin_config_json;
-        }
+  // The dataset "Replace" action targets a dataset chosen by the user, not by
+  // source identity — honor it directly. A target that vanished while the
+  // picker/config dialog was open degrades to a plain fresh load.
+  if (hints.replace_dataset_id != 0 && engine.getDataset(hints.replace_dataset_id) != nullptr) {
+    existing_primary_id = hints.replace_dataset_id;
+  } else {
+    // One pass over the datasets, ranking two match kinds (sameSourceIdentity
+    // canonicalizes paths — filesystem syscalls — so compute it once per dataset):
+    // 1. Path identity, honored only when the incoming path backs exactly ONE
+    //    dataset. This finds a replaced dataset — its engine source_name keeps
+    //    the ORIGINAL basename (there is no engine-level rename), so only its
+    //    tracked path identifies it. Fan-out children are one-of-several from
+    //    the same file, so a fresh load / layout replay of that file must not
+    //    silently refill one of them.
+    // 2. Engine basename, gated on path identity when a path is tracked; a
+    //    dataset with no tracked path (created outside FileLoader, e.g.
+    //    streaming/test data) keeps the legacy basename-only match.
+    DatasetId sole_path_match = 0;
+    bool path_match_ambiguous = false;
+    DatasetId basename_match = 0;
+    for (const auto existing_id : engine.listDatasets()) {
+      const DatasetInfo* info = engine.getDataset(existing_id);
+      if (info == nullptr) {
+        continue;
       }
-      catalog_.restoreDataset(existing_id);
-      session_.setDatasetSourcePath(existing_id, source_identity);
-      emit fileLoaded(source_identity, QString(), source_name, emit_config);
-      co_return;  // layout-replay reuse: done synchronously, no worker
+      const QString tracked_path = session_.datasetSourcePath(existing_id);
+      const bool path_matches = !tracked_path.isEmpty() && sameSourceIdentity(tracked_path, source_identity);
+      if (path_matches) {
+        path_match_ambiguous = sole_path_match != 0;
+        sole_path_match = existing_id;
+      }
+      if (basename_match == 0 && info->source_name == display_name_utf8 && (tracked_path.isEmpty() || path_matches)) {
+        basename_match = existing_id;
+      }
     }
-    // Tombstone is deferred to the post-ingest swap (single-instance) or the fanout fallback below: don't disturb
-    // the live dataset until the staged ingest has succeeded.
-    existing_primary_id = existing_id;
-    break;
+    existing_primary_id = (sole_path_match != 0 && !path_match_ambiguous) ? sole_path_match : basename_match;
   }
+
+  if (existing_primary_id != 0 && hints.prefer_reuse) {
+    // Reuse the id referenced by the layout; keep the recorded config
+    // when legacy XML has no preset. Match the recorded source by path
+    // (not just the most-recent one) so a multi-file session recovers the
+    // right file's config when reloading any of its sources.
+    QString emit_config = hints.preset_config_json;
+    if (emit_config.isEmpty()) {
+      // loadedSources() paths are stored normalized; compare canonically so a
+      // symlink/relative alias of a tracked file still recovers its config.
+      const auto& prior = session_.loadedSources();
+      const auto it = std::find_if(prior.begin(), prior.end(), [&source_identity](const auto& src) {
+        return sameSourceIdentity(src.path, source_identity);
+      });
+      if (it != prior.end()) {
+        emit_config = it->plugin_config_json;
+      }
+    }
+    catalog_.restoreDataset(existing_primary_id);
+    session_.setDatasetSourcePath(existing_primary_id, source_identity);
+    emit fileLoaded(source_identity, QString(), source_name, emit_config);
+    co_return;  // layout-replay reuse: done synchronously, no worker
+  }
+  // Tombstone of a matched dataset is deferred to the post-ingest swap (single-instance) or the fanout fallback
+  // below: don't disturb the live dataset until the staged ingest has succeeded.
 
   // Ingest target — always the LIVE engine/store (no staging engine). A first
   // load creates a fresh dataset. A same-source single-instance reload binds to
@@ -1279,7 +1336,11 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // cancelCurrent (the title-bar IngestProgressWidget), wired by MainWindow. ---
     // issue #98: apply the plugin's dataset name before start() so the
     // commit-driven catalog rebuild surfaces curves under the right tree-root.
-    if (const QString plugin_name = detail::parseDisplayName(config); !plugin_name.isEmpty()) {
+    // On a REPLACING load the rename waits for commit (finishLoadOnGui): the
+    // tree keeps the prior name while the refill runs, and a rollback must not
+    // leave the restored data mislabeled with the new source's name.
+    const QString plugin_name = detail::parseDisplayName(config);
+    if (!replacing && !plugin_name.isEmpty()) {
       catalog_.setDatasetDisplayName(dataset_id, plugin_name);
     }
 
@@ -1293,6 +1354,9 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     ctx_->config = config;
     ctx_->dataset_id = dataset_id;
     ctx_->replacing = replacing;
+    if (replacing) {
+      ctx_->commit_display_name = !plugin_name.isEmpty() ? plugin_name : display_name;
+    }
     ctx_->file_index = request.file_index;
     ctx_->file_total = request.file_total;
 
@@ -1370,7 +1434,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // the fanout create fresh datasets on the live engine. The handle bound to existing_primary_id above is never
     // start()ed here (fanout mints its own per-entry handles), so the dataset takes no data before its removal.
     if (replacing) {
-      emit sourceReplacementAboutToCommit(source_identity);
+      emit sourceReplacementAboutToCommit(source_identity, existing_primary_id);
     }
     if (replacing && catalog_.removeDataset(existing_primary_id)) {
       tombstoned_for_replace.push_back(existing_primary_id);
@@ -1924,6 +1988,11 @@ void FileLoader::refreshAfterReplacingRollback(DatasetId dataset_id) {
 void FileLoader::finishLoadOnGui() {
   const DatasetId dataset_id = ctx_->dataset_id;
 
+  // A replacing load may have pointed the dataset at a different file; surface
+  // the new name in the same catalog rebuild that surfaces the new data.
+  if (ctx_->replacing && !ctx_->commit_display_name.isEmpty()) {
+    catalog_.setDatasetDisplayName(dataset_id, ctx_->commit_display_name);
+  }
   catalog_.rebuildFromDatastore();
 
   // Per pj_scene3D REQUIREMENTS §9: TF buffer is per-dataset, populated at load

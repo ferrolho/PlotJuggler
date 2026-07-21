@@ -238,6 +238,16 @@ class MainWindow : public QMainWindow {
   // Reloads the remembered data source with its recorded plugin config.
   void onReloadDataRequested();
 
+  // Reloads ONE dataset from its tracked source path (curve tree "Reload") —
+  // the per-dataset variant of onReloadDataRequested for sessions with several
+  // files loaded. Recovers the plugin + config recorded for that path, not
+  // just the most recent load.
+  void onReloadDatasetRequested(DatasetId dataset_id);
+
+  // Curve tree "Replace": pick a different file and transactionally replace
+  // the dataset's data with it (FileLoader::replaceFromDialog).
+  void onReplaceDatasetRequested(DatasetId dataset_id);
+
   // Updates playback bounds after a data file has populated datastore and
   // object-store topics.
   void onFileLoaded(
@@ -253,7 +263,7 @@ class MainWindow : public QMainWindow {
   // when nothing depends on the removed series.
   bool confirmAndRemoveDependentTransforms(const std::vector<TopicId>& removed_topics);
 
-  // Removes the selected datasets (curve tree "Remove dataset(s)"): shows one
+  // Removes the selected datasets (curve tree "Remove"): shows one
   // combined confirmation, then erases each. Widget sync is signal-driven.
   void onRemoveDatasetsRequested(const QList<DatasetId>& dataset_ids);
 
@@ -396,6 +406,11 @@ class MainWindow : public QMainWindow {
   void onRedo();
 
  private:
+  // Reloads a recorded source through its plugin + config (dialog skipped when
+  // both are known). Shared by the global Reload button and the per-dataset
+  // context-menu reload.
+  void reloadSource(const QString& path, const QString& plugin_id, const QString& plugin_config_json);
+
   // Sets legend position (or hides if `position` already matches the
   // current state — clicking the active corner toggles the legend off).
   // Updates QSettings, refreshes button checked states, and re-applies
@@ -626,7 +641,12 @@ class MainWindow : public QMainWindow {
   /// source replacement. Timeline validation resolves every id and overflow
   /// guard before the first offset is written.
   [[nodiscard]] CapturedWorkspace captureWorkspace() const;
-  [[nodiscard]] CapturedWorkspace capturePortableWorkspace() const;
+  // `stamp_override_id`, when non-zero, stamps that dataset with
+  // `stamp_override_path` instead of its tracked path — used while a
+  // replacement load retires it in favor of datasets loaded from the NEW path,
+  // so the post-load rebind can map its charts onto them.
+  [[nodiscard]] CapturedWorkspace capturePortableWorkspace(
+      DatasetId stamp_override_id = 0, const QString& stamp_override_path = {}) const;
   [[nodiscard]] TimelineState captureTimelineState() const;
   [[nodiscard]] TimelineChromeState captureTimelineChrome() const;
   void applyTimelineChrome(const TimelineChromeState& state);
