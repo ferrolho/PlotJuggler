@@ -5,6 +5,8 @@
 #include <pj_runtime/AppSession.h>
 #include <pj_runtime/CatalogModel.h>
 #include <pj_widgets/DateRangePicker.h>
+#include <pj_widgets/HeaderDividerHighlight.h>
+#include <pj_widgets/HeaderResizePolicy.h>
 #include <pj_widgets/RangeSlider.h>
 #include <pj_widgets/SvgUtil.h>
 #include <pj_widgets/ToggleSwitch.h>
@@ -162,6 +164,15 @@ bool isNanValue(const NumericValue& v) {
   }
   return false;
 }
+
+// The column that absorbs leftover width — by convention column 0 carries the
+// topic/channel/curve name and is the one worth making wide.
+constexpr int kNameColumn = 0;
+// Starting width for the short data columns (type, encoding, count, ...). Wide
+// enough for a typical value, and draggable from there.
+constexpr int kDataColumnWidth = 96;
+// A radio-button column only ever holds the indicator, so it is pinned narrow.
+constexpr int kRadioColumnWidth = 36;
 
 // Order two values of the SAME comparison class (both integral or both floating);
 // columnValuesComparable() is what guarantees a column never mixes the two.
@@ -598,18 +609,25 @@ static void applyTableRadioColumn(
     radio->setChecked(r == checked_row);
   }
 
-  // Keep the radio column just wide enough for the button, and stretch the first
-  // non-radio column instead. installTreeLikeHeader stretches column 0 by default,
-  // which would over-widen the radio when it is the first column.
+  // Keep the radio column just wide enough for the button, and let the first
+  // non-radio column be the one that absorbs leftover width — installTreeLikeHeader
+  // nominates column 0, which would over-widen the radio when it comes first.
+  //
+  // The radio column stays Interactive rather than Fixed: a Fixed section refuses
+  // to be dragged, which used to leave these tables with no resizable divider at
+  // all. Its width is simply seeded narrow, and the shared policy keeps the row
+  // spanning the viewport.
   auto* header = tw->horizontalHeader();
-  header->setSectionResizeMode(col, QHeaderView::Fixed);
-  tw->setColumnWidth(col, 36);
+  int fill_column = kNameColumn;
   for (int c = 0; c < tw->columnCount(); ++c) {
     if (c != col) {
-      header->setSectionResizeMode(c, QHeaderView::Stretch);
+      fill_column = c;
       break;
     }
   }
+  auto* policy = PJ::HeaderResizePolicy::install(header, fill_column, 20);
+  policy->setFillSection(fill_column);
+  policy->setSectionWidth(col, kRadioColumnWidth);
 }
 
 // Key text identifying a table row for text-keyed selection (selected_items
@@ -727,22 +745,25 @@ static bool tableMatchesHeaders(const QTableWidget* tw, const QStringList& heade
   return true;
 }
 
-// Size a topic/curve table the way it reads best: the first column stretches to
-// fill the viewport (no dead grey space to the right) while every other column is
-// a fixed, user-draggable width. WA_Hover lets the QSS `QHeaderView::section:hover`
-// divider tint fire; header weight is left to the app stylesheet (the global
-// `QHeaderView::section { font-weight: normal }` rule), which reads consistently
-// with CurveTreeView — a widget-side setFont would be ignored while a stylesheet
-// is active anyway.
+// Size a topic/curve table the way it reads best: the first (name) column is the
+// widest and soaks up the leftover width, while the data columns start at a
+// readable default and can be dragged. Header weight is left to the app
+// stylesheet (the global `QHeaderView::section { font-weight: normal }` rule),
+// which reads consistently with CurveTreeView — a widget-side setFont would be
+// ignored while a stylesheet is active anyway.
 //
-// The resize modes are persistent (set once and kept), so this is guarded by a
-// dynamic property and a column-count check: it's safe to call on every
+// Sizing is handled by the shared HeaderResizePolicy so these tables drag exactly
+// like CurveTreeView: every divider is live and follows the cursor, and the next
+// column gives or takes the width. The name column is the policy's fill section,
+// which is what keeps dead grey space off the right edge.
+//
+// The initial data-column widths are applied once and kept, so this is guarded by
+// a dynamic property and a column-count check: it's safe to call on every
 // widget_data delivery — it configures the first time the table actually has
 // columns and no-ops after. This is deliberately NOT gated on the header *labels*
 // changing: dialogs whose .ui predefines column headers (e.g. MCAP's tableWidget)
 // match the plugin's setTableHeaders() verbatim, so a label-change gate would skip
-// them entirely and leave the .ui's default un-stretched sizing — the very bug
-// this fixes.
+// them entirely and leave the .ui's default sizing.
 static void installTreeLikeHeader(QTableWidget* tw) {
   auto* header = tw->horizontalHeader();
   if (header->count() == 0 || tw->property("pjTreeLikeHeader").toBool()) {
@@ -750,21 +771,10 @@ static void installTreeLikeHeader(QTableWidget* tw) {
   }
   tw->setProperty("pjTreeLikeHeader", true);
 
-  header->setStretchLastSection(false);
-  header->setMinimumSectionSize(20);
-  header->setAttribute(Qt::WA_Hover, true);
-  header->viewport()->setAttribute(Qt::WA_Hover, true);
-
-  // The first (name) column stretches to fill the viewport: long names aren't
-  // clipped and no dead space trails the last column, with no dependence on the
-  // viewport already being laid out. The data columns are Interactive so their
-  // dividers DRAG to resize (Stretch / ResizeToContents are auto-sized and can't be
-  // dragged — the reason the separators looked dead); resizing a data column gives
-  // and takes from the stretched name column.
-  header->setSectionResizeMode(0, QHeaderView::Stretch);
-  for (int i = 1; i < header->count(); ++i) {
-    header->setSectionResizeMode(i, QHeaderView::Interactive);
-    header->resizeSection(i, 96);
+  auto* policy = PJ::HeaderResizePolicy::install(header, kNameColumn, 20);
+  PJ::HeaderDividerHighlight::install(header);
+  for (int i = kNameColumn + 1; i < header->count(); ++i) {
+    policy->setSectionWidth(i, kDataColumnWidth);
   }
 }
 

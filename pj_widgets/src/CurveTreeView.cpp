@@ -25,6 +25,8 @@
 #include <utility>
 
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/HeaderDividerHighlight.h"
+#include "pj_widgets/HeaderResizePolicy.h"
 #include "pj_widgets/SvgUtil.h"
 using namespace Qt::StringLiterals;
 
@@ -33,6 +35,8 @@ namespace PJ {
 namespace {
 constexpr int kNameColumn = 0;
 constexpr int kValueColumn = 1;
+// Narrow by default — the numeric column shouldn't dominate the panel.
+constexpr int kValueColumnWidth = 60;
 constexpr int kSearchRole = Qt::UserRole + 1;
 constexpr int kObjectTopicRole = Qt::UserRole + 2;
 constexpr int kCatalogItemRole = Qt::UserRole + 3;
@@ -247,42 +251,17 @@ CurveTreeView::CurveTreeView(QWidget* parent) : QTreeWidget(parent) {
   // Elide the prefix instead: "…state_estimator/contact_lf". Propagates into the
   // delegate, which elides icon rows via opt.textElideMode.
   setTextElideMode(Qt::ElideLeft);
-  // Splitter-style divider: both sections Interactive (Stretch sections
-  // refuse to yield space, so the divider next to a Stretch section is
-  // not draggable). When the user drags the divider Qt resizes Name
-  // (left of divider); we mirror the change into Value so the two
-  // sections together always fill the viewport. Default Value width is
-  // narrow — the numeric column shouldn't dominate the panel.
-  header()->setSectionResizeMode(kNameColumn, QHeaderView::Interactive);
-  header()->setSectionResizeMode(kValueColumn, QHeaderView::Interactive);
-  header()->setStretchLastSection(false);
-  header()->setMinimumSectionSize(20);
-  header()->resizeSection(kValueColumn, 60);
+  // Splitter-style divider: dragging it resizes Name and gives/takes the same
+  // amount from Value, so the two sections always fill the viewport. Name is
+  // the fill section, so it absorbs the slack when the panel is resized or
+  // Value is hidden. Default Value width is narrow — the numeric column
+  // shouldn't dominate the panel.
+  header_policy_ = HeaderResizePolicy::install(header(), kNameColumn, 20);
+  header_policy_->setSectionWidth(kValueColumn, kValueColumnWidth);
   header()->setSectionsClickable(false);
-  // Ensure the header sees Enter/Leave/HoverMove events — the QSS
-  // `QHeaderView::section:hover` rule that tints the column divider
-  // purple only fires when the header has the Hover attribute set.
-  header()->setAttribute(Qt::WA_Hover, true);
-  header()->viewport()->setAttribute(Qt::WA_Hover, true);
-  // Splitter behavior: dragging the divider resizes Name; we translate
-  // that into a Value resize (delta in opposite direction) so the
-  // divider acts like a QSplitter handle and Name + Value always equal
-  // the viewport width. The reentry guard stops the programmatic Value
-  // resize from cascading back through this same handler.
-  connect(header(), &QHeaderView::sectionResized, this, [this](int section, int old_size, int new_size) {
-    if (adjusting_columns_ || section != kNameColumn) {
-      return;
-    }
-    const int delta = new_size - old_size;
-    const int target_value =
-        std::clamp(columnWidth(kValueColumn) - delta, header()->minimumSectionSize(), viewport()->width());
-    adjusting_columns_ = true;
-    header()->resizeSection(kValueColumn, target_value);
-    // If Value clamped (hit min or max), the delta consumed by Value
-    // is less than the user's drag; rebase Name so total = viewport.
-    syncNameColumnWidth();
-    adjusting_columns_ = false;
-  });
+  // Tints the Name|Value boundary while it is grabbable, the way a QSplitter
+  // handle reacts.
+  HeaderDividerHighlight::install(header());
   setEditTriggers(QAbstractItemView::NoEditTriggers);
   setSelectionMode(QAbstractItemView::ExtendedSelection);
   setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -984,7 +963,9 @@ std::vector<QString> CurveTreeView::selectedCatalogKeysRecursive() const {
 
 void CurveTreeView::setValuesColumnHidden(bool hidden) {
   setColumnHidden(kValueColumn, hidden);
-  syncNameColumnWidth();
+  // Hiding a section frees its width; Name reclaims it (and gives it back when
+  // Value returns) so the two always span the viewport exactly.
+  header_policy_->rebalance();
   if (!hidden) {
     scheduleValueRefresh();  // re-show stale cells when the column reappears
   }
@@ -1056,30 +1037,7 @@ void CurveTreeView::scheduleValueRefresh() {
 
 void CurveTreeView::resizeEvent(QResizeEvent* event) {
   QTreeWidget::resizeEvent(event);
-  syncNameColumnWidth();
   scheduleValueRefresh();  // a taller viewport exposes more rows to fill
-}
-
-void CurveTreeView::syncNameColumnWidth() {
-  // Name fills whatever's left after the Value column. The viewport
-  // width excludes the vertical scrollbar, so Name + Value always sum
-  // to exactly the visible row width — no dead space, no horizontal
-  // scroll triggered by the header.
-  const int viewport_width = viewport()->width();
-  const int value_width = isColumnHidden(kValueColumn) ? 0 : columnWidth(kValueColumn);
-  const int min_section = header()->minimumSectionSize();
-  const int name_width = std::max(min_section, viewport_width - value_width);
-  if (columnWidth(kNameColumn) == name_width) {
-    return;
-  }
-  // Suppress the sectionResized hijack: this is a programmatic sync of
-  // Name to the viewport, not a user drag, so it must not be re-routed
-  // back into a Value resize. Without the guard the resize event would
-  // cascade infinitely (sync → resizeSection → lambda → sync → ...).
-  const bool was_adjusting = adjusting_columns_;
-  adjusting_columns_ = true;
-  header()->resizeSection(kNameColumn, name_width);
-  adjusting_columns_ = was_adjusting;
 }
 
 void CurveTreeView::setDragSelectionProvider(DragSelectionProvider provider) {

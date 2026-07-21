@@ -479,3 +479,45 @@ if(DEFINED PJ_WARNING_FLAGS)
     target_compile_options(search_test PRIVATE ${PJ_WARNING_FLAGS})
 endif()
 add_test(NAME SearchTest COMMAND search_test)
+
+add_executable(header_divider_highlight_test
+    header_divider_highlight_test.cpp
+    ${CMAKE_SOURCE_DIR}/resources/resources.qrc
+)
+
+target_link_libraries(header_divider_highlight_test PRIVATE
+    pj_widgets
+    GTest::gtest_main
+)
+
+if(DEFINED PJ_WARNING_FLAGS)
+    target_compile_options(header_divider_highlight_test PRIVATE ${PJ_WARNING_FLAGS})
+endif()
+
+set_target_properties(header_divider_highlight_test PROPERTIES
+    AUTORCC ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+add_test(NAME HeaderDividerHighlightTest COMMAND header_divider_highlight_test)
+
+add_executable(header_resize_policy_test
+    header_resize_policy_test.cpp
+    ${CMAKE_SOURCE_DIR}/resources/resources.qrc
+)
+
+target_link_libraries(header_resize_policy_test PRIVATE
+    pj_widgets
+    GTest::gtest_main
+)
+
+if(DEFINED PJ_WARNING_FLAGS)
+    target_compile_options(header_resize_policy_test PRIVATE ${PJ_WARNING_FLAGS})
+endif()
+
+set_target_properties(header_resize_policy_test PROPERTIES
+    AUTORCC ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+add_test(NAME HeaderResizePolicyTest COMMAND header_resize_policy_test)

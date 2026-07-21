@@ -212,6 +212,8 @@ if(PJ_BUILD_TESTS)
         add_test(NAME ${test} COMMAND ${target})
     endfunction()
 
+    add_pj_app_gui_test(slider_states_test SliderStates tests/slider_states_test.cpp)
+
     # Source-bound layout seam: one replayable file that fans out into several
     # datasets must persist/restore each independent timeline track.
     add_pj_app_gui_test(main_window_source_layout_test MainWindowSourceLayoutTest

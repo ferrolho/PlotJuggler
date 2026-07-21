@@ -296,6 +296,8 @@ on_progress:         #F0F0F0
 // ---- Controls (slider handle + scrollbar hover) ----
 slider_handle_nominal:  #999999
 slider_handle_hovered:  #99CCFF
+slider_handle_pressed:  #4D9FE6
+slider_handle_disabled: #4D4D55
 scroll_handle_hovered:  #148CD2
 
 // ---- Cancel action (msgbox) ----
@@ -1273,6 +1275,66 @@ QSlider::handle:horizontal:hover {
     border: none;
 }
 
+/* Grabbed: the handle deepens while it is being dragged, so the control
+   confirms the grab the same way the playback handle and QSplitter handles do. */
+QSlider::handle:horizontal:pressed {
+    background: ${slider_handle_pressed};
+    border: none;
+}
+
+QSlider::handle:horizontal:disabled {
+    background: ${slider_handle_disabled};
+    border: none;
+}
+
+/* Vertical sliders mirror the horizontal rules above. Without these the whole
+   control renders unstyled — Qt falls back to the native style, which under the
+   app stylesheet paints nothing at all. The filled span is add-page because a
+   vertical QSlider puts its minimum at the bottom. */
+QSlider::groove:vertical {
+    background: ${surface_transparent};
+    border: none;
+    width: 8px;
+    margin: ${space_none}px;
+    border-radius: ${radius_square}px;
+}
+
+QSlider::add-page:vertical {
+    background: ${accent_nominal};
+    border: none;
+    width: 4px;
+    margin: ${space_none}px;
+    border-radius: ${radius_square}px;
+}
+
+QSlider::add-page:vertical:disabled {
+    background: ${surface_disabled};
+}
+
+QSlider::handle:vertical {
+    background: ${slider_handle_nominal};
+    border: none;
+    width: 8px;
+    height: 8px;
+    margin: ${space_none}px -${space_snug}px;
+    border-radius: ${radius_square}px;
+}
+
+QSlider::handle:vertical:hover {
+    background: ${slider_handle_hovered};
+    border: none;
+}
+
+QSlider::handle:vertical:pressed {
+    background: ${slider_handle_pressed};
+    border: none;
+}
+
+QSlider::handle:vertical:disabled {
+    background: ${slider_handle_disabled};
+    border: none;
+}
+
 /* 1-px separator between the playback bar (above) and the timeline
    strip (below). Painted as the strip's top border so the line is
    only visible when the strip itself is visible — folding the strip
@@ -1435,25 +1497,6 @@ QHeaderView::section:only-one {
     border-right: none;
 }
 
-/* Divider hover: paint the section's right border with the interactive outline so the
-   resizable column separator lights up the same way QSplitter handles
-   do when the user hovers it. The full border shorthand is re-specified
-   here (not just `border-right-color`) because Qt's QSS engine drops
-   the inherited bottom + right borders when only the color is changed
-   in a :hover variant. */
-QHeaderView::section:hover {
-    background-color: ${backdrop};
-    color: ${text};
-    padding-left: ${space_snug}px;
-    border: none;
-    border-top: 1px solid ${separation};
-    border-right: 1px solid ${separation};
-}
-QHeaderView::section:last:hover,
-QHeaderView::section:only-one:hover {
-    border-right: none;
-}
-
 QHeaderView::text{
     padding-left: ${space_snug}px;
     padding-right: ${space_snug}px;
@@ -1531,8 +1574,10 @@ QSplitter::handle {
 QSplitter::handle:horizontal { width: 1px; }
 QSplitter::handle:vertical   { height: 1px; }
 
+/* Canonical: an interactable separator lights up under the cursor, the same
+   Highlight family the table-header dividers use, then deepens on grab below. */
 QSplitter::handle:hover {
-  background-color: ${separation};
+  background-color: ${highlight_hovered};
 }
 
 /* Canonical: an interactable separator, while grabbed/pressed, is the Highlight

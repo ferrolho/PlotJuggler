@@ -12,6 +12,8 @@
 
 namespace PJ {
 
+class HeaderResizePolicy;
+
 // Hierarchical tree of curves with two columns (name, value-at-tracker).
 // Drag source emits "curveslist/add_curve" (left drag) or
 // "curveslist/new_XY_axis" (right drag of exactly two curves).
@@ -210,10 +212,6 @@ class CurveTreeView : public QTreeWidget {
   // exists, expands that node and its ancestors and drops the entry. No-op when
   // there are no pending intents.
   void expandPendingGroups();
-  // Recompute the Name column so it fills whatever viewport width is
-  // left over after the Value column. Used by the resize event handler
-  // and the value-column show/hide toggle.
-  void syncNameColumnWidth();
   // Repaint visible value cells now, using the retained provider (no-op if none
   // / column hidden). scheduleValueRefresh() coalesces this onto the next event
   // loop turn — used after expand/collapse/scroll/resize so the freshly-laid-out
@@ -255,10 +253,9 @@ class CurveTreeView : public QTreeWidget {
   // See setEmptyFilterMessage. Empty string disables the overlay.
   QString empty_filter_message_;
   DragSelectionProvider drag_selection_provider_;
-  // Re-entry guard for the header sectionResized handler: programmatic
-  // resizes inside the handler re-fire the signal, which would otherwise
-  // cause an infinite ping-pong between Name and Value.
-  bool adjusting_columns_ = false;
+  // Owned by the header; borrowed here to rebalance after the Value column is
+  // shown or hidden, which the policy cannot observe on its own.
+  HeaderResizePolicy* header_policy_ = nullptr;
   ViewMode view_mode_ = ViewMode::kHierarchical;
   // Retained value-column provider (see refreshVisibleValues). Re-applied on
   // visibility changes so expanding/scrolling fills the newly-revealed rows.

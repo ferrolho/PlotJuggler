@@ -511,16 +511,22 @@ class TimelineRulerItem : public QGraphicsItem {
 /// Vertical marker needle, used for both the playhead and the reference line. No
 /// top handle/arrow: the line starts at the header bottom (just below the frame
 /// numbers — never overlapping the text) and runs down through the rows. Idle it
-/// paints `idle_color_`; while grabbed it darkens to `grabbed_color_` and shows a
-/// current-time pill in the header, on the SAME baseline/font as the ruler numbers
-/// (so the number lines up). A ±6px column stays grabbable for seek-drags.
+/// paints `idle_color_`, under the cursor it lifts to `hovered_color_`, and while
+/// grabbed it darkens to `grabbed_color_` and shows a current-time pill in the
+/// header, on the SAME baseline/font as the ruler numbers (so the number lines
+/// up). A ±6px column stays grabbable for seek-drags.
 class TimelineNeedleItem : public QGraphicsItem {
  public:
   static constexpr double kGrabHalfWidth = 6.0;
   static constexpr double kPillHalfWidth = 52.0;  // paint room for the timestamp pill
 
-  TimelineNeedleItem(const QColor& idle_color, const QColor& grabbed_color, const QColor& grabbed_text_color)
-      : idle_color_(idle_color), grabbed_color_(grabbed_color), grabbed_text_color_(grabbed_text_color) {
+  TimelineNeedleItem(
+      const QColor& idle_color, const QColor& hovered_color, const QColor& grabbed_color,
+      const QColor& grabbed_text_color)
+      : idle_color_(idle_color),
+        hovered_color_(hovered_color),
+        grabbed_color_(grabbed_color),
+        grabbed_text_color_(grabbed_text_color) {
     setFlag(ItemIsSelectable, false);
     setCursor(Qt::SizeHorCursor);
     setAcceptHoverEvents(true);
@@ -528,8 +534,11 @@ class TimelineNeedleItem : public QGraphicsItem {
 
   // Re-resolve on a live theme switch (Timeline::changeEvent) — the colors are
   // captured at construction and would otherwise keep the previous theme's ink.
-  void setColors(const QColor& idle_color, const QColor& grabbed_color, const QColor& grabbed_text_color) {
+  void setColors(
+      const QColor& idle_color, const QColor& hovered_color, const QColor& grabbed_color,
+      const QColor& grabbed_text_color) {
     idle_color_ = idle_color;
+    hovered_color_ = hovered_color;
     grabbed_color_ = grabbed_color;
     grabbed_text_color_ = grabbed_text_color;
     update();
@@ -563,6 +572,19 @@ class TimelineNeedleItem : public QGraphicsItem {
     update();
   }
 
+  /// Hover state: the needle answers the pointer before it is grabbed, so a
+  /// draggable marker is discoverable without pressing first. Ignored while
+  /// grabbed, where the pressed colour must win.
+  void hoverEnterEvent(QGraphicsSceneHoverEvent* /*event*/) override {
+    hovered_ = true;
+    update();
+  }
+
+  void hoverLeaveEvent(QGraphicsSceneHoverEvent* /*event*/) override {
+    hovered_ = false;
+    update();
+  }
+
   /// Current-time text for the pill (formatted by the widget).
   void setLabel(const QString& text) {
     if (text == label_) {
@@ -588,7 +610,7 @@ class TimelineNeedleItem : public QGraphicsItem {
   }
 
   void paint(QPainter* painter, const QStyleOptionGraphicsItem* /*option*/, QWidget* /*widget*/) override {
-    const QColor color = grabbed_ ? grabbed_color_ : idle_color_;
+    const QColor color = grabbed_ ? grabbed_color_ : (hovered_ ? hovered_color_ : idle_color_);
     const double rh = TimelineRulerItem::kRulerHeight;
     // Start at the (sticky) header bottom so the needle reaches up to — never into —
     // the numbers, even when the rows are scrolled and the header floats down. Use a
@@ -621,9 +643,11 @@ class TimelineNeedleItem : public QGraphicsItem {
  private:
   double height_ = 200.0;
   double header_top_ = 0.0;  // scene-y of the sticky header top (see setHeaderTop)
+  bool hovered_ = false;
   bool grabbed_ = false;
   QString label_;
   QColor idle_color_;
+  QColor hovered_color_;
   QColor grabbed_color_;
   QColor grabbed_text_color_;
 };
@@ -1062,6 +1086,7 @@ Timeline::Timeline(QWidget* parent) : QWidget(parent) {
   const auto fw_theme = frameworkTheme();
   playhead_item_ = new TimelineNeedleItem(
       theme::interaction(theme::Variant::Accent, theme::State::Checked, fw_theme),
+      theme::interaction(theme::Variant::Accent, theme::State::CheckedHovered, fw_theme),
       theme::interaction(theme::Variant::Accent, theme::State::CheckedPressed, fw_theme),
       theme::onFill(theme::Variant::Accent, theme::State::CheckedPressed, fw_theme));
   playhead_item_->setZValue(200);
@@ -1069,6 +1094,7 @@ Timeline::Timeline(QWidget* parent) : QWidget(parent) {
 
   reference_item_ = new TimelineNeedleItem(
       theme::interaction(theme::Variant::Highlight, theme::State::Checked, fw_theme),
+      theme::interaction(theme::Variant::Highlight, theme::State::CheckedHovered, fw_theme),
       theme::interaction(theme::Variant::Highlight, theme::State::CheckedPressed, fw_theme),
       theme::onFill(theme::Variant::Highlight, theme::State::CheckedPressed, fw_theme));
   reference_item_->setZValue(190);  // just under the playback needle
@@ -2423,12 +2449,14 @@ void Timeline::changeEvent(QEvent* event) {
     if (playhead_item_ != nullptr) {
       playhead_item_->setColors(
           theme::interaction(theme::Variant::Accent, theme::State::Checked, fw_theme),
+          theme::interaction(theme::Variant::Accent, theme::State::CheckedHovered, fw_theme),
           theme::interaction(theme::Variant::Accent, theme::State::CheckedPressed, fw_theme),
           theme::onFill(theme::Variant::Accent, theme::State::CheckedPressed, fw_theme));
     }
     if (reference_item_ != nullptr) {
       reference_item_->setColors(
           theme::interaction(theme::Variant::Highlight, theme::State::Checked, fw_theme),
+          theme::interaction(theme::Variant::Highlight, theme::State::CheckedHovered, fw_theme),
           theme::interaction(theme::Variant::Highlight, theme::State::CheckedPressed, fw_theme),
           theme::onFill(theme::Variant::Highlight, theme::State::CheckedPressed, fw_theme));
     }
