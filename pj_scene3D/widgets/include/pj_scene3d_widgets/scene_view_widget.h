@@ -303,6 +303,11 @@ class SceneViewWidget : public QOpenGLWidget {
  signals:
   void framesChanged(const QList<FrameRow>& frames);
   void presentationChanged();
+  // Right-click landed on a TF frame gizmo (hover-pick radius). The dock builds
+  // and shows the menu; the view stays menu-free. Empty-space right-clicks are
+  // NOT emitted — contextMenuEvent ignore()s them so the host dock's standard
+  // Split/Clear menu still appears.
+  void frameContextMenuRequested(const QString& frame, const QPoint& global_pos);
 
  protected:
   void initializeGL() override;
@@ -315,6 +320,10 @@ class SceneViewWidget : public QOpenGLWidget {
   // Clears any TF frame hover label when the cursor leaves the view, so a stale
   // name doesn't linger after the mouse moves off the widget.
   void leaveEvent(QEvent* event) override;
+  // Accepts ONLY when a frame gizmo is under the cursor (emits
+  // frameContextMenuRequested); otherwise ignore()s so the event falls through
+  // to the host dock's standard context menu.
+  void contextMenuEvent(QContextMenuEvent* event) override;
   void wheelEvent(QWheelEvent* event) override;
   void changeEvent(QEvent* event) override;
   void keyPressEvent(QKeyEvent* event) override;
@@ -342,6 +351,12 @@ class SceneViewWidget : public QOpenGLWidget {
   // pixels). Updates hovered_frame_ and repaints only when the result changes.
   // A no-op (and clears any hover) when axes are hidden or there is no TF buffer.
   void updateHoverFrame(const QPointF& pos_logical);
+  // The pick core shared by hover and the context menu: projects every
+  // resolvable frame origin through the cached last_view_proj_ and returns the
+  // frame within kHoverRadiusPx of the cursor, if any. Const with mutable
+  // scratch (hover_all_frames_/hover_points_) so both call sites stay
+  // allocation-free.
+  [[nodiscard]] std::optional<std::string> pickFrameAt(const QPointF& pos_logical) const;
   // Draw the hovered TF frame's name in a small HUD box anchored at the frame's
   // CURRENT projected position (re-projected from frame_ctx so it tracks the
   // frame as the scene streams / camera moves). QPainter over the presented FBO,
@@ -484,8 +499,8 @@ class SceneViewWidget : public QOpenGLWidget {
   // emit many move events per second). hover_points_ is INDEX-ALIGNED with
   // hover_all_frames_ — a frame that doesn't project gets an off-screen sentinel
   // — so the winning pick index maps straight back to a frame name.
-  std::vector<std::string> hover_all_frames_;
-  std::vector<glm::vec2> hover_points_;
+  mutable std::vector<std::string> hover_all_frames_;
+  mutable std::vector<glm::vec2> hover_points_;
 
   // Connection to the current GL context's aboutToBeDestroyed signal. Rewired to
   // each new context in initializeGL and disconnected in the destructor so the

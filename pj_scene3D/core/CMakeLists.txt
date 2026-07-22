@@ -23,6 +23,7 @@ add_library(pj_scene3d_core STATIC
   src/shadow_camera.cpp
   src/tf/tf_buffer.cpp
   src/tf/tf_connections.cpp
+  src/trail_sampling.cpp
   src/version.cpp
   src/voxel_grid_view.cpp
   src/voxel_grid_value.cpp
@@ -58,6 +59,7 @@ if(PJ_BUILD_TESTS)
     ../tests/tf_buffer_test.cpp
     ../tests/tf_buffer_hierarchy_test.cpp
     ../tests/tf_connections_test.cpp
+    ../tests/trail_sampling_test.cpp
     ../tests/robot_model_bridges_test.cpp
     ../tests/voxel_grid_view_test.cpp
     ../tests/voxel_grid_value_test.cpp

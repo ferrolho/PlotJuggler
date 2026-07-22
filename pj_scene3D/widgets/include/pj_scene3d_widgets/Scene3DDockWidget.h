@@ -34,6 +34,8 @@ namespace pj::scene3d {
 class SceneViewWidget;
 class TransformService;
 class UrdfPackageResolver;
+struct TrailSource;
+class TrailLayer;
 }  // namespace pj::scene3d
 
 namespace PJ {
@@ -149,6 +151,10 @@ class Scene3DDockWidget : public SceneDockWidget {
   ObjectTopicId addRobotModelLayer(const QString& urdf_path = {});
   // Same local-layer flow, loading the URDF over http(s) instead of from disk.
   ObjectTopicId addRobotModelLayerFromUrl(const QString& url);
+  // Adds a trail layer tracking a TF frame or a pose topic's first pose,
+  // registered under a synthetic local id (a trail is not a wire-object topic —
+  // see TrailLayer). Persisted with role="trail". Returns {0} on failure.
+  ObjectTopicId addTrailLayer(const pj::scene3d::TrailSource& source);
   void setFixedFrame(const QString& frame);
   void setFixedFrameAutoRoot();
   // Set the camera follow target ("" = off). Forwards to the view and emits
@@ -218,6 +224,21 @@ class Scene3DDockWidget : public SceneDockWidget {
 
   [[nodiscard]] ElementRestoreResult restoreLayerElement(
       const QDomElement& layer_el, QString* deferred_topic_name = nullptr);
+  // role="trail" branch of restoreLayerElement: rebuilds a TrailLayer from the
+  // <trail> payload by hosting an unconfigured TrailLayer and delegating the
+  // restore (source resolution included) to TrailLayer::xmlLoadStateResult,
+  // honoring its tri-state result — the RobotModelLayer pattern.
+  [[nodiscard]] ElementRestoreResult restoreTrailElement(const QDomElement& layer_el, QString* deferred_topic_name);
+  // Shared wire/insert/cleanup tail of the two trail creation paths
+  // (interactive addTrailLayer, restore's unconfigured layer).
+  ObjectTopicId addTrailLayerImpl(ObjectTopicId topic_id, std::unique_ptr<pj::scene3d::TrailLayer> layer);
+  // Saved-topic resolution ladder shared by restoreLayerElement and
+  // restoreTrailElement: reads topic_name/dataset_* attributes off `el` and
+  // yields the live topic id (kRestored), a deferral (kDeferred, with the
+  // topic name for the pending queue), or kInvalid.
+  [[nodiscard]] ElementRestoreResult resolveSavedTopicRef(
+      const QDomElement& el, QString* deferred_topic_name, sdk::BuiltinObjectType expected_type,
+      std::optional<ObjectTopicId>& out_topic) const;
   [[nodiscard]] ElementRestoreResult restoreConfigTopicElement(const QDomElement& config_el);
   void applyRestoredLayerOrder();
   // Per-element restore hook the base SceneDockWidget's shared pending-retry loop calls:
@@ -225,6 +246,10 @@ class Scene3DDockWidget : public SceneDockWidget {
   // <layer> -> restoreLayerElement).
   bool restoreOnePending(const QDomElement& element) override;
   void prepareTransformBufferForTopic(ObjectTopicId topic_id);
+  // Fans the current TF binding out to every TrailLayer (which capture the
+  // buffer at attach and would otherwise never see a later bind/unbind — the
+  // restore path binds TF AFTER the layers replay).
+  void pushTransformBufferToTrailLayers();
   // After a tracked topic is dropped, reset the TF binding (tf_buffer_/dataset_id_
   // → null/0, push the empty buffer to the view) when no remaining tracked topic
   // belongs to the bound dataset. This is what lets the dock rebind to a second
@@ -270,8 +295,8 @@ class Scene3DDockWidget : public SceneDockWidget {
   // the per-tick orphan walk is skipped when nothing TF-related moved. Every other
   // call site forces a full recompute.
   void recomputeOrphanStates(bool force = true);
-  [[nodiscard]] bool isLocalRobotLayerId(ObjectTopicId topic_id) const;
-  ObjectTopicId allocateLocalRobotLayerId();
+  [[nodiscard]] bool isLocalLayerId(ObjectTopicId topic_id) const;
+  ObjectTopicId allocateLocalLayerId();
 
   pj::scene3d::TransformService* transform_service_ = nullptr;
   pj::scene3d::SceneViewWidget* view_ = nullptr;
@@ -305,8 +330,8 @@ class Scene3DDockWidget : public SceneDockWidget {
   QSettings* settings_ = nullptr;
   QMap<QString, QByteArray> embedded_assets_;
   QString source_path_;
-  uint32_t next_local_robot_topic_id_ = std::numeric_limits<uint32_t>::max();
-  std::unordered_set<uint32_t> local_robot_layer_ids_;
+  uint32_t next_local_layer_topic_id_ = std::numeric_limits<uint32_t>::max();
+  std::unordered_set<uint32_t> local_layer_ids_;
   std::unordered_map<int64_t, int> restored_layer_orders_;
   bool xml_rollback_in_progress_ = false;
 

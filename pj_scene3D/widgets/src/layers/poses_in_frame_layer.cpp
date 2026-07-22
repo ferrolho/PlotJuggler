@@ -7,6 +7,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLoggingCategory>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <algorithm>
@@ -392,6 +393,12 @@ QWidget* PosesInFrameLayer::createConfigWidget(QWidget* parent) {
     }
     setOverrideColorEnabled(true);  // apply now; the toggled-driven call lags the slide animation
   });
+
+  auto* trail_button = new QToolButton(container);
+  trail_button->setText(tr("Create trail"));
+  trail_button->setToolTip(tr("Trace this topic's first pose across the whole time range"));
+  form->addRow(tr("Trail:"), trail_button);
+  QObject::connect(trail_button, &QToolButton::clicked, this, [this]() { emit trailRequested(); });
 
   return container;
 }

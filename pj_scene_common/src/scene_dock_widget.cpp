@@ -101,9 +101,33 @@ SceneDockWidget::AddOutcome SceneDockWidget::addLayer(
     return AddOutcome::kConsumedAsConfig;
   }
 
-  std::unique_ptr<ISceneLayer> layer = createAndAttachLayer(topic_id, object_type, title);
+  if (!acceptsObjectType(object_type)) {
+    return AddOutcome::kRejected;
+  }
+  std::unique_ptr<ISceneLayer> layer = factory_.create(topic_id, object_type, title);
   if (layer == nullptr) {
     return AddOutcome::kRejected;
+  }
+  return insertLayer(topic_id, std::move(layer)) ? AddOutcome::kLayerAdded : AddOutcome::kRejected;
+}
+
+bool SceneDockWidget::insertLayer(ObjectTopicId topic_id, std::unique_ptr<ISceneLayer> layer) {
+  if (layer == nullptr) {
+    return false;
+  }
+  ensureSceneViewCreated();
+  const int64_t key = topicKey(topic_id);
+  if (layers_.find(key) != layers_.end()) {
+    qCWarning(lcSceneDock) << "insertLayer: topic id" << topic_id.id << "already has a layer";
+    return false;
+  }
+  std::unique_ptr<SceneLayerContext> context = makeContext();
+  SceneLayerContext fallback_context;
+  fallback_context.session = session_;
+  const SceneLayerContext& attach_context = context != nullptr ? *context : fallback_context;
+  if (!layer->attach(attach_context)) {
+    qCWarning(lcSceneDock) << "insertLayer: layer attach failed for topic id" << topic_id.id;
+    return false;
   }
   ever_had_content_ = true;
   wireLayerSignals(layer.get(), topic_id);
@@ -115,26 +139,7 @@ SceneDockWidget::AddOutcome SceneDockWidget::addLayer(
   refreshView();
   emit layerAdded(topic_id);
   notifyWorkspaceChanged();
-  return AddOutcome::kLayerAdded;
-}
-
-std::unique_ptr<ISceneLayer> SceneDockWidget::createAndAttachLayer(
-    ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& title) {
-  if (!acceptsObjectType(object_type)) {
-    return nullptr;
-  }
-  std::unique_ptr<ISceneLayer> layer = factory_.create(topic_id, object_type, title);
-  if (layer == nullptr) {
-    return nullptr;
-  }
-  std::unique_ptr<SceneLayerContext> context = makeContext();
-  SceneLayerContext fallback_context;
-  fallback_context.session = session_;
-  const SceneLayerContext& attach_context = context != nullptr ? *context : fallback_context;
-  if (!layer->attach(attach_context)) {
-    return nullptr;
-  }
-  return layer;
+  return true;
 }
 
 void SceneDockWidget::wireLayerSignals(ISceneLayer* layer, ObjectTopicId topic_id) {

@@ -89,6 +89,19 @@ target_link_libraries(dock_widget_placeholder_test PRIVATE
 
 add_test(NAME DockWidgetPlaceholderTest COMMAND dock_widget_placeholder_test)
 
+add_executable(dock_widget_context_menu_test
+    dock_widget_context_menu_test.cpp
+)
+
+target_compile_options(dock_widget_context_menu_test PRIVATE ${PJ_WARNING_FLAGS})
+target_link_libraries(dock_widget_context_menu_test PRIVATE
+    pj_plotting
+    pj_widgets
+    GTest::gtest
+)
+
+add_test(NAME DockWidgetContextMenuTest COMMAND dock_widget_context_menu_test)
+
 add_executable(dock_fullscreen_test
     dock_fullscreen_test.cpp
 )

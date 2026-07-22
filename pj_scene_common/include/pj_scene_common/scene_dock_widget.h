@@ -257,6 +257,16 @@ class SceneDockWidget : public QWidget, public IDataWidget, public IObjectViewer
   /// NOT re-implement the never-populated short-circuit.
   virtual bool pruneEvictedObjects();
 
+  /// Inserts an already-constructed layer under `topic_id`, running the same
+  /// attach/wire/register/notify pipeline addLayer() uses after factory
+  /// creation. For family-owned layers that never flow through the
+  /// LayerFactory (e.g. the 3D family's trails; synthetic robot models DO go
+  /// through their registered factory creator). Skips the config-topic consult
+  /// and the cross-dataset clock guard — such a layer has no store descriptor
+  /// to check. Returns false (destroying the layer) when the id is taken or
+  /// attach() fails.
+  bool insertLayer(ObjectTopicId topic_id, std::unique_ptr<ISceneLayer> layer);
+
   /// Whether this dock has ever held content (a render layer or a scene-config
   /// topic), live or restored. Latched true on the first add, never cleared. Lets
   /// revalidateObjects() distinguish an intentionally-empty dock (click-created /
@@ -316,9 +326,6 @@ class SceneDockWidget : public QWidget, public IDataWidget, public IObjectViewer
 
   /// Orchestrates adding a topic as a render layer or scene-config topic.
   AddOutcome addLayer(ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& title);
-  /// Creates and attaches a layer; returns nullptr if unsupported or attach fails.
-  [[nodiscard]] std::unique_ptr<ISceneLayer> createAndAttachLayer(
-      ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& title);
   /// Connects a layer's signals to the dock's reconcile/notify slots.
   void wireLayerSignals(ISceneLayer* layer, ObjectTopicId topic_id);
   /// Records a constructed layer in the draw order and seeds its tracker time.

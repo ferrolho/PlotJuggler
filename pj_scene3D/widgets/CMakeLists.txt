@@ -20,6 +20,7 @@ set(PJ_SCENE3D_WIDGETS_SOURCES
   src/passes/grid_geometry.cpp
   src/passes/grid_render_pass.cpp
   src/passes/tf_connections_render_pass.cpp
+  src/passes/trail_render_pass.cpp
   src/passes/pointcloud_render_pass.cpp
   src/passes/pointcloud_aabb_reducer.cpp
   src/passes/occupancy_grid_render_pass.cpp
@@ -37,6 +38,7 @@ set(PJ_SCENE3D_WIDGETS_SOURCES
   src/layers/pointcloud_layer.cpp
   src/layers/occupancy_grid_layer.cpp
   src/layers/poses_in_frame_layer.cpp
+  src/layers/trail_layer.cpp
   src/layers/scene_entities_layer.cpp
   src/layers/robot_model_layer.cpp
   src/layers/voxel_grid_layer.cpp
@@ -57,6 +59,7 @@ set(PJ_SCENE3D_WIDGETS_SOURCES
   include/pj_scene3d_widgets/layers/pointcloud_layer.h
   include/pj_scene3d_widgets/layers/occupancy_grid_layer.h
   include/pj_scene3d_widgets/layers/poses_in_frame_layer.h
+  include/pj_scene3d_widgets/layers/trail_layer.h
   include/pj_scene3d_widgets/layers/scene_entities_layer.h
   include/pj_scene3d_widgets/layers/robot_model_layer.h
   include/pj_scene3d_widgets/layers/voxel_grid_layer.h
@@ -65,6 +68,7 @@ set(PJ_SCENE3D_WIDGETS_SOURCES
   include/pj_scene3d_widgets/passes/voxel_grid_render_pass.h
   include/pj_scene3d_widgets/passes/marker_render_pass.h
   include/pj_scene3d_widgets/passes/poses_render_pass.h
+  include/pj_scene3d_widgets/passes/trail_render_pass.h
   include/pj_scene3d_widgets/passes/mesh_render_pass.h
   include/pj_scene3d_widgets/passes/ssao_pass.h
   include/pj_scene3d_widgets/passes/edl_pass.h
@@ -465,6 +469,20 @@ if(PJ_BUILD_TESTS)
   target_compile_options(scene_view_widget_mouse_gesture_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
   add_test(NAME scene_view_widget_mouse_gesture_test COMMAND scene_view_widget_mouse_gesture_test)
 
+  # Headless TrailLayer unit tests (renderKey coalescing, XML style-only load,
+  # sync rebuild + live append against a hand-fed TransformBuffer). Custom main.
+  add_executable(trail_layer_test
+    tests/trail_layer_test.cpp
+  )
+  target_link_libraries(trail_layer_test PRIVATE
+    pj_scene3d_widgets
+    pj_scene_common
+    GTest::gtest
+  )
+  target_compile_definitions(trail_layer_test PRIVATE PJ_SCENE3D_TEST_HOOKS)
+  target_compile_options(trail_layer_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
+  add_test(NAME trail_layer_test COMMAND trail_layer_test)
+
   add_executable(scene3d_layer_xml_validation_test
     tests/scene3d_layer_xml_validation_test.cpp
   )
@@ -565,6 +583,18 @@ if(PJ_BUILD_TESTS)
   )
   target_compile_options(tf_connections_gl_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
   add_test(NAME tf_connections_gl_test COMMAND tf_connections_gl_test)
+
+  # Real-GL test for the trail split-draw pass on a raw offscreen context (no
+  # SceneViewWidget needed — the pass is layer-owned). Custom main -> GTest::gtest.
+  add_executable(trail_render_pass_gl_test
+    tests/trail_render_pass_gl_test.cpp
+  )
+  target_link_libraries(trail_render_pass_gl_test PRIVATE
+    pj_scene3d_widgets
+    GTest::gtest
+  )
+  target_compile_options(trail_render_pass_gl_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
+  add_test(NAME trail_render_pass_gl_test COMMAND trail_render_pass_gl_test)
 
   # Real-GL regression test: a mesh casts a floor shadow, the data is deleted
   # (TransformBuffer dropped), and the test asserts the shadow pre-pass binds NO

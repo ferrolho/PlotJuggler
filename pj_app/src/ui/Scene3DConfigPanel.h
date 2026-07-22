@@ -110,6 +110,7 @@ class Scene3DConfigPanel : public QWidget {
   // frame set ("None" + each frame), reselecting the dock's current follow target.
   // Signal-blocked so a programmatic refill doesn't echo back as a user pick.
   void populateFollowCombo();
+  void populateTrailCombo();
   void disconnectFromDock();
   void rebuildLayerList();
   void updateSelectedLayerPane();
@@ -170,6 +171,9 @@ class Scene3DConfigPanel : public QWidget {
   // widget; cleared on rebind (rows belong to the dock they were added to).
   ComboBox* model_source_combo_ = nullptr;
   QToolButton* add_model_button_ = nullptr;
+  // "Trail" row: pick a TF frame + add a motion-trail layer to the bound dock.
+  ComboBox* trail_frame_combo_ = nullptr;
+  QToolButton* add_trail_button_ = nullptr;
   // Container for the per-robot rows; hidden while robot_rows_ is empty so the
   // form row collapses (no phantom vertical gap under the Model/URDF row).
   QWidget* robot_rows_host_ = nullptr;

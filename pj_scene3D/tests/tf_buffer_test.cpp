@@ -460,5 +460,100 @@ TEST(TransformBufferTest, RevisionBumpsOnMutationNotOnReject) {
   EXPECT_GT(buffer.revision(), after_replace);
 }
 
+std::vector<int64_t> rawStamps(const std::vector<TimePoint>& stamps) {
+  std::vector<int64_t> raw;
+  raw.reserve(stamps.size());
+  for (const TimePoint stamp : stamps) {
+    raw.push_back(stamp.time_since_epoch().count());
+  }
+  return raw;
+}
+
+TEST(TransformBufferChainSampleTimes, UnionsEveryEdgeOnThePath) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  // odom -> base moves (stamps 10/20/30); base -> lidar is static (single stamp
+  // 5). The lidar trail in odom must sample at the PARENT edge's stamps too —
+  // the lidar's own edge never changes, all its motion comes from odom->base.
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(10ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(20ns), makeTranslation(2.0)));
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(30ns), makeTranslation(3.0)));
+  (void)buffer.setTransform(makeStamped("base", "lidar", tp(5ns), makeTranslation(0.5)));
+
+  std::vector<TimePoint> stamps;
+  buffer.chainSampleTimes("odom", "lidar", tp(0ns), tp(100ns), stamps);
+  EXPECT_EQ(rawStamps(stamps), (std::vector<int64_t>{5, 10, 20, 30}));
+}
+
+TEST(TransformBufferChainSampleTimes, CrossBranchMeetsAtCommonAncestor) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  // odom and cam live in sibling branches under map; the connecting path is
+  // odom->map->cam, so both edges' stamps contribute.
+  (void)buffer.setTransform(makeStamped("map", "odom", tp(1ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("map", "cam", tp(2ns), makeTranslation(1.0)));
+
+  std::vector<TimePoint> stamps;
+  buffer.chainSampleTimes("cam", "odom", tp(0ns), tp(100ns), stamps);
+  EXPECT_EQ(rawStamps(stamps), (std::vector<int64_t>{1, 2}));
+}
+
+TEST(TransformBufferChainSampleTimes, ClipsToWindowAndDeduplicates) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(10ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(20ns), makeTranslation(2.0)));
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(30ns), makeTranslation(3.0)));
+  (void)buffer.setTransform(makeStamped("base", "lidar", tp(20ns), makeTranslation(0.5)));  // duplicate stamp
+
+  std::vector<TimePoint> stamps;
+  buffer.chainSampleTimes("odom", "lidar", tp(15ns), tp(25ns), stamps);
+  EXPECT_EQ(rawStamps(stamps), (std::vector<int64_t>{20}));
+
+  // Inverted window: cleared output, no stamps.
+  buffer.chainSampleTimes("odom", "lidar", tp(25ns), tp(15ns), stamps);
+  EXPECT_TRUE(stamps.empty());
+}
+
+TEST(TransformBufferChainSampleTimes, DegenerateWindowOnAnExactStampKeepsIt) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(10ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(20ns), makeTranslation(2.0)));
+
+  std::vector<TimePoint> stamps;
+  // lo == hi landing exactly on a sample: the inclusive [lo, hi] window keeps
+  // it (the classic lower_bound/upper_bound off-by-one).
+  buffer.chainSampleTimes("odom", "base", tp(20ns), tp(20ns), stamps);
+  EXPECT_EQ(rawStamps(stamps), (std::vector<int64_t>{20}));
+  // lo == hi between samples: empty, not the neighbour.
+  buffer.chainSampleTimes("odom", "base", tp(15ns), tp(15ns), stamps);
+  EXPECT_TRUE(stamps.empty());
+}
+
+TEST(TransformBufferChainSampleTimes, TargetSideChainContributesStamps) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  // The MOVING edge is on the target's side of the meet point: map->odom moves,
+  // the source (cam) hangs statically off map.
+  (void)buffer.setTransform(makeStamped("map", "odom", tp(10ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("map", "odom", tp(20ns), makeTranslation(2.0)));
+  (void)buffer.setTransform(makeStamped("map", "cam", tp(5ns), makeTranslation(0.5)));
+
+  std::vector<TimePoint> stamps;
+  buffer.chainSampleTimes("odom", "cam", tp(0ns), tp(100ns), stamps);
+  EXPECT_EQ(rawStamps(stamps), (std::vector<int64_t>{5, 10, 20}));
+}
+
+TEST(TransformBufferChainSampleTimes, DisconnectedUnknownOrIdenticalIsEmpty) {
+  TransformBuffer buffer(TransformBuffer::kKeepAll);
+  (void)buffer.setTransform(makeStamped("odom", "base", tp(10ns), makeTranslation(1.0)));
+  (void)buffer.setTransform(makeStamped("island_root", "island", tp(10ns), makeTranslation(1.0)));
+
+  std::vector<TimePoint> stamps{tp(999ns)};  // must be cleared even on failure
+  buffer.chainSampleTimes("odom", "island", tp(0ns), tp(100ns), stamps);
+  EXPECT_TRUE(stamps.empty());
+  buffer.chainSampleTimes("odom", "no_such_frame", tp(0ns), tp(100ns), stamps);
+  EXPECT_TRUE(stamps.empty());
+  // target == source: zero hops -> no motion -> no trail stamps.
+  buffer.chainSampleTimes("base", "base", tp(0ns), tp(100ns), stamps);
+  EXPECT_TRUE(stamps.empty());
+}
+
 }  // namespace
 }  // namespace PJ

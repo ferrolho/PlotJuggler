@@ -10,6 +10,7 @@
 #include <QFontMetrics>
 #include <QIcon>
 #include <QLoggingCategory>
+#include <QMenu>
 #include <QPoint>
 #include <QResizeEvent>
 #include <QScopedValueRollback>
@@ -41,6 +42,7 @@
 #include "pj_scene3d_widgets/layers/poses_in_frame_layer.h"
 #include "pj_scene3d_widgets/layers/robot_model_layer.h"
 #include "pj_scene3d_widgets/layers/scene_entities_layer.h"
+#include "pj_scene3d_widgets/layers/trail_layer.h"
 #include "pj_scene3d_widgets/layers/voxel_grid_layer.h"
 #include "pj_scene3d_widgets/object_topic_metadata.h"
 #include "pj_scene3d_widgets/parse_locked.h"
@@ -375,7 +377,7 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
       sdk::BuiltinObjectType::kRobotDescription,
       [this](ObjectTopicId topic_id, sdk::BuiltinObjectType /*object_type*/, const QString& display_name)
           -> std::unique_ptr<ISceneLayer> {
-        const bool local_layer = isLocalRobotLayerId(topic_id);
+        const bool local_layer = isLocalLayerId(topic_id);
         if (!local_layer) {
           prepareTransformBufferForTopic(topic_id);
         }
@@ -412,6 +414,9 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
         prepareTransformBufferForTopic(topic_id);
         auto layer = std::make_unique<PosesInFrameLayer>(topic_id, display_name, this);
         wireScene3DLayer(layer.get());
+        connect(layer.get(), &PosesInFrameLayer::trailRequested, this, [this, topic_id]() {
+          addTrailLayer(pj::scene3d::TrailSource::poseTopic(topic_id));
+        });
         return layer;
       });
   layerFactory().registerType(
@@ -474,7 +479,7 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
   connect(this, &SceneDockWidget::layerRemoved, this, [this](ObjectTopicId topic_id) {
     orphan_states_.erase(topicKey(topic_id));
     restored_layer_orders_.erase(topicKey(topic_id));
-    local_robot_layer_ids_.erase(topic_id.id);
+    local_layer_ids_.erase(topic_id.id);
     scene_topic_datasets_.erase(topic_id.id);
     // A local robot layer carries no store dataset, so its removal never affects
     // the TF binding; a store-backed layer's removal might be the last topic of
@@ -707,7 +712,7 @@ bool Scene3DDockWidget::addTopicImpl(
   if (object_type == sdk::BuiltinObjectType::kFrameTransforms && config_topics_.contains(topic_id.id)) {
     return true;
   }
-  if (!isLocalRobotLayerId(topic_id) && dataset_id_ != 0) {
+  if (!isLocalLayerId(topic_id) && dataset_id_ != 0) {
     const DatasetId incoming_dataset = sessionManager()->objectStore().descriptor(topic_id).dataset_id;
     if (incoming_dataset != 0 && incoming_dataset != dataset_id_) {
       return false;
@@ -736,14 +741,14 @@ bool Scene3DDockWidget::addTopicImpl(
 }
 
 ObjectTopicId Scene3DDockWidget::addRobotModelLayer(const QString& urdf_path) {
-  const ObjectTopicId topic_id = allocateLocalRobotLayerId();
+  const ObjectTopicId topic_id = allocateLocalLayerId();
   if (topic_id.id == 0) {
     qCWarning(lcScene3DDock) << "addRobotModelLayer: exhausted local topic ids";
     return ObjectTopicId{0};
   }
   const QString title = urdf_path.isEmpty() ? tr("Robot model") : QFileInfo(urdf_path).fileName();
   if (!addTopic(topic_id, sdk::BuiltinObjectType::kRobotDescription, title)) {
-    local_robot_layer_ids_.erase(topic_id.id);
+    local_layer_ids_.erase(topic_id.id);
     return ObjectTopicId{0};
   }
   // One-click flow: point the freshly created File-source layer at the chosen
@@ -757,7 +762,7 @@ ObjectTopicId Scene3DDockWidget::addRobotModelLayer(const QString& urdf_path) {
 }
 
 ObjectTopicId Scene3DDockWidget::addRobotModelLayerFromUrl(const QString& url) {
-  const ObjectTopicId topic_id = allocateLocalRobotLayerId();
+  const ObjectTopicId topic_id = allocateLocalLayerId();
   if (topic_id.id == 0) {
     qCWarning(lcScene3DDock) << "addRobotModelLayerFromUrl: exhausted local topic ids";
     return ObjectTopicId{0};
@@ -765,12 +770,35 @@ ObjectTopicId Scene3DDockWidget::addRobotModelLayerFromUrl(const QString& url) {
   const QString file_name = QUrl(url).fileName();
   const QString title = file_name.isEmpty() ? url : file_name;
   if (!addTopic(topic_id, sdk::BuiltinObjectType::kRobotDescription, title)) {
-    local_robot_layer_ids_.erase(topic_id.id);
+    local_layer_ids_.erase(topic_id.id);
     return ObjectTopicId{0};
   }
   if (auto* layer = dynamic_cast<RobotModelLayer*>(layerFor(topic_id)); layer != nullptr) {
     layer->setSourceUrl(url);
   }
+  return topic_id;
+}
+
+ObjectTopicId Scene3DDockWidget::addTrailLayer(const pj::scene3d::TrailSource& source) {
+  const ObjectTopicId topic_id = allocateLocalLayerId();
+  if (topic_id.id == 0) {
+    qCWarning(lcScene3DDock) << "addTrailLayer: exhausted local topic ids";
+    return ObjectTopicId{0};
+  }
+  return addTrailLayerImpl(topic_id, std::make_unique<pj::scene3d::TrailLayer>(topic_id, source, this));
+}
+
+ObjectTopicId Scene3DDockWidget::addTrailLayerImpl(
+    ObjectTopicId topic_id, std::unique_ptr<pj::scene3d::TrailLayer> layer) {
+  wireScene3DLayer(layer.get());
+  if (!insertLayer(topic_id, std::move(layer))) {
+    // The layer is already destroyed, so there is no row to carry a warning —
+    // the log is the only trace of a dead "Create trail" click.
+    qCWarning(lcScene3DDock) << "addTrailLayer: trail layer rejected (attach failed or id in use)";
+    local_layer_ids_.erase(topic_id.id);
+    return ObjectTopicId{0};
+  }
+  recomputeOrphanStates();
   return topic_id;
 }
 
@@ -799,7 +827,17 @@ bool Scene3DDockWidget::pruneEvictedObjects() {
   ObjectStore& store = sessionManager()->objectStore();
   std::vector<ObjectTopicId> dead;
   for (const SceneLayerInfo& info : layers()) {
-    if (isLocalRobotLayerId(info.topic_id)) {
+    if (const auto* trail = dynamic_cast<const pj::scene3d::TrailLayer*>(layerFor(info.topic_id)); trail != nullptr) {
+      // A trail's own id is synthetic (never in the store), but its POSE source
+      // topic can be evicted — drop the trail with its dataset. TF trails
+      // orphan instead (follow-frame philosophy: they revive if the frame returns).
+      if (trail->source().kind == pj::scene3d::TrailSource::Kind::kPoseTopic &&
+          store.descriptor(trail->source().topic).topic_name.empty()) {
+        dead.push_back(info.topic_id);
+      }
+      continue;
+    }
+    if (isLocalLayerId(info.topic_id)) {
       continue;
     }
     if (store.descriptor(info.topic_id).topic_name.empty()) {
@@ -870,6 +908,21 @@ QWidget* Scene3DDockWidget::createSceneView() {
     view_->setCameraModel(static_cast<SceneViewWidget::CameraModel>(camera_model_combo_->currentIndex()));
   }
   connect(view_, &pj::scene3d::SceneViewWidget::framesChanged, this, &Scene3DDockWidget::onAvailableFrames);
+  // Right-click on a frame gizmo: the view picks the frame (hover machinery)
+  // and the dock owns the menu — trail creation plus two one-click conveniences
+  // over existing dock APIs. Empty-space right-clicks never reach here (the
+  // view ignore()s them, so the standard dock menu appears instead).
+  connect(
+      view_, &pj::scene3d::SceneViewWidget::frameContextMenuRequested, this,
+      [this](const QString& frame, const QPoint& global_pos) {
+        QMenu menu(this);
+        menu.addAction(tr("Create trail for '%1'").arg(frame), this, [this, frame]() {
+          addTrailLayer(pj::scene3d::TrailSource::tfFrame(frame));
+        });
+        menu.addAction(tr("Set as fixed frame"), this, [this, frame]() { setFixedFrame(frame); });
+        menu.addAction(tr("Follow this frame"), this, [this, frame]() { setFollowFrame(frame); });
+        menu.exec(global_pos);
+      });
   if (tf_buffer_ != nullptr) {
     view_->setTransformBuffer(tf_buffer_);
   }
@@ -1031,6 +1084,7 @@ void Scene3DDockWidget::prepareTransformBufferForTopic(ObjectTopicId topic_id) {
   if (view_ != nullptr) {
     view_->setTransformBuffer(tf_buffer_);
   }
+  pushTransformBufferToTrailLayers();
 }
 
 void Scene3DDockWidget::resetTransformBindingIfDatasetGone() {
@@ -1049,6 +1103,30 @@ void Scene3DDockWidget::resetTransformBindingIfDatasetGone() {
   dataset_id_ = 0;
   if (view_ != nullptr) {
     view_->setTransformBuffer(nullptr);  // setTransformBuffer tolerates a null buffer
+  }
+  // TF-source trails belonged to the unloaded dataset's frame tree: remove them
+  // with it (pose-source trails prune with their own source topic instead). A
+  // missing FRAME merely orphans a trail; a gone DATASET deletes it. Restored
+  // trails on a never-bound dock are unaffected — this runs only when a live
+  // binding resets.
+  std::vector<ObjectTopicId> dead_trails;
+  for (const SceneLayerInfo& info : layers()) {
+    if (const auto* trail = dynamic_cast<const pj::scene3d::TrailLayer*>(layerFor(info.topic_id));
+        trail != nullptr && trail->source().kind == pj::scene3d::TrailSource::Kind::kTfFrame) {
+      dead_trails.push_back(info.topic_id);
+    }
+  }
+  for (const ObjectTopicId topic_id : dead_trails) {
+    removeTopic(topic_id);
+  }
+  pushTransformBufferToTrailLayers();
+}
+
+void Scene3DDockWidget::pushTransformBufferToTrailLayers() {
+  for (const SceneLayerInfo& info : layers()) {
+    if (auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(layerFor(info.topic_id)); trail != nullptr) {
+      trail->setTransformBuffer(tf_buffer_);
+    }
   }
 }
 
@@ -1438,15 +1516,15 @@ void Scene3DDockWidget::recomputeOrphanStates(bool force) {
   last_orphan_fixed_frame_ = fixed;
 }
 
-bool Scene3DDockWidget::isLocalRobotLayerId(ObjectTopicId topic_id) const {
-  return local_robot_layer_ids_.find(topic_id.id) != local_robot_layer_ids_.end();
+bool Scene3DDockWidget::isLocalLayerId(ObjectTopicId topic_id) const {
+  return local_layer_ids_.find(topic_id.id) != local_layer_ids_.end();
 }
 
-ObjectTopicId Scene3DDockWidget::allocateLocalRobotLayerId() {
-  while (next_local_robot_topic_id_ > 0) {
+ObjectTopicId Scene3DDockWidget::allocateLocalLayerId() {
+  while (next_local_layer_topic_id_ > 0) {
     ObjectTopicId topic_id;
-    topic_id.id = next_local_robot_topic_id_--;
-    if (layerFor(topic_id) == nullptr && local_robot_layer_ids_.insert(topic_id.id).second) {
+    topic_id.id = next_local_layer_topic_id_--;
+    if (layerFor(topic_id) == nullptr && local_layer_ids_.insert(topic_id.id).second) {
       return topic_id;
     }
   }
@@ -1463,6 +1541,11 @@ Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::restoreLayerElement(
   }
   if (sessionManager() == nullptr) {
     return ElementRestoreResult::kDeferred;
+  }
+  // Trails are not object-type layers (object_type is kNone): branch BEFORE the
+  // acceptsObjectType gate, which would reject them.
+  if (layer_el.attribute(u"role"_s) == "trail"_L1) {
+    return restoreTrailElement(layer_el, deferred_topic_name);
   }
   const QString object_type_str = layer_el.attribute(u"object_type"_s);
   const auto object_type_opt = sdk::parseBuiltinObjectType(object_type_str.toStdString());
@@ -1487,51 +1570,18 @@ Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::restoreLayerElement(
     if (*object_type_opt != sdk::BuiltinObjectType::kRobotDescription) {
       return ElementRestoreResult::kInvalid;
     }
-    topic_id = allocateLocalRobotLayerId();
+    topic_id = allocateLocalLayerId();
     if (topic_id.id == 0) {
       return ElementRestoreResult::kInvalid;
     }
   } else {
-    const QString topic_name = layer_el.attribute(u"topic_name"_s);
-    if (topic_name.isEmpty()) {
-      return ElementRestoreResult::kInvalid;
-    }
     std::optional<ObjectTopicId> topic_id_opt;
-    const bool qualified = layer_el.hasAttribute(u"dataset_id"_s) || layer_el.hasAttribute(u"dataset_source"_s) ||
-                           layer_el.hasAttribute(u"dataset_path"_s);
-    if (!qualified) {
-      const auto generic = pj::scene3d::resolveUniqueObjectTopic(
-          sessionManager()->objectStore(), topic_name.toStdString(), *object_type_opt);
-      if (generic.ambiguous) {
-        return ElementRestoreResult::kInvalid;
-      }
-      topic_id_opt = generic.topic_id;
-    } else {
-      bool dataset_ok = false;
-      const qulonglong dataset_value = layer_el.attribute(u"dataset_id"_s).toULongLong(&dataset_ok);
-      if (layer_el.hasAttribute(u"dataset_id"_s) &&
-          (!dataset_ok || dataset_value == 0 || dataset_value > std::numeric_limits<uint32_t>::max())) {
-        return ElementRestoreResult::kInvalid;
-      }
-      const DatasetId saved_id = layer_el.hasAttribute(u"dataset_id"_s) ? static_cast<DatasetId>(dataset_value) : 0;
-      const auto dataset_id_opt = resolveObjectDataset(
-          saved_id, layer_el.attribute(u"dataset_source"_s), layer_el.attribute(u"dataset_path"_s), topic_name);
-      if (dataset_id_opt.has_value()) {
-        topic_id_opt = sessionManager()->objectStore().findTopic(*dataset_id_opt, topic_name.toStdString());
-      }
-    }
-    if (!topic_id_opt.has_value()) {
-      if (deferred_topic_name != nullptr) {
-        *deferred_topic_name = topic_name;
-      }
-      return ElementRestoreResult::kDeferred;
+    const ElementRestoreResult resolved =
+        resolveSavedTopicRef(layer_el, deferred_topic_name, *object_type_opt, topic_id_opt);
+    if (resolved != ElementRestoreResult::kRestored) {
+      return resolved;
     }
     topic_id = *topic_id_opt;
-    const ObjectTopicDescriptor& descriptor = sessionManager()->objectStore().descriptor(topic_id);
-    const sdk::BuiltinObjectType live_type = pj::scene3d::builtinObjectTypeFor(descriptor);
-    if (live_type != sdk::BuiltinObjectType::kNone && live_type != *object_type_opt) {
-      return ElementRestoreResult::kInvalid;
-    }
   }
   if (layerFor(topic_id) != nullptr) {
     return ElementRestoreResult::kInvalid;
@@ -1539,7 +1589,7 @@ Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::restoreLayerElement(
   const QString previous_title = windowTitle();
   if (!addTopicImpl(topic_id, *object_type_opt, display_name, /*enforce_image_gate=*/false)) {
     if (local_layer) {
-      local_robot_layer_ids_.erase(topic_id.id);
+      local_layer_ids_.erase(topic_id.id);
     }
     return ElementRestoreResult::kInvalid;
   }
@@ -1574,6 +1624,108 @@ Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::restoreLayerElement(
     setLayerVisible(topic_id, false);
   }
   restored_layer_orders_[topicKey(topic_id)] = saved_order;
+  applyRestoredLayerOrder();
+  return ElementRestoreResult::kRestored;
+}
+
+Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::resolveSavedTopicRef(
+    const QDomElement& el, QString* deferred_topic_name, sdk::BuiltinObjectType expected_type,
+    std::optional<ObjectTopicId>& out_topic) const {
+  out_topic.reset();
+  const QString topic_name = el.attribute(u"topic_name"_s);
+  if (topic_name.isEmpty()) {
+    return ElementRestoreResult::kInvalid;
+  }
+  std::optional<ObjectTopicId> topic_id_opt;
+  const bool qualified =
+      el.hasAttribute(u"dataset_id"_s) || el.hasAttribute(u"dataset_source"_s) || el.hasAttribute(u"dataset_path"_s);
+  if (!qualified) {
+    const auto generic =
+        pj::scene3d::resolveUniqueObjectTopic(sessionManager()->objectStore(), topic_name.toStdString(), expected_type);
+    if (generic.ambiguous) {
+      return ElementRestoreResult::kInvalid;
+    }
+    topic_id_opt = generic.topic_id;
+  } else {
+    bool dataset_ok = false;
+    const qulonglong dataset_value = el.attribute(u"dataset_id"_s).toULongLong(&dataset_ok);
+    if (el.hasAttribute(u"dataset_id"_s) &&
+        (!dataset_ok || dataset_value == 0 || dataset_value > std::numeric_limits<uint32_t>::max())) {
+      return ElementRestoreResult::kInvalid;
+    }
+    const DatasetId saved_id = el.hasAttribute(u"dataset_id"_s) ? static_cast<DatasetId>(dataset_value) : 0;
+    const auto dataset_id_opt =
+        resolveObjectDataset(saved_id, el.attribute(u"dataset_source"_s), el.attribute(u"dataset_path"_s), topic_name);
+    if (dataset_id_opt.has_value()) {
+      topic_id_opt = sessionManager()->objectStore().findTopic(*dataset_id_opt, topic_name.toStdString());
+    }
+  }
+  if (!topic_id_opt.has_value()) {
+    if (deferred_topic_name != nullptr) {
+      *deferred_topic_name = topic_name;
+    }
+    return ElementRestoreResult::kDeferred;
+  }
+  const ObjectTopicDescriptor& descriptor = sessionManager()->objectStore().descriptor(*topic_id_opt);
+  const sdk::BuiltinObjectType live_type = pj::scene3d::builtinObjectTypeFor(descriptor);
+  if (live_type != sdk::BuiltinObjectType::kNone && live_type != expected_type) {
+    return ElementRestoreResult::kInvalid;
+  }
+  out_topic = topic_id_opt;
+  return ElementRestoreResult::kRestored;
+}
+
+Scene3DDockWidget::ElementRestoreResult Scene3DDockWidget::restoreTrailElement(
+    const QDomElement& layer_el, QString* deferred_topic_name) {
+  // A corrupted layout drops the element with a reason in the log — kInvalid
+  // itself only surfaces as the aggregate workspaceRestoreFailed() flag.
+  const auto invalid = [](const char* reason) {
+    qCWarning(lcScene3DDock) << "restoreTrailElement:" << reason;
+    return ElementRestoreResult::kInvalid;
+  };
+  const QString visible_text = layer_el.attribute(u"visible"_s, u"true"_s);
+  if (visible_text != "true"_L1 && visible_text != "false"_L1) {
+    return invalid("malformed 'visible' attribute");
+  }
+  bool order_ok = false;
+  const int saved_order = layer_el.attribute(u"order"_s).toInt(&order_ok);
+  if (!order_ok || saved_order < 0) {
+    return invalid("malformed 'order' attribute");
+  }
+  const QDomElement payload = layer_el.firstChildElement();
+  if (payload.isNull() || payload.tagName() != "trail"_L1 || !payload.nextSiblingElement().isNull()) {
+    return invalid("expected a single <trail> payload");
+  }
+
+  // The layer owns its restore (source resolution included) — the dock only
+  // hosts it and honors the tri-state result, exactly like RobotModelLayer.
+  const ObjectTopicId layer_id = allocateLocalLayerId();
+  if (layer_id.id == 0) {
+    return invalid("exhausted local topic ids");
+  }
+  if (addTrailLayerImpl(layer_id, std::make_unique<pj::scene3d::TrailLayer>(layer_id, this)).id == 0) {
+    return invalid("trail layer could not be created");
+  }
+  auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(layerFor(layer_id));
+  if (trail == nullptr) {
+    return invalid("trail layer could not be created");
+  }
+  const pj::scene3d::TrailLayer::XmlLoadResult result = trail->xmlLoadStateResult(payload);
+  if (result == pj::scene3d::TrailLayer::XmlLoadResult::kDeferred) {
+    if (deferred_topic_name != nullptr) {
+      *deferred_topic_name = payload.attribute(u"source_topic_name"_s);
+    }
+    removeTopic(layer_id);
+    return ElementRestoreResult::kDeferred;
+  }
+  if (result == pj::scene3d::TrailLayer::XmlLoadResult::kInvalid) {
+    removeTopic(layer_id);
+    return invalid("malformed <trail> payload");
+  }
+  if (visible_text == "false"_L1) {
+    setLayerVisible(layer_id, false);
+  }
+  restored_layer_orders_[topicKey(layer_id)] = saved_order;
   applyRestoredLayerOrder();
   return ElementRestoreResult::kRestored;
 }
@@ -1672,7 +1824,7 @@ QDomElement Scene3DDockWidget::xmlSaveState(QDomDocument& doc) const {
   ObjectStore* store = sessionManager() != nullptr ? &sessionManager()->objectStore() : nullptr;
   int saved_order = 0;
   for (const SceneLayerInfo& info : layers()) {
-    const bool local_layer = isLocalRobotLayerId(info.topic_id);
+    const bool local_layer = isLocalLayerId(info.topic_id);
     if (!local_layer && store == nullptr) {
       continue;
     }
@@ -1693,6 +1845,13 @@ QDomElement Scene3DDockWidget::xmlSaveState(QDomDocument& doc) const {
         layer_el.setAttribute(u"dataset_path"_s, path);
       }
       layer_el.setAttribute(u"topic_name"_s, QString::fromStdString(desc.topic_name));
+    }
+    if (dynamic_cast<const pj::scene3d::TrailLayer*>(layerFor(info.topic_id)) != nullptr) {
+      // Trails restore through restoreTrailElement, keyed on this role marker
+      // (their object_type is kNone, which the normal path would reject). The
+      // SOURCE identity lives inside the layer's own <trail> payload — the
+      // RobotModelLayer topic-source idiom.
+      layer_el.setAttribute(u"role"_s, u"trail"_s);
     }
     const auto object_type_name = sdk::name(info.object_type);
     layer_el.setAttribute(
@@ -1801,7 +1960,7 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
   clearPendingRestores();
   const QString saved_frame = element.attribute(u"fixed_frame"_s);
   clearLayers();
-  local_robot_layer_ids_.clear();
+  local_layer_ids_.clear();
   restored_layer_orders_.clear();
   resetDatasetBindingForRestore();
   int unresolved_topics = 0;
@@ -1846,7 +2005,7 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
     markWorkspaceRestoreFailed();
     clearPendingRestores();
     clearLayers();
-    local_robot_layer_ids_.clear();
+    local_layer_ids_.clear();
     restored_layer_orders_.clear();
     resetDatasetBindingForRestore();
     setWindowTitle(tr("3D View"));

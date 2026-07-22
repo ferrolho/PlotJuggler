@@ -91,6 +91,11 @@ class PosesInFrameLayer : public Scene3DLayer {
     return override_color_;
   }
 
+ signals:
+  // The config widget's "Create trail" button. The dock (which owns layer
+  // creation) responds by adding a TrailLayer bound to this topic.
+  void trailRequested();
+
 #ifdef PJ_SCENE3D_TEST_HOOKS
   // Decode + expand at a chosen time with no GL context (the dock normally drives
   // this from render() at the tracker time).

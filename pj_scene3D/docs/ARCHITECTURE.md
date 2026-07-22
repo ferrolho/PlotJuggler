@@ -350,6 +350,84 @@ desaturated X/Y/Z colors match the TF "Frames" gizmos.
   text and layout (picking a color auto-ticks the box) for cross-layer consistency.
   No host edits.
 
+## Trail layer (`TrailLayer`)
+
+`TrailLayer` draws the trajectory of a TF frame's origin (or a `kPosesInFrame`
+topic's first pose) across the whole loaded time range as a
+screen-space ribbon (triangle strip) in the fixed frame, split-colored at the tracker time. See REQUIREMENTS §3b for
+the behavioral contract; the as-built mechanics:
+
+- **Sampling grid = the chain's own stamps.** `TransformBuffer::chainSampleTimes`
+  unions every edge's sample stamps along the connecting path (both chains to
+  the common ancestor), so a statically-mounted child (lidar on base_link)
+  trails with the motion higher up the chain. The pure build functions
+  (`core/trail_sampling.{h,cpp}`: `decimateEvenly` — even index decimation,
+  endpoints kept, cap `kMaxTrailPoints` = 50k — `buildTfFrameTrail`,
+  `buildPoseTopicTrail`) are Qt/GL-free and unit-tested. Pose-topic builds
+  decimate **before** decoding, so at most 50k messages ever parse.
+- **Split ribbon, zero-upload scrub.** `TrailRenderPass` keeps ONE vertex
+  buffer — a screen-space triangle ribbon, two expanded vertices per point
+  (position + joint tangent + side flag), because core GL caps real lines at
+  1 px (`glLineWidth(2)` is GL_INVALID_VALUE on strict core contexts) and the per-trail thickness (default 4 px) must be honored exactly.
+  CPU points are absolute fixed-frame doubles, downcast to float AFTER
+  subtracting `render_origin` (the large-coordinate rule); the pixel-width
+  offset happens in the vertex shader (scaled by `render_scale`, the EDL
+  rule). Two draws over the one buffer: points `[0, past)` in the past color,
+  `[past-1, N)` in the future color (the shared pair keeps the ribbon
+  continuous). The split index is a binary search over the stamps, so scrubbing
+  re-uploads nothing; the buffer re-uploads only on rebuild or a render-origin
+  change. `renderKey` folds (build revision, style revision, split index) —
+  between two samples the key is constant and the PR #259 repaint gate
+  coalesces.
+- **Documented follow-up — incremental live-append upload.** A live append
+  currently rebuilds the pass's expanded vertex buffer and re-uploads it
+  wholesale (near the 50k cap: ~4 MB CPU touch + ~2.8 MB `glBufferData` per
+  appended tick). A `glBufferSubData` tail path (join-tangent-only recompute,
+  geometrically grown `GL_DYNAMIC_DRAW` buffer) is the planned refinement;
+  file loads never hit this path.
+- **Async rebuild / sync append.** Full TF-source rebuilds run on `QtConcurrent`
+  with latest-wins generation coalescing (safe: `TransformBuffer` is
+  `shared_mutex`-protected and the task copies the `shared_ptr`). Pose-source
+  rebuilds stay synchronous on the GUI thread — `ObjectStore` reads and
+  `parseLocked` decodes are GUI-thread contracts — bounded by
+  decimate-before-decode. Live-edge appends (both kinds) are synchronous and
+  tiny: gated on `TransformBuffer::revision()` / the store entry count, they
+  sample only stamps past the last built point and ring-trim at the cap.
+- **Fixed-frame self-heal.** The layer adopts the fixed frame from the render
+  `FrameContext` (authoritative) and rebuilds on mismatch, so attach order
+  never matters. The TF buffer itself arrives via `Scene3DLayerContext` at
+  attach **and** through `Scene3DDockWidget::pushTransformBufferToTrailLayers`
+  whenever the dock's binding changes — necessary because layout restore
+  replays `<layer>` elements BEFORE the `<config_topic>` that binds TF, so a
+  restored trail starts buffer-less ("waiting for TF") and heals when the
+  binding lands.
+- **Not topic-id-backed.** Trails register under synthetic local ids (the
+  robot-model allocator, generalized to `allocateLocalLayerId`) through the
+  `SceneDockWidget::insertLayer` seam — no `LayerFactory` slot and no new
+  `sdk::BuiltinObjectType` (`info().object_type == kNone`). Persistence marks
+  the layer element `role="trail"`; everything else — including the pose
+  SOURCE topic's `source_topic_name`/`source_dataset_*` identity — lives in
+  the layer's own `<trail>` payload, and the layer self-restores via
+  `TrailLayer::xmlLoadStateResult` (tri-state incl. deferral — the
+  RobotModelLayer topic-source idiom), with the dock's `restoreTrailElement`
+  reduced to a thin host that honors the result. Restore branches BEFORE the
+  object-type gate. `xmlLoadState` applies STYLE only — family copy/paste
+  (PR #204) restyles, never retargets.
+  Pruning: a pose-source trail is dropped when its SOURCE topic is evicted
+  (`pruneEvictedObjects` checks it explicitly — synthetic ids skip the standard
+  sweep). A TF-source trail orphans on a merely-missing frame (it revives if
+  the frame returns, like a follow target) but is REMOVED when the bound TF
+  dataset unloads (`resetTransformBindingIfDatasetGone` deletes TF trails
+  before dropping the binding — a gone dataset deletes, a gone frame orphans).
+- **Entry points.** Right-click on a frame gizmo — `SceneViewWidget::
+  contextMenuEvent` reuses the hover pick (`pickFrameAt`, the extracted core of
+  `updateHoverFrame`) and accepts ONLY when a frame is hit, else `ignore()`s so
+  the host dock's standard menu still appears; the dock owns the `QMenu`
+  (Create trail / Set as fixed frame / Follow this frame). Plus the
+  `Scene3DConfigPanel` "Trail" row (frame combo + add button) and a
+  "Create trail" button on `PosesInFrameLayer`'s config widget
+  (`trailRequested` signal, connected in the dock's factory creator).
+
 ## Pointcloud layer (`PointCloudLayer`)
 
 `PointCloudLayer` keeps the existing `convertCanonical()` -> `DecodedPointCloud` ->

@@ -39,7 +39,9 @@
 #include "pj_runtime/SessionManager.h"
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
 #include "pj_scene3d_widgets/layers/depth_cloud_layer.h"
+#include "pj_scene3d_widgets/layers/poses_in_frame_layer.h"
 #include "pj_scene3d_widgets/layers/robot_model_layer.h"
+#include "pj_scene3d_widgets/layers/trail_layer.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
 #include "pj_scene3d_widgets/transform_service.h"
 using namespace Qt::StringLiterals;
@@ -1040,6 +1042,296 @@ TEST(Scene3DDockPersistence, WorkspaceSignalTracksPresentationAndLayerConfigButN
   workspace_changes = 0;
   ASSERT_TRUE(dock.xmlLoadState(restored_state));
   EXPECT_EQ(workspace_changes, 0) << "undo/layout replay must not recursively create a new history entry";
+}
+
+// ---- Trail layers (role="trail", synthetic local ids) -----------------------
+
+constexpr std::string_view kPosesSchema = "mock/poses_in_frame";
+
+PJ::Expected<PJ::sdk::ObjectRecord> emitPoses(PJ::Timestamp ts, PJ::sdk::PayloadView /*p*/) {
+  PJ::sdk::PosesInFrame poses;
+  poses.timestamp_ns = ts;
+  poses.frame_id = "odom";
+  PJ::sdk::Pose pose;
+  pose.position.x = 1.0;
+  pose.position.y = 2.0;
+  poses.poses.push_back(pose);
+  return PJ::sdk::ObjectRecord{.ts = ts, .object = poses};
+}
+
+PJ::ObjectTopicId registerPoseTopic(
+    PJ::SessionManager& session, PJ::DatasetId dataset_id, const std::string& topic_name) {
+  const auto topic_or = session.objectStore().registerTopic(
+      PJ::ObjectTopicDescriptor{
+          .dataset_id = dataset_id,
+          .topic_name = topic_name,
+          .metadata_json = R"({"builtin_object_type":"kPosesInFrame"})",
+      });
+  EXPECT_TRUE(topic_or.has_value());
+  if (!topic_or.has_value()) {
+    return {};
+  }
+  session.registerObjectTopicParser(*topic_or, makeBoundHandle(kPosesSchema, []() noexcept -> void* {
+    return new CountingObjectParser(kPosesSchema, PJ::sdk::BuiltinObjectType::kPosesInFrame, nullptr, &emitPoses);
+  }));
+  EXPECT_TRUE(session.objectStore().pushOwned(*topic_or, 100, std::vector<uint8_t>{0x01}).has_value());
+  return *topic_or;
+}
+
+TEST(Scene3DDockPersistence, TfTrailRoundTripsThroughXml) {
+  PJ::SessionManager save_session;
+  pj::scene3d::TransformService save_tf(save_session);
+  const DatasetTopic saved = registerTfDataset(save_session, "trail.dat", "/tf");
+  PJ::Scene3DDockWidget save_dock;
+  save_dock.setSessionManager(&save_session);
+  save_dock.setTransformService(&save_tf);
+  ASSERT_TRUE(save_dock.addTopic(saved.topic_id, PJ::sdk::BuiltinObjectType::kFrameTransforms, u"tf"_s));
+
+  const PJ::ObjectTopicId trail_id = save_dock.addTrailLayer(pj::scene3d::TrailSource::tfFrame(u"base_link"_s));
+  ASSERT_NE(trail_id.id, 0U);
+  auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(save_dock.layerFor(trail_id));
+  ASSERT_NE(trail, nullptr);
+  trail->setPastColor(QColor(u"#112233"_s));
+  trail->setFutureColor(QColor(u"#445566"_s));
+  trail->setThickness(4.0F);
+
+  QDomDocument doc;
+  const QDomElement state = save_dock.xmlSaveState(doc);
+  const QDomElement layer_el = state.firstChildElement(u"layer"_s);
+  ASSERT_FALSE(layer_el.isNull());
+  EXPECT_EQ(layer_el.attribute(u"role"_s), u"trail"_s);
+  EXPECT_EQ(layer_el.attribute(u"local"_s), u"true"_s);
+  const QDomElement payload = layer_el.firstChildElement();
+  EXPECT_EQ(payload.tagName(), u"trail"_s);
+  EXPECT_EQ(payload.attribute(u"source_kind"_s), u"tf_frame"_s);
+  EXPECT_EQ(payload.attribute(u"frame"_s), u"base_link"_s);
+
+  PJ::SessionManager load_session;
+  pj::scene3d::TransformService load_tf(load_session);
+  registerTfDataset(load_session, "trail.dat", "/tf");
+  PJ::Scene3DDockWidget load_dock;
+  load_dock.setSessionManager(&load_session);
+  load_dock.setTransformService(&load_tf);
+  ASSERT_TRUE(load_dock.xmlLoadState(state));
+
+  ASSERT_EQ(load_dock.layers().size(), 1U);
+  auto* restored = dynamic_cast<pj::scene3d::TrailLayer*>(load_dock.layerFor(load_dock.layers().front().topic_id));
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->source().kind, pj::scene3d::TrailSource::Kind::kTfFrame);
+  EXPECT_EQ(restored->source().frame, u"base_link"_s);
+  EXPECT_EQ(restored->pastColor().name(), u"#112233"_s);
+  EXPECT_EQ(restored->futureColor().name(), u"#445566"_s);
+  EXPECT_FLOAT_EQ(restored->thickness(), 4.0F);
+  // Layers replay BEFORE the config topic that binds TF; the dock's fan-out
+  // must have delivered the buffer once the binding landed.
+  EXPECT_NE(restored->statusWarning(), u"waiting for TF"_s);
+}
+
+TEST(Scene3DDockPersistence, PoseTrailDefersUntilTopicLoadsThenMaterializes) {
+  // Hand-built saved element for a pose-source trail whose topic is not loaded.
+  QDomDocument doc;
+  QDomElement scene = doc.createElement(u"scene3d"_s);
+  scene.setAttribute(u"version"_s, u"1"_s);
+  doc.appendChild(scene);
+  QDomElement layer_el = doc.createElement(u"layer"_s);
+  layer_el.setAttribute(u"role"_s, u"trail"_s);
+  layer_el.setAttribute(u"local"_s, u"true"_s);
+  layer_el.setAttribute(u"object_type"_s, u"kNone"_s);
+  layer_el.setAttribute(u"display_name"_s, u"Trail: /odom"_s);
+  layer_el.setAttribute(u"visible"_s, u"true"_s);
+  layer_el.setAttribute(u"order"_s, u"0"_s);
+  QDomElement payload = doc.createElement(u"trail"_s);
+  payload.setAttribute(u"source_kind"_s, u"pose_topic"_s);
+  payload.setAttribute(u"source_topic_name"_s, u"/odom"_s);
+  payload.setAttribute(u"source_dataset_source"_s, u"poses.dat"_s);
+  payload.setAttribute(u"past_color"_s, u"#112233"_s);
+  payload.setAttribute(u"future_color"_s, u"#445566"_s);
+  layer_el.appendChild(payload);
+  scene.appendChild(layer_el);
+
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+  PJ::Scene3DDockWidget dock;
+  dock.setSessionManager(&session);
+  dock.setTransformService(&transform_service);
+
+  ASSERT_TRUE(dock.xmlLoadState(scene));
+  EXPECT_TRUE(dock.layers().empty()) << "the pose topic is absent: the trail must defer, not restore";
+  EXPECT_TRUE(dock.unresolvedPendingRestores().contains(u"/odom"_s));
+
+  // The dataset arrives; the pending retry materializes the trail.
+  auto dataset_or =
+      session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "poses.dat", .time_domain_id = 0});
+  ASSERT_TRUE(dataset_or.has_value());
+  const PJ::ObjectTopicId pose_topic = registerPoseTopic(session, *dataset_or, "/odom");
+  ASSERT_NE(pose_topic.id, 0U);
+  EXPECT_EQ(dock.retryPendingRestores(QSet<QString>{u"/odom"_s}), 1);
+
+  ASSERT_EQ(dock.layers().size(), 1U);
+  auto* restored = dynamic_cast<pj::scene3d::TrailLayer*>(dock.layerFor(dock.layers().front().topic_id));
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->source().kind, pj::scene3d::TrailSource::Kind::kPoseTopic);
+  EXPECT_EQ(restored->source().topic, pose_topic);
+  EXPECT_EQ(restored->pastColor().name(), u"#112233"_s);
+}
+
+TEST(Scene3DDockPersistence, PoseTrailBuildsPolylineFromDecodedMessages) {
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+  const DatasetTopic tf = registerTfDataset(session, "posebuild.dat", "/tf");
+  const PJ::ObjectTopicId pose_topic = registerPoseTopic(session, tf.dataset_id, "/odom");
+  // A second message so the trail has two points (registerPoseTopic pushed ts=100).
+  ASSERT_TRUE(session.objectStore().pushOwned(pose_topic, 200, std::vector<uint8_t>{0x02}).has_value());
+
+  PJ::Scene3DDockWidget dock;
+  dock.setSessionManager(&session);
+  dock.setTransformService(&transform_service);
+  ASSERT_TRUE(dock.addTopic(tf.topic_id, PJ::sdk::BuiltinObjectType::kFrameTransforms, u"tf"_s));
+  const PJ::ObjectTopicId trail_id = dock.addTrailLayer(pj::scene3d::TrailSource::poseTopic(pose_topic));
+  ASSERT_NE(trail_id.id, 0U);
+  auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(dock.layerFor(trail_id));
+  ASSERT_NE(trail, nullptr);
+
+  // The mock parser emits frame_id "odom"; with the fixed frame equal to it the
+  // pose lands identity-transformed (no TF needed) — full decode path headless.
+  trail->rebuildNowForTest(u"odom"_s);
+  EXPECT_EQ(trail->pointCountForTest(), 2U);
+  EXPECT_TRUE(trail->statusWarning().isEmpty());
+  EXPECT_EQ(PJ::toRaw(trail->timeRange().min), 100);
+  EXPECT_EQ(PJ::toRaw(trail->timeRange().max), 200);
+}
+
+TEST(Scene3DDockPersistence, PoseTrailPrunesWithItsSourceTopicButTfTrailSurvives) {
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+  const DatasetTopic tf = registerTfDataset(session, "prune.dat", "/tf");
+  const PJ::ObjectTopicId pose_topic = registerPoseTopic(session, tf.dataset_id, "/odom");
+
+  PJ::Scene3DDockWidget dock;
+  dock.setSessionManager(&session);
+  dock.setTransformService(&transform_service);
+  ASSERT_TRUE(dock.addTopic(tf.topic_id, PJ::sdk::BuiltinObjectType::kFrameTransforms, u"tf"_s));
+  const PJ::ObjectTopicId pose_trail = dock.addTrailLayer(pj::scene3d::TrailSource::poseTopic(pose_topic));
+  const PJ::ObjectTopicId tf_trail = dock.addTrailLayer(pj::scene3d::TrailSource::tfFrame(u"base_link"_s));
+  ASSERT_NE(pose_trail.id, 0U);
+  ASSERT_NE(tf_trail.id, 0U);
+  ASSERT_EQ(dock.layers().size(), 2U);
+  EXPECT_TRUE(dock.revalidateObjects());
+
+  // Evict the pose SOURCE topic: its trail must be pruned (a synthetic-id layer
+  // the standard descriptor sweep would skip), while the TF trail orphans and
+  // survives.
+  session.objectStore().removeTopic(pose_topic);
+  EXPECT_TRUE(dock.revalidateObjects());
+  ASSERT_EQ(dock.layers().size(), 1U);
+  EXPECT_EQ(dock.layers().front().topic_id, tf_trail);
+}
+
+TEST(Scene3DDockPersistence, TfTrailRemovedWhenItsDatasetUnloads) {
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+  const DatasetTopic tf = registerTfDataset(session, "unload.dat", "/tf");
+
+  PJ::Scene3DDockWidget dock;
+  dock.setSessionManager(&session);
+  dock.setTransformService(&transform_service);
+  ASSERT_TRUE(dock.addTopic(tf.topic_id, PJ::sdk::BuiltinObjectType::kFrameTransforms, u"tf"_s));
+  const PJ::ObjectTopicId tf_trail = dock.addTrailLayer(pj::scene3d::TrailSource::tfFrame(u"base_link"_s));
+  ASSERT_NE(tf_trail.id, 0U);
+  ASSERT_EQ(dock.layers().size(), 1U);
+
+  // Removing the WHOLE dataset (its last tracked topic) resets the TF binding
+  // and must take the TF trail with it — a gone dataset deletes the trail,
+  // unlike a merely-missing frame, which only orphans it.
+  session.objectStore().removeTopic(tf.topic_id);
+  EXPECT_FALSE(dock.revalidateObjects()) << "no live content should remain";
+  EXPECT_TRUE(dock.layers().empty()) << "the TF trail must be removed with its dataset";
+}
+
+TEST(Scene3DDockPersistence, PoseLayerTrailRequestedSignalCreatesTrail) {
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+  const DatasetTopic tf = registerTfDataset(session, "signal.dat", "/tf");
+  const PJ::ObjectTopicId pose_topic = registerPoseTopic(session, tf.dataset_id, "/odom");
+
+  PJ::Scene3DDockWidget dock;
+  dock.setSessionManager(&session);
+  dock.setTransformService(&transform_service);
+  ASSERT_TRUE(dock.addTopic(tf.topic_id, PJ::sdk::BuiltinObjectType::kFrameTransforms, u"tf"_s));
+  ASSERT_TRUE(dock.addTopic(pose_topic, PJ::sdk::BuiltinObjectType::kPosesInFrame, u"poses"_s));
+  ASSERT_EQ(dock.layers().size(), 1U);
+
+  // The config widget's "Create trail" button emits trailRequested(); the
+  // factory-creator connect must turn it into a pose-source trail layer.
+  auto* poses = dynamic_cast<pj::scene3d::PosesInFrameLayer*>(dock.layerFor(pose_topic));
+  ASSERT_NE(poses, nullptr);
+  emit poses->trailRequested();
+  ASSERT_EQ(dock.layers().size(), 2U);
+  bool found_trail = false;
+  for (const PJ::SceneLayerInfo& info : dock.layers()) {
+    if (auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(dock.layerFor(info.topic_id)); trail != nullptr) {
+      found_trail = true;
+      EXPECT_EQ(trail->source().kind, pj::scene3d::TrailSource::Kind::kPoseTopic);
+      EXPECT_EQ(trail->source().topic, pose_topic);
+    }
+  }
+  EXPECT_TRUE(found_trail);
+
+  // The pose SOURCE identity is payload-owned (the RobotModelLayer idiom): the
+  // trail's own <trail> element carries the resolvable topic reference.
+  QDomDocument doc;
+  const QDomElement state = dock.xmlSaveState(doc);
+  bool payload_checked = false;
+  for (QDomElement layer_el = state.firstChildElement(u"layer"_s); !layer_el.isNull();
+       layer_el = layer_el.nextSiblingElement(u"layer"_s)) {
+    if (layer_el.attribute(u"role"_s) != u"trail"_s) {
+      continue;
+    }
+    const QDomElement payload = layer_el.firstChildElement(u"trail"_s);
+    EXPECT_EQ(payload.attribute(u"source_topic_name"_s), u"/odom"_s);
+    EXPECT_EQ(payload.attribute(u"source_dataset_source"_s), u"signal.dat"_s);
+    EXPECT_TRUE(layer_el.attribute(u"topic_name"_s).isEmpty()) << "the wrapper keeps its local-layer blanks";
+    payload_checked = true;
+  }
+  EXPECT_TRUE(payload_checked);
+}
+
+TEST(Scene3DDockPersistence, TrailRestoreRejectsMalformedElements) {
+  PJ::SessionManager session;
+  pj::scene3d::TransformService transform_service(session);
+
+  const auto try_restore = [&session, &transform_service](
+                               const QString& source_kind, const QString& frame, const QString& order) {
+    QDomDocument doc;
+    QDomElement scene = doc.createElement(u"scene3d"_s);
+    scene.setAttribute(u"version"_s, u"1"_s);
+    doc.appendChild(scene);
+    QDomElement layer_el = doc.createElement(u"layer"_s);
+    layer_el.setAttribute(u"role"_s, u"trail"_s);
+    layer_el.setAttribute(u"local"_s, u"true"_s);
+    layer_el.setAttribute(u"object_type"_s, u"kNone"_s);
+    layer_el.setAttribute(u"display_name"_s, u"Trail"_s);
+    layer_el.setAttribute(u"visible"_s, u"true"_s);
+    layer_el.setAttribute(u"order"_s, order);
+    QDomElement payload = doc.createElement(u"trail"_s);
+    payload.setAttribute(u"source_kind"_s, source_kind);
+    if (!frame.isEmpty()) {
+      payload.setAttribute(u"frame"_s, frame);
+    }
+    layer_el.appendChild(payload);
+    scene.appendChild(layer_el);
+
+    PJ::Scene3DDockWidget dock;
+    dock.setSessionManager(&session);
+    dock.setTransformService(&transform_service);
+    // kInvalid aborts the whole replay: xmlLoadState rejects BEFORE mutation.
+    const bool rejected = !dock.xmlLoadState(scene);
+    return rejected && dock.layers().empty();
+  };
+
+  EXPECT_TRUE(try_restore(u"warp_drive"_s, u"base"_s, u"0"_s)) << "unknown source_kind must reject";
+  EXPECT_TRUE(try_restore(u"tf_frame"_s, QString(), u"0"_s)) << "tf trail without a frame must reject";
+  EXPECT_TRUE(try_restore(u"tf_frame"_s, u"base"_s, u"banana"_s)) << "malformed order must reject";
 }
 
 }  // namespace

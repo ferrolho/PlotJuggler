@@ -7,6 +7,7 @@
 #include <DockManager.h>
 
 #include <QAction>
+#include <QApplication>
 #include <QBoxLayout>
 #include <QContextMenuEvent>
 #include <QDomDocument>
@@ -20,6 +21,7 @@
 #include <QMetaObject>
 #include <QMimeData>
 #include <QPushButton>
+#include <QScopedValueRollback>
 #ifdef PJ_TARGET_WASM
 #include <QPointer>
 #include <QTimer>
@@ -307,7 +309,25 @@ bool DockWidget::eventFilter(QObject* watched, QEvent* event) {
       event != nullptr) {
     switch (event->type()) {
       case QEvent::ContextMenu: {
+        if (forwarding_context_menu_) {
+          break;  // pass-through: the re-sent event must reach the widget's own handler
+        }
         auto* context_event = static_cast<QContextMenuEvent*>(event);
+        // First shot goes to the content widget's own contextMenuEvent (e.g.
+        // the 3D view's frame-gizmo menu). Only an IGNORED event falls back to
+        // the dock's standard menu — same fall-through contract as plain Qt
+        // parent-chain propagation, which this filter would otherwise defeat.
+        {
+          QScopedValueRollback<bool> guard(forwarding_context_menu_, true);
+          QContextMenuEvent forwarded(
+              context_event->reason(), context_event->pos(), context_event->globalPos(), context_event->modifiers());
+          forwarded.ignore();
+          QApplication::sendEvent(watched, &forwarded);
+          if (forwarded.isAccepted()) {
+            event->accept();
+            return true;  // the widget showed its own menu; swallow the original
+          }
+        }
         showObjectContextMenu(context_event->globalPos());
         event->accept();
         return true;

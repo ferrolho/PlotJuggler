@@ -89,6 +89,32 @@ layer, no separate widget.
   the original name, e.g. `intensity`/`ring`), else inferred from attribute type (POSITION→x/y/z,
   COLOR→red/green/blue/alpha, NORMAL→nx/ny/nz, else `generic_N`).
 
+### 3b. Frame trails
+
+A **trail** visualizes the trajectory of a frame's origin across the whole loaded time range as a
+polyline in the current fixed frame, split-colored at the tracker time (past = blue `#1f77b4`,
+future = light blue `#9ecae1`; both per-trail configurable). Thickness is a per-trail parameter
+(1-8 px, default 4, exact at any width — rendered as a screen-space ribbon because core GL caps
+real lines at 1 px), and each half has its own eye toggle to show/hide the past or future segment
+independently. Colors, thickness, and the two visibility flags all persist per-trail. Two sources:
+
+- **TF frame** — any frame in the TF tree, sampled at the connecting chain's own update stamps
+  (`TransformBuffer::chainSampleTimes`), so a statically-mounted child still trails with its
+  moving ancestors.
+- **Pose topic** — a `kPosesInFrame` topic, one point per message (the **first** pose only),
+  each transformed into the fixed frame at that message's own timestamp.
+
+Behavioral contract: whole-range always (no duration window in v1); vertex cap 50 000 with even
+decimation (endpoints kept); TF-unresolvable samples are skipped (the strip bridges the gap);
+scrubbing moves only the color split (no geometry rebuild — repaint-gate friendly); trails grow at
+the live edge under streaming and ring-trim at the cap; a full rebuild under live retention can
+only see the retention window. Created via right-click on a frame gizmo, the panel's "Trail" row,
+or a pose layer's "Create trail" button; persisted in layout XML (`role="trail"`, synthetic local
+id) including colors and thickness. Lifecycle: a missing FRAME merely orphans a TF trail (it
+revives if the frame returns), but unloading the bound TF dataset removes it; a pose-source trail
+is removed when its source topic is evicted. Deferred: duration window, orientation ticks, exact
+interpolated split, strip-breaking at gaps, `PosesInFrame` array-as-path.
+
 ## 4. Scene composition model
 
 - **All layers are frame-locked, always.** On every render, a layer in source frame F is re-transformed via TF to the widget's fixed-frame at the current tracker time. There is no per-layer opt-out and no world-snapshot semantic (Foxglove's per-layer `frame_locked=false` toggle is intentionally not adopted).

@@ -295,6 +295,38 @@ std::optional<TimePoint> TransformBuffer::latestCommonTime(const std::string& ta
   return result.value_or(TimePoint{});
 }
 
+void TransformBuffer::chainSampleTimes(
+    const std::string& target, const std::string& source, TimePoint lo, TimePoint hi,
+    std::vector<TimePoint>& out) const {
+  out.clear();
+  if (lo > hi) {
+    return;
+  }
+  std::shared_lock lock(parents_mutex_);
+  static thread_local std::vector<ChainHop> tgt_chain;
+  static thread_local std::vector<ChainHop> src_chain;
+  chainToRoot(target, tgt_chain);
+  chainToRoot(source, src_chain);
+  const MeetPoint meet = findCommonAncestor(src_chain, tgt_chain);
+  if (!meet.found) {
+    return;
+  }
+  const auto append_edge_stamps = [&out, lo, hi](const std::vector<ChainHop>& chain, std::size_t hops) {
+    for (std::size_t hop = 0; hop < hops; ++hop) {
+      const auto& samples = chain[hop].link->history.samples;
+      auto first = std::lower_bound(samples.begin(), samples.end(), lo, EdgeHistory::lessStamp);
+      const auto last = std::upper_bound(samples.begin(), samples.end(), hi, EdgeHistory::stampLess);
+      for (; first != last; ++first) {
+        out.push_back(first->first);
+      }
+    }
+  };
+  append_edge_stamps(src_chain, meet.src_k);
+  append_edge_stamps(tgt_chain, meet.tgt_k);
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
 std::vector<std::string> TransformBuffer::getAllFrames() const {
   std::vector<std::string> out;
   getAllFrames(out);

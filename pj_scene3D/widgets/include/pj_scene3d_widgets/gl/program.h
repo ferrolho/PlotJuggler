@@ -50,6 +50,7 @@ class Program {
   // first, or you write another program's uniforms.
   void setMat4(const char* name, const glm::mat4& m);
   void setMat3(const char* name, const glm::mat3& m);
+  void setVec2(const char* name, const glm::vec2& v);
   void setVec3(const char* name, const glm::vec3& v);
   void setVec2Array(const char* name, const glm::vec2* values, int count);
   void setVec3Array(const char* name, const glm::vec3* values, int count);

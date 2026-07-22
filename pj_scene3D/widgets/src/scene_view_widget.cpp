@@ -3,6 +3,7 @@
 
 #include "pj_scene3d_widgets/scene_view_widget.h"
 
+#include <QContextMenuEvent>
 #include <QEvent>
 #include <QFont>
 #include <QGuiApplication>
@@ -1068,43 +1069,59 @@ void SceneViewWidget::leaveEvent(QEvent* event) {
   QOpenGLWidget::leaveEvent(event);
 }
 
-void SceneViewWidget::updateHoverFrame(const QPointF& pos_logical) {
-  std::optional<std::string> picked;
-  // Only label when the triads are actually drawn and a TF buffer exists; the
-  // label is an affordance for the visible gizmos, not the raw transform tree.
-  if (axes_visible_ && tf_) {
-    const TransformBuffer& tf_ref = *tf_;
-    // Seed with render_origin_ from the last paint so the projected origins are in
-    // the same render space as last_view_proj_ (the camera-relative proj*view).
-    const FrameContext frame_ctx{tf_ref, fixed_frame_, render_time_, render_origin_};
-    tf_ref.getAllFrames(hover_all_frames_);
+std::optional<std::string> SceneViewWidget::pickFrameAt(const QPointF& pos_logical) const {
+  // Only pick when the triads are actually drawn and a TF buffer exists; the
+  // pick is an affordance for the visible gizmos, not the raw transform tree.
+  if (!axes_visible_ || !tf_) {
+    return std::nullopt;
+  }
+  const TransformBuffer& tf_ref = *tf_;
+  // Seed with render_origin_ from the last paint so the projected origins are in
+  // the same render space as last_view_proj_ (the camera-relative proj*view).
+  const FrameContext frame_ctx{tf_ref, fixed_frame_, render_time_, render_origin_};
+  tf_ref.getAllFrames(hover_all_frames_);
 
-    // Project each origin, keeping hover_points_ index-aligned with
-    // hover_all_frames_: a frame that can't resolve or is behind the camera gets
-    // an off-screen sentinel (always outside the pick radius) so the winning
-    // index still maps straight back to hover_all_frames_.
-    const glm::vec2 kOffscreen{-1.0e6f, -1.0e6f};
-    hover_points_.clear();
-    hover_points_.reserve(hover_all_frames_.size());
-    const glm::vec2 viewport{static_cast<float>(width()), static_cast<float>(height())};
-    for (const std::string& name : hover_all_frames_) {
-      const auto transform = frame_ctx.lookup(name);
-      const auto projected =
-          transform.has_value() ? projectFrameOrigin(last_view_proj_, viewport, glm::vec3(transform->t)) : std::nullopt;
-      hover_points_.push_back(projected.value_or(kOffscreen));
-    }
-
-    const glm::vec2 cursor{static_cast<float>(pos_logical.x()), static_cast<float>(pos_logical.y())};
-    const auto idx = pickNearestFrame(hover_points_, cursor, kHoverRadiusPx);
-    if (idx.has_value()) {
-      picked = hover_all_frames_[*idx];
-    }
+  // Project each origin, keeping hover_points_ index-aligned with
+  // hover_all_frames_: a frame that can't resolve or is behind the camera gets
+  // an off-screen sentinel (always outside the pick radius) so the winning
+  // index still maps straight back to hover_all_frames_.
+  const glm::vec2 offscreen_sentinel{-1.0e6f, -1.0e6f};
+  hover_points_.clear();
+  hover_points_.reserve(hover_all_frames_.size());
+  const glm::vec2 viewport{static_cast<float>(width()), static_cast<float>(height())};
+  for (const std::string& name : hover_all_frames_) {
+    const auto transform = frame_ctx.lookup(name);
+    const auto projected =
+        transform.has_value() ? projectFrameOrigin(last_view_proj_, viewport, glm::vec3(transform->t)) : std::nullopt;
+    hover_points_.push_back(projected.value_or(offscreen_sentinel));
   }
 
+  const glm::vec2 cursor{static_cast<float>(pos_logical.x()), static_cast<float>(pos_logical.y())};
+  const auto idx = pickNearestFrame(hover_points_, cursor, kHoverRadiusPx);
+  if (!idx.has_value()) {
+    return std::nullopt;
+  }
+  return hover_all_frames_[*idx];
+}
+
+void SceneViewWidget::updateHoverFrame(const QPointF& pos_logical) {
+  std::optional<std::string> picked = pickFrameAt(pos_logical);
   if (picked != hovered_frame_) {
     hovered_frame_ = std::move(picked);
     update();  // repaint only when the hovered frame actually changes
   }
+}
+
+void SceneViewWidget::contextMenuEvent(QContextMenuEvent* event) {
+  // Accept ONLY when a frame gizmo is under the cursor: an empty-space
+  // right-click must fall through (ignore()) to the host dock's standard
+  // Split/Clear menu.
+  if (const auto frame = pickFrameAt(event->pos()); frame.has_value()) {
+    emit frameContextMenuRequested(QString::fromStdString(*frame), event->globalPos());
+    event->accept();
+    return;
+  }
+  event->ignore();
 }
 
 void SceneViewWidget::wheelEvent(QWheelEvent* event) {

@@ -26,6 +26,7 @@
 
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
 #include "pj_scene3d_widgets/layers/robot_model_layer.h"
+#include "pj_scene3d_widgets/layers/trail_layer.h"
 #include "pj_scene3d_widgets/mesh_shading_params.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
 #include "pj_scene_common/layer_params.h"
@@ -472,6 +473,25 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   addGridRow(tm_grid, tm_row, tr("Model/URDF"), model_source_combo_, add_model_button_);
   connect(add_model_button_, &QToolButton::clicked, this, &Scene3DConfigPanel::onAddModelClicked);
 
+  trail_frame_combo_ = new ComboBox;
+  trail_frame_combo_->setFocusPolicy(Qt::ClickFocus);
+  trail_frame_combo_->setToolTip(tr("TF frame whose motion trail to draw"));
+  add_trail_button_ = new QToolButton(this);
+  add_trail_button_->setAutoRaise(true);
+  add_trail_button_->setFocusPolicy(Qt::NoFocus);
+  add_trail_button_->setToolTip(tr("Add a motion trail for the selected frame"));
+  sizeTrailingButton(add_trail_button_);
+  addGridRow(tm_grid, tm_row, tr("Trail"), trail_frame_combo_, add_trail_button_);
+  connect(add_trail_button_, &QToolButton::clicked, this, [this]() {
+    if (bound_dock_ == nullptr || trail_frame_combo_ == nullptr) {
+      return;
+    }
+    const QString frame = trail_frame_combo_->currentData().toString();
+    if (!frame.isEmpty()) {
+      bound_dock_->addTrailLayer(pj::scene3d::TrailSource::tfFrame(frame));
+    }
+  });
+
   // One row per panel-added robot model (name + bin), appended below the
   // Model/URDF row by addRobotRow. Hosted in a widget that spans all three
   // columns and stays hidden while empty — an empty grid row would otherwise
@@ -636,6 +656,9 @@ void Scene3DConfigPanel::applyIcons() {
   }
   if (add_model_button_ != nullptr) {
     add_model_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
+  }
+  if (add_trail_button_ != nullptr) {
+    add_trail_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
   }
   if (tf_lines_button_ != nullptr) {
     tf_lines_button_->setIcon(loadSvg(QLatin1String(kTfConnectionsIconPath), theme_));
@@ -849,6 +872,7 @@ void Scene3DConfigPanel::bindDock(Scene3DDockWidget* dock) {
 
   if (dock == nullptr) {
     populateFollowCombo();  // reset to "None"
+    populateTrailCombo();
     updateSelectedLayerPane();
     return;
   }
@@ -856,6 +880,7 @@ void Scene3DConfigPanel::bindDock(Scene3DDockWidget* dock) {
   rebuildLayerList();
   loadControlsFromDock(dock);  // reflect THIS dock's look; controls are per-dock
   populateFollowCombo();       // reflect THIS dock's follow target + frame set
+  populateTrailCombo();
 
   connect(dock, &SceneDockWidget::layerAdded, this, &Scene3DConfigPanel::onLayerAdded);
   connect(dock, &SceneDockWidget::layerRemoved, this, &Scene3DConfigPanel::onLayerRemoved);
@@ -864,6 +889,7 @@ void Scene3DConfigPanel::bindDock(Scene3DDockWidget* dock) {
   // Keep the follow combo in step with the dock's frame set and follow target.
   connect(dock, &Scene3DDockWidget::availableFramesChanged, this, [this](const QList<pj::scene3d::FrameRow>&) {
     populateFollowCombo();
+    populateTrailCombo();
   });
   connect(dock, &Scene3DDockWidget::followFrameChanged, this, [this](const QString&) { populateFollowCombo(); });
 }
@@ -873,6 +899,29 @@ void Scene3DConfigPanel::disconnectFromDock() {
     disconnect(bound_dock_.data(), nullptr, this, nullptr);
   }
   bound_dock_ = nullptr;
+}
+
+void Scene3DConfigPanel::populateTrailCombo() {
+  if (trail_frame_combo_ == nullptr) {
+    return;
+  }
+  QSignalBlocker block(trail_frame_combo_);
+  const QString previous = trail_frame_combo_->currentData().toString();
+  trail_frame_combo_->clear();
+  if (bound_dock_ != nullptr) {
+    for (const auto& row : bound_dock_->availableFrames()) {
+      const QString name = QString::fromStdString(row.name);
+      const QString display = QString(row.depth * 2, QLatin1Char(' ')) + name;
+      trail_frame_combo_->addItem(display, name);
+    }
+  }
+  const int idx = trail_frame_combo_->findData(previous);
+  if (idx >= 0) {
+    trail_frame_combo_->setCurrentIndex(idx);  // keep the user's pick across refreshes
+  }
+  if (add_trail_button_ != nullptr) {
+    add_trail_button_->setEnabled(trail_frame_combo_->count() > 0);
+  }
 }
 
 void Scene3DConfigPanel::populateFollowCombo() {

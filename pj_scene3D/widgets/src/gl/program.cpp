@@ -235,6 +235,14 @@ void Program::setMat3(const char* name, const glm::mat3& m) {
       [location, &m](auto& functions) { functions.glUniformMatrix3fv(location, 1, GL_FALSE, glm::value_ptr(m)); });
 }
 
+void Program::setVec2(const char* name, const glm::vec2& v) {
+  const GLint location = uniformLocation(name);
+  if (location < 0) {
+    return;
+  }
+  withGlFunctions([location, &v](auto& functions) { functions.glUniform2fv(location, 1, glm::value_ptr(v)); });
+}
+
 void Program::setVec3(const char* name, const glm::vec3& v) {
   const GLint location = uniformLocation(name);
   if (location < 0) {

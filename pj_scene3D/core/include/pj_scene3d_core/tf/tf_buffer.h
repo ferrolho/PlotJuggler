@@ -122,6 +122,17 @@ class TransformBuffer {
   // areConnected() instead.
   [[nodiscard]] std::optional<TimePoint> latestCommonTime(const std::string& target, const std::string& source) const;
 
+  // Union of every edge's sample stamps along the connecting path between
+  // `target` and `source` (both chains up to their common ancestor), clipped to
+  // [lo, hi] inclusive, sorted ascending and deduplicated into `out` (cleared
+  // first). Empty when either frame is unknown, the two are disconnected
+  // (same reachability rule as tryLookupTransform), or target == source.
+  // This is the natural sampling grid for a motion trail: a frame whose own
+  // edge is static still moves whenever an edge higher up the chain does.
+  void chainSampleTimes(
+      const std::string& target, const std::string& source, TimePoint lo, TimePoint hi,
+      std::vector<TimePoint>& out) const;
+
   [[nodiscard]] std::vector<std::string> getAllFrames() const;
   // Same result as getAllFrames(), but refills the caller's vector (cleared
   // first) so it can reuse capacity across calls — used by per-frame render

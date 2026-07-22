@@ -163,6 +163,11 @@ class DockWidget : public ads::CDockWidget, public IDataWidget {
   // Deliberately NOT set on the factory/drop path (onCatalogItemsDropped), which
   // already seeds streaming at creation — arming it there would double-fire.
   bool object_widget_awaiting_first_topic_ = false;
+  // Re-entrancy guard for the ContextMenu case of eventFilter: while the dock
+  // forwards the event to the content widget's own handler (first shot — e.g.
+  // the 3D view's frame-gizmo menu), the filter must pass it through instead of
+  // intercepting it again.
+  bool forwarding_context_menu_ = false;
   DockToolbar* toolbar_ = nullptr;
   QString state_id_;
 };

@@ -4,9 +4,11 @@ The purpose of this module is to implement 3D visualization of robotics data
 (TF, pointclouds, occupancy grids / costmaps, meshes / URDF robot models,
 scene entities (markers), pose arrays (`PosesInFrame`, drawn as per-pose
 coordinate-triad gizmos), dense voxel grids (`VoxelGridLayer`, drawn as
-GPU-instanced cubes), and depth images back-projected into point clouds
-(`DepthCloudLayer`)); paths and laserscans remain future work. Sibling
-widget family to `pj_scene2D`.
+GPU-instanced cubes), depth images back-projected into point clouds
+(`DepthCloudLayer`), and motion **trails** (`TrailLayer`: a frame's — or a
+pose topic's first-pose — trajectory over the whole time range as a
+split-colored screen-space ribbon; see ARCHITECTURE.md → "Trail layer")); `PosesInFrame` array-as-path rendering and laserscans remain
+future work. Sibling widget family to `pj_scene2D`.
 
 `VoxelGridLayer` consumes `sdk::VoxelGrid` (SDK ≥ 0.10.0): a dense 3D lattice
 whose per-voxel value is generic via `fields` (occupancy/cost/ESDF/semantic, or a
