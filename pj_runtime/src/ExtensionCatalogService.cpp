@@ -16,9 +16,11 @@
 #include <system_error>
 #include <utility>
 
+#ifndef PJ_TARGET_WASM
 #include "pj_marketplace/extension_manager.hpp"
 #include "pj_marketplace/platform_utils.hpp"
 #include "pj_marketplace/version_compare.hpp"
+#endif
 #include "pj_plugins/host/plugin_catalog.hpp"
 using namespace Qt::StringLiterals;
 
@@ -28,11 +30,19 @@ namespace {
 Q_LOGGING_CATEGORY(lcCatalog, "pj.app_core.extensions")
 
 QString defaultExtensionsDir() {
+#ifdef PJ_TARGET_WASM
+  return {};
+#else
   return PlatformUtils::extensionsDir();
+#endif
 }
 
 QString defaultPendingDir() {
+#ifdef PJ_TARGET_WASM
+  return {};
+#else
   return PlatformUtils::pendingDir();
+#endif
 }
 
 // User-managed extra plugin folders (Preferences page). QStringList.
@@ -179,6 +189,7 @@ ExtensionCatalogService::ExtensionCatalogService(
   const QString pending_dir =
       (default_mode_ && default_marketplace) ? defaultPendingDir() : extensions_dir_ + "/.pending";
 
+#ifndef PJ_TARGET_WASM
   if (!QDir().mkpath(extensions_dir_)) {
     qCWarning(lcCatalog) << "Failed to create extensions directory" << extensions_dir_
                          << "- plugin loading will be a no-op until it exists.";
@@ -197,6 +208,9 @@ ExtensionCatalogService::ExtensionCatalogService(
   // pending staged installs above, so a staged upgrade is promoted before the
   // seed's version comparison sees it.
   seedBundledPlugins();
+#else
+  (void)pending_dir;
+#endif
   plugin_catalog_ = std::make_unique<PluginRuntimeCatalog>(std::filesystem::path{}, sink_, "ExtensionCatalogService");
   // Gauge each plugin's min_plotjuggler_version against the version the app
   // advertises. Only breaks ties between duplicate plugin ids (see
@@ -210,7 +224,10 @@ ExtensionCatalogService::ExtensionCatalogService(
   // folders, then the marketplace dir; the catalog de-duplicates by plugin id —
   // authoritative entries override, then compatibility, then version, then
   // folder priority).
-  std::vector<PluginDirEntry> scan_dirs = buildScanHierarchy(!default_mode_);
+  std::vector<PluginDirEntry> scan_dirs;
+#ifndef PJ_TARGET_WASM
+  scan_dirs = buildScanHierarchy(!default_mode_);
+#endif
   const auto scan_dir_count = scan_dirs.size();
   plugin_catalog_->setPluginDirs(std::move(scan_dirs));
 
@@ -230,12 +247,16 @@ void ExtensionCatalogService::setCustomPluginFolders(const QStringList& folders)
 }
 
 QStringList ExtensionCatalogService::builtinPluginFolders() const {
+#ifdef PJ_TARGET_WASM
+  return {};
+#else
   QStringList folders;
   folders << extensions_dir_;
   if (marketplace_dir_ != extensions_dir_) {
     folders << marketplace_dir_;
   }
   return folders;
+#endif
 }
 
 std::vector<PluginDirEntry> ExtensionCatalogService::buildScanHierarchy(bool extensions_dir_is_explicit) const {
@@ -265,6 +286,7 @@ std::vector<PluginDirEntry> ExtensionCatalogService::buildScanHierarchy(bool ext
   return dirs;
 }
 
+#ifndef PJ_TARGET_WASM
 void ExtensionCatalogService::seedBundledPlugins() {
   // Refresh staging area: a SIBLING of the marketplace dir, so the promote
   // rename never crosses a filesystem, yet an interrupted seed can never leak
@@ -414,10 +436,14 @@ void ExtensionCatalogService::seedBundledPlugins() {
     extension_manager_->setBundledVersions(bundled_versions);
   }
 }
+#endif
 
 ExtensionCatalogService::~ExtensionCatalogService() = default;
 
 void ExtensionCatalogService::reload() {
+#ifdef PJ_TARGET_WASM
+  return;
+#else
   bool changed = false;
   {
     // Exclusive: reload() clears/reallocates the catalog's parser vector. Any
@@ -429,6 +455,7 @@ void ExtensionCatalogService::reload() {
   if (changed) {
     emit catalogChanged();
   }
+#endif
 }
 
 MessageParserHandle ExtensionCatalogService::createParserHandleForEncoding(QStringView encoding) const {

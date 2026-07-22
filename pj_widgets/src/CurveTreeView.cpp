@@ -6,13 +6,24 @@
 #include <QApplication>
 #include <QDataStream>
 #include <QDrag>
+#ifdef PJ_TARGET_WASM
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDropEvent>
+#endif
 #include <QFontDatabase>
 #include <QHeaderView>
 #include <QIcon>
+#ifdef PJ_TARGET_WASM
+#include <QKeyEvent>
+#endif
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
+#ifdef PJ_TARGET_WASM
+#include <QScopeGuard>
+#endif
 #include <QScrollBar>
 #include <QSet>
 #include <QSize>
@@ -1071,7 +1082,38 @@ std::vector<QString> CurveTreeView::selectedCurveNamesForDrag() const {
   return names;
 }
 
+#ifdef PJ_TARGET_WASM
+bool CurveTreeView::event(QEvent* event) {
+  if (wasm_drag_mime_ != nullptr) {
+    const bool escape = event->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape;
+    if (escape || event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse) {
+      // The synchronous drop handler still owns wasm_drag_mime_. Do not let a
+      // nested cancellation free it or balance the source press before the
+      // outer drop returns and completes its normal cleanup.
+      if (in_wasm_drop_) {
+        event->accept();
+        return true;
+      }
+      abortWasmDrag(QApplication::keyboardModifiers());
+      event->accept();
+      return true;
+    }
+  }
+  return QTreeWidget::event(event);
+}
+#endif
+
 void CurveTreeView::mousePressEvent(QMouseEvent* event) {
+#ifdef PJ_TARGET_WASM
+  if (in_wasm_drop_) {
+    event->accept();
+    return;
+  }
+  // A second press should not normally arrive before release, but cancelling
+  // here keeps the synthetic drag state balanced if the browser interrupted a
+  // gesture (lost focus, modal UI, or an injected automation event).
+  cancelWasmDrag();
+#endif
   drag_curve_names_.clear();
   drag_catalog_keys_.clear();
   suppress_next_release_ = false;
@@ -1112,6 +1154,27 @@ void CurveTreeView::mousePressEvent(QMouseEvent* event) {
 }
 
 void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
+#ifdef PJ_TARGET_WASM
+  if (in_wasm_drop_) {
+    event->accept();
+    return;
+  }
+  if (wasm_drag_mime_ != nullptr) {
+    if (!event->buttons().testFlag(wasm_drag_button_)) {
+      // Browser focus changes can lose the matching release. Do not leave a
+      // stale accepted target receiving buttonless drag moves indefinitely.
+      abortWasmDrag(event->modifiers());
+      event->accept();
+      return;
+    }
+    // Once the threshold starts our in-app drag, keep every grabbed move in
+    // the DnD dispatcher. Passing these moves back to QAbstractItemView would
+    // rubber-select each source row crossed on the way to the plot.
+    updateWasmDrag(event->globalPosition().toPoint(), event->buttons(), event->modifiers());
+    event->accept();
+    return;
+  }
+#endif
   if (drag_button_ == Qt::NoButton) {
     QTreeWidget::mouseMoveEvent(event);
     return;
@@ -1140,10 +1203,149 @@ void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
 
+#ifdef PJ_TARGET_WASM
+  beginWasmDrag(mime_data, event);
+#else
   auto* drag = new QDrag(this);
   drag->setMimeData(mime_data);
   drag->exec(Qt::CopyAction | Qt::MoveAction);
+#endif
 }
+
+#ifdef PJ_TARGET_WASM
+void CurveTreeView::beginWasmDrag(QMimeData* mime_data, QMouseEvent* event) {
+  // A drop handler running on our stack (in_wasm_drop_) may synthesize a press
+  // that reaches here; do not start a fresh drag inside the in-flight one.
+  if (in_wasm_drop_) {
+    delete mime_data;
+    return;
+  }
+  wasm_drag_mime_.reset(mime_data);
+  wasm_drag_button_ = event->buttons().testFlag(Qt::RightButton) ? Qt::RightButton : Qt::LeftButton;
+  updateWasmDrag(event->globalPosition().toPoint(), event->buttons(), event->modifiers());
+  event->accept();
+}
+
+void CurveTreeView::updateWasmDrag(
+    const QPoint& global_pos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+  if (wasm_drag_mime_ == nullptr) {
+    return;
+  }
+
+  QWidget* leaf = QApplication::widgetAt(global_pos);
+
+  // If the pointer is still inside the accepted target (possibly over one of
+  // its children), give it a move first. A target may reject only part of its
+  // area; rejection falls through to the next accepting ancestor below.
+  bool target_is_ancestor = false;
+  for (QWidget* candidate = leaf; candidate != nullptr; candidate = candidate->parentWidget()) {
+    if (candidate == wasm_drag_target_) {
+      target_is_ancestor = true;
+      break;
+    }
+  }
+  if (wasm_drag_target_ != nullptr && target_is_ancestor) {
+    QDragMoveEvent move_event(
+        wasm_drag_target_->mapFromGlobal(global_pos), Qt::CopyAction | Qt::MoveAction, wasm_drag_mime_.get(), buttons,
+        modifiers);
+    QApplication::sendEvent(wasm_drag_target_, &move_event);
+    if (move_event.isAccepted()) {
+      return;
+    }
+  }
+
+  if (wasm_drag_target_ != nullptr) {
+    QDragLeaveEvent leave_event;
+    QApplication::sendEvent(wasm_drag_target_, &leave_event);
+    wasm_drag_target_.clear();
+  }
+
+  // Match Qt's normal deepest-widget-first routing. Event filters installed on
+  // placeholder buttons and the live plot canvas still run through sendEvent;
+  // an ignored child lets the nearest accepting parent try the same payload.
+  QPointer<QWidget> candidate = leaf;
+  while (candidate != nullptr) {
+    QPointer<QWidget> current = candidate;
+    // Capture the next hop before delivery: a drag-enter filter is arbitrary
+    // application code and may synchronously delete its watched widget.
+    QPointer<QWidget> parent = current->parentWidget();
+    if (!current->acceptDrops()) {
+      candidate = parent;
+      continue;
+    }
+    QDragEnterEvent enter_event(
+        current->mapFromGlobal(global_pos), Qt::CopyAction | Qt::MoveAction, wasm_drag_mime_.get(), buttons, modifiers);
+    QApplication::sendEvent(current, &enter_event);
+    if (enter_event.isAccepted() && current != nullptr) {
+      wasm_drag_target_ = current;
+      return;
+    }
+    candidate = parent;
+  }
+}
+
+void CurveTreeView::finishWasmDrag(QMouseEvent* event) {
+  // The drop handler rebuilds this tree synchronously (see in_wasm_drop_); a
+  // re-entry on that stack must not dispatch a nested drop.
+  if (wasm_drag_mime_ == nullptr || in_wasm_drop_) {
+    return;
+  }
+
+  const QPoint global_pos = event->globalPosition().toPoint();
+  // Drop straight to the target the last move already entered and accepted — do
+  // NOT re-run updateWasmDrag here. Re-routing on release could leave the old
+  // target and enter a new one (arbitrary app code) before the drop, turning a
+  // single release into enter->leave->enter->drop. DnD drops on the last-entered
+  // target, so any pointer drift since the last move is intentionally ignored.
+  QPointer<QWidget> target = wasm_drag_target_;
+  if (target != nullptr) {
+    QDropEvent drop_event(
+        QPointF(target->mapFromGlobal(global_pos)), Qt::CopyAction | Qt::MoveAction, wasm_drag_mime_.get(),
+        wasm_drag_button_, event->modifiers());
+    // RAII so the guard clears on every exit of this scope (including an
+    // exception unwinding out of the drop handler).
+    in_wasm_drop_ = true;
+    const auto drop_guard = qScopeGuard([this] { in_wasm_drop_ = false; });
+    QApplication::sendEvent(target, &drop_event);
+  }
+
+  // A drop ends the sequence without a leave event, matching native DnD.
+  wasm_drag_target_.clear();
+  wasm_drag_mime_.reset();
+  wasm_drag_button_ = Qt::NoButton;
+  event->accept();
+}
+
+void CurveTreeView::cancelWasmDrag() {
+  if (wasm_drag_target_ != nullptr) {
+    QDragLeaveEvent leave_event;
+    QApplication::sendEvent(wasm_drag_target_, &leave_event);
+  }
+  wasm_drag_target_.clear();
+  wasm_drag_mime_.reset();
+  wasm_drag_button_ = Qt::NoButton;
+}
+
+void CurveTreeView::balanceWasmSourcePress(Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+  if (suppress_next_release_) {
+    // The corresponding press was consumed before the base class saw it.
+    suppress_next_release_ = false;
+    return;
+  }
+  // Balance the base-class press at its original position. Forwarding a real
+  // release over the plot makes ExtendedSelection select the entire row span.
+  QMouseEvent balanced_release(
+      QEvent::MouseButtonRelease, QPointF(drag_start_pos_), QPointF(viewport()->mapToGlobal(drag_start_pos_)), button,
+      Qt::NoButton, modifiers);
+  QTreeWidget::mouseReleaseEvent(&balanced_release);
+}
+
+void CurveTreeView::abortWasmDrag(Qt::KeyboardModifiers modifiers) {
+  const Qt::MouseButton button = wasm_drag_button_;
+  cancelWasmDrag();
+  balanceWasmSourcePress(button, modifiers);
+}
+#endif
 
 QMimeData* CurveTreeView::createDragMimeData(Qt::MouseButton button) const {
   const std::vector<QString> names = selectedCurveNamesForDrag();
@@ -1190,6 +1392,22 @@ QMimeData* CurveTreeView::createDragMimeData(Qt::MouseButton button) const {
 }
 
 void CurveTreeView::mouseReleaseEvent(QMouseEvent* event) {
+#ifdef PJ_TARGET_WASM
+  if (in_wasm_drop_) {
+    event->accept();
+    return;
+  }
+  if (wasm_drag_mime_ != nullptr && event->button() == wasm_drag_button_) {
+    const Qt::MouseButton button = wasm_drag_button_;
+    finishWasmDrag(event);
+    // The native QDrag loop leaves QAbstractItemView's pressed/selection state
+    // balanced when it consumes the release. Our in-app loop must forward that
+    // release explicitly; otherwise the next plain drag is interpreted as a
+    // continuation and selects every row crossed between the two gestures.
+    balanceWasmSourcePress(button, event->modifiers());
+    return;
+  }
+#endif
   if (suppress_next_release_) {
     suppress_next_release_ = false;
     drag_button_ = Qt::NoButton;

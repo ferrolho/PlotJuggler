@@ -1,4 +1,8 @@
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGLWidgets Xml)
+if(EMSCRIPTEN)
+    find_package(Qt6 REQUIRED COMPONENTS Core Gui GuiPrivate Widgets Xml ShaderTools)
+else()
+    find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGLWidgets Xml)
+endif()
 
 add_library(pj_plotting STATIC
     src/CurveEditor.cpp
@@ -15,6 +19,7 @@ add_library(pj_plotting STATIC
     src/PlotLegend.cpp
     src/PlotMagnifier.cpp
     src/PlotPanner.cpp
+    src/PlotSampleReducer.cpp
     src/PlotScaleDraw.cpp
     src/PlotWidget.cpp
     src/PlotWidgetBase.cpp
@@ -36,6 +41,7 @@ add_library(pj_plotting STATIC
     include/pj_plotting/PlotLegend.h
     include/pj_plotting/PlotMagnifier.h
     include/pj_plotting/PlotPanner.h
+    include/pj_plotting/PlotSampleReducer.h
     include/pj_plotting/PlotScaleDraw.h
     include/pj_plotting/PlotWidget.h
     include/pj_plotting/PlotWidgetBase.h
@@ -62,10 +68,34 @@ target_link_libraries(pj_plotting PUBLIC
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
-    Qt6::OpenGLWidgets
     Qt6::Xml
     pj_scripting  # PUBLIC: public headers (FilterEditorPanel.h, ParameterForm.h) expose pj_scripting types
     pj_widgets    # PUBLIC: XYCurveDialog.h (a public header) derives from PJ::Dialog
   PRIVATE
     pj_datastore  # DataProcessor (applyBatch preview) — formerly pj_proc
 )
+
+if(EMSCRIPTEN)
+  target_sources(pj_plotting PRIVATE
+    src/PlotRhiCanvas.cpp
+    include/pj_plotting/PlotRhiCanvas.h
+  )
+  if(PJ_WASM_ENABLE_INGRESS_PROBE)
+    target_compile_definitions(pj_plotting PRIVATE PJ_WASM_ENABLE_INGRESS_PROBE)
+  endif()
+  target_link_libraries(pj_plotting PRIVATE Qt6::GuiPrivate)
+  qt_add_shaders(pj_plotting pj_plot_rhi_shaders
+    PREFIX "/pj_plotting/shaders"
+    BASE shaders
+    GLSL "300 es,120,150"
+    NOHLSL
+    NOMSL
+    FILES
+      shaders/plot_color.vert
+      shaders/plot_color.frag
+      shaders/plot_text.vert
+      shaders/plot_text.frag
+  )
+else()
+  target_link_libraries(pj_plotting PUBLIC Qt6::OpenGLWidgets)
+endif()

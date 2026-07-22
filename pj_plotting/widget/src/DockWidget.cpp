@@ -20,6 +20,10 @@
 #include <QMetaObject>
 #include <QMimeData>
 #include <QPushButton>
+#ifdef PJ_TARGET_WASM
+#include <QPointer>
+#include <QTimer>
+#endif
 #include <QUuid>
 #include <QWidget>
 #include <utility>
@@ -607,11 +611,38 @@ void DockWidget::onCatalogItemsXyRequested(const QStringList& keys) {
   if (!catalog_->curveDescriptor(keys.front()).has_value() || !catalog_->curveDescriptor(keys.back()).has_value()) {
     return;
   }
+#ifdef PJ_TARGET_WASM
+  const bool created_plot = plot_widget_ == nullptr;
+#endif
   PlotWidget* plot = ensurePlotWidget();
   if (plot == nullptr) {
     return;
   }
   plot->setModeXY(true);
+#ifdef PJ_TARGET_WASM
+  const QPointer<DockWidget> guard(this);
+  const QPointer<PlotWidget> pending_plot(plot);
+  plot->createCurveXYInteractiveAsync(
+      keys.front(), keys.back(), [guard, pending_plot, created_plot](PlotWidget::CurveInfo* created) {
+        if (guard.isNull() || pending_plot.isNull() || guard->plot_widget_ != pending_plot.data()) {
+          return;
+        }
+        if (created != nullptr) {
+          pending_plot->zoomOut(true);
+          emit guard->undoableChange();
+          guard->focusSelf();
+          return;
+        }
+        // Do not schedule the just-cancelled plot for deletion while its dialog's
+        // finished handler is still on that plot's stack.
+        QTimer::singleShot(0, guard, [guard, pending_plot, created_plot]() {
+          if (created_plot && !guard.isNull() && !pending_plot.isNull() && guard->plot_widget_ == pending_plot.data() &&
+              pending_plot->curveList().empty()) {
+            guard->setPlaceholderWidget();
+          }
+        });
+      });
+#else
   if (plot->createCurveXYInteractive(keys.front(), keys.back()) != nullptr) {
     plot->zoomOut(true);
     emit undoableChange();
@@ -620,6 +651,7 @@ void DockWidget::onCatalogItemsXyRequested(const QStringList& keys) {
     // Cancelled in the dialog: drop the just-created empty plot back to a placeholder.
     setPlaceholderWidget();
   }
+#endif
 }
 
 void DockWidget::clearToPlaceholder() {
@@ -793,7 +825,16 @@ void DockWidget::removeObjectContextMenuFilter(QWidget* root) {
 
 void DockWidget::showObjectContextMenu(const QPoint& global_pos) {
   const QString theme = currentTheme();
+#ifdef PJ_TARGET_WASM
+  // QMenu::exec() needs a nested event loop, which the Asyncify-free browser
+  // build cannot enter. Retain the popup until it closes; action wiring stays
+  // identical to the desktop menu below.
+  auto* wasm_menu = new QMenu(this);
+  wasm_menu->setAttribute(Qt::WA_DeleteOnClose);
+  QMenu& menu = *wasm_menu;
+#else
   QMenu menu(this);
+#endif
   menu.setObjectName(u"PJMenu"_s);
   menu.setProperty("categorySeparators", true);
   QAction* copy_action = menu.addAction(
@@ -814,7 +855,11 @@ void DockWidget::showObjectContextMenu(const QPoint& global_pos) {
   addActionCategorySeparator(menu);
   menu.addAction(
       QIcon(loadSvg(":/resources/svg/clear.svg", theme)), tr("Clear"), this, [this]() { clearToPlaceholder(); });
+#ifdef PJ_TARGET_WASM
+  menu.popup(global_pos);
+#else
   menu.exec(global_pos);
+#endif
 }
 
 }  // namespace PJ

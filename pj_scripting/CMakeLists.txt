@@ -11,13 +11,15 @@
 
 find_package(Luau REQUIRED)
 find_package(nlohmann_json REQUIRED)
-find_package(Python REQUIRED)    # conan-provided embedded CPython (cpython::embed)
-find_package(pybind11 REQUIRED)  # embedded CPython backend (python_engine.cpp)
+if(NOT EMSCRIPTEN)
+  find_package(Python REQUIRED)    # conan-provided embedded CPython (cpython::embed)
+  find_package(pybind11 REQUIRED)  # embedded CPython backend (python_engine.cpp)
+endif()
 
 # Outside Conan (e.g. a conda/pixi environment) there is no cpython::embed —
 # resolve the embed library through CMake's stock FindPython and bridge it to
 # the same target name.
-if(NOT TARGET cpython::embed)
+if(NOT EMSCRIPTEN AND NOT TARGET cpython::embed)
   find_package(Python REQUIRED COMPONENTS Interpreter Development.Embed)
   add_library(cpython::embed INTERFACE IMPORTED)
   target_link_libraries(cpython::embed INTERFACE Python::Python)
@@ -54,10 +56,12 @@ if(NOT _pj_python_home AND DEFINED _Python_EXECUTABLE)
   get_filename_component(_pj_python_home "${_Python_EXECUTABLE}" DIRECTORY)
   get_filename_component(_pj_python_home "${_pj_python_home}" DIRECTORY)
 endif()
-if(NOT _pj_python_home)
+if(NOT EMSCRIPTEN AND NOT _pj_python_home)
   message(WARNING "pj_scripting: could not determine the embedded Python home; the Python backend may fail to init at runtime")
 endif()
-message(STATUS "pj_scripting: embedded Python home = ${_pj_python_home}")
+if(NOT EMSCRIPTEN)
+  message(STATUS "pj_scripting: embedded Python home = ${_pj_python_home}")
+endif()
 
 # PYTHONHOME the embedded interpreter is pointed at. On Windows the Conan CPython
 # package nests its runtime — python3XX.dll, Lib/ (stdlib), DLLs/ — under
@@ -86,13 +90,19 @@ if(NOT WIN32 AND _pj_python_home)
   file(WRITE "${CMAKE_BINARY_DIR}/pj_python_home.txt" "${_pj_python_home}\n")
 endif()
 
-add_library(pj_scripting STATIC
+set(PJ_SCRIPTING_SOURCES
   src/luau_engine.cpp
   src/lua_siso_transform.cpp
   src/lua_mimo_transform.cpp
   src/filter_catalogue.cpp
-  src/python_engine.cpp
 )
+if(EMSCRIPTEN)
+  list(APPEND PJ_SCRIPTING_SOURCES src/python_engine_unavailable.cpp)
+else()
+  list(APPEND PJ_SCRIPTING_SOURCES src/python_engine.cpp)
+endif()
+
+add_library(pj_scripting STATIC ${PJ_SCRIPTING_SOURCES})
 target_include_directories(pj_scripting PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -112,11 +122,18 @@ target_link_libraries(pj_scripting
   PRIVATE
     Luau::VM                      # Luau backend (hand-bound) — luau_engine.cpp only
     Luau::Compiler
-    pybind11::embed               # Python backend (embedded CPython) — python_engine.cpp only
-    cpython::embed                # static libpython for the embedded interpreter
 )
 
-target_compile_definitions(pj_scripting PRIVATE PJ_PYTHON_HOME="${_pj_python_home_define}")
+if(NOT EMSCRIPTEN)
+  target_link_libraries(pj_scripting PRIVATE
+    pybind11::embed               # Python backend (embedded CPython) — python_engine.cpp only
+    cpython::embed                # static libpython for the embedded interpreter
+  )
+endif()
+
+if(NOT EMSCRIPTEN)
+  target_compile_definitions(pj_scripting PRIVATE PJ_PYTHON_HOME="${_pj_python_home_define}")
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests

@@ -82,6 +82,27 @@ TEST(ScrubberBase, NoEditingFinishedWhileDragInProgress) {
   EXPECT_EQ(finished_spy.count(), 0);  // still dragging — not settled yet
 }
 
+// If the platform swallowed the release outside the app, the first move with
+// no pressed left button must settle the drag instead of leaving the global
+// wasm event filter active until another click.
+TEST(ScrubberBase, ButtonlessMoveSelfHealsLostDragRelease) {
+  PJ::IntScrubber scrubber;
+  configure(scrubber);
+  QSignalSpy finished_spy(&scrubber, &PJ::ScrubberBase::editingFinished);
+
+  const QPointF body_local(40, kHeight / 2);
+  sendMouse(&scrubber, QEvent::MouseButtonPress, body_local, QPointF(100, 100), Qt::LeftButton, Qt::LeftButton);
+  sendMouse(&scrubber, QEvent::MouseMove, QPointF(70, kHeight / 2), QPointF(140, 100), Qt::NoButton, Qt::LeftButton);
+  sendMouse(&scrubber, QEvent::MouseMove, QPointF(72, kHeight / 2), QPointF(142, 100), Qt::NoButton, Qt::NoButton);
+
+  EXPECT_EQ(finished_spy.count(), 1);
+
+  // A later physical release must not emit a second settlement.
+  sendMouse(
+      &scrubber, QEvent::MouseButtonRelease, QPointF(72, kHeight / 2), QPointF(142, 100), Qt::LeftButton, Qt::NoButton);
+  EXPECT_EQ(finished_spy.count(), 1);
+}
+
 // Clicking an arrow (press steps once, release ends the interaction) settles once.
 TEST(ScrubberBase, ArrowClickFiresEditingFinished) {
   PJ::IntScrubber scrubber;

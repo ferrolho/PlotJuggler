@@ -12,6 +12,9 @@
 #include <QStringList>
 #include <QTimer>
 #include <cstddef>
+#ifdef PJ_TARGET_WASM
+#include <functional>
+#endif
 #include <optional>
 #include <vector>
 
@@ -46,11 +49,19 @@ class PlotWidget : public PlotWidgetBase {
   CurveInfo* addCurveXY(
       const QString& x_name, const QString& y_name, const QString& alias, QColor color = Qt::transparent);
 
-  // Interactive XY creation: pops the XYCurveDialog (Swap + alias) for the two
-  // series, then adds the curve with the chosen orientation/alias. Returns nullptr
-  // if the user cancels. Used by the on-canvas drop and the placeholder-dock drop;
-  // never on layout/undo load (that path passes the saved alias to addCurveXY).
+#ifndef PJ_TARGET_WASM
+  // Desktop interactive XY creation: pops the XYCurveDialog (Swap + alias) for
+  // the two series, then adds the curve with the chosen orientation/alias.
+  // Returns nullptr if the user cancels. Never used by layout/undo load.
   CurveInfo* createCurveXYInteractive(const QString& x_key, const QString& y_key);
+#else
+  // Browser counterpart to createCurveXYInteractive(). Qt/WASM builds are
+  // Asyncify-free, so nested QDialog::exec() event loops are unavailable. The
+  // callback runs after the nonblocking dialog (and any duplicate-name warning)
+  // closes; it receives nullptr on cancel or validation failure.
+  void createCurveXYInteractiveAsync(
+      const QString& x_key, const QString& y_key, std::function<void(CurveInfo*)> on_finished);
+#endif
 
   // Add (or look up, if already present) the curve described by a layout `<curve>`
   // element and apply its saved style (color, line_width, style, visible). Picks
@@ -96,6 +107,10 @@ class PlotWidget : public PlotWidgetBase {
   // this off does not hide the playback red line.
   void setShowPoints(bool show);
   [[nodiscard]] bool showPoints() const noexcept;
+  [[nodiscard]] bool pointInspectorVisible() const noexcept;
+  // Hidden inspectors expose no stale sample state.
+  [[nodiscard]] QPointF pointInspectorPosition() const noexcept;
+  [[nodiscard]] QString pointInspectorLabel() const;
   // Enable/disable the canvas right-click context menu (off for read-only
   // previews, e.g. the Filter Editor's preview plot). Default on.
   void setContextMenuEnabled(bool enabled) noexcept {

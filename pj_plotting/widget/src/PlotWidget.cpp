@@ -341,6 +341,7 @@ PlotWidget::CurveInfo* PlotWidget::addCurveXY(
   return info;
 }
 
+#ifndef PJ_TARGET_WASM
 PlotWidget::CurveInfo* PlotWidget::createCurveXYInteractive(const QString& x_key, const QString& y_key) {
   if (catalog_ == nullptr) {
     return nullptr;
@@ -366,6 +367,74 @@ PlotWidget::CurveInfo* PlotWidget::createCurveXYInteractive(const QString& x_key
   }
   return nullptr;  // cancelled
 }
+#else
+void PlotWidget::createCurveXYInteractiveAsync(
+    const QString& x_key, const QString& y_key, std::function<void(CurveInfo*)> on_finished) {
+  if (catalog_ == nullptr) {
+    if (on_finished) {
+      on_finished(nullptr);
+    }
+    return;
+  }
+  const auto x_descriptor = catalog_->curveDescriptor(x_key);
+  const auto y_descriptor = catalog_->curveDescriptor(y_key);
+  if (!x_descriptor.has_value() || !y_descriptor.has_value()) {
+    if (on_finished) {
+      on_finished(nullptr);
+    }
+    return;
+  }
+
+  // Deliberately heap-owned and opened asynchronously: QDialog::exec() enters a
+  // nested event loop, which an Asyncify-free Qt/WASM build cannot suspend.
+  // Keep this one dialog alive across duplicate-name retries so the user's Swap
+  // and alias edits are retained exactly like the desktop while(exec()) loop.
+  auto* dialog = new XYCurveDialog(curveDisplayName(*x_descriptor), curveDisplayName(*y_descriptor), this);
+  connect(
+      dialog, &QDialog::finished, this,
+      [this, dialog, x_key, y_key, on_finished = std::move(on_finished)](int result) mutable {
+        if (result != QDialog::Accepted) {
+          dialog->deleteLater();
+          if (on_finished) {
+            auto completion = std::move(on_finished);
+            completion(nullptr);
+          }
+          return;
+        }
+
+        const QString alias = dialog->alias();
+        if (curveFromTitle(alias) != nullptr) {
+          // MessageBox::warning() is synchronous too, so reproduce it with the
+          // same instance UI and reopen the XY dialog only after dismissal.
+          auto* warning = new MessageBox(this);
+          warning->setAttribute(Qt::WA_DeleteOnClose);
+          warning->setTitle(tr("Duplicate name"));
+          warning->setText(tr("A curve named \"%1\" already exists in this plot.").arg(alias));
+          warning->addButton(MessageBox::tr("OK"), MessageBox::kPrimaryRole);
+          connect(warning, &QDialog::finished, dialog, [dialog](int) {
+            dialog->setWindowModality(Qt::ApplicationModal);
+            dialog->show();
+          });
+          // QDialog::open() force-downgrades ApplicationModal to WindowModal.
+          // show() preserves desktop exec()'s app-wide modality without nesting.
+          warning->setWindowModality(Qt::ApplicationModal);
+          warning->show();
+          return;
+        }
+
+        const QString final_x = dialog->swapped() ? y_key : x_key;
+        const QString final_y = dialog->swapped() ? x_key : y_key;
+        CurveInfo* created = addCurveXY(final_x, final_y, alias);
+        dialog->deleteLater();
+        if (on_finished) {
+          auto completion = std::move(on_finished);
+          completion(created);
+        }
+      });
+  dialog->setWindowModality(Qt::ApplicationModal);
+  dialog->show();
+}
+#endif
 
 void PlotWidget::setZoomRectangle(QRectF rect, bool emit_signal) {
   if (isXYPlot() && keepRatioXY()) {
@@ -450,6 +519,19 @@ void PlotWidget::setShowPoints(bool show) {
 
 bool PlotWidget::showPoints() const noexcept {
   return show_points_;
+}
+
+bool PlotWidget::pointInspectorVisible() const noexcept {
+  return show_point_marker_ != nullptr && show_point_text_ != nullptr && show_point_marker_->isVisible() &&
+         show_point_text_->isVisible();
+}
+
+QPointF PlotWidget::pointInspectorPosition() const noexcept {
+  return pointInspectorVisible() ? show_point_marker_->value() : QPointF{};
+}
+
+QString PlotWidget::pointInspectorLabel() const {
+  return pointInspectorVisible() ? show_point_text_->label().text() : QString{};
 }
 
 void PlotWidget::showPointValues(QPoint paint_point) {
@@ -1271,12 +1353,39 @@ void PlotWidget::onDropEvent(QDropEvent* event) {
     } else {
       const bool was_xy = isXYPlot();
       setModeXY(true);
+#ifdef PJ_TARGET_WASM
+      // The source-side WASM drag loop must finish unwinding before any dialog
+      // result mutates the plot. Accept and clear the transient drag state now;
+      // the completion reproduces the synchronous desktop finalization later.
+      const QString x_key = dragging_.curves[0];
+      const QString y_key = dragging_.curves[1];
+      dragging_ = {};
+      event->acceptProposedAction();
+      createCurveXYInteractiveAsync(x_key, y_key, [this, was_empty, was_xy](CurveInfo* created) {
+        if (created == nullptr) {
+          if (!was_xy && curveList().empty()) {
+            // A cancelled first XY drop must not strand the empty plot in XY mode.
+            setModeXY(false);
+          }
+          return;
+        }
+        emit curvesDropped();
+        if (was_empty) {
+          zoomOut(true);
+        } else {
+          replot();
+        }
+        emit undoableChange();
+      });
+      return;
+#else
       curves_changed = createCurveXYInteractive(dragging_.curves[0], dragging_.curves[1]) != nullptr;
       if (!curves_changed && !was_xy) {
         // Cancelled the dialog on a plot that was not already XY: don't strand the
         // (still empty) plot in XY mode, or it would silently refuse normal drops.
         setModeXY(false);
       }
+#endif
     }
   }
 
@@ -1471,7 +1580,17 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
     return;
   }
 
+#ifdef PJ_TARGET_WASM
+  // QMenu::exec() enters a nested event loop, which requires Asyncify in Qt
+  // WASM. Keep the production browser build Asyncify-free and retain the menu
+  // until its asynchronous popup closes. Actions and their handlers are shared
+  // unchanged with desktop.
+  auto* wasm_menu = new QMenu(qwtPlot());
+  wasm_menu->setAttribute(Qt::WA_DeleteOnClose);
+  QMenu& menu = *wasm_menu;
+#else
   QMenu menu(qwtPlot());
+#endif
   menu.setObjectName(u"PJMenu"_s);
   menu.setProperty("categorySeparators", true);
   // Refresh icons with the active theme on every popup so the
@@ -1510,7 +1629,11 @@ void PlotWidget::canvasContextMenuTriggered(const QPoint& pos) {
   addActionCategorySeparator(menu);
   menu.addAction(action_remove_all_curves_);
   action_remove_all_curves_->setEnabled(!curveList().empty());
+#ifdef PJ_TARGET_WASM
+  menu.popup(qwtPlot()->canvas()->mapToGlobal(pos));
+#else
   menu.exec(qwtPlot()->canvas()->mapToGlobal(pos));
+#endif
 }
 
 void PlotWidget::launchFilterEditor() {

@@ -15,14 +15,21 @@
 #include <QThread>
 #include <QTimer>
 #include <Qt>
+#ifndef PJ_TARGET_WASM
 #include <backward.hpp>
+#endif
 #include <cstdio>
 #include <cstdlib>
+#ifndef PJ_TARGET_WASM
 #include <filesystem>
 #include <map>
+#endif
 #include <memory>
+#ifndef PJ_TARGET_WASM
 #include <string>
+#endif
 
+#include "BrowserPersistence.h"
 #include "DebugMode.h"
 #include "KeySequence.h"
 #include "MainWindow.h"
@@ -30,8 +37,12 @@
 #include "WidgetTuner.h"
 #include "pj_plotting/PlotWidgetBase.h"
 #include "pj_plotting/RasterTextEngine.h"
+#ifndef PJ_TARGET_WASM
 #include "pj_runtime/PluginRuntimeCatalog.h"
+#endif
+#ifdef PJ_WITH_SCENE3D
 #include "pj_scene3d_widgets/scene_view_widget.h"  // --screenshot grabs the 3D view
+#endif
 #include "pj_version.h"
 #include "pj_widgets/Style.h"
 using namespace Qt::StringLiterals;
@@ -43,6 +54,7 @@ namespace {
 // relying on the global defined inside backward-cpp's compiled backward.cpp,
 // which the linker drops from the static archive when nothing references it.
 // backward-cpp recommends exactly one such instance per program.
+#ifndef PJ_TARGET_WASM
 backward::SignalHandling g_crash_handler;
 
 int validatePlugins(const QString& plugin_dir, const QStringList& expected_specs) {
@@ -131,6 +143,7 @@ int validatePlugins(const QString& plugin_dir, const QStringList& expected_specs
   std::printf("[plugin-validation] OK: loaded all %zu whitelisted plugin(s)\n", loaded.size());
   return EXIT_SUCCESS;
 }
+#endif
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -161,6 +174,13 @@ int main(int argc, char* argv[]) {
   PJ::installRasterTextEngines();
 
   QApplication app(argc, argv);
+#ifdef PJ_TARGET_WASM
+  // Qt's browser-backed exec() never returns, including on application exit.
+  // Let File -> Quit close the window (and run MainWindow::closeEvent's
+  // cooperative worker shutdown) without also asking QEventLoop to exit. The
+  // browser owns the runtime lifetime and releases it when the page closes.
+  app.setQuitOnLastWindowClosed(false);
+#endif
   QCoreApplication::setOrganizationName(u"PlotJuggler"_s);
   QCoreApplication::setApplicationName(u"PlotJuggler4"_s);
   // PJ_VERSION_STRING comes from the root project(VERSION) via pj_app's
@@ -168,6 +188,15 @@ int main(int argc, char* argv[]) {
   // box and compared against the latest GitHub release.
   QCoreApplication::setApplicationVersion(QStringLiteral(PJ_VERSION_STRING));
   QApplication::setApplicationDisplayName(u"PlotJuggler 4"_s);
+
+#ifdef PJ_TARGET_WASM
+  // Install the deny-by-default browser persistence boundary before the first
+  // app-owned QSettings consumer (WidgetTuner, splash, Theme, MainWindow, or a
+  // plugin host). Native builds do not execute or instantiate this code and
+  // therefore retain their existing settings backend and behavior.
+  auto* browser_persistence = new PJ::BrowserPersistence(&app);
+  Q_UNUSED(browser_persistence);
+#endif
 
   // Register the bundled Noto Sans and apply it as the application font, before
   // any window is built so every widget — and every plugin dialog, which
@@ -198,12 +227,14 @@ int main(int argc, char* argv[]) {
   const QCommandLineOption plugin_dir_option(
       u"plugin-dir"_s, u"Override the directory where extensions are discovered and managed."_s, u"path"_s);
   parser.addOption(plugin_dir_option);
+#ifndef PJ_TARGET_WASM
   const QCommandLineOption validate_plugins_option(
       u"validate-plugins"_s, u"Load and validate every whitelisted plugin in this directory, then exit."_s, u"path"_s);
   parser.addOption(validate_plugins_option);
   const QCommandLineOption expect_plugin_option(
       u"expect-plugin"_s, u"Expected plugin as id=version; repeat once per whitelisted plugin."_s, u"id=version"_s);
   parser.addOption(expect_plugin_option);
+#endif
   const QCommandLineOption layout_option(
       u"layout"_s, u"Load a layout file on startup, reloading its data source(s)."_s, u"path"_s);
   parser.addOption(layout_option);
@@ -243,9 +274,11 @@ int main(int argc, char* argv[]) {
   parser.addOption(screenshot_delay_option);
   parser.process(app);
 
+#ifndef PJ_TARGET_WASM
   if (parser.isSet(validate_plugins_option)) {
     return validatePlugins(parser.value(validate_plugins_option), parser.values(expect_plugin_option));
   }
+#endif
 
   // Latch the launch-time debug gate before any UI is built (PreferencesDialog
   // reads it to decide whether to show the chrome-metric scrubbers).
@@ -287,9 +320,11 @@ int main(int argc, char* argv[]) {
 
   // App-wide gesture watcher. Observes key presses without consuming them and
   // calls the entry point when the fixed sequence completes.
+#ifndef PJ_TARGET_WASM
   auto* gesture_watcher =
       new PJ::KeySequenceWatcher(PJ::unlockSteps(), [&window]() { window.openEmbeddedConsole(); }, &app);
   qApp->installEventFilter(gesture_watcher);
+#endif
 
   // Arm autoplay BEFORE any data loads, so its one-shot listener catches the first
   // range — whether --test-data sets it synchronously below or --layout's async
@@ -353,6 +388,7 @@ int main(int argc, char* argv[]) {
     const QString path = parser.value(screenshot_option);
     const int delay_ms = parser.value(screenshot_delay_option).toInt();
     QTimer::singleShot(delay_ms, &window, [&window, path]() {
+#ifdef PJ_WITH_SCENE3D
       const QList<pj::scene3d::SceneViewWidget*> views = window.findChildren<pj::scene3d::SceneViewWidget*>();
       if (views.isEmpty()) {
         std::fprintf(stderr, "[screenshot] no 3D SceneViewWidget found\n");
@@ -366,6 +402,11 @@ int main(int argc, char* argv[]) {
           std::fprintf(stderr, "[screenshot] save FAILED: %s\n", qPrintable(path));
         }
       }
+#else
+      Q_UNUSED(window);
+      Q_UNUSED(path);
+      std::fprintf(stderr, "[screenshot] Scene3D is not available in this build\n");
+#endif
       QCoreApplication::quit();
     });
   }

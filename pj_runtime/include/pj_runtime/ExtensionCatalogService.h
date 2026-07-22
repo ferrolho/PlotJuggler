@@ -85,9 +85,11 @@ class ExtensionCatalogService : public QObject {
 
   // Reference valid for the service's lifetime. Browser builds have no dynamic
   // marketplace; their plugins are registered statically through pluginCatalog.
+#ifndef PJ_TARGET_WASM
   ExtensionManager& extensionManager() const {
     return *extension_manager_;
   }
+#endif
 
   // Direct access to the loaded plugin catalog (reference valid for the
   // service's lifetime). Tests use it to register in-process plugins without
@@ -214,7 +216,9 @@ class ExtensionCatalogService : public QObject {
   bool default_mode_ = false;
   DiagnosticSink sink_;
 
+#ifndef PJ_TARGET_WASM
   std::unique_ptr<ExtensionManager> extension_manager_;
+#endif
   std::unique_ptr<PluginRuntimeCatalog> plugin_catalog_;
 
   // Guards plugin_catalog_'s vectors against the one genuine cross-thread

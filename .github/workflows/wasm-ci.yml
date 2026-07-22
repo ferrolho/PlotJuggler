@@ -1,0 +1,206 @@
+# On-demand check for the WebAssembly platform. Manually triggered
+# (workflow_dispatch) — the wasm build is expensive and most PRs don't touch
+# it, so run it deliberately from the Actions tab (or `gh workflow run
+# "WASM CI" --ref <branch>`) when working on wasm-relevant changes, before
+# merging one, or when cutting a release. Two configurations of the same
+# sources prove the advertised feature matrix:
+#
+#   1. Production MVP — Scene2D/Scene3D OFF, probes OFF: the app must
+#      configure, build, package deterministically, and pass the deployment
+#      contract + cold threaded Chromium boot.
+#   2. Acceptance — Scene2D ON, ingress probe ON: the functional browser
+#      suite (file selection, persistence/layout, plotting, scene2D,
+#      streaming) runs against the packaged build.
+#
+# The full release (Scene3D, cross-browser, size/performance budgets) stays in
+# wasm-release.yml.
+name: WASM CI
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm:
+    runs-on: depot-ubuntu-22.04-4
+    # Generous first-run ceiling (cold Qt+emsdk+ccache); warm runs are expected
+    # in the 20-30 minute band. Tighten once real timings accumulate.
+    timeout-minutes: 120
+
+    steps:
+      - name: Use HTTPS for github.com submodules
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Read toolchain versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source ./versions.env
+          for name in PJ_WASM_QT_VERSION PJ_EMSCRIPTEN_VERSION PJ_WASM_NODE_VERSION; do
+            echo "${name}=${!name}" >> "${GITHUB_ENV}"
+          done
+          echo "wasm_qt=${PJ_WASM_QT_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "emscripten=${PJ_EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "node=${PJ_WASM_NODE_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install pinned packaging runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache ninja-build python3-pip
+          # Runtime libraries for the desktop host Qt tools (qsb bakes the QRhi
+          # shaders offline and transitively links the full Qt GUI stack, even
+          # headless). The lean runner ships none of these, so qsb would die at
+          # load time with exit 127.
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libfontconfig1 libfreetype6 libxkbcommon0 \
+            libx11-6 libxcb1 libglib2.0-0 libdbus-1-3
+
+      - name: Cache Qt WebAssembly and host kits
+        id: qt-cache
+        uses: actions/cache@v5
+        with:
+          path: .qt-wasm
+          key: qt-wasm-${{ steps.versions.outputs.wasm_qt }}-multithread-shadertools-v1
+
+      - name: Install Qt WebAssembly and host kits
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user 'aqtinstall==3.3.0'
+          "${HOME}/.local/bin/aqt" install-qt linux desktop \
+            "${PJ_WASM_QT_VERSION}" linux_gcc_64 --outputdir .qt-wasm \
+            -m qtshadertools
+          "${HOME}/.local/bin/aqt" install-qt all_os wasm \
+            "${PJ_WASM_QT_VERSION}" wasm_multithread --outputdir .qt-wasm \
+            -m qtshadertools
+
+      - name: Cache Emscripten SDK
+        id: emsdk-cache
+        uses: actions/cache@v5
+        with:
+          path: .emsdk
+          key: emsdk-${{ steps.versions.outputs.emscripten }}-linux-x64-v1
+
+      - name: Install Emscripten SDK
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${PJ_EMSCRIPTEN_VERSION}" \
+            https://github.com/emscripten-core/emsdk.git .emsdk
+          .emsdk/emsdk install "${PJ_EMSCRIPTEN_VERSION}"
+          .emsdk/emsdk activate "${PJ_EMSCRIPTEN_VERSION}"
+
+      - name: Restore WebAssembly compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-wasm-ci-${{ github.sha }}
+          restore-keys: |
+            ccache-wasm-ci-
+
+      - name: Configure compiler cache
+        run: |
+          ccache --set-config=max_size=4G
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --set-config=hash_dir=false
+          ccache --set-config=base_dir="${GITHUB_WORKSPACE}"
+          ccache --zero-stats
+
+      - name: Build production MVP (Scene2D/Scene3D off, probes off)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .emsdk/emsdk_env.sh >/dev/null
+          cmake -S . -B build-wasm-mvp -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${PWD}/.qt-wasm/${PJ_WASM_QT_VERSION}/wasm_multithread/lib/cmake/Qt6/qt.toolchain.cmake" \
+            -DQT_HOST_PATH="${PWD}/.qt-wasm/${PJ_WASM_QT_VERSION}/gcc_64" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DPJ_BUILD_TESTS=OFF \
+            -DPJ_BUILD_DEMOS=OFF \
+            -DPJ_WASM_ENABLE_INGRESS_PROBE=OFF \
+            -DPJ_WASM_WITH_SCENE2D=OFF \
+            -DPJ_WASM_WITH_SCENE3D=OFF
+          cmake --build build-wasm-mvp --target pj_app --parallel 4
+
+      - name: Package MVP and verify packaging scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix tests/wasm run test:package
+          npm --prefix tests/wasm run test:size
+          node scripts/package_wasm.mjs \
+            --source build-wasm-mvp/pj_app --output build-wasm-mvp/deploy
+          node scripts/package_wasm.mjs \
+            --source build-wasm-mvp/pj_app --output build-wasm-mvp/deploy-b
+          diff -qr build-wasm-mvp/deploy build-wasm-mvp/deploy-b
+
+      - name: Install browser gate
+        working-directory: tests/wasm
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Deployment contract and cold threaded boot (MVP package)
+        working-directory: tests/wasm
+        env:
+          PJ_WASM_PACKAGE_DIR: ${{ github.workspace }}/build-wasm-mvp/deploy
+        run: npm run test:deployment
+
+      - name: Build acceptance configuration (Scene2D on, ingress probe on)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .emsdk/emsdk_env.sh >/dev/null
+          # Scene2D's find_package(ZLIB 1.3.1 EXACT) resolves against Emscripten's
+          # sysroot zlib port, which is lazily materialized. Build it before the
+          # configure so a cold emsdk cache doesn't fail at find_package time.
+          embuilder build zlib
+          cmake -S . -B build-wasm-probe -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${PWD}/.qt-wasm/${PJ_WASM_QT_VERSION}/wasm_multithread/lib/cmake/Qt6/qt.toolchain.cmake" \
+            -DQT_HOST_PATH="${PWD}/.qt-wasm/${PJ_WASM_QT_VERSION}/gcc_64" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DPJ_BUILD_TESTS=OFF \
+            -DPJ_BUILD_DEMOS=OFF \
+            -DPJ_WASM_ENABLE_INGRESS_PROBE=ON \
+            -DPJ_WASM_WITH_SCENE2D=ON \
+            -DPJ_WASM_WITH_SCENE3D=OFF
+          cmake --build build-wasm-probe --target pj_app --parallel 4
+          ccache --show-stats
+
+      - name: Functional browser suite (acceptance package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/package_wasm.mjs \
+            --source build-wasm-probe/pj_app --output build-wasm-probe/deploy
+          node scripts/serve_wasm.mjs --root build-wasm-probe/deploy --port 6931 &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS -o /dev/null http://127.0.0.1:6931/ && break
+            sleep 0.2
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:6931/ || { echo "wasm server failed to start"; exit 1; }
+          PJ_WASM_URL="http://127.0.0.1:6931/" PJ_WASM_BUILD_DIR=build-wasm-probe \
+            npm --prefix tests/wasm run test

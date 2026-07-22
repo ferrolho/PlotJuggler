@@ -60,9 +60,12 @@ class MessageBox : public QDialog {
   void setShowDontShowAgain(bool show, const QString& label = {});
   [[nodiscard]] bool dontShowAgainChecked() const;
 
-  // Appends a button to the bottom of the vertical column. The dialog
-  // owns the returned pointer.
+  // Appends a button to the bottom of the vertical column. The dialog owns the
+  // returned pointer. Buttons close the dialog by default; an asynchronous
+  // action may opt out so it can keep a retry surface visible until its callback
+  // arrives.
   QPushButton* addButton(const QString& label, ButtonRole role);
+  QPushButton* addButton(const QString& label, ButtonRole role, bool close_on_click);
 
   // Index of the button the user clicked (in addButton() order), or -1
   // if the dialog was rejected without picking one (Esc when no Cancel

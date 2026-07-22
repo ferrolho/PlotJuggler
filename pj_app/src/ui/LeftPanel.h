@@ -31,9 +31,11 @@ class LeftPanel : public QWidget {
   // header. The popup has two sections — Layouts and Files — so picking an
   // entry emits one of two signals depending on its section. MainWindow wires
   // recentFileSelected to FileLoader::loadFile and recentLayoutSelected to
-  // onLoadRecentLayout (which validates existence + prunes dead entries).
+  // onLoadRecentLayout. On WASM the latter carries a bounded browser-recipe id
+  // rather than a filesystem path.
   void recentFileSelected(QString path);
   void recentLayoutSelected(QString path);
+  void clearRecentLayoutsRequested();
   // The cog button is a one-shot Start action — there is no "stop" affordance
   // in the UI (Davide: streaming should always be open). Emitted on click.
   void streamingStartRequested();

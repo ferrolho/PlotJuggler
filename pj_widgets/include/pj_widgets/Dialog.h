@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QDialog>
+#include <QPoint>
+#include <QRect>
 #include <QString>
 #include <Qt>
 
@@ -72,11 +74,23 @@ class Dialog : public QDialog {
   // or a corner combination) the point lies inside the kResizeMargin
   // band of, or 0 when the point is in the interior.
   [[nodiscard]] Qt::Edges edgesAtPoint(const QPoint& pos) const;
+  // Apply one manual-drag step: recompute geometry from the armed edge set
+  // (or move) and the cursor's travel since the press, clamped to the
+  // effective min/max sizes.
+  void applyManualDrag(const QPoint& global_pos);
 
   Ui::Dialog* ui_;
   // One-shot guard so the first-show pill attach runs once (attach itself is
   // idempotent, but this avoids re-walking the tree on every show).
   bool scroll_pills_attached_ = false;
+  // Manual drag fallback for platforms whose QPA implements neither
+  // startSystemResize nor startSystemMove (Qt-wasm): the edge set being
+  // resized (0 = none), whether a title-bar move drag is active, and the
+  // press-time cursor/geometry the drag is computed against.
+  Qt::Edges manual_resize_edges_ = {};
+  bool manual_move_active_ = false;
+  QPoint manual_press_global_;
+  QRect manual_press_geometry_;
 };
 
 }  // namespace PJ

@@ -25,6 +25,7 @@
 #include <QLabel>
 #include <QLoggingCategory>
 #include <QMenu>
+#include <QMenuBar>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
@@ -65,13 +66,37 @@
 #include <optional>
 #include <unordered_set>
 #include <utility>
+
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+#include <emscripten/emscripten.h>
+
+#include <QAbstractItemView>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QPlainTextEdit>
+#include <QRadioButton>
+#include <QTableWidget>
+#include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
+#endif
 #include <vector>
 
+#include "BuiltinPlugins.h"
+#ifdef PJ_TARGET_WASM
+#include "BrowserFileStore.h"
+#include "BrowserPersistence.h"
+#endif
 #include "DatasetMergeActions.h"
 #include "DebugUi.h"
 #include "FileLoader.h"
+#ifdef PJ_TARGET_WASM
+#include "FanoutConfig.h"
+#include "FileSelectionService.h"
+#endif
 #include "LayoutXml.h"
-#include "LoadInput.h"
 #include "PendingDisplayBinder.h"
 #include "PreferencesDialog.h"
 #include "RasterKeyMap.h"
@@ -87,14 +112,24 @@
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/reader.hpp"
 #include "pj_datastore/writer.hpp"
+#ifndef PJ_TARGET_WASM
 #include "pj_marketplace/marketplace_window.hpp"
+#endif
 #include "pj_marketplace/qt_diagnostic_bridge.hpp"
 #include "pj_plotting/CurveEditor.h"
 #include "pj_plotting/CurveTracker.h"
 #include "pj_plotting/DockWidget.h"
 #include "pj_plotting/FilterEditorPanel.h"
 #include "pj_plotting/PlotDocker.h"
+#ifdef PJ_TARGET_WASM
+#include "pj_plotting/PlotRhiCanvas.h"
+#endif
 #include "pj_plotting/PlotWidget.h"
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+#include "pj_plotting/XYCurveDialog.h"
+#include "pj_widgets/LayerListView.h"
+#include "pj_widgets/RealSlider.h"
+#endif
 #include "pj_plotting/TabbedPlotWidget.h"
 #include "pj_plugins/host/dialog_handle.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
@@ -115,10 +150,14 @@
 #include "pj_runtime/ToolboxRuntimeHost.h"
 #include "pj_runtime/TopicDemandTracker.h"
 #include "pj_runtime/UpdateChecker.h"
+#ifdef PJ_WITH_SCENE2D
 #include "pj_scene2d_widgets/Scene2DDockWidget.h"
 #include "pj_scene2d_widgets/media_viewer_widget.h"
+#endif
+#ifdef PJ_WITH_SCENE3D
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
 #include "pj_scene3d_widgets/transform_service.h"
+#endif
 #include "pj_scene_common/scene_dock_widget.h"
 #include "pj_widgets/CoalescingTrigger.h"
 #include "pj_widgets/FileDialog.h"
@@ -126,7 +165,9 @@
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/IngestProgressWidget.h"
 #include "pj_widgets/MessageBox.h"
+#ifndef PJ_TARGET_WASM
 #include "pj_widgets/RasterStreamView.h"
+#endif
 #include "pj_widgets/Scrollbar.h"
 #include "pj_widgets/SectionHeaderBand.h"
 #include "pj_widgets/SvgButton.h"
@@ -138,11 +179,19 @@
 #include "ui/CurveListPanel.h"
 #include "ui/DiagnosticsDetailDialog.h"
 #include "ui/LeftPanel.h"
+#ifdef PJ_WITH_SCENE2D
 #include "ui/Scene2DConfigPanel.h"
+#endif
+#ifdef PJ_WITH_SCENE3D
 #include "ui/Scene3DConfigPanel.h"
+#endif
 #include "ui/TimelineWidget.h"
 #include "ui_MainWindow.h"
 using namespace Qt::StringLiterals;
+
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+#include "../tests/wasm_acceptance_probes.inc"
+#endif
 
 namespace PJ {
 
@@ -190,7 +239,9 @@ constexpr int kMinTimelineStripHeight = 150;
 // QSettings key keeps cross-version migration trivial (a user who
 // upgrades from PJ3 lands in their existing layout directory). Fallback
 // when unset is QDir::currentPath() — matches PJ3.
+#ifndef PJ_TARGET_WASM
 constexpr auto kLastLayoutDirKey = "MainWindow.lastLayoutDirectory";
+#endif
 
 // Layout schema version. Bumped only on incompatible changes (additive
 // elements/attributes don't need a bump — the loader silently skips
@@ -208,7 +259,7 @@ constexpr auto kLastLayoutDirKey = "MainWindow.lastLayoutDirectory";
 // v3 also round-trips the Source Timeline. Per-source: each <fileInfo> carries
 // display_offset_ns + timeline_order, re-bound by source path so a dataset's bar
 // offset and vertical slot restore exactly. Global view chrome: a <source_timeline>
-// element carries zoom + scroll_left_ns + name_column_width + snap. Additive — older
+// element carries zoom + horizontal/vertical scroll + name_column_width + snap. Additive — older
 // readers ignore the new attributes/element; this build tolerates their absence in
 // pre-v3 layouts.
 // v4 adds one <dataset> child per fan-out member under each <fileInfo>
@@ -248,6 +299,21 @@ constexpr int kIconSizeDefault = 24;
 constexpr int kIconPaddingDefault = 4;
 constexpr int kLayoutPaddingDefault = 2;
 constexpr int kLayoutSpacingDefault = 2;
+
+#ifdef PJ_TARGET_WASM
+void showBrowserLayoutWarning(QWidget* parent, const QString& title, const QString& text) {
+  // The browser main thread cannot enter MessageBox::warning's nested exec().
+  // Parent ownership plus WA_DeleteOnClose gives the same application-modal
+  // presentation without borrowing stack state across the async lifetime.
+  auto* dialog = new MessageBox(parent);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowModality(Qt::ApplicationModal);
+  dialog->setTitle(title);
+  dialog->setText(text);
+  dialog->addButton(QObject::tr("OK"), MessageBox::kPrimaryRole);
+  dialog->show();
+}
+#endif
 
 // Scene scrubber drags emit workspaceChanged per tick; one history snapshot
 // publishes after the gesture goes quiet.
@@ -325,6 +391,49 @@ inline constexpr std::array<std::pair<const char*, double>, 4> kWidthButtonSpecs
 }};
 }  // namespace
 
+#ifdef PJ_TARGET_WASM
+struct MainWindow::BrowserLayoutRuntime {
+  struct DatasetShape {
+    DatasetId dataset_id = 0;
+    QString source_name;
+  };
+
+  struct SourceRecord {
+    QString display_name;
+    QString prefix;
+    QString content_sha256;
+    QString plugin_id;
+    QString plugin_config_json;
+    std::vector<DatasetShape> datasets;
+  };
+
+  struct Replay {
+    QDomDocument doc;
+    QString layout_name;
+    QList<layout_xml::DataSourceRef> sources;
+    std::vector<LoadInput> staged_inputs;
+    QStringList selected_identities;
+    QSet<QString> loaded_identities;
+    int selection_index = 0;
+    bool load_failed = false;
+    QString load_failure;
+    CapturedWorkspace previous_workspace;
+    QPointer<QPushButton> selection_button;
+    quint64 active_picker_generation = 0;
+    QMetaObject::Connection loaded_connection;
+    QMetaObject::Connection failed_connection;
+    QMetaObject::Connection drained_connection;
+  };
+
+  QHash<QString, SourceRecord> sources;
+  std::optional<Replay> replay;
+  QPointer<MessageBox> decision_dialog;
+  QString pending_recipe_name;
+  bool pending_generic_recipe = false;
+  quint64 next_picker_generation = 0;
+};
+#endif
+
 MainWindow::MainWindow(QWidget* parent) : MainWindow(QString{}, parent) {}
 
 MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
@@ -332,7 +441,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       ui_(new Ui::MainWindow),
       diagnostic_bridge_(new QtDiagnosticBridge(this)),
       app_settings_(std::make_unique<QSettings>()),
-      session_(std::make_unique<AppSession>(std::move(extensions_dir), diagnostic_bridge_->sink())),
+      session_(
+          std::make_unique<AppSession>(
+              std::move(extensions_dir), diagnostic_bridge_->sink(), pj_app::builtInPlugins())),
       pending_binder_(
           std::make_unique<PendingDisplayBinder>(session_->catalogModel(), &session_->topicDemandTracker())),
       topic_demand_controller_(
@@ -341,10 +452,15 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
               session_->sessionManager().dataProcessorService(), *pending_binder_,
               session_->sessionManager().dataEngine())),
       theme_(std::make_unique<Theme>()) {
+#ifdef PJ_TARGET_WASM
+  browser_layout_runtime_ = std::make_unique<BrowserLayoutRuntime>();
+#endif
   // The 3D transform service owns the per-dataset TF buffers + load-time
   // ingest. It lives in the shell (not pj_runtime) so the runtime stays
   // domain-neutral; it reads only SessionManager's neutral surface.
+#ifdef PJ_WITH_SCENE3D
   transform_service_ = std::make_unique<pj::scene3d::TransformService>(session_->sessionManager());
+#endif
   // Pull saved icon metrics before setupUi so the literals we feed into
   // build*Toolbar() pick up the correct values on first paint. Widgets
   // that auto-construct from the .ui still draw at their default sizes
@@ -418,6 +534,10 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // Qt 6.8 QRhiWidget needs an RHI-capable top-level backing store from
   // the first show(). Keep a zero-size viewer in an existing visible layout
   // so image docks created later can initialize their QRhi.
+  // Excluded on wasm: an early WebGL context can be lost across a cold
+  // browser file-picker round-trip, and Emscripten then dereferences null
+  // WebGL context attributes (see docs/research/wasm_reboot_plan.md, W8a).
+#if defined(PJ_WITH_SCENE2D) && !defined(PJ_TARGET_WASM)
   auto* rhi_bootstrap = new MediaViewerWidget(ui_->globalToolbarWidget);
   rhi_bootstrap->setObjectName(u"rhi_bootstrap"_s);
   rhi_bootstrap->setMaximumSize(0, 0);
@@ -425,6 +545,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   if (auto* global_toolbar_layout = qobject_cast<QVBoxLayout*>(ui_->globalToolbarWidget->layout())) {
     global_toolbar_layout->addWidget(rhi_bootstrap);
   }
+#endif
 
   ui_->mainSplitter->setHandleWidth(1);
   ui_->timelineSplitter->setHandleWidth(1);
@@ -495,11 +616,27 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // LeftPanel "recent" popup (Layouts section) alongside recent data files,
   // wired below via LeftPanel::recentLayoutSelected.
   QMenu* file_menu = title_bar_->fileMenu();
+  // Desktop retains its path-based layout dialogs. WASM exposes W9's
+  // content-based layout open/download actions; Preferences remains omitted
+  // until its nested dialog flow has a browser-safe continuation.
+#ifndef PJ_TARGET_WASM
   action_load_layout_ = file_menu->addAction(tr("Load Layout..."), this, &MainWindow::onLoadLayout);
   action_save_layout_ = file_menu->addAction(tr("Save Layout..."), this, &MainWindow::onSaveLayout);
   file_menu->addSeparator();
   file_menu->addAction(ui_->actionMarketplace);
   action_preferences_ = file_menu->addAction(tr("Preferences..."), this, &MainWindow::onShowPreferencesDialog);
+#else
+  // W9 uses content-based open and generic browser download; no native paths.
+  action_load_layout_ = file_menu->addAction(tr("Load Layout..."), this, &MainWindow::onLoadLayout);
+  action_load_layout_->setObjectName(u"actionLoadLayout"_s);
+  action_save_layout_ = file_menu->addAction(tr("Save Layout..."), this, &MainWindow::onSaveLayout);
+  action_save_layout_->setObjectName(u"actionSaveLayout"_s);
+  action_save_source_layout_ =
+      file_menu->addAction(tr("Save Layout with Sources..."), this, &MainWindow::onSaveSourceLayout);
+  action_save_source_layout_->setObjectName(u"actionSaveSourceLayout"_s);
+  action_save_source_layout_->setEnabled(false);
+  ui_->actionMarketplace->setVisible(false);
+#endif
   file_menu->addSeparator();
   file_menu->addAction(ui_->actionExit);
 
@@ -511,7 +648,11 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // (rebuilt on aboutToShow; managing extensions happens in the
   // Marketplace, reached from the File menu).
   QMenu* help_menu = title_bar_->helpMenu();
+#ifndef PJ_TARGET_WASM
+  // AboutDialog::exec() blocks on a nested event loop, unusable on wasm.
+  // Async port deferred to W8.
   help_menu->addAction(tr("About PlotJuggler..."), this, &MainWindow::onShowAboutDialog);
+#endif
   help_menu->addAction(tr("Check for Updates..."), this, &MainWindow::onCheckForUpdates);
   help_menu->addAction(
       tr("Documentation"), this, []() { QDesktopServices::openUrl(QUrl(u"https://plotjuggler.io"_s)); });
@@ -545,13 +686,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   title_bar_->setDiagnosticHistory(diagnostic_history_);
 
   ui_->tabbedPlotWidget->setDataServices(&session_->sessionManager(), &session_->catalogModel());
+#if defined(PJ_WITH_SCENE2D) || defined(PJ_WITH_SCENE3D)
   ui_->tabbedPlotWidget->setObjectWidgetFactory(
       [this](const QString& kind, const ObjectDropSeed* seed, QWidget* dock_parent) -> IDataWidget* {
         // One factory for both paths. Layout restore passes the saved XML tag as
         // `kind` with a null seed (the dock reloads its own state); a catalog
         // drop passes an empty kind with a seed, which we classify into a kind,
         // construct, and populate. Family routing for v0:
-        //   3D-ish (kPointCloud/kFrameTransforms/kOccupancyGrid)                     → scene3d
+        //   3D-ish (point clouds, transforms, grids, poses)                          → scene3d
         //   2D-ish (kImage/kDepthImage/kImageAnnotations/kSceneEntities/kVideoFrame) → scene2d
         QString resolved_kind = kind;
         if (resolved_kind.isEmpty() && seed != nullptr) {
@@ -595,15 +737,31 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         // side-effects. An unknown kind here is a real failure — tell the user.
         IDataWidget* widget = makeSceneDock(resolved_kind, dock_parent);
         if (widget == nullptr) {
+#ifdef PJ_TARGET_WASM
+          showBrowserLayoutWarning(
+              this, tr("Cannot display topic"),
+              tr("This object topic cannot be displayed (object_type=%1).").arg(static_cast<int>(seed->object_type)));
+#else
           MessageBox::warning(
               this, tr("Cannot display topic"),
               tr("This object topic cannot be displayed (object_type=%1).").arg(static_cast<int>(seed->object_type)));
+#endif
           return nullptr;
         }
         QWidget* qwidget = widget->widget();
+#ifdef PJ_WITH_SCENE3D
         if (auto* scene3d = qobject_cast<Scene3DDockWidget*>(qwidget)) {
           if (!scene3d->addTopic(seed->topic_id, seed->object_type, seed->title)) {
             scene3d->deleteLater();
+#ifdef PJ_TARGET_WASM
+            showBrowserLayoutWarning(
+                this, tr("Cannot display topic"),
+                tr("This object topic cannot be displayed in a 3D view (object_type=%1). "
+                   "The 3D view requires a registered parser that emits one of its supported "
+                   "canonical objects (PointCloud, CompressedPointCloud, OccupancyGrid, "
+                   "SceneEntities, or FrameTransforms).")
+                    .arg(static_cast<int>(seed->object_type)));
+#else
             MessageBox::warning(
                 this, tr("Cannot display topic"),
                 tr("This object topic cannot be displayed in a 3D view (object_type=%1). "
@@ -611,6 +769,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
                    "canonical objects (PointCloud, CompressedPointCloud, OccupancyGrid, "
                    "SceneEntities, or FrameTransforms).")
                     .arg(static_cast<int>(seed->object_type)));
+#endif
             return nullptr;
           }
           // A 3D-only stream must seed playback here too (see header doc).
@@ -619,21 +778,35 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
           // never gets the current playhead — seed it now to render at the right
           // time immediately.
           scene3d->onTrackerTime(toAxisDouble(session_->playbackEngine().currentTime()));
-        } else if (auto* media2d = qobject_cast<Scene2DDockWidget*>(qwidget)) {
+        } else
+#endif
+#ifdef PJ_WITH_SCENE2D
+            if (auto* media2d = qobject_cast<Scene2DDockWidget*>(qwidget)) {
           if (!media2d->setImageTopic(seed->topic_id, seed->object_type, seed->title)) {
             media2d->deleteLater();
+#ifdef PJ_TARGET_WASM
+            showBrowserLayoutWarning(
+                this, tr("Cannot display topic"),
+                tr("This object topic cannot be displayed in a 2D view (object_type=%1). "
+                   "Typically this means the source did not register a parser for the topic, "
+                   "or the type is not yet supported by the built-in viewer.")
+                    .arg(static_cast<int>(seed->object_type)));
+#else
             MessageBox::warning(
                 this, tr("Cannot display topic"),
                 tr("This object topic cannot be displayed in a 2D view (object_type=%1). "
                    "Typically this means the source did not register a parser for the topic, "
                    "or the type is not yet supported by the built-in viewer.")
                     .arg(static_cast<int>(seed->object_type)));
+#endif
             return nullptr;
           }
           seedStreamingPlaybackFromDrop();
           media2d->setPointInspectorEnabled(show_points_);
           media2d->onTrackerTime(toAxisDouble(session_->playbackEngine().currentTime()));
-        } else {
+        } else
+#endif
+        {
           // makeSceneDock produced a kind this populate switch doesn't handle —
           // a programming error if a new family is added without a branch here.
           // Fail loudly rather than returning an unpopulated dock.
@@ -643,6 +816,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         }
         return widget;
       });
+#endif
   connect(ui_->tabbedPlotWidget, &TabbedPlotWidget::tabAdded, this, &MainWindow::onPlotTabAdded);
   wireExistingPlots();
   ui_->curveListPanel->setCatalog(&session_->catalogModel());
@@ -657,6 +831,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     syncWidgetsToCatalog();
   });
   connect(session_.get(), &AppSession::datasetsMerged, this, [this](DatasetId anchor, QList<DatasetId> consumed) {
+#ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       for (const DatasetId id : consumed) {
         transform_service_->invalidateDataset(id);
@@ -664,6 +839,10 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       transform_service_->invalidateDataset(anchor);
       transform_service_->ingestFrameTransformsForDataset(anchor);
     }
+#else
+    Q_UNUSED(anchor);
+    Q_UNUSED(consumed);
+#endif
     syncWidgetsToCatalog();
     resetUndoHistory();
   });
@@ -739,9 +918,11 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     // lastLoadedSource for the quick-reload path (#99).
     session_->sessionManager().clearAllObjects();
     // TF buffers derive from the just-evicted objects; drop them with the data.
+#ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       transform_service_->invalidateAll();
     }
+#endif
     // REAL delete: drop the catalog (no tombstone — nothing is kept) so widgets tear down
     // their curve adapters via cleared(), THEN erase every dataset's scalar storage from
     // the engine (adapters gone, so DataEngine::removeDataset's invalidate-first contract
@@ -752,6 +933,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       session_manager.removeDataset(id);
     }
     resetUndoHistory();
+#ifdef PJ_TARGET_WASM
+    updateBrowserLayoutActions();
+#endif
   });
 
   QSettings settings;
@@ -1115,6 +1299,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // default. The factor keeps TF resolvable slightly past the oldest scrubbable
   // object entry — the store and the TF buffer trim on independent ticks, so the
   // headroom avoids a TF lookup failing on a frame whose object still exists.
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     connect(
         streaming_manager_.get(), &StreamingSourceManager::retentionWindowChanged, this,
@@ -1123,6 +1308,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
           transform_service_->setLiveCacheWindow(id, std::chrono::nanoseconds(kTfWindowHeadroomFactor * window_ns));
         });
   }
+#endif
   connect(
       &session_->sessionManager(), &SessionManager::samplesIngested, this,
       [this, refresh_streaming_seek_lock](const QVector<TopicId>&, bool live) {
@@ -1171,7 +1357,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
 
   file_loader_ = std::make_unique<FileLoader>(
       session_->sessionManager(), session_->extensionCatalog(), session_->catalogModel(), this);
+#ifdef PJ_WITH_SCENE3D
   file_loader_->setTransformService(transform_service_.get());
+#endif
   // Passing the MainWindow as the metrics source primes the file dialog's
   // toolbar icon size and keeps it in step via chromeMetricsChanged. Injected
   // here so FileLoader itself never links MainWindow (keeps it testable).
@@ -1191,6 +1379,177 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   connect(ui_->curveListPanel, &CurveListPanel::reloadDatasetRequested, this, &MainWindow::onReloadDatasetRequested);
   connect(ui_->curveListPanel, &CurveListPanel::replaceDatasetRequested, this, &MainWindow::onReplaceDatasetRequested);
   connect(ui_->leftPanel, &LeftPanel::loadDataRequested, this, &MainWindow::onLoadDataRequested);
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+  // Qt Widgets live in one browser canvas, so automation has no DOM element to
+  // target when Chromium occasionally drops a synthetic canvas gesture after
+  // many fresh WASM contexts. Install probe-build-only browser callbacks that
+  // invoke the exact application slot / embedded QPushButton. Production WASM
+  // and desktop do not expose them.
+  pj_wasm_install_browser_test_probes();
+  const auto run_wasm_plot_probe = [this](bool fit_complete_series) {
+    PlotWidget* plot = firstPlotOfActiveTab();
+    const auto curves = session_->catalogModel().curves();
+    if (plot == nullptr || curves.empty()) {
+      qWarning("PJ_WASM_PLOT_PROBE_FAILED no plot or scalar curve");
+      return;
+    }
+    auto selected = std::find_if(
+        curves.begin(), curves.end(), [](const CurveDescriptor& curve) { return curve.field_name == u"temp"_s; });
+    if (selected == curves.end()) {
+      selected = curves.begin();
+    }
+    auto* added = plot->addCurve(selected->name);
+    if (added == nullptr) {
+      qWarning("PJ_WASM_PLOT_PROBE_FAILED addCurve rejected %s", qPrintable(selected->name));
+      return;
+    }
+    if (fit_complete_series) {
+      plot->zoomOut(/*emit_signal=*/false);
+    }
+    auto* canvas = plot->findChild<PlotRhiCanvas*>();
+    const QColor curve_color = added->curve->pen().color();
+    QTimer::singleShot(500, canvas, [canvas, curve_color]() {
+      const QImage image = canvas->grabFramebuffer();
+      qsizetype curve_pixels = 0;
+      int min_x = image.width();
+      int min_y = image.height();
+      int max_x = -1;
+      int max_y = -1;
+      for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+          const QColor pixel = image.pixelColor(x, y);
+          if (std::abs(pixel.red() - curve_color.red()) <= 2 && std::abs(pixel.green() - curve_color.green()) <= 2 &&
+              std::abs(pixel.blue() - curve_color.blue()) <= 2) {
+            ++curve_pixels;
+            min_x = std::min(min_x, x);
+            min_y = std::min(min_y, y);
+            max_x = std::max(max_x, x);
+            max_y = std::max(max_y, y);
+          }
+        }
+      }
+      qInfo(
+          "PJ_WASM_PLOT_READBACK size=%dx%d curve=%s curve_pixels=%lld curve_bounds=%d,%d..%d,%d", image.width(),
+          image.height(), qPrintable(curve_color.name(QColor::HexArgb)), static_cast<long long>(curve_pixels), min_x,
+          min_y, max_x, max_y);
+    });
+  };
+  auto* wasm_plot_probe_shortcut = new QShortcut(QKeySequence(Qt::Key_F9), this);
+  connect(wasm_plot_probe_shortcut, &QShortcut::activated, this, [run_wasm_plot_probe]() {
+    run_wasm_plot_probe(/*fit_complete_series=*/false);
+  });
+  auto* wasm_reduction_probe_shortcut = new QShortcut(QKeySequence(Qt::Key_F10), this);
+  connect(wasm_reduction_probe_shortcut, &QShortcut::activated, this, [run_wasm_plot_probe]() {
+    run_wasm_plot_probe(/*fit_complete_series=*/true);
+  });
+  auto* wasm_plot_state_shortcut = new QShortcut(QKeySequence(Qt::Key_F8), this);
+  connect(wasm_plot_state_shortcut, &QShortcut::activated, this, [this]() {
+    PlotWidget* plot = firstPlotOfActiveTab();
+    if (plot == nullptr) {
+      qWarning("PJ_WASM_PLOT_STATE_FAILED no plot");
+      return;
+    }
+    auto* canvas = plot->findChild<PlotRhiCanvas*>();
+    if (canvas == nullptr) {
+      qWarning("PJ_WASM_PLOT_STATE_FAILED no RHI canvas");
+      return;
+    }
+    QStringList titles;
+    std::vector<std::pair<QString, QColor>> curve_colors;
+    for (const PlotWidgetBase::CurveInfo& info : plot->curveList()) {
+      if (info.curve == nullptr) {
+        continue;
+      }
+      const QString title = info.curve->title().text();
+      titles.push_back(title);
+      curve_colors.emplace_back(title, info.curve->pen().color());
+    }
+    const QPoint canvas_position = canvas->mapTo(this, QPoint(0, 0));
+    const QRectF view = plot->currentBoundingRect();
+    const QColor tracker_color =
+        theme::interaction(theme::Variant::Highlight, theme::State::Checked, theme::appTheme());
+    const QColor grid_color =
+        theme::outline(theme::OutlineRole::Gridline, theme::OutlineState::Rest, theme::appTheme());
+    const QColor hover_fill_color =
+        theme::interaction(theme::Variant::Emphasis, theme::State::Nominal, theme::appTheme());
+    const QColor canvas_color = canvas->palette().color(QPalette::Window);
+    const WasmHoverState hover = findWasmHoverState(plot);
+    const QByteArray encoded_hover_label = QUrl::toPercentEncoding(hover.label);
+    const int curve_style = static_cast<int>(plot->defaultCurveStyle());
+    const int line_width = static_cast<int>(plot->lineWidth());
+    qInfo(
+        "PJ_WASM_PLOT_STATE count=%lld titles=%s canvas=%d,%d,%dx%d view=%.17g,%.17g,%.17g,%.17g "
+        "time=%.17g tracker_enabled=%d tracker_parameter=%d xy=%d style=%d width=%d",
+        static_cast<long long>(titles.size()), qPrintable(titles.join(',')), canvas_position.x(), canvas_position.y(),
+        canvas->width(), canvas->height(), view.left(), view.right(), view.bottom(), view.top(),
+        toAxisDouble(session_->playbackEngine().currentTime()), plot->trackerEnabled() ? 1 : 0,
+        static_cast<int>(plot->trackerParameter()), plot->isXYPlot() ? 1 : 0, curve_style, line_width);
+    qInfo(
+        "PJ_WASM_PLOT_HOVER enabled=%d visible=%d point=%.17g,%.17g label=%s", plot->showPoints() ? 1 : 0,
+        hover.visible ? 1 : 0, hover.point.x(), hover.point.y(), encoded_hover_label.constData());
+
+    QTimer::singleShot(
+        250, canvas,
+        [canvas, curve_colors = std::move(curve_colors), tracker_color, grid_color, hover_fill_color, canvas_color,
+         curve_style, line_width]() {
+          const QImage image = canvas->grabFramebuffer();
+          QStringList counts;
+          WasmPixelBounds first_curve;
+          for (const auto& [title, color] : curve_colors) {
+            const WasmPixelBounds pixels = findWasmExactColor(image, color);
+            if (counts.empty()) {
+              first_curve = pixels;
+            }
+            counts.push_back(u"%1:%2:%3"_s.arg(title, color.name(QColor::HexArgb)).arg(pixels.pixels));
+          }
+          qInfo("PJ_WASM_PLOT_CURVE_PIXELS curves=%s", qPrintable(counts.join(',')));
+          if (!curve_colors.empty()) {
+            qInfo(
+                "PJ_WASM_PLOT_STYLE_PIXELS style=%d width=%d pixels=%lld bounds=%d,%d..%d,%d hash=%llu "
+                "framebuffer=%dx%d",
+                curve_style, line_width, static_cast<long long>(first_curve.pixels), first_curve.min_x,
+                first_curve.min_y, first_curve.max_x, first_curve.max_y,
+                static_cast<unsigned long long>(first_curve.coordinate_hash), image.width(), image.height());
+          }
+
+          const WasmLineCadence major_grid = findWasmVerticalCadence(image, grid_color, 6, 4);
+          const WasmLineCadence minor_grid = findWasmVerticalCadence(image, grid_color, 3, 1);
+          qInfo(
+              "PJ_WASM_PLOT_GRID_PIXELS major_pixels=%lld major_column=%d major_period=%d "
+              "major_period_matches=%d major_period_comparisons=%d major_phase_mask=%d major_on_phases=%d "
+              "minor_pixels=%lld minor_column=%d minor_period=%d minor_period_matches=%d "
+              "minor_period_comparisons=%d minor_phase_mask=%d minor_on_phases=%d",
+              static_cast<long long>(major_grid.pixels), major_grid.column, major_grid.period,
+              major_grid.period_matches, major_grid.period_comparisons, major_grid.phase_mask, major_grid.on_phases,
+              static_cast<long long>(minor_grid.pixels), minor_grid.column, minor_grid.period,
+              minor_grid.period_matches, minor_grid.period_comparisons, minor_grid.phase_mask, minor_grid.on_phases);
+
+          const WasmPixelBounds tracker = findWasmBlendedColor(image, tracker_color, canvas_color);
+          qInfo(
+              "PJ_WASM_PLOT_TRACKER color=%s pixels=%lld bounds=%d,%d..%d,%d framebuffer=%dx%d",
+              qPrintable(tracker_color.name(QColor::HexArgb)), static_cast<long long>(tracker.pixels), tracker.min_x,
+              tracker.min_y, tracker.max_x, tracker.max_y, image.width(), image.height());
+          const WasmPixelBounds text = findWasmDarkPixels(image);
+          qInfo(
+              "PJ_WASM_PLOT_TEXT_PIXELS pixels=%lld bounds=%d,%d..%d,%d framebuffer=%dx%d",
+              static_cast<long long>(text.pixels), text.min_x, text.min_y, text.max_x, text.max_y, image.width(),
+              image.height());
+          const WasmPixelBounds hover_fill = findWasmExactColor(image, hover_fill_color);
+          WasmPixelBounds hover_border;
+          if (hover_fill.pixels > 0) {
+            const QRect hover_border_rect =
+                QRect(QPoint(hover_fill.min_x, hover_fill.min_y), QPoint(hover_fill.max_x, hover_fill.max_y))
+                    .adjusted(-3, -3, 3, 3);
+            hover_border = findWasmDarkPixels(image, hover_border_rect);
+          }
+          qInfo(
+              "PJ_WASM_PLOT_HOVER_PIXELS yellow_pixels=%lld yellow_bounds=%d,%d..%d,%d border_pixels=%lld "
+              "framebuffer=%dx%d",
+              static_cast<long long>(hover_fill.pixels), hover_fill.min_x, hover_fill.min_y, hover_fill.max_x,
+              hover_fill.max_y, static_cast<long long>(hover_border.pixels), image.width(), image.height());
+        });
+  });
+#endif
   connect(ui_->leftPanel, &LeftPanel::reloadDataRequested, this, &MainWindow::onReloadDataRequested);
   connect(ui_->leftPanel, &LeftPanel::cloudToolboxRequested, this, [this](const QString& id) { launchToolbox(id); });
   scene_undo_debounce_.setSingleShot(true);
@@ -1223,7 +1582,8 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
           const QString& path, const QString& /*prefix*/, const QString& /*plugin_id*/,
           const QString& /*plugin_config_json*/) {
         // A browser upload token and its MEMFS backing file both expire with
-        // the page; keep such identities out of the desktop-style recent list.
+        // this page. Keep it out of the desktop-style recent-file list; W9c
+        // source layouts reselect bytes explicitly instead.
         if (isBrowserUploadIdentity(path)) {
           return;
         }
@@ -1244,10 +1604,23 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // Recent layouts load through the same validated path as the (removed) File
   // menu submenu — onLoadRecentLayout checks existence and prunes dead entries.
   connect(ui_->leftPanel, &LeftPanel::recentLayoutSelected, this, &MainWindow::onLoadRecentLayout);
+#ifdef PJ_TARGET_WASM
+  connect(ui_->leftPanel, &LeftPanel::clearRecentLayoutsRequested, this, [this]() {
+    if (BrowserPersistence::instance() != nullptr) {
+      BrowserPersistence::instance()->clearRecentLayouts();
+    }
+    ui_->leftPanel->setRecentEnabled(false);
+  });
+#endif
   // Enable the popup immediately when prior sessions recorded recent files or
   // layouts (either section is enough to make the popup worth showing).
+#ifdef PJ_TARGET_WASM
+  const bool had_recent =
+      BrowserPersistence::instance() != nullptr && !BrowserPersistence::instance()->recentLayouts().isEmpty();
+#else
   const bool had_recent = !settings.value(u"File/recent"_s).toStringList().isEmpty() ||
                           !settings.value(u"Layout/recent"_s).toStringList().isEmpty();
+#endif
   ui_->leftPanel->setRecentEnabled(had_recent);
 
   // Title-bar load progress strip — the non-modal replacement for the import
@@ -1279,9 +1652,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       return;
     }
 
-    // Heap instance continued from its finished signal: the load keeps
-    // progressing while the question is up, so completion must be able to
-    // dismiss it — which a nested exec() would make fragile to unwind.
+    // The browser main thread must never enter a nested QDialog event loop.
+    // Keep the instance alive through QObject parentage and continue from its
+    // finished signal instead.
     auto* dialog = new MessageBox(this);
     ingest_stop_dialog_ = dialog;
     dialog->setAttribute(Qt::WA_DeleteOnClose);
@@ -1334,7 +1707,13 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         ingest_progress_->setTitle(title);
         ingest_progress_->setCounterText(total > 1 ? u"%1/%2"_s.arg(index).arg(total) : QString());
         ingest_progress_->setRange(0, 0);  // busy until the first determinate progress tick
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+        // Keep browser cancellation fixtures small and deterministic. Production
+        // retains the anti-flash delay below.
+        ingest_show_timer_->start(50);
+#else
         ingest_show_timer_->start(500);
+#endif
       });
   connect(file_loader_.get(), &FileLoader::ingestProgress, this, [this](int current, int maximum) {
     ingest_progress_->setRange(0, maximum);  // maximum 0 keeps the bar in busy/indeterminate mode
@@ -1345,7 +1724,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     QTimer::singleShot(1000, this, [this]() { ingest_progress_->setActive(false); });
   });
 
+#ifndef PJ_TARGET_WASM
   connect(ui_->actionMarketplace, &QAction::triggered, this, &MainWindow::onOpenMarketplace);
+#endif
   connect(ui_->actionExit, &QAction::triggered, this, &QWidget::close);
 
   // Undo/Redo apply to plot-layout snapshots. They are keyboard-only
@@ -1419,10 +1800,13 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     layout->addStretch(1);
     return page;
   };
+#ifdef PJ_WITH_SCENE2D
   scene2d_config_panel_ = new Scene2DConfigPanel(right_panel_stack_);
   scene2d_config_page_ = scene2d_config_panel_;
   scene2d_config_panel_->onStylesheetChanged(theme_->currentTheme());
   connect(this, &MainWindow::stylesheetChanged, scene2d_config_panel_, &Scene2DConfigPanel::onStylesheetChanged);
+#endif
+#ifdef PJ_WITH_SCENE3D
   scene3d_config_panel_ = new Scene3DConfigPanel(right_panel_stack_);
   scene3d_config_page_ = scene3d_config_panel_;
   // Push the active theme into the panel so its row icons paint in the
@@ -1430,9 +1814,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // toggles via the standard stylesheetChanged signal.
   scene3d_config_panel_->onStylesheetChanged(theme_->currentTheme());
   connect(this, &MainWindow::stylesheetChanged, scene3d_config_panel_, &Scene3DConfigPanel::onStylesheetChanged);
+#endif
   empty_dock_page_ = make_placeholder(tr("No widget selected"));
+#ifdef PJ_WITH_SCENE2D
   right_panel_stack_->addWidget(scene2d_config_page_);
+#endif
+#ifdef PJ_WITH_SCENE3D
   right_panel_stack_->addWidget(scene3d_config_page_);
+#endif
   right_panel_stack_->addWidget(empty_dock_page_);
   right_panel_stack_->setCurrentWidget(plot_config_page_);
 
@@ -1491,6 +1880,7 @@ IDataWidget* MainWindow::makeSceneDock(const QString& kind, QWidget* parent) {
   // Single construct + wire site for object-widget docks, shared by the drop
   // and layout-restore paths. Wiring (session / transform service / theme) is
   // identical regardless of how the dock is later populated.
+#ifdef PJ_WITH_SCENE3D
   if (kind == "scene3d"_L1) {
     auto* widget = new Scene3DDockWidget(parent);
     connect(widget, &SceneDockWidget::pendingRestoresChanged, this, &MainWindow::schedulePendingDisplayBindingRebuild);
@@ -1522,6 +1912,8 @@ IDataWidget* MainWindow::makeSceneDock(const QString& kind, QWidget* parent) {
     // palette luminance and repaints on QEvent::PaletteChange.
     return widget;
   }
+#endif
+#ifdef PJ_WITH_SCENE2D
   if (kind == "scene2d"_L1) {
     auto* widget = new Scene2DDockWidget(parent);
     connect(widget, &SceneDockWidget::pendingRestoresChanged, this, &MainWindow::schedulePendingDisplayBindingRebuild);
@@ -1530,6 +1922,9 @@ IDataWidget* MainWindow::makeSceneDock(const QString& kind, QWidget* parent) {
     topic_demand_controller_->registerSceneDock(widget);
     return widget;
   }
+#endif
+  Q_UNUSED(kind);
+  Q_UNUSED(parent);
   return nullptr;
 }
 
@@ -1644,7 +2039,438 @@ bool MainWindow::populateTestData() {
   return true;
 }
 
+#ifdef PJ_TARGET_WASM
+QDomDocument MainWindow::browserGenericLayoutDocument() const {
+  QDomDocument doc = xmlSaveState();
+  doc.documentElement().setAttribute(u"binding"_s, u"generic"_s);
+  layout_xml::removeDatasetQualifiersForGenericLayout(doc);
+  doc.documentElement().appendChild(saveRightPanelState(doc));
+  doc.documentElement().appendChild(ui_->leftPanel->saveSourcesState(doc));
+  doc.documentElement().appendChild(ui_->curveListPanel->saveListState(doc));
+  doc.documentElement().appendChild(saveChromeState(doc));
+  doc.documentElement().appendChild(saveSourceTimelineViewState(doc));
+  return doc;
+}
+
+std::optional<QDomDocument> MainWindow::browserSourceLayoutDocument(QString& error) const {
+  error.clear();
+  if (browser_layout_runtime_ == nullptr) {
+    error = tr("Browser source state is unavailable.");
+    return std::nullopt;
+  }
+
+  const std::vector<std::pair<DatasetId, QString>> live_datasets = session_->catalogModel().datasets();
+  if (live_datasets.empty()) {
+    error = tr("Open a browser data source before saving a source-bound layout.");
+    return std::nullopt;
+  }
+
+  struct SerializableSource {
+    QString identity;
+    const BrowserLayoutRuntime::SourceRecord* record = nullptr;
+  };
+  std::vector<SerializableSource> sources;
+  QSet<QString> seen_sources;
+  for (const auto& [dataset_id, unused_name] : live_datasets) {
+    (void)unused_name;
+    const QString identity = file_loader_->sourcePathForDataset(dataset_id);
+    if (!isBrowserUploadIdentity(identity)) {
+      error = tr("Every loaded dataset must be backed by a browser-selected file.");
+      return std::nullopt;
+    }
+    const auto record_it = browser_layout_runtime_->sources.constFind(identity);
+    if (record_it == browser_layout_runtime_->sources.cend()) {
+      error = tr("A loaded browser source can no longer be identified.");
+      return std::nullopt;
+    }
+    if (!seen_sources.contains(identity)) {
+      seen_sources.insert(identity);
+      sources.push_back({.identity = identity, .record = &record_it.value()});
+    }
+  }
+
+  // A source is replayable only while its complete original fan-out shape is
+  // live. IDs make a removed-and-coincidentally-similar sibling insufficient;
+  // names additionally guard order/shape drift inside one fan-out.
+  for (const SerializableSource& source : sources) {
+    std::vector<BrowserLayoutRuntime::DatasetShape> current_shape;
+    for (const auto& [dataset_id, unused_name] : live_datasets) {
+      (void)unused_name;
+      if (file_loader_->sourcePathForDataset(dataset_id) != source.identity) {
+        continue;
+      }
+      current_shape.push_back({
+          .dataset_id = dataset_id,
+          .source_name = session_->catalogModel().datasetSourceName(dataset_id).value_or(QString{}),
+      });
+    }
+    if (source.record == nullptr || source.record->datasets.empty() ||
+        current_shape.size() != source.record->datasets.size() ||
+        !std::equal(
+            current_shape.cbegin(), current_shape.cend(), source.record->datasets.cbegin(),
+            [](const auto& current, const auto& original) {
+              return current.dataset_id == original.dataset_id && current.source_name == original.source_name;
+            })) {
+      error = tr("A browser source no longer has its complete original dataset set.");
+      return std::nullopt;
+    }
+  }
+
+  QDomDocument doc = xmlSaveState();
+  QDomElement root = doc.documentElement();
+  root.setAttribute(u"binding"_s, u"source"_s);
+
+  QDomElement wrapper = doc.createElement(u"previouslyLoaded_Datafiles"_s);
+  QHash<DatasetId, int> timeline_order;
+  if (source_timeline_controller_ != nullptr) {
+    const std::vector<DatasetId> order = source_timeline_controller_->currentTrackOrder();
+    for (int index = 0; index < static_cast<int>(order.size()); ++index) {
+      timeline_order.insert(order[static_cast<std::size_t>(index)], index);
+    }
+  }
+
+  QHash<DatasetId, QString> logical_path_for_dataset;
+  QHash<QString, QString> logical_path_for_identity;
+  for (std::size_t source_index = 0; source_index < sources.size(); ++source_index) {
+    const SerializableSource& source = sources[source_index];
+    const BrowserLayoutRuntime::SourceRecord& record = *source.record;
+    const QString basename = BrowserFileStore::sanitizedBasename(record.display_name);
+    if (basename.isEmpty()) {
+      error = tr("A browser source has no usable filename.");
+      return std::nullopt;
+    }
+    if (record.content_sha256.isEmpty()) {
+      error = tr("A browser source no longer has its staged content fingerprint.");
+      return std::nullopt;
+    }
+    // Preserve W9c.2's compact one-source document. Multi-source documents use
+    // an ordinal directory for every source, so duplicate basenames can never
+    // alias in fileInfo, curve, processor, or scene qualifiers.
+    const QString logical_path =
+        sources.size() == 1 ? basename : u"pj4-sources/%1/%2"_s.arg(source_index).arg(basename);
+    logical_path_for_identity.insert(source.identity, logical_path);
+
+    QDomElement file_info = doc.createElement(u"fileInfo"_s);
+    file_info.setAttribute(u"filename"_s, logical_path);
+    file_info.setAttribute(u"prefix"_s, record.prefix);
+    file_info.setAttribute(u"content_sha256"_s, record.content_sha256);
+    for (std::size_t dataset_index = 0; dataset_index < record.datasets.size(); ++dataset_index) {
+      const BrowserLayoutRuntime::DatasetShape& shape = record.datasets[dataset_index];
+      logical_path_for_dataset.insert(shape.dataset_id, logical_path);
+      QDomElement dataset = doc.createElement(u"dataset"_s);
+      dataset.setAttribute(u"source_index"_s, QString::number(dataset_index));
+      if (!shape.source_name.isEmpty()) {
+        dataset.setAttribute(u"source_name"_s, shape.source_name);
+      }
+      const QString offset =
+          QString::number(session_->sessionManager().sourceDisplayOffset(shape.dataset_id).value.count());
+      dataset.setAttribute(u"display_offset_ns"_s, offset);
+      if (const auto order_it = timeline_order.constFind(shape.dataset_id); order_it != timeline_order.constEnd()) {
+        dataset.setAttribute(u"timeline_order"_s, QString::number(order_it.value()));
+      }
+      file_info.appendChild(dataset);
+      if (dataset_index == 0) {
+        file_info.setAttribute(u"display_offset_ns"_s, offset);
+        if (dataset.hasAttribute(u"timeline_order"_s)) {
+          file_info.setAttribute(u"timeline_order"_s, dataset.attribute(u"timeline_order"_s));
+        }
+      }
+    }
+
+    if (!record.plugin_id.isEmpty()) {
+      QDomElement plugin = doc.createElement(u"plugin"_s);
+      plugin.setAttribute(u"ID"_s, record.plugin_id);
+      plugin.setAttribute(u"filepath_mode"_s, u"source"_s);
+      const std::string logical_config =
+          detail::rewriteReplayFilepaths(record.plugin_config_json.toStdString(), logical_path);
+      layout_xml::appendJsonAsCdata(doc, plugin, QString::fromStdString(logical_config));
+      file_info.appendChild(plugin);
+    }
+    wrapper.appendChild(file_info);
+  }
+  root.appendChild(wrapper);
+
+  layout_xml::stampDatasetSourcePaths(doc, [&logical_path_for_dataset](std::uint32_t id) {
+    return logical_path_for_dataset.value(static_cast<DatasetId>(id));
+  });
+  layout_xml::remapDatasetSourcePaths(
+      doc, [&logical_path_for_identity](const QString& path) { return logical_path_for_identity.value(path, path); });
+  layout_xml::removeUnvalidatedDatasetIds(doc);
+
+  root.appendChild(saveRightPanelState(doc));
+  root.appendChild(ui_->leftPanel->saveSourcesState(doc));
+  root.appendChild(ui_->curveListPanel->saveListState(doc));
+  root.appendChild(saveChromeState(doc));
+  root.appendChild(saveSourceTimelineViewState(doc));
+
+  const QByteArray serialized = doc.toByteArray(2);
+  if (layout_xml::containsEphemeralBrowserPath(serialized)) {
+    error = tr("The layout still contains an ephemeral browser path and was not downloaded.");
+    return std::nullopt;
+  }
+  return doc;
+}
+#endif
+
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+QByteArray MainWindow::wasmProbeLayoutBytes() const {
+  // The fixture and browser download use the exact same serialized document.
+  const QDomDocument doc = browserGenericLayoutDocument();
+  return doc.toByteArray(2);
+}
+
+qsizetype MainWindow::wasmProbeDatasetCount() const {
+  return static_cast<qsizetype>(session_->catalogModel().datasets().size());
+}
+
+void MainWindow::wasmProbeReportFilterResult() const {
+  const auto recipes = session_->sessionManager().dataProcessorService().recipes();
+  QStringList processor_ids;
+  QStringList output_names;
+  processor_ids.reserve(static_cast<qsizetype>(recipes.size()));
+  output_names.reserve(static_cast<qsizetype>(recipes.size()));
+  for (const DataProcessorService::FilterRecipe& recipe : recipes) {
+    processor_ids.push_back(QString::fromStdString(recipe.processor_id));
+    output_names.push_back(QString::fromStdString(recipe.output_name).toUtf8().toBase64());
+  }
+  qInfo(
+      "PJ_WASM_FILTER_RECIPES count=%llu ids=%s outputs_b64=%s", static_cast<unsigned long long>(recipes.size()),
+      qPrintable(processor_ids.join(u","_s)), qPrintable(output_names.join(u","_s)));
+
+  int visible_plots = 0;
+  int visible_curves = 0;
+  for (PJ::PlotWidget* plot : findChildren<PJ::PlotWidget*>()) {
+    if (!plot->isVisibleTo(this)) {
+      continue;
+    }
+    ++visible_plots;
+    for (const PJ::PlotWidgetBase::CurveInfo& info : plot->curveList()) {
+      if (info.curve == nullptr || info.curve->data() == nullptr || !info.curve->isVisible()) {
+        continue;
+      }
+      ++visible_curves;
+      const auto* data = info.curve->data();
+      QStringList y_values;
+      const std::size_t count = data->size();
+      const std::size_t reported = std::min<std::size_t>(count, 32);
+      y_values.reserve(static_cast<qsizetype>(reported));
+      for (std::size_t index = 0; index < reported; ++index) {
+        y_values.push_back(QString::number(data->sample(index).y(), 'g', 17));
+      }
+      const QByteArray title = info.curve->title().text().toUtf8().toBase64();
+      const QByteArray source = info.source_name.toUtf8().toBase64();
+      qInfo(
+          "PJ_WASM_FILTER_CURVE title_b64=%s source_b64=%s samples=%llu y=%s truncated=%d", title.constData(),
+          source.constData(), static_cast<unsigned long long>(count), qPrintable(y_values.join(u","_s)),
+          reported < count ? 1 : 0);
+    }
+  }
+  qInfo("PJ_WASM_FILTER_RESULT visible_plots=%d visible_curves=%d", visible_plots, visible_curves);
+}
+
+void MainWindow::wasmProbeReportToolboxTransformResult() const {
+  const auto recipes = session_->sessionManager().dataProcessorService().transformRecipes();
+  qInfo("PJ_WASM_TOOLBOX_TRANSFORMS count=%llu", static_cast<unsigned long long>(recipes.size()));
+
+  auto* custom = findChild<QTreeWidget*>(u"customView"_s);
+  for (const DataProcessorService::TransformRecipe& recipe : recipes) {
+    QStringList inputs;
+    QStringList outputs;
+    inputs.reserve(static_cast<qsizetype>(recipe.inputs.size()));
+    outputs.reserve(static_cast<qsizetype>(recipe.outputs.size()));
+    for (const std::string& input : recipe.inputs) {
+      inputs.push_back(QString::fromStdString(input).toUtf8().toBase64());
+    }
+    for (const std::string& output : recipe.outputs) {
+      outputs.push_back(QString::fromStdString(output).toUtf8().toBase64());
+    }
+
+    QPoint custom_center(-1, -1);
+    if (custom != nullptr && !recipe.outputs.empty()) {
+      const QString wanted = QString::fromStdString(recipe.outputs.front());
+      for (QTreeWidgetItemIterator it(custom); *it != nullptr; ++it) {
+        QTreeWidgetItem* item = *it;
+        if (item->text(0) != wanted) {
+          continue;
+        }
+        custom_center = mapFromGlobal(custom->viewport()->mapToGlobal(custom->visualItemRect(item).center()));
+        break;
+      }
+    }
+
+    const QByteArray key = QString::fromStdString(recipe.key).toUtf8().toBase64();
+    const QByteArray owner = QString::fromStdString(recipe.owner_plugin).toUtf8().toBase64();
+    const QByteArray user_id = QString::fromStdString(recipe.user_id).toUtf8().toBase64();
+    qInfo(
+        "PJ_WASM_TOOLBOX_TRANSFORM key_b64=%s owner_b64=%s user_b64=%s backend=%s inputs_b64=%s "
+        "outputs_b64=%s ephemeral=%d custom=%d,%d",
+        key.constData(), owner.constData(), user_id.constData(), recipe.backend.c_str(),
+        qPrintable(inputs.join(u","_s)), qPrintable(outputs.join(u","_s)), recipe.ephemeral ? 1 : 0, custom_center.x(),
+        custom_center.y());
+  }
+}
+
+void MainWindow::wasmProbeReportStreamingState() const {
+  static quint64 sequence = 0;
+  const quint64 current_sequence = ++sequence;
+
+  const auto widget_center = [this](const QWidget* widget) {
+    if (widget == nullptr || !widget->isVisibleTo(this)) {
+      return QPoint(-1, -1);
+    }
+    return mapFromGlobal(widget->mapToGlobal(widget->rect().center()));
+  };
+
+  auto* source_combo = findChild<QComboBox*>(u"comboStreaming"_s);
+  auto* stream_tab = findChild<QToolButton*>(u"tabStream"_s);
+  auto* start_button = findChild<QPushButton*>(u"buttonStreamingOptions"_s);
+  auto* pause_button = findChild<QPushButton*>(u"buttonStreamingPause"_s);
+  auto* buffer = findChild<QWidget*>(u"streamingSpinBox"_s);
+  auto* tree = findChild<QTreeWidget*>(u"treeView"_s);
+  auto* datasets_menu = findChild<QToolButton*>(u"buttonDatasetsMenu"_s);
+
+  QPushButton* remove_all = nullptr;
+  for (QPushButton* button : findChildren<QPushButton*>()) {
+    if (button->text() == tr("Remove all Datasets")) {
+      remove_all = button;
+      break;
+    }
+  }
+
+  const auto item_center = [this, tree](QTreeWidgetItem* item) {
+    if (tree == nullptr || item == nullptr || !tree->isVisibleTo(this) || item->isHidden()) {
+      return QPoint(-1, -1);
+    }
+    for (QTreeWidgetItem* parent = item->parent(); parent != nullptr; parent = parent->parent()) {
+      if (!parent->isExpanded() || parent->isHidden()) {
+        return QPoint(-1, -1);
+      }
+    }
+    const QRect visual = tree->visualItemRect(item);
+    if (!visual.isValid() || visual.isEmpty() || !tree->viewport()->rect().intersects(visual)) {
+      return QPoint(-1, -1);
+    }
+    return mapFromGlobal(tree->viewport()->mapToGlobal(visual.center()));
+  };
+
+  QTreeWidgetItem* dataset_item = tree != nullptr && tree->topLevelItemCount() > 0 ? tree->topLevelItem(0) : nullptr;
+  QTreeWidgetItem* topic_item = nullptr;
+  QTreeWidgetItem* field_item = nullptr;
+  int tree_rows = 0;
+  if (tree != nullptr) {
+    for (QTreeWidgetItemIterator it(tree); *it != nullptr; ++it) {
+      QTreeWidgetItem* item = *it;
+      ++tree_rows;
+      if (item->text(0) == u"dummy/sin_cos"_s) {
+        topic_item = item;
+      }
+      if (item->text(0) == u"sin"_s && item->childCount() == 0) {
+        field_item = item;
+      }
+    }
+  }
+
+  PlotWidget* visible_plot = nullptr;
+  PlotRhiCanvas* canvas = nullptr;
+  QWidget* plot_drop_target = nullptr;
+  const QwtSeriesData<QPointF>* plotted_data = nullptr;
+  QString plotted_title;
+  quint64 vertices = 0;
+  for (PlotWidget* plot : findChildren<PlotWidget*>()) {
+    if (!plot->isVisibleTo(this)) {
+      continue;
+    }
+    visible_plot = plot;
+    canvas = plot->findChild<PlotRhiCanvas*>();
+    if (canvas != nullptr) {
+      vertices = canvas->lastVertexCount();
+      plot_drop_target = canvas;
+    }
+    for (const PlotWidgetBase::CurveInfo& info : plot->curveList()) {
+      if (info.curve != nullptr && info.curve->isVisible() && info.curve->data() != nullptr) {
+        plotted_data = info.curve->data();
+        plotted_title = info.curve->title().text();
+        break;
+      }
+    }
+    break;
+  }
+  if (plot_drop_target == nullptr) {
+    for (DockWidget* dock : findChildren<DockWidget*>()) {
+      if (dock != nullptr && dock->isVisibleTo(this) && dock->window() == this) {
+        plot_drop_target = dock;
+        break;
+      }
+    }
+  }
+
+  const std::size_t sample_count = plotted_data != nullptr ? plotted_data->size() : 0;
+  QPointF first_sample;
+  QPointF last_sample;
+  if (sample_count > 0) {
+    first_sample = plotted_data->sample(0);
+    last_sample = plotted_data->sample(sample_count - 1);
+  }
+
+  const QString source = source_combo != nullptr ? source_combo->currentText() : QString();
+  const QByteArray source_b64 = source.toUtf8().toBase64();
+  const QByteArray dataset_b64 = dataset_item != nullptr ? dataset_item->text(0).toUtf8().toBase64() : QByteArray();
+  const QByteArray topic_b64 = topic_item != nullptr ? topic_item->text(0).toUtf8().toBase64() : QByteArray();
+  const QByteArray field_b64 = field_item != nullptr ? field_item->text(0).toUtf8().toBase64() : QByteArray();
+  const QByteArray title_b64 = plotted_title.toUtf8().toBase64();
+  const auto& playback = session_->playbackEngine();
+  qInfo(
+      "PJ_WASM_STREAM_STATE sequence=%llu sources=%d source_b64=%s active=%d datasets=%lld catalog=%llu paused=%d "
+      "playing=%d range=%.17g,%.17g current=%.17g",
+      static_cast<unsigned long long>(current_sequence), source_combo != nullptr ? source_combo->count() : 0,
+      source_b64.constData(), streaming_manager_ != nullptr && streaming_manager_->hasActiveSession() ? 1 : 0,
+      static_cast<long long>(wasmProbeDatasetCount()),
+      static_cast<unsigned long long>(session_->catalogModel().curves().size()),
+      pause_button != nullptr && pause_button->isChecked() ? 1 : 0, playback.isPlaying() ? 1 : 0,
+      toAxisDouble(playback.rangeMin()), toAxisDouble(playback.rangeMax()), toAxisDouble(playback.currentTime()));
+
+  const QPoint tab_center = widget_center(stream_tab);
+  const QPoint combo_center = widget_center(source_combo);
+  const QPoint start_center = widget_center(start_button);
+  const QPoint pause_center = widget_center(pause_button);
+  const QPoint buffer_center = widget_center(buffer);
+  const QPoint tree_center = widget_center(tree);
+  const QPoint menu_center = widget_center(datasets_menu);
+  const QPoint remove_center = widget_center(remove_all);
+  const QPoint canvas_center = widget_center(plot_drop_target);
+  qInfo(
+      "PJ_WASM_STREAM_CONTROLS sequence=%llu tab=%d,%d combo=%d,%d start=%d,%d pause=%d,%d buffer=%d,%d "
+      "tree=%d,%d menu=%d,%d remove=%d,%d canvas=%d,%d",
+      static_cast<unsigned long long>(current_sequence), tab_center.x(), tab_center.y(), combo_center.x(),
+      combo_center.y(), start_center.x(), start_center.y(), pause_center.x(), pause_center.y(), buffer_center.x(),
+      buffer_center.y(), tree_center.x(), tree_center.y(), menu_center.x(), menu_center.y(), remove_center.x(),
+      remove_center.y(), canvas_center.x(), canvas_center.y());
+
+  const QPoint dataset_center = item_center(dataset_item);
+  const QPoint topic_center = item_center(topic_item);
+  const QPoint field_center = item_center(field_item);
+  qInfo(
+      "PJ_WASM_STREAM_TREE sequence=%llu rows=%d dataset_b64=%s dataset=%d,%d topic_b64=%s topic=%d,%d "
+      "field_b64=%s field=%d,%d",
+      static_cast<unsigned long long>(current_sequence), tree_rows, dataset_b64.constData(), dataset_center.x(),
+      dataset_center.y(), topic_b64.constData(), topic_center.x(), topic_center.y(), field_b64.constData(),
+      field_center.x(), field_center.y());
+  qInfo(
+      "PJ_WASM_STREAM_CURVE sequence=%llu plotted=%d title_b64=%s samples=%llu first=%.17g,%.17g "
+      "last=%.17g,%.17g vertices=%llu",
+      static_cast<unsigned long long>(current_sequence), visible_plot != nullptr && plotted_data != nullptr ? 1 : 0,
+      title_b64.constData(), static_cast<unsigned long long>(sample_count), first_sample.x(), first_sample.y(),
+      last_sample.x(), last_sample.y(), static_cast<unsigned long long>(vertices));
+}
+
+void MainWindow::wasmProbeSupersedeBrowserReplayPicker() {
+  const quint64 generation = beginBrowserReplayPickerGeneration();
+  qInfo("PJ_WASM_SOURCE_LAYOUT_PICKER_SUPERSEDED generation=%llu", static_cast<unsigned long long>(generation));
+}
+#endif
+
 void MainWindow::onOpenMarketplace() {
+#ifndef PJ_TARGET_WASM
   auto& catalog = session_->extensionCatalog();
   MarketplaceWindow dlg(&catalog.extensionManager(), effectiveRegistryUrl(), this);
   dlg.setChromeMetrics(chrome_metrics_);
@@ -1655,6 +2481,7 @@ void MainWindow::onOpenMarketplace() {
   if (dlg.installationsChanged()) {
     catalog.reload();
   }
+#endif
 }
 
 void MainWindow::onLoadDataRequested() {
@@ -1804,6 +2631,33 @@ void MainWindow::onFileLoaded(
   if (!isBrowserUploadIdentity(path)) {
     session_->sessionManager().recordLoadedSource(path, prefix, plugin_id, plugin_config_json);
   }
+#ifdef PJ_TARGET_WASM
+  if (isBrowserUploadIdentity(path) && browser_layout_runtime_ != nullptr) {
+    const QString display_name = BrowserFileStore::displayNameForIdentity(path);
+    if (!display_name.isEmpty()) {
+      std::vector<BrowserLayoutRuntime::DatasetShape> datasets;
+      for (const auto& [dataset_id, unused_name] : session_->catalogModel().datasets()) {
+        (void)unused_name;
+        if (file_loader_->sourcePathForDataset(dataset_id) == path) {
+          datasets.push_back({
+              .dataset_id = dataset_id,
+              .source_name = session_->catalogModel().datasetSourceName(dataset_id).value_or(QString{}),
+          });
+        }
+      }
+      browser_layout_runtime_->sources.insert(
+          path, BrowserLayoutRuntime::SourceRecord{
+                    .display_name = display_name,
+                    .prefix = prefix,
+                    .content_sha256 = file_loader_->browserContentSha256(path),
+                    .plugin_id = plugin_id,
+                    .plugin_config_json = plugin_config_json,
+                    .datasets = std::move(datasets),
+                });
+    }
+  }
+#endif
+#ifdef PJ_WITH_SCENE3D
   // Feed the loaded source path to every existing 3D dock so its URDF package
   // resolver can key per-source remembered roots and auto-seed search roots from
   // the file's directory (M.2/M.16). Docks created later pick it up from
@@ -1816,6 +2670,7 @@ void MainWindow::onFileLoaded(
       scene3d->setSourcePath(path);
     }
   });
+#endif
   // TODO(embedded-assets): route in-band embedded assets to Scene3D docks once the
   // load path surfaces the extracted asset map (resolver step 0).
   if (pending_source_replacement_.has_value() && layout_xml::isSamePath(pending_source_replacement_->path, path)) {
@@ -1843,7 +2698,13 @@ void MainWindow::onFileLoaded(
   // already was (e.g. 0) would otherwise leave the value column blank until the
   // first scrub. Mirrors PJ3's update2ndColumnValues-after-load.
   broadcastTrackerTime(toAxisDouble(session_->playbackEngine().currentTime()));
-  ui_->leftPanel->setReloadEnabled(true);
+  // Browser uploads deliberately are not recorded as reloadable paths: their
+  // logical identity is not a host path and the browser must grant a fresh file
+  // selection gesture. Do not leave a button enabled that can only no-op.
+  ui_->leftPanel->setReloadEnabled(session_->sessionManager().lastLoadedSource().has_value());
+#ifdef PJ_TARGET_WASM
+  updateBrowserLayoutActions();
+#endif
 }
 
 bool MainWindow::confirmAndRemoveDependentTransforms(const std::vector<TopicId>& removed_topics) {
@@ -1907,9 +2768,11 @@ void MainWindow::onCatalogTrashRequested(QStringList keys, bool covers_all) {
     // "Remove all Datasets" path). Keep lastLoadedSource for reload.
     session_->sessionManager().clearAllObjects();
     // TF buffers derive from the just-evicted objects; drop them with the data.
+#ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       transform_service_->invalidateAll();
     }
+#endif
     // REAL delete: drop the catalog (no tombstone), then erase every dataset's scalar
     // storage from the engine. clearAll()'s cleared() tears down curve adapters first, so
     // the engine erase satisfies DataEngine::removeDataset's invalidate-first contract
@@ -1920,6 +2783,9 @@ void MainWindow::onCatalogTrashRequested(QStringList keys, bool covers_all) {
       session_manager.removeDataset(id);
     }
     resetUndoHistory();
+#ifdef PJ_TARGET_WASM
+    updateBrowserLayoutActions();
+#endif
     return;
   }
   // Cascade to derived series that depend on the trashed ones (warn + remove).
@@ -1963,6 +2829,9 @@ void MainWindow::onCatalogTrashRequested(QStringList keys, bool covers_all) {
     session_->seedPlaybackFromSession();
   }
   resetUndoHistory();
+#ifdef PJ_TARGET_WASM
+  updateBrowserLayoutActions();
+#endif
 }
 
 void MainWindow::removeDatasetData(DatasetId dataset_id) {
@@ -1988,9 +2857,11 @@ void MainWindow::removeDatasetData(DatasetId dataset_id) {
   // 2D/3D layers). Then drop the catalog items (tearing down every curve adapter).
   // ONLY THEN erase the engine's scalar storage: DataEngine::removeDataset requires
   // all readers/adapters invalidated first, which the synchronous teardown above guarantees.
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     transform_service_->invalidateDataset(dataset_id);
   }
+#endif
   session_->sessionManager().evictDatasetObjects(dataset_id);
   session_->catalogModel().removeDataset(dataset_id, /*tombstone=*/false);
   session_->sessionManager().removeDataset(dataset_id);
@@ -1998,6 +2869,9 @@ void MainWindow::removeDatasetData(DatasetId dataset_id) {
   // the layout-save liveness filter (appendDataSourceElement), not by mutating
   // loaded_sources_ — that list is kept whole so the quick-reload button still works.
   file_loader_->untrackDataset(dataset_id);
+#ifdef PJ_TARGET_WASM
+  updateBrowserLayoutActions();
+#endif
 }
 
 void MainWindow::onRemoveDatasetsRequested(const QList<DatasetId>& dataset_ids) {
@@ -2067,6 +2941,14 @@ void MainWindow::onMergeDatasetsRequested(const QList<DatasetId>& dataset_ids) {
     if (source_timeline_controller_ != nullptr) {
       source_timeline_controller_->markDatasetMerged(*anchor);
     }
+#ifdef PJ_TARGET_WASM
+    // A merge result cannot be recreated by replaying one browser file. Remove
+    // its save-ledger entry so the single-source action cannot claim otherwise.
+    if (browser_layout_runtime_ != nullptr) {
+      browser_layout_runtime_->sources.remove(file_loader_->sourcePathForDataset(*anchor));
+    }
+    updateBrowserLayoutActions();
+#endif
   }
 }
 
@@ -2301,6 +3183,11 @@ void MainWindow::applyIcons(QString theme) {
   if (action_save_layout_ != nullptr) {
     action_save_layout_->setIcon(QIcon(loadSvg(":/resources/svg/save_as.svg", theme)));
   }
+#ifdef PJ_TARGET_WASM
+  if (action_save_source_layout_ != nullptr) {
+    action_save_source_layout_->setIcon(QIcon(loadSvg(":/resources/svg/save_as.svg", theme)));
+  }
+#endif
 }
 
 void MainWindow::onPlotTabAdded(PlotDocker* docker) {
@@ -2567,6 +3454,7 @@ void MainWindow::applyGlobalToggles(PlotWidget* plot) {
 }
 
 void MainWindow::applyShowPointsToDock(DockWidget* dock) {
+#ifdef PJ_WITH_SCENE2D
   if (dock == nullptr || dock->objectWidget() == nullptr) {
     return;
   }
@@ -2574,6 +3462,9 @@ void MainWindow::applyShowPointsToDock(DockWidget* dock) {
   if (media != nullptr) {
     media->setPointInspectorEnabled(show_points_);
   }
+#else
+  Q_UNUSED(dock);
+#endif
 }
 
 void MainWindow::applyShowPointsTo2DWidgets() {
@@ -2911,6 +3802,19 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   if (file_loader_ != nullptr) {
     file_loader_->joinForShutdown();
   }
+#ifdef PJ_TARGET_WASM
+  // Closing the last Qt window in a browser hides the canvas, but Emscripten may
+  // keep the live runtime instead of unwinding main() immediately. Do not rely
+  // on MainWindow's stack destructor to stop worker threads in that case: the
+  // user-facing File -> Quit action is the terminal boundary, so cooperatively
+  // stop and join every live source before accepting it. Desktop keeps its
+  // existing destructor-driven shutdown behavior unchanged.
+  if (streaming_manager_ != nullptr && streaming_manager_->hasActiveSession()) {
+    streaming_manager_->stopAllAndWait(tr("application shutdown"));
+    active_streaming_dataset_id_ = 0;
+    streaming_playback_seeded_ = false;
+  }
+#endif
   QSettings settings;
   settings.setValue(u"MainWindow.buttonLink"_s, button_link_->isChecked());
   // Remember the left-panel width (the whole splitter layout) so the next launch
@@ -2921,6 +3825,16 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
 void MainWindow::showEvent(QShowEvent* event) {
   QMainWindow::showEvent(event);
+
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+  if (!property("pjWasmReadyReported").toBool()) {
+    setProperty("pjWasmReadyReported", true);
+    // Report readiness only after the real top-level has entered showEvent.
+    // Browser acceptance can now wait for an application-owned boundary
+    // instead of sleeping for an arbitrary five seconds after catalog setup.
+    QTimer::singleShot(0, this, []() { qInfo("PJ_WASM_APP_READY"); });
+  }
+#endif
 
   // (1) Restore the remembered left-panel width once, after the splitter has real
   // geometry. Done here rather than in the constructor so the saved sizes aren't
@@ -2970,6 +3884,29 @@ void MainWindow::showEvent(QShowEvent* event) {
 }
 
 void MainWindow::onLoadLayout() {
+#ifdef PJ_TARGET_WASM
+  if (layout_selection_pending_) {
+    return;
+  }
+  layout_selection_pending_ = true;
+  updateBrowserLayoutActions();
+  qInfo("PJ_WASM_LAYOUT_PICKER_OPEN");
+  QPointer<MainWindow> self(this);
+  FileSelectionService::selectFileContent(
+      this, tr(kLayoutFilter), [self](FileSelectionService::Selection selection) mutable {
+        if (self.isNull()) {
+          return;
+        }
+        if (selection.browser_name.isEmpty()) {
+          self->layout_selection_pending_ = false;
+          self->updateBrowserLayoutActions();
+          qInfo("PJ_WASM_LAYOUT_PICKER_CANCELLED");
+          return;
+        }
+        self->loadLayoutFromBytes(selection.bytes, selection.browser_name);
+      });
+  return;
+#else
   // Remember the last directory across sessions (matches PJ3 behaviour
   // and the data-file loader's pattern at FileLoader.cpp:82). Default
   // to the working directory on first run rather than ~/Documents,
@@ -2983,9 +3920,28 @@ void MainWindow::onLoadLayout() {
   }
   QSettings().setValue(kLastLayoutDirKey, QFileInfo(path).absolutePath());
   loadLayoutFromPath(path);
+#endif
 }
 
 void MainWindow::onSaveLayout() {
+#ifdef PJ_TARGET_WASM
+  const QString file_name = u"plotjuggler-layout.pj4.xml"_s;
+  const QByteArray bytes = browserGenericLayoutDocument().toByteArray(2);
+  if (layout_xml::containsEphemeralBrowserPath(bytes)) {
+    const QString error = tr("The layout still contains an ephemeral browser path and was not downloaded.");
+    showBrowserLayoutWarning(this, tr("Save Layout"), error);
+    emitDiagnostic(DiagnosticLevel::kWarning, "Layout", "ephemeral-browser-path", error);
+    qWarning("PJ_WASM_LAYOUT_DOWNLOAD_FAILED reason=%s", qPrintable(error));
+    return;
+  }
+  FileSelectionService::saveFileContent(this, bytes, file_name);
+  emitDiagnostic(
+      DiagnosticLevel::kInfo, "Layout", "download-requested", tr("Requested layout download: %1").arg(file_name));
+  qInfo(
+      "PJ_WASM_LAYOUT_DOWNLOAD_REQUESTED name=%s bytes=%lld", qPrintable(file_name),
+      static_cast<long long>(bytes.size()));
+  return;
+#else
   const QString start_dir = QSettings().value(kLastLayoutDirKey, QDir::currentPath()).toString();
   // setDefaultSuffix (passed through PJ::FileDialog) wants the extension
   // without the leading dot.
@@ -3009,12 +3965,56 @@ void MainWindow::onSaveLayout() {
   QSettings().setValue(kLastLayoutDirKey, QFileInfo(save_path).absolutePath());
   const bool include_data_source = !result.option_states.empty() && result.option_states[0];
   saveLayoutToPath(save_path, include_data_source);
+#endif
 }
+
+#ifdef PJ_TARGET_WASM
+void MainWindow::onSaveSourceLayout() {
+  QString error;
+  const std::optional<QDomDocument> doc = browserSourceLayoutDocument(error);
+  if (!doc.has_value()) {
+    showBrowserLayoutWarning(this, tr("Save Layout with Sources"), error);
+    qWarning("PJ_WASM_SOURCE_LAYOUT_DOWNLOAD_FAILED reason=%s", qPrintable(error));
+    return;
+  }
+
+  const QString file_name = u"plotjuggler-source-layout.pj4.xml"_s;
+  const QByteArray bytes = doc->toByteArray(2);
+  FileSelectionService::saveFileContent(this, bytes, file_name);
+  emitDiagnostic(
+      DiagnosticLevel::kInfo, "Layout", "download-requested",
+      tr("Requested source-bound layout download: %1").arg(file_name));
+  qInfo(
+      "PJ_WASM_SOURCE_LAYOUT_DOWNLOAD_REQUESTED name=%s bytes=%lld", qPrintable(file_name),
+      static_cast<long long>(bytes.size()));
+}
+#endif
 
 void MainWindow::onLoadRecentLayout(const QString& path) {
   if (path.isEmpty()) {
     return;
   }
+#ifdef PJ_TARGET_WASM
+  BrowserPersistence* persistence = BrowserPersistence::instance();
+  const std::optional<BrowserPersistence::LayoutRecipe> recipe =
+      persistence != nullptr ? persistence->recentLayout(path) : std::nullopt;
+  if (!recipe.has_value()) {
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "missing-browser-recipe",
+        tr("This browser no longer has that recent layout recipe."));
+    if (persistence == nullptr || persistence->recentLayouts().isEmpty()) {
+      ui_->leftPanel->setRecentEnabled(false);
+    }
+    return;
+  }
+  if (layout_selection_pending_) {
+    return;
+  }
+  layout_selection_pending_ = true;
+  updateBrowserLayoutActions();
+  loadLayoutFromBytes(recipe->xml, recipe->name);
+  return;
+#else
   if (!QFileInfo::exists(path)) {
     emitDiagnostic(DiagnosticLevel::kWarning, "Layout", "missing", tr("Layout file no longer exists: %1").arg(path));
     // Drop the dead entry so it stops showing up.
@@ -3024,6 +4024,7 @@ void MainWindow::onLoadRecentLayout(const QString& path) {
     return;
   }
   loadLayoutFromPath(path);
+#endif
 }
 
 void MainWindow::onRebuildExtensionsMenu() {
@@ -3239,6 +4240,7 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
               .preset_config_json = replay.plugin_config_json,
               .skip_dialog = !replay.plugin_id.isEmpty() && !replay.plugin_config_json.isEmpty(),
               .prefer_reuse = true,
+              .rewrite_preset_filepath = replay.rewrite_plugin_filepath,
           };
           file_loader_->loadFile(replay.resolved_path, this, hints);
         }
@@ -3258,6 +4260,678 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
   }
   applyRestoredLayout(doc, path);
 }
+
+#ifdef PJ_TARGET_WASM
+void MainWindow::loadLayoutFromBytes(const QByteArray& bytes, const QString& browser_name) {
+  if (browser_layout_runtime_ != nullptr) {
+    browser_layout_runtime_->pending_recipe_name.clear();
+    browser_layout_runtime_->pending_generic_recipe = false;
+  }
+  QDomDocument doc;
+  const QDomDocument::ParseResult parse_result = doc.setContent(bytes);
+  if (!parse_result) {
+    showBrowserLayoutWarning(
+        this, tr("Load Layout"),
+        tr("'%1' is not a valid PJ4 layout: %2 (line %3, col %4)")
+            .arg(browser_name, parse_result.errorMessage)
+            .arg(parse_result.errorLine)
+            .arg(parse_result.errorColumn));
+    finishBrowserLayoutLoad(browser_name, false, u"parse"_s);
+    return;
+  }
+  const QDomElement root = doc.documentElement();
+  const bool source_bound = root.attribute(u"binding"_s, u"source"_s) != "generic"_L1 &&
+                            !layout_xml::extractDataSource(doc, QDir()).isEmpty();
+  if (browser_layout_runtime_ != nullptr) {
+    browser_layout_runtime_->pending_recipe_name = browser_name;
+    // Only source-free documents are retained implicitly. Source-bound layouts
+    // can carry plugin configs; users keep those explicitly as downloads and
+    // reselect them through W9c instead of leaking them into localStorage.
+    browser_layout_runtime_->pending_generic_recipe = !source_bound;
+  }
+  switch (loadBrowserParsedLayout(std::move(doc), browser_name)) {
+    case BrowserLayoutLoadResult::kApplied:
+      finishBrowserLayoutLoad(browser_name, true);
+      break;
+    case BrowserLayoutLoadResult::kFailed:
+      finishBrowserLayoutLoad(browser_name, false, u"apply"_s);
+      break;
+    case BrowserLayoutLoadResult::kPending:
+      break;
+  }
+}
+
+MainWindow::BrowserLayoutLoadResult MainWindow::loadBrowserParsedLayout(QDomDocument doc, const QString& browser_name) {
+  const QDomElement root = doc.documentElement();
+  bool version_ok = false;
+  const int version = root.attribute(u"pj4_version"_s, u"0"_s).toInt(&version_ok);
+  if (version_ok && version > kLayoutSchemaVersion) {
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "schema-newer",
+        tr("Layout '%1' was saved by a newer PJ4 (pj4_version=%2 > %3); loading best-effort.")
+            .arg(browser_name)
+            .arg(version)
+            .arg(kLayoutSchemaVersion));
+  }
+
+  // A browser selection supplies bytes and a display name, never a durable
+  // directory. Do not resolve or replay source paths: retain the intent for the
+  // later reselection package and bind this slice only to compatible live data.
+  layout_xml::removeUnvalidatedDatasetIds(doc);
+  layout_xml::normalizePlotRangeBasis(doc);
+  const QString binding = root.attribute(u"binding"_s, u"source"_s);
+  const QList<layout_xml::DataSourceRef> sources = layout_xml::extractDataSource(doc, QDir());
+  if (binding != "generic"_L1 && !sources.empty()) {
+    beginBrowserSourceReplay(std::move(doc), browser_name, sources);
+    return BrowserLayoutLoadResult::kPending;
+  }
+  return applyBrowserRestoredLayout(std::move(doc), browser_name) ? BrowserLayoutLoadResult::kApplied
+                                                                  : BrowserLayoutLoadResult::kFailed;
+}
+
+void MainWindow::beginBrowserSourceReplay(
+    QDomDocument doc, const QString& browser_name, QList<layout_xml::DataSourceRef> sources) {
+  if (browser_layout_runtime_ == nullptr || browser_layout_runtime_->replay.has_value()) {
+    finishBrowserLayoutLoad(browser_name, false, u"busy"_s);
+    return;
+  }
+  browser_layout_runtime_->replay.emplace(
+      BrowserLayoutRuntime::Replay{
+          .doc = std::move(doc),
+          .layout_name = browser_name,
+          .sources = std::move(sources),
+          .staged_inputs = {},
+          .selected_identities = {},
+          .loaded_identities = {},
+          .selection_index = 0,
+          .load_failed = false,
+          .load_failure = {},
+          .previous_workspace = captureWorkspace(),
+          .selection_button = {},
+          .active_picker_generation = 0,
+          .loaded_connection = {},
+          .failed_connection = {},
+          .drained_connection = {},
+      });
+
+  BrowserLayoutRuntime::Replay& replay = *browser_layout_runtime_->replay;
+  if (replay.sources.isEmpty()) {
+    finishBrowserLayoutLoad(browser_name, false, u"source-list"_s);
+    return;
+  }
+  QSet<QString> logical_paths;
+  QHash<QString, int> basename_counts;
+  for (const layout_xml::DataSourceRef& source : replay.sources) {
+    if (source.serialized_path.isEmpty() || logical_paths.contains(source.serialized_path)) {
+      showBrowserLayoutWarning(
+          this, tr("Load source-bound layout"), tr("The layout does not uniquely identify every saved data source."));
+      finishBrowserLayoutLoad(browser_name, false, u"source-list"_s);
+      return;
+    }
+    logical_paths.insert(source.serialized_path);
+    const QString basename = BrowserFileStore::sanitizedBasename(source.serialized_path);
+    basename_counts.insert(basename, basename_counts.value(basename) + 1);
+  }
+  for (const layout_xml::DataSourceRef& source : replay.sources) {
+    const QString basename = BrowserFileStore::sanitizedBasename(source.serialized_path);
+    if (basename_counts.value(basename) > 1 && source.content_sha256.isEmpty()) {
+      showBrowserLayoutWarning(
+          this, tr("Load source-bound layout"),
+          tr("This older layout contains more than one source named '%1', but no content fingerprints to tell "
+             "them apart safely. Open the sources separately and use a newer source-bound layout.")
+              .arg(basename));
+      finishBrowserLayoutLoad(browser_name, false, u"ambiguous-source-name"_s);
+      return;
+    }
+  }
+
+  auto* dialog = new MessageBox(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowModality(Qt::ApplicationModal);
+  dialog->setTitle(tr("Load source-bound layout"));
+  const QString first_name = BrowserFileStore::sanitizedBasename(replay.sources.front().serialized_path);
+  const QString first_context =
+      replay.sources.front().plugin_id.isEmpty()
+          ? replay.sources.front().serialized_path
+          : tr("%1 (plugin: %2)").arg(replay.sources.front().serialized_path, replay.sources.front().plugin_id);
+  dialog->setText(
+      replay.sources.size() == 1
+          ? tr("This layout was saved with data source '%1'. Reselect that file to reload it, or apply the layout "
+               "to compatible data already open in this page.")
+                .arg(first_name)
+          : tr("This layout was saved with %1 data sources. Select source 1 of %1: '%2' for saved slot '%3'. "
+               "Every file will be staged before any import begins.")
+                .arg(replay.sources.size())
+                .arg(first_name, first_context));
+  QPushButton* reselect_button = dialog->addButton(
+      replay.sources.size() == 1 ? tr("Reselect source") : tr("Select source 1 of %1").arg(replay.sources.size()),
+      MessageBox::kPrimaryRole, /*close_on_click=*/false);
+  dialog->addButton(tr("Apply to current data"), MessageBox::kNeutralRole);
+  dialog->addButton(tr("Cancel"), MessageBox::kCancelRole);
+  replay.selection_button = reselect_button;
+  browser_layout_runtime_->decision_dialog = dialog;
+
+  QPointer<MainWindow> self(this);
+  connect(reselect_button, &QPushButton::clicked, this, [self]() {
+    if (!self.isNull()) {
+      // Keep the decision surface alive until the picker/stager calls back. If
+      // a browser drops a synthetic or denied picker request without a callback,
+      // the user can click Reselect again instead of being left in a locked state.
+      self->selectBrowserReplaySource();
+    }
+  });
+  QPointer<MessageBox> guarded_dialog(dialog);
+  connect(dialog, &QDialog::finished, this, [self, guarded_dialog](int) {
+    if (self.isNull() || guarded_dialog.isNull() || self->browser_layout_runtime_ == nullptr ||
+        !self->browser_layout_runtime_->replay.has_value() ||
+        self->browser_layout_runtime_->decision_dialog != guarded_dialog) {
+      return;
+    }
+    self->browser_layout_runtime_->decision_dialog.clear();
+    const int choice = guarded_dialog->clickedIndex();
+    if (choice == 0) {
+      // The Reselect button itself never finishes the dialog. Reaching this
+      // branch means an external close happened after it was clicked; cancel
+      // the replay so a vanished surface cannot lock layout actions forever.
+    }
+    if (choice == 1) {
+      BrowserLayoutRuntime::Replay& replay = *self->browser_layout_runtime_->replay;
+      QDomDocument apply_doc = replay.doc;
+      QHash<QString, QString> identity_for_logical_path;
+      QSet<QString> consumed_identities;
+      QStringList matched_identities;
+      const auto live_datasets = self->session_->catalogModel().datasets();
+      for (const layout_xml::DataSourceRef& source : replay.sources) {
+        const QString expected_name = BrowserFileStore::sanitizedBasename(source.serialized_path);
+        const bool basename_is_ambiguous =
+            std::count_if(
+                replay.sources.cbegin(), replay.sources.cend(),
+                [&expected_name](const layout_xml::DataSourceRef& candidate) {
+                  return BrowserFileStore::sanitizedBasename(candidate.serialized_path) == expected_name;
+                }) > 1;
+        QString matching_identity;
+        bool ambiguous = false;
+        QSet<QString> inspected;
+        for (const auto& [id, unused_name] : live_datasets) {
+          (void)unused_name;
+          const QString identity = self->file_loader_->sourcePathForDataset(id);
+          if (inspected.contains(identity) || consumed_identities.contains(identity)) {
+            continue;
+          }
+          inspected.insert(identity);
+          const auto record_it = self->browser_layout_runtime_->sources.constFind(identity);
+          if (!isBrowserUploadIdentity(identity) || record_it == self->browser_layout_runtime_->sources.cend() ||
+              BrowserFileStore::sanitizedBasename(record_it->display_name) != expected_name) {
+            continue;
+          }
+          if (basename_is_ambiguous && record_it->content_sha256 != source.content_sha256) {
+            continue;
+          }
+          std::vector<BrowserLayoutRuntime::DatasetShape> live_shape;
+          for (const auto& [candidate_id, candidate_name] : live_datasets) {
+            (void)candidate_name;
+            if (self->file_loader_->sourcePathForDataset(candidate_id) == identity) {
+              live_shape.push_back({
+                  .dataset_id = candidate_id,
+                  .source_name = self->session_->catalogModel().datasetSourceName(candidate_id).value_or(QString{}),
+              });
+            }
+          }
+          if (live_shape.size() != record_it->datasets.size() ||
+              !std::equal(
+                  live_shape.cbegin(), live_shape.cend(), record_it->datasets.cbegin(),
+                  [](const auto& current, const auto& original) {
+                    return current.dataset_id == original.dataset_id && current.source_name == original.source_name;
+                  })) {
+            continue;
+          }
+          const int expected_count = source.datasets.isEmpty() ? 1 : source.datasets.size();
+          if (static_cast<int>(record_it->datasets.size()) != expected_count) {
+            continue;
+          }
+          bool shape_matches = true;
+          for (int index = 0; index < expected_count && !source.datasets.isEmpty(); ++index) {
+            const QString& expected_source = source.datasets[index].source_name;
+            shape_matches = expected_source.isEmpty() ||
+                            record_it->datasets[static_cast<std::size_t>(index)].source_name == expected_source;
+            if (!shape_matches) {
+              break;
+            }
+          }
+          if (!shape_matches) {
+            continue;
+          }
+          if (!matching_identity.isEmpty()) {
+            ambiguous = true;
+            break;
+          }
+          matching_identity = identity;
+        }
+        if (ambiguous || matching_identity.isEmpty()) {
+          showBrowserLayoutWarning(
+              self, self->tr("Load source-bound layout"),
+              self->tr("The currently open browser data does not uniquely match every saved source."));
+          const QString layout_name = replay.layout_name;
+          self->finishBrowserLayoutLoad(layout_name, false, u"current-source-shape"_s);
+          return;
+        }
+        consumed_identities.insert(matching_identity);
+        matched_identities.push_back(matching_identity);
+        identity_for_logical_path.insert(source.serialized_path, matching_identity);
+      }
+
+      QDomElement file_info = apply_doc.documentElement()
+                                  .firstChildElement(u"previouslyLoaded_Datafiles"_s)
+                                  .firstChildElement(u"fileInfo"_s);
+      for (int index = 0; index < matched_identities.size() && !file_info.isNull(); ++index) {
+        file_info.setAttribute(u"filename"_s, matched_identities[index]);
+        file_info = file_info.nextSiblingElement(u"fileInfo"_s);
+      }
+      layout_xml::remapDatasetSourcePaths(apply_doc, [&identity_for_logical_path](const QString& path) {
+        return identity_for_logical_path.value(path, path);
+      });
+      const QString layout_name = replay.layout_name;
+      const bool applied = self->applyBrowserRestoredLayout(std::move(apply_doc), layout_name);
+      self->finishBrowserLayoutLoad(layout_name, applied, applied ? QString{} : u"apply"_s);
+      return;
+    }
+    const QString layout_name = self->browser_layout_runtime_->replay->layout_name;
+    self->finishBrowserLayoutLoad(layout_name, false, u"cancelled"_s);
+  });
+  dialog->show();
+  qInfo("PJ_WASM_SOURCE_LAYOUT_DECISION name=%s", qPrintable(browser_name));
+}
+
+quint64 MainWindow::beginBrowserReplayPickerGeneration() {
+  if (browser_layout_runtime_ == nullptr || !browser_layout_runtime_->replay.has_value()) {
+    return 0;
+  }
+  // Each click supersedes any earlier picker that the browser may have left
+  // pending. The counter belongs to the whole page lifetime (not one Replay),
+  // so a late callback cannot attach itself to a later layout transaction.
+  ++browser_layout_runtime_->next_picker_generation;
+  if (browser_layout_runtime_->next_picker_generation == 0) {
+    ++browser_layout_runtime_->next_picker_generation;
+  }
+  const quint64 generation = browser_layout_runtime_->next_picker_generation;
+  browser_layout_runtime_->replay->active_picker_generation = generation;
+  return generation;
+}
+
+void MainWindow::selectBrowserReplaySource() {
+  const quint64 generation = beginBrowserReplayPickerGeneration();
+  if (generation == 0) {
+    return;
+  }
+  QPointer<MainWindow> self(this);
+  file_loader_->selectBrowserInput(this, [self, generation](FileLoader::BrowserSelectionResult selection) mutable {
+    if (self.isNull()) {
+      return;
+    }
+    self->loadBrowserReplaySource(
+        generation, std::move(selection.browser_name), std::move(selection.input), std::move(selection.error));
+  });
+}
+
+void MainWindow::loadBrowserReplaySource(
+    quint64 picker_generation, QString browser_name, std::optional<LoadInput> input, QString error) {
+  if (browser_layout_runtime_ == nullptr || !browser_layout_runtime_->replay.has_value()) {
+    return;
+  }
+  BrowserLayoutRuntime::Replay& replay = *browser_layout_runtime_->replay;
+  if (replay.active_picker_generation != picker_generation) {
+    qInfo(
+        "PJ_WASM_SOURCE_LAYOUT_STALE_PICKER generation=%llu active=%llu",
+        static_cast<unsigned long long>(picker_generation),
+        static_cast<unsigned long long>(replay.active_picker_generation));
+    return;
+  }
+  // Consume this callback exactly once. A duplicate delivery with the same
+  // token is stale even if it arrives synchronously before the next click.
+  replay.active_picker_generation = 0;
+  const QString layout_name = replay.layout_name;
+  if (replay.selection_index < 0 || replay.selection_index >= replay.sources.size()) {
+    finishBrowserLayoutLoad(layout_name, false, u"selection-index"_s);
+    return;
+  }
+  if (!input.has_value()) {
+    if (error.isEmpty()) {
+      finishBrowserLayoutLoad(layout_name, false, u"cancelled"_s);
+      return;
+    }
+    showBrowserLayoutWarning(this, tr("Load source-bound layout"), error);
+    finishBrowserLayoutLoad(layout_name, false, u"staging"_s);
+    return;
+  }
+
+  const layout_xml::DataSourceRef& source = replay.sources[replay.selection_index];
+  const QString expected_name = BrowserFileStore::sanitizedBasename(source.serialized_path);
+  const QString selected_name = BrowserFileStore::sanitizedBasename(browser_name);
+  if (selected_name != expected_name) {
+    showBrowserLayoutWarning(
+        this, tr("Load source-bound layout"),
+        tr("Select '%1' to replay this layout (selected '%2').").arg(expected_name, selected_name));
+    qInfo("PJ_WASM_SOURCE_LAYOUT_SELECTION_REJECTED index=%d reason=name", replay.selection_index);
+    return;
+  }
+  const bool basename_is_ambiguous =
+      std::count_if(
+          replay.sources.cbegin(), replay.sources.cend(), [&expected_name](const layout_xml::DataSourceRef& candidate) {
+            return BrowserFileStore::sanitizedBasename(candidate.serialized_path) == expected_name;
+          }) > 1;
+  if (basename_is_ambiguous && input->content_sha256 != source.content_sha256) {
+    showBrowserLayoutWarning(
+        this, tr("Load source-bound layout"),
+        tr("The selected '%1' is not the file saved for source %2 of %3 ('%4'). Select the original file for "
+           "that saved slot.")
+            .arg(expected_name)
+            .arg(replay.selection_index + 1)
+            .arg(replay.sources.size())
+            .arg(source.serialized_path));
+    qInfo("PJ_WASM_SOURCE_LAYOUT_SELECTION_REJECTED index=%d reason=content", replay.selection_index);
+    return;
+  }
+
+  replay.selected_identities.push_back(input->source_identity);
+  replay.staged_inputs.push_back(std::move(*input));
+  ++replay.selection_index;
+  qInfo(
+      "PJ_WASM_SOURCE_LAYOUT_STAGED index=%d total=%d name=%s", replay.selection_index, replay.sources.size(),
+      qPrintable(selected_name));
+
+  if (replay.selection_index < replay.sources.size()) {
+    const layout_xml::DataSourceRef& next_source = replay.sources[replay.selection_index];
+    const QString next_name = BrowserFileStore::sanitizedBasename(next_source.serialized_path);
+    const QString next_context = next_source.plugin_id.isEmpty()
+                                     ? next_source.serialized_path
+                                     : tr("%1 (plugin: %2)").arg(next_source.serialized_path, next_source.plugin_id);
+    if (!browser_layout_runtime_->decision_dialog.isNull()) {
+      browser_layout_runtime_->decision_dialog->setText(
+          tr("Staged %1 of %2 data sources. Select source %3 of %2: '%4' for saved slot '%5'. No import has "
+             "started yet.")
+              .arg(replay.selection_index)
+              .arg(replay.sources.size())
+              .arg(replay.selection_index + 1)
+              .arg(next_name, next_context));
+    }
+    if (!replay.selection_button.isNull()) {
+      replay.selection_button->setText(
+          tr("Select source %1 of %2").arg(replay.selection_index + 1).arg(replay.sources.size()));
+    }
+    return;
+  }
+
+  if (!browser_layout_runtime_->decision_dialog.isNull()) {
+    QPointer<MessageBox> decision = browser_layout_runtime_->decision_dialog;
+    browser_layout_runtime_->decision_dialog.clear();
+    decision->accept();
+  }
+  startBrowserReplayImports();
+}
+
+void MainWindow::startBrowserReplayImports() {
+  if (browser_layout_runtime_ == nullptr || !browser_layout_runtime_->replay.has_value()) {
+    return;
+  }
+  BrowserLayoutRuntime::Replay& replay = *browser_layout_runtime_->replay;
+  const QString layout_name = replay.layout_name;
+  if (replay.sources.size() != replay.selected_identities.size() ||
+      replay.sources.size() != static_cast<int>(replay.staged_inputs.size())) {
+    finishBrowserLayoutLoad(layout_name, false, u"staging-shape"_s);
+    return;
+  }
+
+  QPointer<MainWindow> self(this);
+  replay.loaded_connection = connect(
+      file_loader_.get(), &FileLoader::fileLoaded, this,
+      [self](const QString& path, const QString&, const QString&, const QString&) {
+        if (self.isNull() || self->browser_layout_runtime_ == nullptr ||
+            !self->browser_layout_runtime_->replay.has_value()) {
+          return;
+        }
+        BrowserLayoutRuntime::Replay& active = *self->browser_layout_runtime_->replay;
+        if (active.selected_identities.contains(path)) {
+          active.loaded_identities.insert(path);
+        }
+      });
+  replay.failed_connection = connect(
+      file_loader_.get(), &FileLoader::fileLoadFailed, this, [self](const QString& path, const QString& reason) {
+        if (self.isNull() || self->browser_layout_runtime_ == nullptr ||
+            !self->browser_layout_runtime_->replay.has_value()) {
+          return;
+        }
+        BrowserLayoutRuntime::Replay& active = *self->browser_layout_runtime_->replay;
+        if (active.selected_identities.contains(path)) {
+          active.load_failed = true;
+          active.load_failure = reason;
+        }
+      });
+  replay.drained_connection = connect(file_loader_.get(), &FileLoader::queueDrained, this, [self]() {
+    if (self.isNull() || self->browser_layout_runtime_ == nullptr ||
+        !self->browser_layout_runtime_->replay.has_value()) {
+      return;
+    }
+    self->finishBrowserReplayImports();
+  });
+
+  for (int index = 0; index < replay.sources.size(); ++index) {
+    const layout_xml::DataSourceRef& source = replay.sources[index];
+    const bool has_saved_plugin = !source.plugin_id.isEmpty();
+    const LoadHints hints{
+        .expected_plugin_id = source.plugin_id,
+        .preset_config_json = source.plugin_config_json,
+        .skip_dialog = has_saved_plugin,
+        .prefer_reuse = false,
+        .require_expected_plugin = has_saved_plugin,
+        .rewrite_preset_filepath = has_saved_plugin,
+    };
+    if (!file_loader_->loadFile(std::move(replay.staged_inputs[static_cast<std::size_t>(index)]), this, hints)) {
+      replay.load_failed = true;
+      replay.load_failure = tr("A staged source could not be queued for import.");
+    }
+  }
+}
+
+void MainWindow::finishBrowserReplayImports() {
+  if (browser_layout_runtime_ == nullptr || !browser_layout_runtime_->replay.has_value()) {
+    return;
+  }
+  BrowserLayoutRuntime::Replay& replay = *browser_layout_runtime_->replay;
+  const QString layout_name = replay.layout_name;
+  QString validation_error;
+  if (replay.load_failed || replay.loaded_identities.size() != replay.selected_identities.size()) {
+    validation_error = replay.load_failure.isEmpty()
+                           ? tr("One or more selected sources closed without completing their import.")
+                           : replay.load_failure;
+  }
+
+  QSet<int> timeline_slots;
+  const auto live_datasets = session_->catalogModel().datasets();
+  for (int source_index = 0; validation_error.isEmpty() && source_index < replay.sources.size(); ++source_index) {
+    const layout_xml::DataSourceRef& source = replay.sources[source_index];
+    const QString& identity = replay.selected_identities[source_index];
+    std::vector<DatasetId> candidates;
+    for (const auto& [dataset_id, unused_name] : live_datasets) {
+      (void)unused_name;
+      if (file_loader_->sourcePathForDataset(dataset_id) == identity) {
+        candidates.push_back(dataset_id);
+      }
+    }
+    const int expected_count = source.datasets.isEmpty() ? 1 : source.datasets.size();
+    if (static_cast<int>(candidates.size()) != expected_count) {
+      validation_error = tr("Source '%1' produced %2 dataset(s); the layout requires exactly %3.")
+                             .arg(BrowserFileStore::sanitizedBasename(source.serialized_path))
+                             .arg(static_cast<qulonglong>(candidates.size()))
+                             .arg(expected_count);
+      break;
+    }
+    for (int dataset_index = 0; dataset_index < expected_count; ++dataset_index) {
+      if (source.datasets.isEmpty()) {
+        continue;
+      }
+      const layout_xml::DataSourceDatasetRef& expected = source.datasets[dataset_index];
+      const QString actual_name = session_->catalogModel()
+                                      .datasetSourceName(candidates[static_cast<std::size_t>(dataset_index)])
+                                      .value_or(QString{});
+      if ((expected.source_index >= 0 && expected.source_index != dataset_index) ||
+          (!expected.source_name.isEmpty() && expected.source_name != actual_name)) {
+        validation_error = tr("Source '%1' did not reproduce the saved fan-out dataset order and names.")
+                               .arg(BrowserFileStore::sanitizedBasename(source.serialized_path));
+        break;
+      }
+      if (expected.timeline_order >= 0 && timeline_slots.contains(expected.timeline_order)) {
+        validation_error = tr("The saved Source Timeline contains duplicate track positions.");
+        break;
+      }
+      if (expected.timeline_order >= 0) {
+        timeline_slots.insert(expected.timeline_order);
+      }
+      if (!expected.has_display_offset) {
+        continue;
+      }
+      qint64 offset = expected.display_offset_ns;
+      if (expected.display_offset_includes_global_reference) {
+        const std::optional<qint64> migrated =
+            checkedTimelineDifference(offset, session_->sessionManager().globalTimeReference());
+        if (!migrated.has_value()) {
+          validation_error = tr("A saved Source Timeline offset is outside the supported range.");
+          break;
+        }
+        offset = *migrated;
+      }
+      if (const auto raw = session_->datasetRawTimeRange(candidates[static_cast<std::size_t>(dataset_index)]);
+          raw.has_value() && (!timelineDifferenceFits(raw->min, offset) || !timelineDifferenceFits(raw->max, offset))) {
+        validation_error = tr("A saved Source Timeline offset is outside the selected dataset's supported range.");
+        break;
+      }
+    }
+  }
+  for (int slot = 0; validation_error.isEmpty() && slot < timeline_slots.size(); ++slot) {
+    if (!timeline_slots.contains(slot)) {
+      validation_error = tr("The saved Source Timeline contains invalid track positions.");
+    }
+  }
+
+  if (!validation_error.isEmpty()) {
+    showBrowserLayoutWarning(this, tr("Load source-bound layout"), validation_error);
+    rollbackBrowserReplayImports();
+    finishBrowserLayoutLoad(layout_name, false, u"source-shape"_s);
+    return;
+  }
+
+  QDomDocument apply_doc = replay.doc;
+  QHash<QString, QString> identity_for_logical_path;
+  QDomElement file_info =
+      apply_doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s).firstChildElement(u"fileInfo"_s);
+  for (int index = 0; index < replay.sources.size(); ++index) {
+    identity_for_logical_path.insert(replay.sources[index].serialized_path, replay.selected_identities[index]);
+    if (!file_info.isNull()) {
+      file_info.setAttribute(u"filename"_s, replay.selected_identities[index]);
+      file_info = file_info.nextSiblingElement(u"fileInfo"_s);
+    }
+  }
+  layout_xml::remapDatasetSourcePaths(apply_doc, [&identity_for_logical_path](const QString& path) {
+    return identity_for_logical_path.value(path, path);
+  });
+  layout_xml::removeUnvalidatedDatasetIds(apply_doc);
+  const bool applied = applyBrowserRestoredLayout(std::move(apply_doc), layout_name);
+  finishBrowserLayoutLoad(layout_name, applied, applied ? QString{} : u"apply-after-source-load"_s);
+}
+
+void MainWindow::rollbackBrowserReplayImports() {
+  if (browser_layout_runtime_ == nullptr || !browser_layout_runtime_->replay.has_value()) {
+    return;
+  }
+  BrowserLayoutRuntime::Replay& replay = *browser_layout_runtime_->replay;
+  QSet<QString> imported;
+  for (const QString& identity : replay.selected_identities) {
+    imported.insert(identity);
+  }
+  std::vector<DatasetId> remove_ids;
+  for (const auto& [dataset_id, unused_name] : session_->catalogModel().datasets()) {
+    (void)unused_name;
+    if (imported.contains(file_loader_->sourcePathForDataset(dataset_id))) {
+      remove_ids.push_back(dataset_id);
+    }
+  }
+  for (const DatasetId dataset_id : remove_ids) {
+    removeDatasetData(dataset_id);
+  }
+  for (const QString& identity : imported) {
+    browser_layout_runtime_->sources.remove(identity);
+  }
+  const CapturedWorkspace previous = replay.previous_workspace;
+  if (restoreWorkspaceState(previous, MissingCurvePolicy::kExact, TimelineRestoreMode::kExact) !=
+      RestoreResult::kApplied) {
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "browser-source-rollback-failed",
+        tr("The failed source replay was removed, but the previous workspace could not be restored exactly."));
+  }
+  session_->seedPlaybackFromSession();
+}
+
+void MainWindow::finishBrowserLayoutLoad(const QString& browser_name, bool applied, const QString& reason) {
+  if (browser_layout_runtime_ != nullptr && browser_layout_runtime_->replay.has_value()) {
+    QObject::disconnect(browser_layout_runtime_->replay->loaded_connection);
+    QObject::disconnect(browser_layout_runtime_->replay->failed_connection);
+    QObject::disconnect(browser_layout_runtime_->replay->drained_connection);
+    if (!browser_layout_runtime_->decision_dialog.isNull()) {
+      QPointer<MessageBox> decision = browser_layout_runtime_->decision_dialog;
+      browser_layout_runtime_->decision_dialog.clear();
+      decision->reject();
+    }
+    browser_layout_runtime_->replay.reset();
+  }
+  if (browser_layout_runtime_ != nullptr) {
+    if (applied && browser_layout_runtime_->pending_generic_recipe && BrowserPersistence::instance() != nullptr) {
+      QString persistence_error;
+      const QByteArray recipe = browserGenericLayoutDocument().toByteArray(2);
+      if (BrowserPersistence::instance()->rememberGenericLayout(
+              browser_layout_runtime_->pending_recipe_name, recipe, &persistence_error)) {
+        ui_->leftPanel->setRecentEnabled(true);
+        qInfo(
+            "PJ_WASM_LAYOUT_RECIPE_RECORDED name=%s bytes=%lld count=%lld", qPrintable(browser_name),
+            static_cast<long long>(recipe.size()),
+            static_cast<long long>(BrowserPersistence::instance()->recentLayouts().size()));
+      } else {
+        qCWarning(lcMain).noquote() << "Browser layout recipe was not retained:" << persistence_error;
+      }
+    }
+    browser_layout_runtime_->pending_recipe_name.clear();
+    browser_layout_runtime_->pending_generic_recipe = false;
+  }
+  layout_selection_pending_ = false;
+  updateBrowserLayoutActions();
+  if (applied) {
+    qInfo("PJ_WASM_LAYOUT_LOAD_OK name=%s", qPrintable(browser_name));
+  } else if (reason == "cancelled"_L1) {
+    qInfo("PJ_WASM_SOURCE_LAYOUT_CANCELLED name=%s", qPrintable(browser_name));
+  } else {
+    qWarning(
+        "PJ_WASM_LAYOUT_LOAD_FAILED name=%s reason=%s", qPrintable(browser_name),
+        qPrintable(reason.isEmpty() ? u"apply"_s : reason));
+  }
+}
+
+void MainWindow::updateBrowserLayoutActions() {
+  const bool idle = !layout_selection_pending_;
+  if (action_load_layout_ != nullptr) {
+    action_load_layout_->setEnabled(idle);
+  }
+  if (action_save_layout_ != nullptr) {
+    action_save_layout_->setEnabled(idle);
+  }
+
+  bool source_eligible = false;
+  if (idle) {
+    QString ignored_error;
+    source_eligible = browserSourceLayoutDocument(ignored_error).has_value();
+  }
+  if (action_save_source_layout_ != nullptr) {
+    action_save_source_layout_->setEnabled(idle && source_eligible);
+  }
+}
+#endif
 
 void MainWindow::loadLayoutAtStartup(const QString& path) {
   // --layout CLI entry: load the layout and auto-reload its data source(s) with no
@@ -3285,6 +4959,47 @@ void MainWindow::enableAutoplay() {
     pb.play();
   });
 }
+
+#ifdef PJ_TARGET_WASM
+bool MainWindow::applyBrowserRestoredLayout(QDomDocument doc, const QString& browser_name) {
+  if (session_->catalogModel().datasets().empty()) {
+    showBrowserLayoutWarning(
+        this, tr("Load Layout"), tr("No data is loaded. Open a data source before applying this layout."));
+    return false;
+  }
+
+  // kExact turns an unresolved curve/scene into failure. restoreWorkspaceState
+  // rolls any failed application back to the captured workspace, so a browser
+  // layout can never silently drop incompatible content.
+  if (restoreWorkspaceState(doc, MissingCurvePolicy::kExact) != RestoreResult::kApplied) {
+    showBrowserLayoutWarning(
+        this, tr("Load Layout"),
+        tr("Layout was parsed but could not be applied to the currently loaded data. Open matching data sources "
+           "and try again."));
+    return false;
+  }
+
+  // Source replay validation has already proven an exact dataset/fan-out
+  // shape. Apply per-source offsets and vertical order only after the workspace
+  // succeeds, so a curve/scene failure cannot leave a partially moved timeline.
+  static_cast<void>(applyTimelineStateFromLayout(layout_xml::extractDataSource(doc, QDir())));
+  restoreBrowserChromeAndPanels(doc, browser_name);
+  resetUndoHistory();
+  return true;
+}
+
+void MainWindow::restoreBrowserChromeAndPanels(const QDomDocument& doc, const QString& browser_name) {
+  ui_->curveListPanel->restoreListState(doc.documentElement().firstChildElement(u"curve_list_state"_s));
+  restoreRightPanelState(doc.documentElement().firstChildElement(u"right_panel_state"_s));
+  ui_->leftPanel->restoreSourcesState(doc.documentElement().firstChildElement(u"left_panel_state"_s));
+  restoreChromeState(doc.documentElement().firstChildElement(u"chrome_state"_s));
+
+  // Explicit source replay applies per-source offsets/order after exact shape
+  // validation; this element owns the remaining global view chrome.
+  restoreSourceTimelineViewState(doc.documentElement().firstChildElement(u"source_timeline"_s));
+  emitDiagnostic(DiagnosticLevel::kInfo, "Layout", "loaded", tr("Loaded layout: %1").arg(browser_name));
+}
+#endif
 
 void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path) {
   // 3. Filters + curve rebinding + plot apply happen together in restoreWorkspaceState
@@ -4724,6 +6439,7 @@ QDomElement MainWindow::saveSourceTimelineViewState(QDomDocument& doc) const {
   layout_xml::SourceTimelineViewState state{
       .zoom = chrome.zoom,
       .scroll_left_ns = chrome.scroll_left_ns,
+      .scroll_top_px = chrome.scroll_top_px,
       .name_column_width = chrome.name_column_width,
       .snap = chrome.snap,
   };
@@ -4741,6 +6457,9 @@ void MainWindow::restoreSourceTimelineViewState(const QDomElement& element) {
   }
   if (saved.scroll_left_ns) {
     state.scroll_left_ns = *saved.scroll_left_ns;
+  }
+  if (saved.scroll_top_px) {
+    state.scroll_top_px = *saved.scroll_top_px;
   }
   if (saved.name_column_width) {
     state.name_column_width = *saved.name_column_width;
@@ -5201,31 +6920,46 @@ void MainWindow::onDockFocused(DockWidget* dock) {
   // through to the empty page — "nothing to configure" is the honest
   // signal when there is no curve, image, or scene to act on.
   QWidget* target = empty_dock_page_;
+#ifdef PJ_WITH_SCENE3D
   Scene3DDockWidget* scene3d_dock = nullptr;
+#endif
+#ifdef PJ_WITH_SCENE2D
   SceneDockWidget* scene2d_dock = nullptr;
+#endif
   if (dock != nullptr) {
     if (dock->plotWidget() != nullptr) {
       target = plot_config_page_;
     } else if (dock->objectWidget() != nullptr) {
       QWidget* obj = dock->objectWidget()->widget();
+#ifdef PJ_WITH_SCENE2D
       if (auto* s2d = qobject_cast<Scene2DDockWidget*>(obj); s2d != nullptr) {
         target = scene2d_config_page_;
         scene2d_dock = s2d;
-      } else if (auto* s3d = qobject_cast<Scene3DDockWidget*>(obj); s3d != nullptr) {
+      } else
+#endif
+#ifdef PJ_WITH_SCENE3D
+          if (auto* s3d = qobject_cast<Scene3DDockWidget*>(obj); s3d != nullptr) {
         target = scene3d_config_page_;
         scene3d_dock = s3d;
       }
+#else
+      Q_UNUSED(obj);
+#endif
     }
   }
   // Bind / unbind the config panels BEFORE switching the stack so the page is
   // already populated when it becomes visible. Passing nullptr when leaving a
   // scene dock detaches signal connections cleanly.
+#ifdef PJ_WITH_SCENE2D
   if (scene2d_config_panel_ != nullptr) {
     scene2d_config_panel_->bindDock(scene2d_dock);
   }
+#endif
+#ifdef PJ_WITH_SCENE3D
   if (scene3d_config_panel_ != nullptr) {
     scene3d_config_panel_->bindDock(scene3d_dock);
   }
+#endif
   if (right_panel_stack_ != nullptr) {
     right_panel_stack_->setCurrentWidget(target);
   }
@@ -5915,6 +7649,9 @@ void MainWindow::dismissTakeoverPanel() {
 }
 
 void MainWindow::openEmbeddedConsole() {
+#ifdef PJ_TARGET_WASM
+  qWarning("MainWindow::openEmbeddedConsole: external helper processes are unavailable in the browser");
+#else
   auto* view = new RasterStreamView(this);
   view->setKeyTranslator(&engineKeyForQtKey);
   if (!presentPanel(view)) {
@@ -5928,6 +7665,7 @@ void MainWindow::openEmbeddedConsole() {
     helper = dir + u"pj-raster-helper"_s;
   }
   view->start(helper, dir + u"base.wad"_s);
+#endif
 }
 
 void MainWindow::launchToolbox(
@@ -6039,12 +7777,16 @@ void MainWindow::launchToolbox(
     // render. Runs AFTER the catalog rebuild so the object topics + their
     // render parsers are registered; ingest is idempotent (invalidate first so
     // a re-fetch of the same dataset re-ingests the new transforms).
+#ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       for (const DatasetId id : ingested_datasets) {
         transform_service_->invalidateDataset(id);
         transform_service_->ingestFrameTransformsForDataset(id);
       }
     }
+#else
+    Q_UNUSED(ingested_datasets);
+#endif
     // A parser-ingest import (the cloud connector's fetch) gets FOCUS
     // semantics: the timeline snaps to the imported data so a 10s snippet
     // plays back as 10s — the monotonic union would bury it inside whatever
@@ -6070,6 +7812,11 @@ void MainWindow::launchToolbox(
         }
       }
     }
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+    qInfo(
+        "PJ_WASM_TOOLBOX_TRANSFORM_READY plugin=%s recipes=%llu", plugin_id_std.c_str(),
+        static_cast<unsigned long long>(dps.transformRecipes().size()));
+#endif
   };
   callbacks.on_message = [this, source](PJ_toolbox_message_level_t level, std::string message) {
     if (diagnostic_history_ == nullptr) {
@@ -6130,6 +7877,13 @@ void MainWindow::launchToolbox(
   // toolbox expects human field names ("topic/field"). CatalogModel owns that
   // mapping, so resolve dropped keys to names before they reach onItemsDropped.
   PanelEngineConfig panel_config;
+#ifdef Q_OS_WASM
+  // The Transform Editor defers its eager preview rebuild to on_tick. Restarting
+  // the deadline after each browser-delivered edit both debounces typing and
+  // guarantees one post-edit wake-up on Qt's WASM event dispatcher. Desktop
+  // retains PanelEngine's existing fixed periodic cadence.
+  panel_config.restart_tick_timer_on_event = plugin_id_std == "toolbox-transform-editor";
+#endif
   // Hand the panel a session + catalog so its chart_series previews render with the
   // full PlotWidget (grid/zoom/tracker/legend) — matching the native editor — instead
   // of falling back to the bare ChartPreviewWidget.
@@ -6142,10 +7896,6 @@ void MainWindow::launchToolbox(
     }
     return (descriptor->topic_name + "/" + descriptor->field_name).toStdString();
   };
-  // Give chart containers the session + catalog so they render with the real
-  // PJ4 PlotWidget (zoom / tracker / legend / grid), not the bare ChartPreviewWidget.
-  panel_config.session = session_.get();
-  panel_config.catalog = &session_->catalogModel();
   auto* engine = new PanelEngine(DialogHandle::fromBorrowed(borrowed), panel_config, this);
   QWidget* panel = engine->openPanel();
   if (panel == nullptr) {

@@ -56,6 +56,22 @@ TEST(MessageBoxTest, ShortLabelIsNotWrapped) {
   EXPECT_EQ(ok->text(), u"OK"_s);
 }
 
+TEST(MessageBoxTest, AsyncButtonCanKeepDialogOpenUntilCallbackCompletes) {
+  PJ::MessageBox dlg;
+  QPushButton* select = dlg.addButton(u"Select file"_s, PJ::MessageBox::kPrimaryRole, /*close_on_click=*/false);
+  bool finished = false;
+  QObject::connect(&dlg, &QDialog::finished, [&finished](int) { finished = true; });
+  realize(dlg);
+
+  select->click();
+  QCoreApplication::processEvents();
+
+  EXPECT_EQ(dlg.clickedIndex(), 0);
+  EXPECT_FALSE(finished);
+  EXPECT_TRUE(dlg.isVisible());
+  dlg.accept();
+}
+
 TEST(MessageBoxTest, LongLabelWrapsInsteadOfClipping) {
   PJ::MessageBox dlg;
   dlg.setTitle(u"Confirm"_s);

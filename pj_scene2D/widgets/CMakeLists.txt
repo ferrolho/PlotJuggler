@@ -2,22 +2,91 @@
 # pj_scene2d_widgets — Qt widget layer for media display (requires the configured Qt floor)
 # ---------------------------------------------------------------------------
 
-if(NOT DEFINED PJ_QT_VERSION)
-  set(PJ_QT_VERSION 6.11.1)
+if(NOT DEFINED PJ_QT_REQUIRED_VERSION)
+  if(DEFINED PJ_QT_VERSION)
+    set(PJ_QT_REQUIRED_VERSION ${PJ_QT_VERSION})
+  else()
+    set(PJ_QT_REQUIRED_VERSION 6.11.1)
+  endif()
 endif()
 
 # GuiPrivate (for QRhi private headers used by MediaViewerWidget) must be
 # requested in THIS scope: Qt 6.11 no longer leaks the Qt6::GuiPrivate imported
 # target in from another subdirectory's find_package the way 6.8 did.
-find_package(Qt6 ${PJ_QT_VERSION} QUIET COMPONENTS Widgets Gui GuiPrivate)
+find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} QUIET COMPONENTS Widgets Gui GuiPrivate)
 if(NOT Qt6_FOUND)
-  message(STATUS "pj_scene2d_widgets: Qt ${PJ_QT_VERSION}+ not found, skipping")
+  message(STATUS "pj_scene2d_widgets: Qt ${PJ_QT_REQUIRED_VERSION}+ not found, skipping")
   return()
 endif()
 message(STATUS "pj_scene2d_widgets: using Qt ${Qt6_VERSION}")
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
+
+if(EMSCRIPTEN)
+  # The browser backend needs GLSL ES 300 inside every serialized shader pack.
+  # Re-bake to the build tree and compare hashes at configure time so CI catches
+  # both a missing WebGL2 dialect and a source/blob mismatch.
+  if(NOT TARGET Qt6::qsb)
+    message(FATAL_ERROR "WASM Scene2D shader verification requires Qt6::qsb")
+  endif()
+  get_target_property(_pj_scene2d_qsb Qt6::qsb IMPORTED_LOCATION)
+  if(NOT _pj_scene2d_qsb OR _pj_scene2d_qsb MATCHES "-NOTFOUND$")
+    get_target_property(_pj_scene2d_qsb Qt6::qsb IMPORTED_LOCATION_RELWITHDEBINFO)
+  endif()
+  if(NOT EXISTS "${_pj_scene2d_qsb}")
+    message(FATAL_ERROR "WASM Scene2D cannot locate the host qsb executable")
+  endif()
+
+  set(_pj_scene2d_shader_verify_dir "${CMAKE_CURRENT_BINARY_DIR}/verified_shaders")
+  file(MAKE_DIRECTORY "${_pj_scene2d_shader_verify_dir}")
+  foreach(_pj_scene2d_shader IN ITEMS
+      scene_lines.vert scene_lines.frag
+      scene_quads.vert scene_quads.frag
+      scene_text.vert scene_text.frag
+      yuv_to_rgb.vert yuv_to_rgb.frag)
+    if(_pj_scene2d_shader MATCHES "^yuv_to_rgb\\.")
+      # Preserve the image pass's existing desktop GLSL 440 target while
+      # adding only the WebGL2 dialect needed by WASM.
+      set(_pj_scene2d_glsl_targets "300 es,440")
+    else()
+      # Preserve the overlay packs' existing targets and add WebGL2.
+      set(_pj_scene2d_glsl_targets "100 es,120,150,300 es")
+    endif()
+    set(_pj_scene2d_shader_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_pj_scene2d_shader}")
+    set(_pj_scene2d_shader_pack "${_pj_scene2d_shader_source}.qsb")
+    set(_pj_scene2d_shader_rebuilt
+        "${_pj_scene2d_shader_verify_dir}/${_pj_scene2d_shader}.qsb")
+    execute_process(
+      COMMAND "${_pj_scene2d_qsb}"
+        --glsl "${_pj_scene2d_glsl_targets}" --hlsl 50 --msl 12
+        -o "${_pj_scene2d_shader_rebuilt}" "${_pj_scene2d_shader_source}"
+      RESULT_VARIABLE _pj_scene2d_qsb_result
+      ERROR_VARIABLE _pj_scene2d_qsb_error)
+    if(NOT _pj_scene2d_qsb_result EQUAL 0)
+      message(FATAL_ERROR
+        "Failed to bake ${_pj_scene2d_shader}: ${_pj_scene2d_qsb_error}")
+    endif()
+    file(SHA256 "${_pj_scene2d_shader_pack}" _pj_scene2d_committed_hash)
+    file(SHA256 "${_pj_scene2d_shader_rebuilt}" _pj_scene2d_rebuilt_hash)
+    if(NOT _pj_scene2d_committed_hash STREQUAL _pj_scene2d_rebuilt_hash)
+      message(FATAL_ERROR
+        "Stale Scene2D shader pack ${_pj_scene2d_shader_pack}; re-bake with the documented qsb command")
+    endif()
+  endforeach()
+  unset(_pj_scene2d_committed_hash)
+  unset(_pj_scene2d_glsl_targets)
+  unset(_pj_scene2d_qsb)
+  unset(_pj_scene2d_qsb_error)
+  unset(_pj_scene2d_qsb_result)
+  unset(_pj_scene2d_rebuilt_hash)
+  unset(_pj_scene2d_shader)
+  unset(_pj_scene2d_shader_pack)
+  unset(_pj_scene2d_shader_rebuilt)
+  unset(_pj_scene2d_shader_source)
+  unset(_pj_scene2d_shader_verify_dir)
+endif()
 
 # --- pj_scene2d_widgets: image viewer (QRhiWidget), no mpv dependency ---
 set(PJ_SCENE2D_WIDGETS_SOURCES

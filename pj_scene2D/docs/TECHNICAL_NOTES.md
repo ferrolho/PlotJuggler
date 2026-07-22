@@ -74,10 +74,28 @@ The widget consumes offline-compiled Qt shader blobs (`*.qsb`) through
 `QShader::fromSerialized()`. `shaders/shaders.qrc` embeds the `.qsb` files;
 the neighboring `.vert` / `.frag` files are reference inputs. Editing GLSL
 sources has no runtime or build effect until the matching `.qsb` file is
-regenerated with Qt's `qsb` tool from the `qtshadertools` module. The pinned
-`.qt` install in this worktree currently does not include `qsb`, and
-`widgets/CMakeLists.txt` has no `qt6_add_shaders` rule. Adding that build-time
-rule is deferred work tracked as F-009.
+regenerated with Qt's `qsb` tool from the `qtshadertools` module. The W11 WASM
+port bakes every pack with Qt 6.11's host tool. The overlay packs retain their
+existing GLSL targets and add WebGL2:
+
+```bash
+qsb --glsl "100 es,120,150,300 es" --hlsl 50 --msl 12 \
+  -o shaders/<overlay-name>.qsb shaders/<overlay-name>
+```
+
+The image pass retains its existing desktop GLSL 440 target and adds WebGL2:
+
+```bash
+qsb --glsl "300 es,440" --hlsl 50 --msl 12 \
+  -o shaders/yuv_to_rgb.<stage>.qsb shaders/yuv_to_rgb.<stage>
+```
+
+Both commands retain the desktop GLSL/HLSL/MSL variants and add GLSL ES 300
+for WebGL2. In an Emscripten configuration, `widgets/CMakeLists.txt` repeats that
+command into the build tree and compares SHA-256 hashes with the committed
+packs. Configuration therefore fails if a source and blob diverge or a pack is
+rebaked with the wrong target set. A general `qt6_add_shaders` migration remains
+deferred work tracked as F-009.
 
 ### QRhiWidget Multi-Instance Lifecycle (Qt 6.8)
 
@@ -101,6 +119,40 @@ layout->addWidget(bootstrap);
 
 Dynamically added `QRhiWidget` instances will then initialize
 successfully.
+
+That workaround is **native-only**. Qt/WASM must not create a zero-size WebGL
+surface before a browser file picker: the context can be lost during the picker
+round trip, after which Emscripten's context-attribute path may dereference a
+null result. The measured browser lifecycle is instead:
+
+1. omit both the top-level and per-dock zero-size Scene2D bootstraps;
+2. construct the real `MediaViewerWidget` parentless, so its constructor calls
+   `setApi(OpenGL)` before `QStackedWidget` adds it to the visible hierarchy;
+3. let that nonzero widget switch the top-level from raster to RHI composition;
+4. after its first `frameSubmitted`, queue one full top-level repaint so the
+   pre-existing raster regions are uploaded to the mixed compositor; and
+5. re-arm that repaint in `releaseResources()` for a changed QRhi/top-level.
+
+Constructing the browser viewer with its already-attached parent produced
+repeated `QRhiWidget: No QRhi` and a blank dock. The parentless-before-API-fixed
+ordering follows QRhiWidget's documented one-time API selection rule. A QRhi
+framebuffer readback proves GPU output, while a separate full-window snapshot is
+required to catch uninitialized black raster regions after the compositor switch.
+
+### Static JPEG ABI in the monolithic WASM module
+
+Qt's static JPEG image plugin and Scene2D's static TurboJPEG archive occupy one
+WASM symbol namespace. Both export process-global `jpeg_*` symbols, so a normal
+successful static link can bind a caller from one archive to the implementation
+from the other. Qt 6.11's kit declares `JPEG_LIB_VERSION 80`; libjpeg-turbo's
+default build emulates v6b (`62`). That mismatch crashed during splash pixmap
+construction before `MainWindow`.
+
+The WASM dependency provider therefore reads the selected Qt kit's
+`QtJpeg/jconfig.h`, fails unless its ABI is the reviewed v8 contract, and builds
+TurboJPEG with `WITH_JPEG8=ON`. Matching only the library versions is
+insufficient here: the C ABI selected by the build option is the load-bearing
+contract. Desktop continues to use its independently packaged dependencies.
 
 **Additional lifecycle rules**:
 
@@ -371,10 +423,11 @@ fallbacks) and build the matrix per frame with `video_color.h::buildYuvMatrix`.
 Key implementation choice: encode the whole thing as **one affine 4x4** applied to
 `vec4(y, u-0.5, v-0.5, 1)`, with the limited-range luma scale (255/219), chroma
 scale (255/224) and all offsets folded into the constant 4th column. That keeps the
-GLSL untouched (no `.qsb` recompile — which matters, since the aqt Qt install here
-ships no `qsb` tool), and makes BT.709+full reduce to the exact historical matrix so
-existing full-range content is byte-identical. Unit-tested in `video_color_test`
-(black/white/gray reconstruction + 601≠709).
+GLSL untouched (no `.qsb` recompile was needed for that fix), and makes
+BT.709+full reduce to the exact historical matrix so existing full-range content
+is byte-identical. Unit-tested in `video_color_test` (black/white/gray
+reconstruction + 601≠709). The later W11 WebGL2 re-bake changes only the packed
+target dialects, not this shader math.
 
 Corollary — **HW decode now emits NV12, not YUV420P.** Once `FfmpegDecoder` stopped
 forcing `sws_scale` to YUV420P, VAAPI frames come back as `kNV12`. Any consumer of

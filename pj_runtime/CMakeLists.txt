@@ -52,12 +52,18 @@ target_include_directories(pj_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
+if(EMSCRIPTEN)
+    # DiagnosticHistory uses the lightweight QtDiagnosticBridge type. The wasm
+    # app compiles that bridge directly while the rest of marketplace is absent.
+    target_include_directories(pj_runtime PRIVATE ${CMAKE_SOURCE_DIR}/pj_marketplace/include)
+endif()
+
 target_link_libraries(pj_runtime PUBLIC
     Qt6::Core
     Qt6::Network
     Qt6::Xml
     pj_datastore
-    pj_marketplace
+    $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:pj_marketplace>
     pj_data_source_host
     pj_message_parser_host
     pj_toolbox_host

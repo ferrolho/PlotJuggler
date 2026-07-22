@@ -25,6 +25,9 @@
 #include <initializer_list>
 #include <nlohmann/json.hpp>
 
+#ifdef PJ_TARGET_WASM
+#include "BrowserPersistence.h"
+#endif
 #include "pj_widgets/IntScrubber.h"
 #include "pj_widgets/ScrubberBase.h"
 #include "pj_widgets/SvgUtil.h"
@@ -34,11 +37,13 @@ using namespace Qt::StringLiterals;
 namespace PJ {
 
 namespace {
+#ifndef PJ_TARGET_WASM
 constexpr const char* kRecentFilesKey = "File/recent";
 // Recent-layouts list, written by MainWindow::recordRecentLayout. Mirrored here
 // so the single recent popup can render the Layouts section without coupling to
 // MainWindow — kept in sync with MainWindow's kRecentLayoutsKey.
 constexpr const char* kRecentLayoutsKey = "Layout/recent";
+#endif
 // Recent-button chevron: points right when the popup is closed, down while it
 // is open. Both are the _light asset, recolored per theme by loadSvg.
 constexpr const char* kRecentIconCollapsed = ":/resources/svg/keyboard_arrow_right_light.svg";
@@ -72,6 +77,29 @@ LeftPanel::LeftPanel(QWidget* parent) : QWidget(parent), ui_(new Ui::LeftPanel) 
   recent_menu->setObjectName(u"PJMenu"_s);
   connect(recent_menu, &QMenu::aboutToShow, this, [this, recent_menu]() {
     recent_menu->clear();
+#ifdef PJ_TARGET_WASM
+    const QList<BrowserPersistence::LayoutRecipe> recipes = BrowserPersistence::instance() != nullptr
+                                                                ? BrowserPersistence::instance()->recentLayouts()
+                                                                : QList<BrowserPersistence::LayoutRecipe>{};
+    if (recipes.isEmpty()) {
+      QAction* placeholder = recent_menu->addAction(tr("(no recent layouts)"));
+      placeholder->setEnabled(false);
+      return;
+    }
+    QAction* header = recent_menu->addAction(tr("Layouts"));
+    header->setEnabled(false);
+    QFont header_font = header->font();
+    header_font.setWeight(QFont::DemiBold);
+    header->setFont(header_font);
+    for (const BrowserPersistence::LayoutRecipe& recipe : recipes) {
+      QAction* action = recent_menu->addAction(recipe.name);
+      action->setToolTip(tr("Stored in this browser; no source file bytes are retained."));
+      connect(action, &QAction::triggered, this, [this, id = recipe.id]() { emit recentLayoutSelected(id); });
+    }
+    recent_menu->addSeparator();
+    QAction* clear = recent_menu->addAction(tr("Clear recent layouts"));
+    connect(clear, &QAction::triggered, this, &LeftPanel::clearRecentLayoutsRequested);
+#else
     const QStringList layouts = QSettings().value(kRecentLayoutsKey).toStringList();
     const QStringList files = QSettings().value(kRecentFilesKey).toStringList();
     if (layouts.isEmpty() && files.isEmpty()) {
@@ -102,6 +130,7 @@ LeftPanel::LeftPanel(QWidget* parent) : QWidget(parent), ui_(new Ui::LeftPanel) 
         connect(action, &QAction::triggered, this, [this, path]() { emit recentFileSelected(path); });
       }
     }
+#endif
   });
   // Flip the chevron to point down while the popup is open, back to right when
   // it closes (loadSvg recolors the _light asset for the current theme).

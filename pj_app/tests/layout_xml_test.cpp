@@ -203,11 +203,53 @@ TEST(ExtractDataSource, AbsolutePathPassesThrough) {
   EXPECT_EQ(refs.front().resolved_path, QFileInfo(abs).absoluteFilePath());
 }
 
+TEST(ExtractDataSource, PreservesSerializedPathAndOpaqueUploadIdentity) {
+  const QString identity = u"pj-upload://session/7/folder%2Flog.csv"_s;
+  const QDomDocument doc = buildDataSourceDoc(identity);
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir(u"/tmp/layouts"_s));
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().serialized_path, identity);
+  EXPECT_EQ(refs.front().resolved_path, identity)
+      << "an opaque browser identity must not be anchored under the layout directory";
+}
+
 TEST(ExtractDataSource, RelativePathIsAnchoredAtLayoutDir) {
   const QDomDocument doc = buildDataSourceDoc(u"data/run.csv"_s);
   const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir(u"/tmp/layouts"_s));
   ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().serialized_path, u"data/run.csv"_s);
   EXPECT_EQ(refs.front().resolved_path, u"/tmp/layouts/data/run.csv"_s);
+}
+
+TEST(ExtractDataSource, CanonicalBrowserContentFingerprintIsOptionalAndValidated) {
+  constexpr auto kSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  QDomDocument doc = buildDataSourceDoc(u"duplicate.csv"_s);
+  QDomElement file_info =
+      doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s).firstChildElement(u"fileInfo"_s);
+  file_info.setAttribute(u"content_sha256"_s, QLatin1StringView(kSha256));
+  QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().content_sha256, QLatin1StringView(kSha256));
+
+  file_info.setAttribute(u"content_sha256"_s, u"ABCDEF"_s);
+  refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_TRUE(refs.front().content_sha256.isEmpty());
+
+  file_info.removeAttribute(u"content_sha256"_s);
+  refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_TRUE(refs.front().content_sha256.isEmpty());
+}
+
+TEST(ExtractDataSource, RelativeFilesystemPathContainingSchemeTextStillAnchors) {
+  const QString relative = u"logs/http://capture.mcap"_s;
+  const QDomDocument doc = buildDataSourceDoc(relative);
+  const QDir layout_dir(u"/tmp/layouts"_s);
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, layout_dir);
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().serialized_path, relative);
+  EXPECT_EQ(refs.front().resolved_path, layout_dir.absoluteFilePath(relative));
 }
 
 TEST(ExtractDataSource, PluginIdAndCdataJsonRoundTrip) {
@@ -218,6 +260,26 @@ TEST(ExtractDataSource, PluginIdAndCdataJsonRoundTrip) {
   EXPECT_EQ(refs.front().prefix, u"robot"_s);
   EXPECT_EQ(refs.front().plugin_id, u"DataLoad MCAP"_s);
   EXPECT_EQ(refs.front().plugin_config_json, json);
+  EXPECT_FALSE(refs.front().rewrite_plugin_filepath);
+}
+
+TEST(ExtractDataSource, LogicalPluginFilepathMarkerOptsIntoResolvedReplayPath) {
+  const QString json = uR"({"filepath":"run.csv"})"_s;
+  QDomDocument doc = buildDataSourceDoc(u"run.csv"_s, QString(), u"CSV Loader"_s, json);
+  QDomElement plugin = doc.documentElement()
+                           .firstChildElement(u"previouslyLoaded_Datafiles"_s)
+                           .firstChildElement(u"fileInfo"_s)
+                           .firstChildElement(u"plugin"_s);
+  plugin.setAttribute(u"filepath_mode"_s, u"source"_s);
+
+  QDomDocument reparsed;
+  ASSERT_TRUE(reparsed.setContent(doc.toByteArray(2)));
+  const QDir layout_dir(QDir::tempPath() + u"/layouts"_s);
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(reparsed, layout_dir);
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().resolved_path, layout_dir.absoluteFilePath(u"run.csv"_s));
+  EXPECT_EQ(refs.front().plugin_config_json, json);
+  EXPECT_TRUE(refs.front().rewrite_plugin_filepath);
 }
 
 TEST(ExtractDataSource, PluginCdataWithClosingSequenceRoundTrips) {
@@ -438,6 +500,42 @@ TEST(IsSamePath, NonexistentPathsAreNotSame) {
   EXPECT_FALSE(PJ::layout_xml::isSamePath(u"/nonexistent/a.mcap"_s, u"/nonexistent/a.mcap"_s));
 }
 
+TEST(IsSamePath, OpaqueUploadIdentitiesCompareLiterally) {
+  const QString identity = u"pj-upload://session/1/log.csv"_s;
+  EXPECT_TRUE(PJ::layout_xml::isSamePath(identity, identity));
+  EXPECT_FALSE(PJ::layout_xml::isSamePath(identity, u"pj-upload://session/2/log.csv"_s));
+  EXPECT_FALSE(PJ::layout_xml::isSamePath(identity, u"/tmp/log.csv"_s));
+}
+
+TEST(IsSamePath, FilesystemPathContainingSchemeTextStillCanonicalizes) {
+  QTemporaryDir dir;
+  ASSERT_TRUE(dir.isValid());
+#ifdef Q_OS_WIN
+  // ':' cannot occur in a Windows path component. A doubled separator after
+  // the drive prefix is nevertheless a legal spelling of the same file and
+  // still contains the `://` text that the historical broad URI check
+  // misclassified.
+  const QString absolute = QDir::fromNativeSeparators(dir.filePath(u"capture.mcap"_s));
+  ASSERT_TRUE(QFile(absolute).open(QIODevice::WriteOnly));
+  ASSERT_GE(absolute.size(), 3);
+  ASSERT_EQ(absolute.at(1), u':');
+  ASSERT_EQ(absolute.at(2), u'/');
+  QString scheme_like = absolute;
+  scheme_like.insert(2, u'/');
+  ASSERT_TRUE(scheme_like.contains(u"://"_s));
+  EXPECT_TRUE(PJ::layout_xml::isSamePath(absolute, scheme_like));
+#else
+  ASSERT_TRUE(QDir().mkpath(dir.filePath(u"logs/http:"_s)));
+  const QString absolute = dir.filePath(u"logs/http:/capture.mcap"_s);
+  ASSERT_TRUE(QFile(absolute).open(QIODevice::WriteOnly));
+
+  const QString previous = QDir::currentPath();
+  ASSERT_TRUE(QDir::setCurrent(dir.path()));
+  EXPECT_TRUE(PJ::layout_xml::isSamePath(absolute, u"logs/http://capture.mcap"_s));
+  EXPECT_TRUE(QDir::setCurrent(previous));
+#endif
+}
+
 TEST(EnsureLayoutExtension, AppendsWhenNoExtension) {
   EXPECT_EQ(PJ::layout_xml::ensureLayoutExtension(u"my_layout"_s), u"my_layout.pj4.xml"_s);
   EXPECT_EQ(PJ::layout_xml::ensureLayoutExtension(u"/home/user/setup"_s), u"/home/user/setup.pj4.xml"_s);
@@ -630,6 +728,49 @@ TEST(DatasetSourcePath, StampResolveAndPortableIdGuardCoverEveryIdentityShape) {
   EXPECT_EQ(xy.attribute(u"x_dataset_path"_s), expected);
   EXPECT_EQ(processor.attribute(u"input_dataset_path"_s), expected);
   EXPECT_EQ(transform_input.attribute(u"dataset_path"_s), expected);
+}
+
+TEST(DatasetSourcePath, RemapCoversAllFiveQualifierShapesWithoutTouchingOtherAttributes) {
+  QDomDocument doc;
+  QDomElement root = doc.createElement(u"root"_s);
+  doc.appendChild(root);
+  QDomElement element = doc.createElement(u"identity_carrier"_s);
+  root.appendChild(element);
+  const QStringList attributes{
+      u"dataset_path"_s, u"x_dataset_path"_s, u"y_dataset_path"_s, u"input_dataset_path"_s, u"source_dataset_path"_s};
+  for (const QString& attribute : attributes) {
+    element.setAttribute(attribute, u"saved/log.csv"_s);
+  }
+  element.setAttribute(u"unrelated_path"_s, u"saved/log.csv"_s);
+  QDomElement empty = doc.createElement(u"empty"_s);
+  empty.setAttribute(u"dataset_path"_s, QString());
+  root.appendChild(empty);
+
+  int calls = 0;
+  PJ::layout_xml::remapDatasetSourcePaths(doc, [&calls](const QString& path) {
+    ++calls;
+    EXPECT_EQ(path, u"saved/log.csv"_s);
+    return u"pj-upload://fresh/9/log.csv"_s;
+  });
+
+  EXPECT_EQ(calls, 5);
+  for (const QString& attribute : attributes) {
+    EXPECT_EQ(element.attribute(attribute), u"pj-upload://fresh/9/log.csv"_s);
+  }
+  EXPECT_EQ(element.attribute(u"unrelated_path"_s), u"saved/log.csv"_s);
+  EXPECT_TRUE(empty.attribute(u"dataset_path"_s).isEmpty());
+}
+
+TEST(DatasetSourcePath, DesktopResolverLeavesOpaqueUriQualifiersLiteral) {
+  QDomDocument doc;
+  QDomElement root = doc.createElement(u"root"_s);
+  doc.appendChild(root);
+  QDomElement curve = doc.createElement(u"curve"_s);
+  curve.setAttribute(u"dataset_path"_s, u"pj-upload://session/7/log.csv"_s);
+  root.appendChild(curve);
+
+  PJ::layout_xml::resolveDatasetSourcePaths(doc, QDir(u"/tmp/layouts"_s));
+  EXPECT_EQ(curve.attribute(u"dataset_path"_s), u"pj-upload://session/7/log.csv"_s);
 }
 
 TEST(GenericLayout, RemovesDatasetQualifiersButKeepsStablePaths) {
@@ -883,6 +1024,7 @@ TEST(SourceTimelineViewState, AllFieldsRoundTrip) {
   SourceTimelineViewState in;
   in.zoom = 1.234567890123456e-7;  // tiny pixels-per-ns: 17 sig-figs must survive
   in.scroll_left_ns = -5'000'000'000LL;
+  in.scroll_top_px = 84;
   in.name_column_width = 173;
   in.snap = false;
 
@@ -891,6 +1033,8 @@ TEST(SourceTimelineViewState, AllFieldsRoundTrip) {
   EXPECT_DOUBLE_EQ(*out.zoom, *in.zoom);  // exact: 'g',17 preserves the double
   ASSERT_TRUE(out.scroll_left_ns.has_value());
   EXPECT_EQ(*out.scroll_left_ns, *in.scroll_left_ns);
+  ASSERT_TRUE(out.scroll_top_px.has_value());
+  EXPECT_EQ(*out.scroll_top_px, 84);
   ASSERT_TRUE(out.name_column_width.has_value());
   EXPECT_EQ(*out.name_column_width, 173);
   ASSERT_TRUE(out.snap.has_value());
@@ -902,6 +1046,7 @@ TEST(SourceTimelineViewState, AbsentElementYieldsAllNullopt) {
   const SourceTimelineViewState out = readSourceTimelineViewState(QDomElement{});
   EXPECT_FALSE(out.zoom.has_value());
   EXPECT_FALSE(out.scroll_left_ns.has_value());
+  EXPECT_FALSE(out.scroll_top_px.has_value());
   EXPECT_FALSE(out.name_column_width.has_value());
   EXPECT_FALSE(out.snap.has_value());
 }
@@ -912,11 +1057,13 @@ TEST(SourceTimelineViewState, MissingAndMalformedAttributesStayNullopt) {
   el.setAttribute(u"zoom"_s, u"0"_s);                // non-positive → rejected
   el.setAttribute(u"name_column_width"_s, u"-4"_s);  // non-positive → rejected
   el.setAttribute(u"scroll_left_ns"_s, u"not-a-number"_s);
+  el.setAttribute(u"scroll_top_px"_s, u"-1"_s);
   // snap omitted entirely.
   const SourceTimelineViewState out = readSourceTimelineViewState(el);
   EXPECT_FALSE(out.zoom.has_value());
   EXPECT_FALSE(out.name_column_width.has_value());
   EXPECT_FALSE(out.scroll_left_ns.has_value());
+  EXPECT_FALSE(out.scroll_top_px.has_value());
   EXPECT_FALSE(out.snap.has_value());
 }
 
@@ -930,6 +1077,7 @@ TEST(SourceTimelineViewState, UnsetFieldsAreNotWritten) {
   EXPECT_TRUE(el.hasAttribute(u"snap"_s));
   EXPECT_FALSE(el.hasAttribute(u"zoom"_s));
   EXPECT_FALSE(el.hasAttribute(u"scroll_left_ns"_s));
+  EXPECT_FALSE(el.hasAttribute(u"scroll_top_px"_s));
   EXPECT_FALSE(el.hasAttribute(u"name_column_width"_s));
 }
 
@@ -1054,6 +1202,18 @@ TEST(MatchFanoutDatasets, EmptySavedNameMatchesByIndexAcrossAnyNames) {
   const auto matches = PJ::layout_xml::matchFanoutDatasets(
       {fanout::savedChild(QString(), 1)}, candidates, fanout::namesOf(candidates, {u"a"_s, u"b"_s}));
   EXPECT_EQ(matches, (std::vector<std::uint32_t>{22}));
+}
+
+TEST(BrowserLayoutSerialization, DetectsEveryEphemeralPathSentinel) {
+  EXPECT_FALSE(
+      PJ::layout_xml::containsEphemeralBrowserPath(
+          QByteArrayLiteral("<root binding=\"generic\"><curve source=\"capture.mcap\"/></root>")));
+  EXPECT_TRUE(
+      PJ::layout_xml::containsEphemeralBrowserPath(
+          QByteArrayLiteral("<root><curve dataset_path=\"pj-upload://session/7/capture.mcap\"/></root>")));
+  EXPECT_TRUE(
+      PJ::layout_xml::containsEphemeralBrowserPath(QByteArrayLiteral(
+          "<root><plugin><![CDATA[{\"filepath\":\"/pj_uploads/7/capture.mcap\"}]]></plugin></root>")));
 }
 
 }  // namespace

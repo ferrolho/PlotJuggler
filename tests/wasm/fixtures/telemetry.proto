@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package test;
+
+message Telemetry {
+  double temperature = 1;
+  int32 count = 2;
+  string label = 3;
+}

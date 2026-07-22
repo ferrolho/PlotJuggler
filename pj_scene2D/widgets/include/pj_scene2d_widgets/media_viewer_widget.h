@@ -10,6 +10,9 @@
 #include <QRhiWidget>
 #include <QSize>
 #include <QWheelEvent>
+#ifdef PJ_TARGET_WASM
+#include <QShowEvent>
+#endif
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -102,6 +105,9 @@ class MediaViewerWidget : public QRhiWidget {
   void initialize(QRhiCommandBuffer* cb) override;
   void render(QRhiCommandBuffer* cb) override;
   void releaseResources() override;
+#ifdef PJ_TARGET_WASM
+  void showEvent(QShowEvent* event) override;
+#endif
 
   void wheelEvent(QWheelEvent* e) override;
   void mousePressEvent(QMouseEvent* e) override;
@@ -229,6 +235,11 @@ class MediaViewerWidget : public QRhiWidget {
 
   // Pipeline for YUV→RGB shader (video frames)
   QRhi* rhi_cached_ = nullptr;
+#ifdef PJ_TARGET_WASM
+  // Qt/WASM switches the top-level from raster to RHI composition when this
+  // late-created widget submits its first frame. Re-armed by releaseResources().
+  bool composition_refresh_queued_ = false;
+#endif
   QRhiGraphicsPipeline* pipeline_ = nullptr;
   QRhiGraphicsPipeline* composite_pipeline_ = nullptr;
   QRhiSampler* sampler_ = nullptr;

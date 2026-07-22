@@ -203,6 +203,15 @@ void ScrubberBase::mouseMoveEvent(QMouseEvent* event) {
     }
   }
   if (state_ == State::kDragging) {
+    // A platform may lose the release while the pointer is outside the
+    // application (tab switch, native menu, window deactivation). The next
+    // move carries the authoritative button state; settle instead of keeping
+    // an app-wide wasm drag filter alive indefinitely.
+    if (!(event->buttons() & Qt::LeftButton)) {
+      endDrag();
+      event->accept();
+      return;
+    }
     handleDragMove(event->globalPosition());
     event->accept();
     return;
@@ -283,6 +292,13 @@ void ScrubberBase::startDrag() {
   if (cursor_hidden_during_drag_) {
     QApplication::setOverrideCursor(Qt::BlankCursor);
   }
+#ifdef PJ_TARGET_WASM
+  // Qt-wasm can't warp the pointer, so a long drag walks the cursor off the
+  // widget and the implicit grab stops delivering move/release to us. Watch the
+  // app-wide stream instead (mirrors PJ::Dialog's wasm drag) so the release
+  // always reaches endDrag() and commits the value.
+  qApp->installEventFilter(this);
+#endif
   update();
 }
 
@@ -290,7 +306,11 @@ void ScrubberBase::endDrag() {
   if (cursor_hidden_during_drag_) {
     QApplication::restoreOverrideCursor();
   }
+#ifdef PJ_TARGET_WASM
+  qApp->removeEventFilter(this);
+#else
   QCursor::setPos(press_screen_pos_);
+#endif
   state_ = State::kIdle;
   update();
   emit editingFinished();  // drag gesture settled
@@ -310,7 +330,10 @@ void ScrubberBase::handleDragMove(const QPointF& global_pos) {
     accumulated_pixels_ += pixels_per_step_;
   }
 
-  // Wrap at screen edges so the scrub can continue forever.
+#ifndef PJ_TARGET_WASM
+  // Wrap at screen edges so the scrub can continue forever. Qt-wasm can't warp
+  // the pointer, so on that target the drag simply tracks real pointer travel
+  // (below) — the app-wide filter installed in startDrag keeps events flowing.
   const QRect screen = screenGeometryAt(global_pos);
   if (!screen.isNull()) {
     if (global_pos.x() <= screen.left() + 1) {
@@ -326,6 +349,7 @@ void ScrubberBase::handleDragMove(const QPointF& global_pos) {
       return;
     }
   }
+#endif
   last_drag_global_ = global_pos;
 }
 
@@ -349,6 +373,26 @@ QLineEdit* ScrubberBase::ensureLineEdit() {
 }
 
 bool ScrubberBase::eventFilter(QObject* obj, QEvent* event) {
+#ifdef PJ_TARGET_WASM
+  // Wasm has no pointer-warp and the implicit grab drops move/release once the
+  // pointer leaves the widget, so drive the drag from the app-wide stream: the
+  // release here is what fires endDrag()→editingFinished and commits the value.
+  if (state_ == State::kDragging) {
+    if (event->type() == QEvent::MouseMove) {
+      auto* mouse_event = static_cast<QMouseEvent*>(event);
+      if (!(mouse_event->buttons() & Qt::LeftButton)) {
+        endDrag();
+        return false;
+      }
+      handleDragMove(mouse_event->globalPosition());
+      return true;
+    }
+    if (event->type() == QEvent::MouseButtonRelease && static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton) {
+      endDrag();
+      return true;
+    }
+  }
+#endif
   if (state_ == State::kEditing) {
     // Line-edit-targeted: Escape and FocusOut both revert.
     if (obj == line_edit_) {

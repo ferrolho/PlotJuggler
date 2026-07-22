@@ -11,6 +11,18 @@ target_link_libraries(datastore_curve_adapter_test PRIVATE
 
 add_test(NAME DatastoreCurveAdapterTest COMMAND datastore_curve_adapter_test)
 
+add_executable(plot_sample_reducer_test
+    plot_sample_reducer_test.cpp
+)
+
+target_compile_options(plot_sample_reducer_test PRIVATE ${PJ_WARNING_FLAGS})
+target_link_libraries(plot_sample_reducer_test PRIVATE
+    pj_plotting
+    GTest::gtest_main
+)
+
+add_test(NAME PlotSampleReducerTest COMMAND plot_sample_reducer_test)
+
 add_executable(filtered_curve_adapter_test
     filtered_curve_adapter_test.cpp
 )

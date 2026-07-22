@@ -9,6 +9,7 @@
 #include <QImage>
 #include <QMetaObject>
 #include <QPainter>
+#include <QTimer>
 #include <QVector4D>
 #include <algorithm>
 #include <array>
@@ -38,6 +39,16 @@ MediaViewerWidget::MediaViewerWidget(QWidget* parent) : QRhiWidget(parent) {
   setObjectName(u"mediaViewerCanvas"_s);
   setFocusPolicy(Qt::StrongFocus);
   setMouseTracking(true);
+#ifdef PJ_TARGET_WASM
+  connect(this, &QRhiWidget::frameSubmitted, this, [this]() {
+    if (composition_refresh_queued_) {
+      return;
+    }
+    composition_refresh_queued_ = true;
+    QWidget* top_level = window();
+    QTimer::singleShot(0, top_level, [top_level]() { top_level->update(); });
+  });
+#endif
   static bool resources_initialized = [] {
     pjMediaQtInitResources();
     return true;
@@ -266,6 +277,9 @@ void MediaViewerWidget::resetPendingPixelLayers() {
 }
 
 void MediaViewerWidget::releaseResources() {
+#ifdef PJ_TARGET_WASM
+  composition_refresh_queued_ = false;
+#endif
   hidePointInspector();
   delete pipeline_;
   pipeline_ = nullptr;
@@ -297,6 +311,17 @@ void MediaViewerWidget::releaseResources() {
   has_pending_pixel_layers_ = !pending_pixel_layers_.empty();
   has_pending_ = hasRetainedUploadableFrameLocked();
 }
+
+#ifdef PJ_TARGET_WASM
+void MediaViewerWidget::showEvent(QShowEvent* event) {
+  QRhiWidget::showEvent(event);
+  // Workspace restore constructs and may render this widget while its docker is
+  // hidden. Re-arm after the hierarchy becomes visible so the next submitted
+  // frame refreshes the mixed raster/RHI top-level at the useful time.
+  composition_refresh_queued_ = false;
+  update();
+}
+#endif
 
 void MediaViewerWidget::clearTextCache() {
   for (auto& kv : text_cache_) {

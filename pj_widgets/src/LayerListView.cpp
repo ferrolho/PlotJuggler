@@ -4,10 +4,13 @@
 #include "pj_widgets/LayerListView.h"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QDropEvent>
 #include <QListView>
 #include <QListWidget>
 #include <QModelIndex>
+#include <QMouseEvent>
+#include <QPoint>
 #include <QResizeEvent>
 #include <QSignalBlocker>
 #include <QSize>
@@ -145,8 +148,42 @@ class LayerRowWidget : public QWidget {
  signals:
   void visibilityToggled(qint64 id, bool visible);
   void removeClicked(qint64 id);
+#ifdef PJ_TARGET_WASM
+  void reorderPressed(QPoint global_pos);
+  void reorderMoved(QPoint global_pos);
+  void reorderReleased(QPoint global_pos);
+#endif
 
  protected:
+#ifdef PJ_TARGET_WASM
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton) {
+      emit reorderPressed(event->globalPosition().toPoint());
+      event->accept();
+      return;
+    }
+    QWidget::mousePressEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if (event->buttons().testFlag(Qt::LeftButton)) {
+      emit reorderMoved(event->globalPosition().toPoint());
+      event->accept();
+      return;
+    }
+    QWidget::mouseMoveEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton) {
+      emit reorderReleased(event->globalPosition().toPoint());
+      event->accept();
+      return;
+    }
+    QWidget::mouseReleaseEvent(event);
+  }
+#endif
+
   void resizeEvent(QResizeEvent* event) override {
     QWidget::resizeEvent(event);
     const int h = height();
@@ -220,9 +257,51 @@ class LayerListWidget : public QListWidget {
  public:
   explicit LayerListWidget(QWidget* parent) : QListWidget(parent) {
     setSelectionMode(QAbstractItemView::SingleSelection);
+#ifdef PJ_TARGET_WASM
+    // QListWidget's platform drag object does not complete an InternalMove in
+    // Qt/WASM. Row widgets feed the same insertion semantics through the
+    // pointer-only fallback below; native keeps Qt's standard DnD path.
+    setDragDropMode(QAbstractItemView::NoDragDrop);
+#else
     setDragDropMode(QAbstractItemView::InternalMove);
     setDefaultDropAction(Qt::MoveAction);
+#endif
   }
+
+#ifdef PJ_TARGET_WASM
+  void beginPointerReorder(QListWidgetItem* item, const QPoint& global_pos) {
+    pointer_drag_from_ = row(item);
+    pointer_drag_start_ = global_pos;
+    pointer_drag_active_ = false;
+    setCurrentItem(item);
+  }
+
+  void updatePointerReorder(const QPoint& global_pos) {
+    if (pointer_drag_from_ < 0 || pointer_drag_active_) {
+      return;
+    }
+    pointer_drag_active_ = (global_pos - pointer_drag_start_).manhattanLength() >= QApplication::startDragDistance();
+  }
+
+  void finishPointerReorder(const QPoint& global_pos) {
+    const int from = pointer_drag_from_;
+    const bool active = pointer_drag_active_;
+    pointer_drag_from_ = -1;
+    pointer_drag_active_ = false;
+    if (!active || from < 0) {
+      return;
+    }
+
+    const QPoint local_pos = viewport()->mapFromGlobal(global_pos);
+    int to = local_pos.y() < 0 ? 0 : count();
+    const QPoint row_axis_pos(viewport()->rect().center().x(), local_pos.y());
+    if (const QModelIndex index = indexAt(row_axis_pos); index.isValid()) {
+      const QRect item_rect = visualRect(index);
+      to = index.row() + (local_pos.y() > item_rect.center().y() ? 1 : 0);
+    }
+    emit rowMoved(from, to);
+  }
+#endif
 
  signals:
   void rowMoved(int from, int to);
@@ -247,6 +326,13 @@ class LayerListWidget : public QListWidget {
       emit rowMoved(from, to);
     }
   }
+
+#ifdef PJ_TARGET_WASM
+ private:
+  QPoint pointer_drag_start_;
+  int pointer_drag_from_ = -1;
+  bool pointer_drag_active_ = false;
+#endif
 };
 
 std::optional<LayerRow> storedRowForItem(const QListWidget* list, QListWidgetItem* item) {
@@ -463,6 +549,14 @@ void LayerListView::installRowWidget(QListWidgetItem* item, const LayerRow& row)
 
   connect(row_widget, &LayerRowWidget::visibilityToggled, this, &LayerListView::visibilityToggled);
   connect(row_widget, &LayerRowWidget::removeClicked, this, &LayerListView::removeRequested);
+#ifdef PJ_TARGET_WASM
+  auto* list = static_cast<LayerListWidget*>(list_);
+  connect(row_widget, &LayerRowWidget::reorderPressed, list, [list, item](const QPoint& global_pos) {
+    list->beginPointerReorder(item, global_pos);
+  });
+  connect(row_widget, &LayerRowWidget::reorderMoved, list, &LayerListWidget::updatePointerReorder);
+  connect(row_widget, &LayerRowWidget::reorderReleased, list, &LayerListWidget::finishPointerReorder);
+#endif
 }
 
 void LayerListView::rebuildFromOrder(const std::vector<qint64>& ordered_ids, qint64 select_id) {

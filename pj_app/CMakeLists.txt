@@ -4,12 +4,16 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Svg Test)
 # `Backward` config and the `Backward::Backward` target, which propagates the
 # BACKWARD_HAS_* defines and links the stack-detail backend (elfutils/libdw)
 # transitively. main.cpp installs the signal handler.
-find_package(Backward REQUIRED)
+if(NOT EMSCRIPTEN)
+    find_package(Backward REQUIRED)
+endif()
 
 # The whole shell as an OBJECT library so a headless test can link the exact
 # same MainWindow object files (see main_window_source_layout_test) instead of
 # duplicating the widget tree. The executable below is a thin main.cpp wrapper.
 add_library(pj_app_shell OBJECT
+    src/BuiltinPlugins.cpp
+    src/BuiltinPlugins.h
     src/Splashscreen.cpp
     src/Splashscreen.h
     src/DialogPresenter.cpp
@@ -18,6 +22,8 @@ add_library(pj_app_shell OBJECT
     src/FanoutConfig.h
     src/BrowserFileStore.cpp
     src/BrowserFileStore.h
+    src/BrowserPersistence.cpp
+    src/BrowserPersistence.h
     src/FileSelectionService.cpp
     src/FileSelectionService.h
     src/LoadInput.h
@@ -59,10 +65,6 @@ add_library(pj_app_shell OBJECT
     src/ui/CurveListPanel.cpp
     src/ui/CurveListPanel.h
     src/ui/CurveListPanel.ui
-    src/ui/Scene2DConfigPanel.cpp
-    src/ui/Scene2DConfigPanel.h
-    src/ui/Scene3DConfigPanel.cpp
-    src/ui/Scene3DConfigPanel.h
     src/ui/LeftPanel.cpp
     src/ui/LeftPanel.h
     src/ui/LeftPanel.ui
@@ -84,6 +86,39 @@ add_library(pj_app_shell OBJECT
     src/RasterKeyMap.cpp
     src/RasterKeyMap.h
 )
+
+if(TARGET pj_scene2d_widgets)
+    target_sources(pj_app_shell PRIVATE
+        src/ui/Scene2DConfigPanel.cpp
+        src/ui/Scene2DConfigPanel.h)
+endif()
+if(TARGET pj_scene3d_widgets)
+    target_sources(pj_app_shell PRIVATE
+        src/ui/Scene3DConfigPanel.cpp
+        src/ui/Scene3DConfigPanel.h)
+endif()
+
+if(EMSCRIPTEN)
+    # DiagnosticHistory consumes this QObject bridge, normally supplied by the
+    # marketplace library that is intentionally absent in a static web build.
+    target_sources(pj_app_shell PRIVATE
+        ${CMAKE_SOURCE_DIR}/pj_marketplace/src/core/QtDiagnosticBridge.cpp
+        ${CMAKE_SOURCE_DIR}/pj_marketplace/include/pj_marketplace/qt_diagnostic_bridge.hpp)
+    target_include_directories(pj_app_shell PRIVATE
+        ${CMAKE_SOURCE_DIR}/pj_marketplace/include)
+
+    if(PJ_WASM_ENABLE_INGRESS_PROBE)
+        target_sources(pj_app_shell PRIVATE
+            tests/wasm_acceptance_probes.inc
+            tests/wasm_ingress_probe_source.cpp)
+        if(TARGET pj_wasm_mcap_source AND NOT TARGET pj_wasm_ros_parser)
+            target_sources(pj_app_shell PRIVATE tests/wasm_mcap_probe_parser.cpp)
+            target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_ENABLE_MCAP_PROBE_PARSER)
+        endif()
+        target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_ENABLE_INGRESS_PROBE)
+        target_link_libraries(pj_app_shell PUBLIC pj_dialog_sdk)
+    endif()
+endif()
 
 # LayoutXml.cpp is also compiled directly into focused test executables. Its
 # plot-range vocabulary is a header-only contract owned by pj_plotting_core, so
@@ -109,9 +144,10 @@ target_link_libraries(pj_app_shell PUBLIC
     pj_widgets
     pj_plotting
     pj_scripting
-    pj_scene2d_widgets
-    pj_scene3d_widgets
-    pj_marketplace_ui
+    pj_scene_common
+    $<$<TARGET_EXISTS:pj_scene2d_widgets>:pj_scene2d_widgets>
+    $<$<TARGET_EXISTS:pj_scene3d_widgets>:pj_scene3d_widgets>
+    $<$<TARGET_EXISTS:pj_marketplace_ui>:pj_marketplace_ui>
     pj_dialog_engine_qt
     qt_advanced_docking
     Qt6::Core
@@ -122,10 +158,40 @@ target_link_libraries(pj_app_shell PUBLIC
     Qt6::Svg
 )
 
-add_executable(pj_app
-    src/main.cpp
-    ${CMAKE_SOURCE_DIR}/resources/resources.qrc
-)
+if(TARGET pj_wasm_csv_source)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_csv_source)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_CSV_PLUGIN)
+endif()
+if(TARGET pj_wasm_mcap_source)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_mcap_source)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_MCAP_PLUGIN)
+endif()
+if(TARGET pj_wasm_ros_parser)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_ros_parser)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_ROS_PLUGIN)
+endif()
+if(TARGET pj_wasm_protobuf_parser)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_protobuf_parser)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_PROTOBUF_PLUGIN)
+endif()
+if(TARGET pj_wasm_transform_editor)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_transform_editor)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_TRANSFORM_EDITOR_PLUGIN)
+endif()
+if(TARGET pj_wasm_dummy_stream)
+    target_link_libraries(pj_app_shell PUBLIC pj_wasm_dummy_stream)
+    target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_WITH_DUMMY_STREAM_PLUGIN)
+endif()
+
+if(EMSCRIPTEN)
+    qt_add_executable(pj_app
+        src/main.cpp
+        ${CMAKE_SOURCE_DIR}/resources/resources.qrc)
+else()
+    add_executable(pj_app
+        src/main.cpp
+        ${CMAKE_SOURCE_DIR}/resources/resources.qrc)
+endif()
 set_target_properties(pj_app PROPERTIES
     # The CMake target id stays `pj_app` (internal module name), but the installed
     # binary is `plotjuggler4` — the user-facing command and what packaging ships
@@ -134,7 +200,9 @@ set_target_properties(pj_app PROPERTIES
     AUTORCC ON
 )
 target_include_directories(pj_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(pj_app PRIVATE pj_app_shell Backward::Backward)
+target_link_libraries(pj_app PRIVATE
+    pj_app_shell
+    $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:Backward::Backward>)
 
 # App version: single source of truth is versions.env, stamped by the root
 # CMakeLists into generated/pj_version.h (PJ_VERSION_STRING). main.cpp — the only
@@ -156,8 +224,14 @@ endif()
 # vs 1.6.58 (Conan) ABI skew that crashes QGtk3Interface::fileIcon during
 # QFileDialog with an "invalid pointer" free. --exclude-libs,ALL is the
 # GNU/LLD spelling; harmless on other linkers but only meaningful here.
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT WIN32)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT WIN32 AND NOT EMSCRIPTEN)
     target_link_options(pj_app PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+
+if(EMSCRIPTEN)
+    set_target_properties(pj_app PROPERTIES QT_WASM_INITIAL_MEMORY "256MB")
+    target_compile_options(pj_app PRIVATE -fexceptions)
+    target_link_options(pj_app PRIVATE -fexceptions -sALLOW_MEMORY_GROWTH=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -178,6 +252,15 @@ if(PJ_BUILD_TESTS)
         target_compile_options(browser_file_store_test PRIVATE ${PJ_WARNING_FLAGS})
     endif()
     add_test(NAME BrowserFileStoreTest COMMAND browser_file_store_test)
+
+    add_executable(browser_persistence_test
+        tests/browser_persistence_test.cpp
+        src/BrowserPersistence.cpp
+        src/BrowserPersistence.h)
+    target_include_directories(browser_persistence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(browser_persistence_test PRIVATE Qt6::Core Qt6::Xml GTest::gtest_main)
+    target_compile_options(browser_persistence_test PRIVATE ${PJ_WARNING_FLAGS})
+    add_test(NAME BrowserPersistenceTest COMMAND browser_persistence_test)
 
     add_executable(file_selection_service_test
         tests/file_selection_service_test.cpp

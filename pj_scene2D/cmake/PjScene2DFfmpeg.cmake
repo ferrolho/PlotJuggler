@@ -1,4 +1,14 @@
 function(pj_scene2d_find_ffmpeg out_found out_targets out_source)
+  # Video is a separate WASM work package. Do not let a host package or an
+  # accidental sysroot installation leak native FFmpeg into the still-image
+  # Scene2D configuration.
+  if(EMSCRIPTEN)
+    set(${out_found} FALSE PARENT_SCOPE)
+    set(${out_targets} "" PARENT_SCOPE)
+    set(${out_source} "" PARENT_SCOPE)
+    return()
+  endif()
+
   find_package(ffmpeg CONFIG QUIET)
   if(TARGET ffmpeg::avcodec AND TARGET ffmpeg::avformat AND TARGET ffmpeg::avutil AND TARGET ffmpeg::swscale)
     set(${out_found} TRUE PARENT_SCOPE)

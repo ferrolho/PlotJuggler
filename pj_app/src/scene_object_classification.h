@@ -3,8 +3,12 @@
 #pragma once
 
 #include "pj_base/builtin/builtin_object.hpp"
+#ifdef PJ_WITH_SCENE2D
 #include "pj_scene2d_widgets/Scene2DDockWidget.h"
+#endif
+#ifdef PJ_WITH_SCENE3D
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
+#endif
 
 namespace PJ {
 
@@ -14,11 +18,21 @@ namespace PJ {
 // handled by both families; the factory ladder gives 3D precedence (3D is tried
 // first, 2D falls back for types the 3D family does not claim).
 [[nodiscard]] inline bool is3dSceneObjectType(sdk::BuiltinObjectType type) {
+#ifdef PJ_WITH_SCENE3D
   return Scene3DDockWidget::handlesObjectType(type);
+#else
+  (void)type;
+  return false;
+#endif
 }
 
 [[nodiscard]] inline bool is2dSceneObjectType(sdk::BuiltinObjectType type) {
+#ifdef PJ_WITH_SCENE2D
   return Scene2DDockWidget::handlesObjectType(type);
+#else
+  (void)type;
+  return false;
+#endif
 }
 
 // The image-family object types — those a 2D media viewer renders: stills

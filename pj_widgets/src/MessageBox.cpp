@@ -191,6 +191,10 @@ bool MessageBox::dontShowAgainChecked() const {
 }
 
 QPushButton* MessageBox::addButton(const QString& label, ButtonRole role) {
+  return addButton(label, role, true);
+}
+
+QPushButton* MessageBox::addButton(const QString& label, ButtonRole role, bool close_on_click) {
   auto* btn = new QPushButton(label, this);
   btn->setObjectName(u"pjMessageBoxButton"_s);
   btn->setProperty("msgbox_role", QLatin1String(roleToToken(role)));
@@ -206,9 +210,11 @@ QPushButton* MessageBox::addButton(const QString& label, ButtonRole role) {
   button_labels_.append(label);  // un-wrapped original; see rewrapButtonLabels()
   button_column_->addWidget(btn);
 
-  QObject::connect(btn, &QPushButton::clicked, this, [this, index]() {
+  QObject::connect(btn, &QPushButton::clicked, this, [this, index, close_on_click]() {
     clicked_index_ = index;
-    accept();
+    if (close_on_click) {
+      accept();
+    }
   });
   return btn;
 }

@@ -2,6 +2,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#include <QByteArray>
 #include <QDir>
 #include <QDomDocument>
 #include <QDomElement>
@@ -29,6 +30,12 @@ inline constexpr char kLayoutExtension[] = ".pj4.xml";
 // lands as a .pj4.xml file regardless of platform dialog quirks. Empty in,
 // empty out.
 [[nodiscard]] QString ensureLayoutExtension(const QString& path);
+
+// Returns true when serialized browser-layout bytes still contain a
+// page-lifetime upload identity or its MEMFS backing path. Both generic and
+// source-bound browser downloads must reject such bytes before handing them to
+// the browser; native layout files are not subject to this policy.
+[[nodiscard]] bool containsEphemeralBrowserPath(const QByteArray& serialized);
 
 // Per-dataset Source Timeline state nested under one replayable file. One file
 // may fan out into several DatasetIds; source_index is the stable position in
@@ -62,13 +69,29 @@ struct DataSourceDatasetRef {
     const QList<DataSourceDatasetRef>& saved, const std::vector<std::uint32_t>& candidates,
     const std::function<QString(std::uint32_t)>& source_name_of);
 
-// Resolved data-source reference extracted from <previouslyLoaded_Datafiles>.
-// Empty resolved_path means no replayable source was found in the layout.
+// Data-source reference extracted from <previouslyLoaded_Datafiles>.
+// serialized_path preserves the filename attribute exactly as written so a
+// browser source-bound layout can match it to a newly selected upload without
+// inventing a filesystem base directory. resolved_path is the desktop-ready
+// form: relative filesystem paths are anchored at the layout directory, while
+// pj-upload:// identities are preserved literally. Empty resolved_path means
+// no replayable source was found in the layout.
 struct DataSourceRef {
+  QString serialized_path;
   QString resolved_path;
   QString prefix;
+  // Optional browser-authored fingerprint of the selected source bytes. Only
+  // canonical lower-case SHA-256 is accepted on read; native layouts omit it.
+  // Browser replay consults it when two logical sources share a basename.
+  QString content_sha256;
   QString plugin_id;           // Empty when the layout had no <plugin> child.
   QString plugin_config_json;  // Empty when the layout had no <plugin> child.
+  // Browser-authored source layouts persist a logical filename in plugin JSON
+  // because their staged backing path expires with the page. On desktop replay,
+  // this additive opt-in asks FileLoader to replace that logical filepath with
+  // resolved_path immediately before loadConfig(). Older/native layouts omit the
+  // marker and therefore retain their existing pass-through behavior.
+  bool rewrite_plugin_filepath = false;
   // Source Timeline state, re-bound by source path on reload (DatasetIds are
   // re-minted each session, so the file path is the only stable identity).
   // display_offset_ns is the per-source display shift (display = raw - offset);
@@ -108,7 +131,9 @@ void appendJsonAsCdata(QDomDocument& doc, QDomElement& parent, const QString& js
 
 // Reads every <previouslyLoaded_Datafiles>/<fileInfo> and its optional
 // <plugin> child, one DataSourceRef per file in document order. Each
-// resolved_path is absolute — relatives are anchored at `layout_dir`.
+// serialized_path is the raw filename attribute. resolved_path is absolute for
+// filesystem paths (relatives are anchored at `layout_dir`) and literal for a
+// pj-upload:// identity.
 // fileInfo entries with no filename are skipped. Returns an empty list when
 // the wrapper element is absent or holds no usable fileInfo. Multiple entries
 // support multi-file sessions; single-file layouts yield a one-element list.
@@ -121,6 +146,7 @@ void appendJsonAsCdata(QDomDocument& doc, QDomElement& parent, const QString& js
 struct SourceTimelineViewState {
   std::optional<double> zoom;            // pixels-per-ns (Ctrl+wheel zoom); only > 0 is valid
   std::optional<qint64> scroll_left_ns;  // display-ns at the viewport's left edge
+  std::optional<int> scroll_top_px;      // vertical viewport offset (px); only >= 0 is valid
   std::optional<int> name_column_width;  // left name-column width (px); only > 0 is valid
   std::optional<bool> snap;              // edge-snap-while-dragging toggle
 };
@@ -134,12 +160,15 @@ struct SourceTimelineViewState {
 [[nodiscard]] QDomElement writeSourceTimelineViewState(QDomDocument& doc, const SourceTimelineViewState& state);
 [[nodiscard]] SourceTimelineViewState readSourceTimelineViewState(const QDomElement& element);
 
-// True iff both paths resolve to the same on-disk file. Used by the
+// True iff both inputs identify the same source. Filesystem paths compare as
+// the same on-disk file; pj-upload:// identities compare literally. Used by the
 // layout-load data-source replay to decide whether the currently
 // loaded source is the one the layout references (and re-load is a
 // no-op) or a different file (and the user should be prompted).
-// Compares via QFileInfo::canonicalFilePath, so relative-vs-absolute,
-// trailing-slash, and symlink variations all collapse correctly.
+// Files compare via QFileInfo::canonicalFilePath, so relative-vs-absolute,
+// trailing-slash, and symlink variations all collapse correctly. Browser upload
+// identities are deliberately not normalized: their tokens are opaque
+// and session-scoped.
 // Empty inputs are treated as "not the same".
 [[nodiscard]] bool isSamePath(const QString& a, const QString& b);
 
@@ -245,6 +274,15 @@ void removeUnvalidatedDatasetIds(QDomDocument& doc);
 // source-bound layout moves together with its data. Undo snapshots carry no such
 // portable path attributes and are unchanged.
 void resolveDatasetSourcePaths(QDomDocument& doc, const QDir& layout_dir);
+
+// Rewrites every non-empty dataset source-path qualifier in place. Covers the
+// five qualifier shapes used by plots, processors, transforms, and scene docks:
+// dataset_path, x_dataset_path, y_dataset_path, input_dataset_path, and
+// source_dataset_path. The callback receives the serialized value and must
+// return the desired replacement (returning it unchanged is a no-op). This is a
+// pure XML pass: it performs no filesystem access and changes no schema.
+using DatasetPathRemapper = std::function<QString(const QString&)>;
+void remapDatasetSourcePaths(QDomDocument& doc, const DatasetPathRemapper& remap);
 
 // Removes every <curve> left without any usable key after rebindCurveKeys
 // (empty name and empty curve_x/curve_y). Two-pass so the live node list

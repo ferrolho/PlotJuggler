@@ -10,7 +10,11 @@
 #include <qwt_plot_grid.h>
 #include <qwt_plot_layout.h>
 #include <qwt_plot_marker.h>
+#ifndef PJ_TARGET_WASM
 #include <qwt_plot_opengl_canvas.h>
+#else
+#include "pj_plotting/PlotRhiCanvas.h"
+#endif
 #include <qwt_scale_engine.h>
 #include <qwt_scale_map.h>
 #include <qwt_scale_widget.h>
@@ -204,8 +208,6 @@ PlotWidgetBase::PlotWidgetBase(QWidget* parent) : QWidget(parent) {
     }
   };
 
-  const bool use_opengl = !g_opengl_disabled_override && QSettings().value("Preferences::use_opengl", true).toBool();
-
   // QwtPlotCanvas uses a backing-store paint path that ignores QSS background
   // rules, so the canvas needs a solid palette colour. The Main Plot is the
   // Data Backdrop surface (ui_framework.md § Data Backdrop); read it from the
@@ -214,6 +216,15 @@ PlotWidgetBase::PlotWidgetBase(QWidget* parent) : QWidget(parent) {
   const QColor canvas_bg = dataBackdropForCurrentTheme();
 
   QWidget* abs_canvas = nullptr;
+#ifdef PJ_TARGET_WASM
+  // QOpenGLWidget cannot provide its context-sharing contract on WebGL. Keep
+  // the existing Qwt canvas and preferences byte-for-byte on desktop, while
+  // the browser submits plot geometry through QRhi's OpenGL/WebGL backend.
+  auto* rhi_canvas = new PlotRhiCanvas();
+  rhi_canvas->setPalette(canvas_bg);
+  abs_canvas = rhi_canvas;
+#else
+  const bool use_opengl = !g_opengl_disabled_override && QSettings().value("Preferences::use_opengl", true).toBool();
   if (use_opengl) {
     auto* canvas = new QwtPlotOpenGLCanvas();
     // Drop Qwt's own backing-store FBO: it is a persistent-content GL resource
@@ -234,9 +245,16 @@ PlotWidgetBase::PlotWidgetBase(QWidget* parent) : QWidget(parent) {
     canvas->setPaintAttribute(QwtPlotCanvas::BackingStore, true);
     abs_canvas = canvas;
   }
+#endif
   abs_canvas->setObjectName("qwtCanvas");
 
   plot_ = new QwtPlotPimpl(this, abs_canvas, on_view_resized, on_event);
+#ifdef PJ_TARGET_WASM
+  // The canvas is constructed before the plot exists (QwtPlot adopts its canvas
+  // during its own ctor), so bind the source plot now instead of resolving it
+  // from parentWidget() on every frame.
+  rhi_canvas->setPlot(plot_);
+#endif
 
   auto* layout = new QHBoxLayout(this);
   layout->setContentsMargins(
@@ -480,6 +498,11 @@ void PlotWidgetBase::setLegendSize(int size) {
 
 void PlotWidgetBase::setLegendAlignment(Qt::Alignment alignment) {
   plot_->legend->setAlignmentInCanvas(alignment);
+#ifdef PJ_TARGET_WASM
+  // The retained QRhi buffers need an explicit dirty signal after the item
+  // mutation. Preserve the native Qwt repaint behavior exactly as before.
+  replot();
+#endif
 }
 
 void PlotWidgetBase::setLegendVisible(bool visible) {

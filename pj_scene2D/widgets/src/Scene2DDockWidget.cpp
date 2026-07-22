@@ -449,12 +449,17 @@ QWidget* Scene2DDockWidget::createSceneView() {
       PJ::theme::space(PJ::theme::Space::None), PJ::theme::space(PJ::theme::Space::None));
   layout->setSpacing(PJ::theme::space(PJ::theme::Space::None));
 
-  // Forces Qt 6.8 to create an RHI-backed window backing store before first show();
-  // dynamically added QRhiWidgets otherwise never get a QRhi. See TECHNICAL_NOTES.md.
+  // Forces native Qt 6.8 to create an RHI-backed window backing store before
+  // first show(); dynamically added QRhiWidgets otherwise never get a QRhi.
+  // The browser must instead let the first real, nonzero viewer trigger Qt's
+  // dynamic raster-to-RHI switch. A zero-size WebGL surface can lose its
+  // context across a cold browser picker. See TECHNICAL_NOTES.md.
+#ifndef PJ_TARGET_WASM
   bootstrap_ = new MediaViewerWidget(container);
   bootstrap_->setObjectName(u"scene2dRhiBootstrap"_s);
   bootstrap_->setMaximumSize(0, 0);
   layout->addWidget(bootstrap_);
+#endif
 
   // Page 0 = empty-state placeholder, page 1 = GPU viewer. A stack (rather than
   // an overlay) keeps the raster placeholder off the QRhiWidget's surface, where
@@ -463,7 +468,14 @@ QWidget* Scene2DDockWidget::createSceneView() {
   layout->addWidget(view_stack_, /*stretch=*/1);
   view_stack_->addWidget(makeEmptyPlaceholder(view_stack_));
 
+#ifdef PJ_TARGET_WASM
+  // Construct parentless so MediaViewerWidget::setApi(OpenGL) completes before
+  // QStackedWidget inserts it into an already-visible top-level hierarchy.
+  // QRhiWidget documents the API choice as immutable once that happens.
+  viewer_ = new MediaViewerWidget();
+#else
   viewer_ = new MediaViewerWidget(view_stack_);
+#endif
   viewer_->setObjectName(u"scene2dMediaViewer"_s);
   viewer_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   connect(viewer_, &MediaViewerWidget::viewInteractionCommitted, this, [this]() { notifyWorkspaceChanged(); });

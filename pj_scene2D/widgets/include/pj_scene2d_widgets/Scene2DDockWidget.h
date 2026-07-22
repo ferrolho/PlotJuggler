@@ -70,8 +70,9 @@ class Scene2DDockWidget : public SceneDockWidget {
   /// Workspace XML tag for the 2D scene dock.
   [[nodiscard]] QString xmlTag() const override;
   [[nodiscard]] bool acceptsStateChildTag(const QString& tag) const override;
-  /// Builds the QRhi bootstrap child plus the real MediaViewerWidget, fronted by
-  /// a stacked empty-state placeholder shown until the first layer arrives.
+  /// Builds the native QRhi bootstrap where required plus the real
+  /// MediaViewerWidget, fronted by a stacked empty-state placeholder shown until
+  /// the first layer arrives.
   QWidget* createSceneView() override;
   /// Re-tints the placeholder icon when the palette/theme changes.
   void changeEvent(QEvent* event) override;
@@ -113,8 +114,9 @@ class Scene2DDockWidget : public SceneDockWidget {
   /// Returns raw nanoseconds because CompositeMediaSource is the core-side seam.
   [[nodiscard]] std::optional<int64_t> seedTimestampNs(const std::vector<ISceneLayer*>& ordered_layers) const;
 
-  // Zero-size QRhiWidget kept as a child so Qt 6.8 creates an RHI-backed backing
-  // store on first show(); see TECHNICAL_NOTES.md "QRhiWidget Multi-Instance Lifecycle".
+  // Native-only zero-size QRhiWidget kept as a child so Qt 6.8 creates an
+  // RHI-backed backing store on first show(); the browser deliberately leaves
+  // this null. See TECHNICAL_NOTES.md "QRhiWidget Multi-Instance Lifecycle".
   MediaViewerWidget* bootstrap_ = nullptr;
   // The real viewer is non-owning here; Qt parent ownership is the container made
   // by createSceneView(), while composite_ owns the source it polls.

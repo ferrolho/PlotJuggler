@@ -12,6 +12,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
+#include <algorithm>
 
 #include "pj_widgets/Scrollbar.h"
 #include "pj_widgets/SvgUtil.h"
@@ -130,13 +131,62 @@ void Dialog::mousePressEvent(QMouseEvent* event) {
     QWidget* hit = ui_->dialogTitleBar->childAt(ui_->dialogTitleBar->mapFrom(this, event->position().toPoint()));
     if (hit == nullptr || hit == ui_->dialogTitleLabel) {
       if (auto* h = windowHandle()) {
-        h->startSystemMove();
+        const bool system_move_started = h->startSystemMove();
+#ifdef Q_OS_WASM
+        if (!system_move_started) {
+          // Qt-wasm's QPA implements no system move; drive the drag manually
+          // from the app-wide event filter until release. Desktop platforms
+          // keep their native behavior even when startSystemMove declines.
+          manual_move_active_ = true;
+          manual_press_global_ = event->globalPosition().toPoint();
+          manual_press_geometry_ = geometry();
+        }
+#else
+        Q_UNUSED(system_move_started)
+#endif
         event->accept();
         return;
       }
     }
   }
   QDialog::mousePressEvent(event);
+}
+
+void Dialog::applyManualDrag(const QPoint& global_pos) {
+  const QPoint delta = global_pos - manual_press_global_;
+  if (manual_move_active_) {
+    move(manual_press_geometry_.topLeft() + delta);
+    return;
+  }
+  const QSize min_size = minimumSizeHint().expandedTo(minimumSize());
+  const QSize max_size = maximumSize();
+  QRect target = manual_press_geometry_;
+  // Grow/shrink only the pressed edges, keeping the opposite edge anchored.
+  // Clamping happens edge-wise so an over-shrunk drag pins the moving edge
+  // at the size limit instead of pushing the anchored edge around.
+  if (manual_resize_edges_ & Qt::LeftEdge) {
+    target.setLeft(
+        std::clamp(
+            manual_press_geometry_.left() + delta.x(), target.right() + 1 - max_size.width(),
+            target.right() + 1 - min_size.width()));
+  } else if (manual_resize_edges_ & Qt::RightEdge) {
+    target.setRight(
+        std::clamp(
+            manual_press_geometry_.right() + delta.x(), target.left() - 1 + min_size.width(),
+            target.left() - 1 + max_size.width()));
+  }
+  if (manual_resize_edges_ & Qt::TopEdge) {
+    target.setTop(
+        std::clamp(
+            manual_press_geometry_.top() + delta.y(), target.bottom() + 1 - max_size.height(),
+            target.bottom() + 1 - min_size.height()));
+  } else if (manual_resize_edges_ & Qt::BottomEdge) {
+    target.setBottom(
+        std::clamp(
+            manual_press_geometry_.bottom() + delta.y(), target.top() - 1 + min_size.height(),
+            target.top() - 1 + max_size.height()));
+  }
+  setGeometry(target);
 }
 
 Qt::Edges Dialog::edgesAtPoint(const QPoint& pos) const {
@@ -156,7 +206,7 @@ Qt::Edges Dialog::edgesAtPoint(const QPoint& pos) const {
 
 bool Dialog::eventFilter(QObject* watched, QEvent* event) {
   const QEvent::Type type = event->type();
-  if (type != QEvent::MouseMove && type != QEvent::MouseButtonPress) {
+  if (type != QEvent::MouseMove && type != QEvent::MouseButtonPress && type != QEvent::MouseButtonRelease) {
     return QDialog::eventFilter(watched, event);
   }
   auto* widget = qobject_cast<QWidget*>(watched);
@@ -167,23 +217,48 @@ bool Dialog::eventFilter(QObject* watched, QEvent* event) {
     return QDialog::eventFilter(watched, event);
   }
   auto* mouse_event = static_cast<QMouseEvent*>(event);
-  const QPoint window_pos = mapFromGlobal(mouse_event->globalPosition().toPoint());
-  const Qt::Edges edges = edgesAtPoint(window_pos);
+  const QPoint global_pos = mouse_event->globalPosition().toPoint();
 
+  if (type == QEvent::MouseButtonRelease) {
+    if (manual_resize_edges_ != 0 || manual_move_active_) {
+      manual_resize_edges_ = {};
+      manual_move_active_ = false;
+      return true;
+    }
+    return false;
+  }
   if (type == QEvent::MouseMove) {
-    if (edges != 0) {
-      setCursor(cursorForEdges(edges));
+    if (manual_resize_edges_ != 0 || manual_move_active_) {
+      applyManualDrag(global_pos);
+      return true;
+    }
+    const Qt::Edges hover_edges = edgesAtPoint(mapFromGlobal(global_pos));
+    if (hover_edges != 0) {
+      setCursor(cursorForEdges(hover_edges));
     } else {
       unsetCursor();
     }
     return false;
   }
   // MouseButtonPress
+  const Qt::Edges edges = edgesAtPoint(mapFromGlobal(global_pos));
   if (mouse_event->button() != Qt::LeftButton || edges == 0) {
     return false;
   }
   if (auto* handle = windowHandle()) {
-    handle->startSystemResize(edges);
+    const bool system_resize_started = handle->startSystemResize(edges);
+#ifdef Q_OS_WASM
+    if (!system_resize_started) {
+      // Qt-wasm's QPA implements no system resize (and frameless windows get
+      // none of its DOM resize handles); drive the geometry manually until
+      // release. Desktop platforms keep their native behavior.
+      manual_resize_edges_ = edges;
+      manual_press_global_ = global_pos;
+      manual_press_geometry_ = geometry();
+    }
+#else
+    Q_UNUSED(system_resize_started)
+#endif
     return true;
   }
   return false;

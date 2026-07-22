@@ -16,20 +16,36 @@
 option(PJ_SYSTEM_QWT
     "Link the environment's prebuilt Qwt (conda/pixi) instead of downloading and building the pinned release" OFF)
 
-find_package(Qt6 REQUIRED COMPONENTS
-    Core Gui Widgets Concurrent Svg OpenGL PrintSupport OpenGLWidgets SvgWidgets)
-
-set(PJ_QWT_QT_LIBS
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Concurrent
-    Qt6::Svg
-    Qt6::OpenGL
-    Qt6::PrintSupport
-    Qt6::OpenGLWidgets
-    Qt6::SvgWidgets
-)
+# The browser build excludes the QOpenGLWidget-based canvas: QOpenGLWidget
+# cannot provide its context contract on WebGL, so the wasm plot canvas is the
+# QRhi one in pj_plotting and Qwt is built without the OpenGL components.
+if(EMSCRIPTEN)
+    find_package(Qt6 REQUIRED COMPONENTS
+        Core Gui Widgets Concurrent Svg PrintSupport SvgWidgets)
+    set(PJ_QWT_QT_LIBS
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Concurrent
+        Qt6::Svg
+        Qt6::PrintSupport
+        Qt6::SvgWidgets
+    )
+else()
+    find_package(Qt6 REQUIRED COMPONENTS
+        Core Gui Widgets Concurrent Svg OpenGL PrintSupport OpenGLWidgets SvgWidgets)
+    set(PJ_QWT_QT_LIBS
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Concurrent
+        Qt6::Svg
+        Qt6::OpenGL
+        Qt6::PrintSupport
+        Qt6::OpenGLWidgets
+        Qt6::SvgWidgets
+    )
+endif()
 
 if(PJ_SYSTEM_QWT)
     if(WIN32)
@@ -256,10 +272,12 @@ set(QWT_SRC
 
     qwt_plot_abstract_canvas.h
     qwt_plot_abstract_canvas.cpp
-
-    qwt_plot_opengl_canvas.h
-    qwt_plot_opengl_canvas.cpp
     )
+if(NOT EMSCRIPTEN)
+    list(APPEND QWT_SRC
+        qwt_plot_opengl_canvas.h
+        qwt_plot_opengl_canvas.cpp)
+endif()
 list(TRANSFORM QWT_SRC PREPEND "${qwt_upstream_SOURCE_DIR}/src/")
 
 add_library(plotjuggler_qwt STATIC ${QWT_SRC})

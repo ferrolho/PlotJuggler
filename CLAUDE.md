@@ -270,6 +270,10 @@ Parity-plus with PJ3: file + streaming sources, 11 built-in transforms, undo/red
 
 The 3D widget family ships as `pj_scene3D` (built and wired into `pj_app` via `Scene3DDockWidget`): TF, pointclouds, occupancy grids, axis/grid render passes, SceneEntities/markers, pluggable camera models, URDF/mesh robot models, the HDR/tonemap/SSAO/EDL rendering pipeline, live/streaming TF+object ingest (`TransformService` + `driveVisibleLayersToLiveEdge`), and per-use parser bindings (`parse_locked.h`) — see `pj_scene3D/docs/ARCHITECTURE.md` for the as-built design, `docs/REQUIREMENTS.md` + plan §5.5 for scope.
 
+Every new static archive linked into the monolithic WASM executable needs an
+ABI/process-global-symbol collision audit; a successful link alone did not
+catch a prior Qt/libjpeg collision.
+
 ## Non-goals (explicitly deferred)
 
 - `StatePublisher` parity

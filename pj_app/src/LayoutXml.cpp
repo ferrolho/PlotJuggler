@@ -6,6 +6,7 @@
 #include <QDomNodeList>
 #include <QFileInfo>
 #include <QSet>
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <utility>
@@ -17,11 +18,34 @@ using namespace Qt::StringLiterals;
 
 namespace PJ::layout_xml {
 
+namespace {
+
+bool isOpaqueBrowserUploadIdentity(const QString& value) {
+  // Keep this deliberately narrow. `:` is legal in POSIX path components, so a
+  // relative path such as logs/http://capture.mcap must retain the exact desktop
+  // filesystem behavior it had before browser identities existed.
+  return value.startsWith(QLatin1StringView("pj-upload://"));
+}
+
+bool isCanonicalSha256(const QString& value) {
+  if (value.size() != 64) {
+    return false;
+  }
+  return std::all_of(
+      value.cbegin(), value.cend(), [](QChar ch) { return (ch >= u'0' && ch <= u'9') || (ch >= u'a' && ch <= u'f'); });
+}
+
+}  // namespace
+
 QString ensureLayoutExtension(const QString& path) {
   if (path.isEmpty() || !QFileInfo(path).suffix().isEmpty()) {
     return path;
   }
   return path + QLatin1String(kLayoutExtension);
+}
+
+bool containsEphemeralBrowserPath(const QByteArray& serialized) {
+  return serialized.contains("pj-upload://") || serialized.contains("/pj_uploads");
 }
 
 void appendJsonAsCdata(QDomDocument& doc, QDomElement& parent, const QString& json) {
@@ -71,9 +95,21 @@ QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layo
       continue;
     }
     DataSourceRef info;
-    const QFileInfo qfi(filename);
-    info.resolved_path = qfi.isAbsolute() ? qfi.absoluteFilePath() : layout_dir.absoluteFilePath(filename);
+    info.serialized_path = filename;
+    // Browser upload identities are opaque, session-scoped URI tokens. Never
+    // reinterpret them as relative filesystem paths (which would silently turn
+    // pj-upload://... into <layout-dir>/pj-upload:/...).
+    if (isOpaqueBrowserUploadIdentity(filename)) {
+      info.resolved_path = filename;
+    } else {
+      const QFileInfo qfi(filename);
+      info.resolved_path = qfi.isAbsolute() ? qfi.absoluteFilePath() : layout_dir.absoluteFilePath(filename);
+    }
     info.prefix = file_info.attribute(u"prefix"_s);
+    const QString content_sha256 = file_info.attribute(u"content_sha256"_s);
+    if (isCanonicalSha256(content_sha256)) {
+      info.content_sha256 = content_sha256;
+    }
 
     // Legacy single-track state on <fileInfo> (optional; absent in pre-v3
     // layouts). A missing display_offset_ns leaves has_display_offset false so
@@ -121,6 +157,7 @@ QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layo
     const QDomElement plugin = file_info.firstChildElement(u"plugin"_s);
     if (!plugin.isNull()) {
       info.plugin_id = plugin.attribute(u"ID"_s);
+      info.rewrite_plugin_filepath = plugin.attribute(u"filepath_mode"_s) == "source"_L1;
       // QDomElement::text() concatenates all child text/CDATA — exactly
       // the round-trip of doc.createCDATASection above.
       info.plugin_config_json = plugin.text();
@@ -491,9 +528,22 @@ void removeUnvalidatedDatasetIds(QDomDocument& doc) {
 }
 
 void resolveDatasetSourcePaths(QDomDocument& doc, const QDir& layout_dir) {
+  remapDatasetSourcePaths(doc, [&layout_dir](const QString& saved_path) {
+    if (isOpaqueBrowserUploadIdentity(saved_path)) {
+      return saved_path;
+    }
+    const QFileInfo info(saved_path);
+    return QDir::cleanPath(info.isAbsolute() ? info.absoluteFilePath() : layout_dir.absoluteFilePath(saved_path));
+  });
+}
+
+void remapDatasetSourcePaths(QDomDocument& doc, const DatasetPathRemapper& remap) {
+  if (!remap) {
+    return;
+  }
   static constexpr std::array<const char*, 5> kPathAttributes{
       "dataset_path", "x_dataset_path", "y_dataset_path", "input_dataset_path", "source_dataset_path"};
-  forEachElement(doc, [&layout_dir](QDomElement& element) {
+  forEachElement(doc, [&remap](QDomElement& element) {
     for (const char* raw_name : kPathAttributes) {
       const QString name = QString::fromLatin1(raw_name);
       if (!element.hasAttribute(name)) {
@@ -503,9 +553,7 @@ void resolveDatasetSourcePaths(QDomDocument& doc, const QDir& layout_dir) {
       if (saved_path.isEmpty()) {
         continue;
       }
-      const QFileInfo info(saved_path);
-      element.setAttribute(
-          name, QDir::cleanPath(info.isAbsolute() ? info.absoluteFilePath() : layout_dir.absoluteFilePath(saved_path)));
+      element.setAttribute(name, remap(saved_path));
     }
   });
 }
@@ -557,6 +605,9 @@ QDomElement writeSourceTimelineViewState(QDomDocument& doc, const SourceTimeline
   if (state.scroll_left_ns) {
     element.setAttribute(u"scroll_left_ns"_s, QString::number(*state.scroll_left_ns));
   }
+  if (state.scroll_top_px) {
+    element.setAttribute(u"scroll_top_px"_s, QString::number(*state.scroll_top_px));
+  }
   if (state.name_column_width) {
     element.setAttribute(u"name_column_width"_s, QString::number(*state.name_column_width));
   }
@@ -584,6 +635,12 @@ SourceTimelineViewState readSourceTimelineViewState(const QDomElement& element) 
       state.scroll_left_ns = left_ns;
     }
   }
+  if (element.hasAttribute(u"scroll_top_px"_s)) {
+    const int top_px = element.attribute(u"scroll_top_px"_s).toInt(&ok);
+    if (ok && top_px >= 0) {
+      state.scroll_top_px = top_px;
+    }
+  }
   if (element.hasAttribute(u"name_column_width"_s)) {
     const int width = element.attribute(u"name_column_width"_s).toInt(&ok);
     if (ok && width > 0) {
@@ -599,6 +656,11 @@ SourceTimelineViewState readSourceTimelineViewState(const QDomElement& element) 
 bool isSamePath(const QString& a, const QString& b) {
   if (a.isEmpty() || b.isEmpty()) {
     return false;
+  }
+  const bool a_is_browser_upload = isOpaqueBrowserUploadIdentity(a);
+  const bool b_is_browser_upload = isOpaqueBrowserUploadIdentity(b);
+  if (a_is_browser_upload || b_is_browser_upload) {
+    return a_is_browser_upload && b_is_browser_upload && a == b;
   }
   const QString canon_a = QFileInfo(a).canonicalFilePath();
   const QString canon_b = QFileInfo(b).canonicalFilePath();

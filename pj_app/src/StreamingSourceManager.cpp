@@ -22,7 +22,6 @@
 #include "pj_datastore/engine.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/topic_storage.hpp"
-#include "pj_marketplace/extension.hpp"
 #include "pj_plugins/host/data_source_handle.hpp"
 #include "pj_plugins/host/data_source_library.hpp"
 #include "pj_plugins/host/message_parser_handle.hpp"
@@ -350,6 +349,13 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
         session_manager_.registerObjectTopicParser(id, std::move(parser));
       },
       secondary_object_store_.get(), secondary_data_engine_.get(), std::move(library_keepalive));
+#ifdef PJ_TARGET_WASM
+  // Browser RobotDescription handlers are object-only. Defer their payloads
+  // until RobotModel requests one instead of invoking the absent scalar path.
+  // The native streaming policy remains untouched.
+  session->runtime_host->policyResolver().setForType(
+      sdk::BuiltinObjectType::kRobotDescription, sdk::ObjectIngestPolicy::kPureLazy);
+#endif
   // [worker/poll thread, per DataSourceRuntimeHost::on_available_topics] — hop to
   // the GUI thread before touching CatalogModel/TopicDemandTracker, mirroring the
   // samplesIngested marshal in workerLoop below. The lambda may run before start()

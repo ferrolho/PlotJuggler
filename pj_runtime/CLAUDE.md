@@ -43,6 +43,8 @@ The authoritative source is `include/pj_runtime/`. Today:
 
 Public link surface (per `CMakeLists.txt`): `Qt6::Core`, `Qt6::Network`, `Qt6::Xml`, `pj_datastore`, `pj_marketplace`, the SDK discovery primitives (`pj_data_source_host`, `pj_message_parser_host`, `pj_toolbox_host`, `pj_plugin_catalog`, `pj_base`), `nlohmann_json`. Private: `tsl::robin_map`, `pj_internal_fmt`, `pj_scripting` (DataProcessorService routes by-id applyFilter through the Luau FilterCatalogue).
 
+The `pj_marketplace` link is conditional: `$<$<NOT:$<BOOL:${EMSCRIPTEN}>>:pj_marketplace>` in `pj_runtime/CMakeLists.txt` links it only on non-wasm builds. On `EMSCRIPTEN`, `pj_runtime` instead adds `pj_marketplace/include` as a private include directory (so `DiagnosticHistory`'s lightweight `QtDiagnosticBridge` type still compiles) without linking the rest of the marketplace module.
+
 ## When porting from PJ3
 
 PJ3 wiring into `PlotDataMapRef` / `TransformsMap` becomes wiring into the services above — primarily `CatalogModel`, `SessionManager`, `PlaybackEngine`, and (future) `TransformRegistry`. This is the **one systematic rewrite** during a PJ3 port; everything else should be lifted close to verbatim.

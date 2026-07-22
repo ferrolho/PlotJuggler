@@ -764,6 +764,31 @@ static bool tableMatchesHeaders(const QTableWidget* tw, const QStringList& heade
 // changing: dialogs whose .ui predefines column headers (e.g. MCAP's tableWidget)
 // match the plugin's setTableHeaders() verbatim, so a label-change gate would skip
 // them entirely and leave the .ui's default sizing.
+#ifdef PJ_TARGET_WASM
+// Re-clamps a horizontal QHeaderView to its sizeHint height whenever Qt-wasm's
+// QTableView resizes it (see installTreeLikeHeader). Owned by the header it
+// watches. No Q_OBJECT: it overrides only the virtual eventFilter.
+class WasmHeaderHeightClamp : public QObject {
+ public:
+  explicit WasmHeaderHeightClamp(QHeaderView* header) : QObject(header), header_(header) {}
+
+  bool eventFilter(QObject* watched, QEvent* event) override {
+    if (event->type() == QEvent::Resize && watched == header_) {
+      const int want = header_->sizeHint().height();
+      // Only act when the height is wrong, so the setFixedHeight-triggered
+      // resize back to `want` is a no-op the next time through (no loop).
+      if (want > 0 && header_->height() != want) {
+        header_->setFixedHeight(want);
+      }
+    }
+    return QObject::eventFilter(watched, event);
+  }
+
+ private:
+  QHeaderView* header_;
+};
+#endif
+
 static void installTreeLikeHeader(QTableWidget* tw) {
   auto* header = tw->horizontalHeader();
   if (header->count() == 0 || tw->property("pjTreeLikeHeader").toBool()) {
@@ -776,6 +801,18 @@ static void installTreeLikeHeader(QTableWidget* tw) {
   for (int i = kNameColumn + 1; i < header->count(); ++i) {
     policy->setSectionWidth(i, kDataColumnWidth);
   }
+
+#ifdef PJ_TARGET_WASM
+  // Qt-for-WebAssembly's QTableView lays the horizontal header out at the full
+  // table height instead of its sizeHint (a platform layout bug; desktop clamps
+  // correctly), collapsing the row viewport to zero — the rows exist but can't
+  // paint. QTableView positions the header with a direct setGeometry that
+  // bypasses maximumHeight, and it re-runs on every relayout, so a one-shot
+  // setFixedHeight at build time gets overwritten. Re-clamp the header to its
+  // sizeHint every time it is resized; it converges (setFixedHeight sticks once
+  // the layout has settled) and self-heals on later relayouts.
+  header->installEventFilter(new WasmHeaderHeightClamp(header));
+#endif
 }
 
 // Write a delta-provided cell's text/value into (row, col): update in place if
@@ -2092,10 +2129,11 @@ void connectWidgetSignals(QWidget* root, WidgetEventCallback callback) {
         std::string from_iso;
         std::string to_iso;
         if (f.date_from.has_value()) {
-          from_iso = QDateTime(*f.date_from, f.from_time, QTimeZone::utc()).toString(Qt::ISODate).toStdString();
+          from_iso =
+              QDateTime(*f.date_from, f.from_time, QTimeZone(QTimeZone::UTC)).toString(Qt::ISODate).toStdString();
         }
         if (f.date_to.has_value()) {
-          to_iso = QDateTime(*f.date_to, f.to_time, QTimeZone::utc()).toString(Qt::ISODate).toStdString();
+          to_iso = QDateTime(*f.date_to, f.to_time, QTimeZone(QTimeZone::UTC)).toString(Qt::ISODate).toStdString();
         }
         callback(name, WidgetEventBuilder::dateRangeChanged(from_iso, to_iso));
       });

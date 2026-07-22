@@ -181,9 +181,11 @@ class FileLoader : public QObject {
   // 3D TF ingest is triggered at load time through this service (owned by the
   // app shell, not the domain-neutral runtime). When unset, TF ingest is
   // skipped — non-3D builds simply never set it.
+#ifdef PJ_WITH_SCENE3D
   void setTransformService(pj::scene3d::TransformService* service) {
     transform_service_ = service;
   }
+#endif
 
   // Normalized full filesystem path the given dataset was loaded from, or empty
   // if this loader did not create it (e.g. a streaming or test dataset, or an id
@@ -326,7 +328,9 @@ class FileLoader : public QObject {
 #ifdef PJ_TARGET_WASM
   QHash<QString, QString> browser_content_sha256_;
 #endif
+#ifdef PJ_WITH_SCENE3D
   pj::scene3d::TransformService* transform_service_ = nullptr;
+#endif
 
   // --- Sequential async load queue (single-instance loads run on a worker) ---
   std::deque<LoadRequest> queue_;

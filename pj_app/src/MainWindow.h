@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "LayoutXml.h"
+#include "LoadInput.h"
 #include "pj_base/builtin/builtin_object.hpp"  // sdk::BuiltinObjectType — onPlaceholderTopicDropped's slot parameter
 #include "pj_base/diagnostic_sink.hpp"
 #include "pj_base/time.hpp"  // PJ::Timepoint — the frame-invariant absolute instant the reference line stores
@@ -51,9 +52,11 @@ namespace Ui {
 class MainWindow;
 }
 
+#ifdef PJ_WITH_SCENE3D
 namespace pj::scene3d {
 class TransformService;
 }  // namespace pj::scene3d
+#endif
 
 namespace PJ {
 
@@ -64,7 +67,6 @@ class DiagnosticHistory;
 class DockWidget;
 class FileLoader;
 class IDataWidget;
-class MessageBox;
 class PanelEngine;
 class PlotDocker;
 class PlotWidget;
@@ -73,6 +75,7 @@ class QtDiagnosticBridge;
 class SceneDockWidget;
 class StreamingSourceManager;
 class IngestProgressWidget;
+class MessageBox;
 class SourceTimelineController;
 class TopicDemandController;
 class SvgButton;
@@ -118,6 +121,22 @@ class MainWindow : public QMainWindow {
 
   // Populates the session with generated data for smoke testing.
   [[nodiscard]] bool populateTestData();
+
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+  // Acceptance-only canonical layout fixture: serializes the live workspace
+  // through the same state serializers used by production save, but never
+  // writes a path.
+  [[nodiscard]] QByteArray wasmProbeLayoutBytes() const;
+  [[nodiscard]] qsizetype wasmProbeDatasetCount() const;
+  void wasmProbeReportFilterResult() const;
+  void wasmProbeReportToolboxTransformResult() const;
+  // Reports streaming controls, catalog/tree state, playback range, and the
+  // first plotted curve without triggering any application action.
+  void wasmProbeReportStreamingState() const;
+  // Supersedes an in-flight source-replay picker without opening another host
+  // picker, making late-callback rejection deterministic in browser tests.
+  void wasmProbeSupersedeBrowserReplayPicker();
+#endif
 
   // Loads `path` on startup and auto-reloads its data source(s) without prompting
   // (the --layout CLI option). Safe no-op if the layout binds to no source.
@@ -234,6 +253,9 @@ class MainWindow : public QMainWindow {
   // from the LeftPanel recent popup's Layouts section.
   void onLoadLayout();
   void onSaveLayout();
+#ifdef PJ_TARGET_WASM
+  void onSaveSourceLayout();
+#endif
   void onLoadRecentLayout(const QString& path);
 
   // Opens the extension marketplace dialog.
@@ -569,6 +591,27 @@ class MainWindow : public QMainWindow {
 
   // Layout helpers.
   void loadLayoutFromPath(const QString& path);
+#ifdef PJ_TARGET_WASM
+  enum class BrowserLayoutLoadResult { kApplied, kPending, kFailed };
+
+  [[nodiscard]] QDomDocument browserGenericLayoutDocument() const;
+  [[nodiscard]] std::optional<QDomDocument> browserSourceLayoutDocument(QString& error) const;
+  void loadLayoutFromBytes(const QByteArray& bytes, const QString& browser_name);
+  [[nodiscard]] BrowserLayoutLoadResult loadBrowserParsedLayout(QDomDocument doc, const QString& browser_name);
+  [[nodiscard]] bool applyBrowserRestoredLayout(QDomDocument doc, const QString& browser_name);
+  void restoreBrowserChromeAndPanels(const QDomDocument& doc, const QString& browser_name);
+  void beginBrowserSourceReplay(
+      QDomDocument doc, const QString& browser_name, QList<layout_xml::DataSourceRef> sources);
+  [[nodiscard]] quint64 beginBrowserReplayPickerGeneration();
+  void selectBrowserReplaySource();
+  void loadBrowserReplaySource(
+      quint64 picker_generation, QString browser_name, std::optional<LoadInput> input, QString error);
+  void startBrowserReplayImports();
+  void finishBrowserReplayImports();
+  void rollbackBrowserReplayImports();
+  void finishBrowserLayoutLoad(const QString& browser_name, bool applied, const QString& reason = {});
+  void updateBrowserLayoutActions();
+#endif
   // Applies a parsed layout to already-loaded data: curve rebind, plot/panel
   // restore, recent-files. The progressive reload path uses beginProgressiveLayoutRestore
   // instead so the structure can appear before the load queue drains.
@@ -925,7 +968,9 @@ class MainWindow : public QMainWindow {
   // Owns the per-dataset 3D TF buffers + load-time ingest. Lives here in the
   // shell (not pj_runtime) so the runtime stays domain-neutral. Declared after
   // session_ so it is destroyed first (it holds a reference into session_).
+#ifdef PJ_WITH_SCENE3D
   std::unique_ptr<pj::scene3d::TransformService> transform_service_;
+#endif
   std::unique_ptr<FileLoader> file_loader_;
   std::unique_ptr<StreamingSourceManager> streaming_manager_;
   // ~30 Hz rate cap for the tracker-time fan-out. Every per-cursor-move driver
@@ -968,9 +1013,8 @@ class MainWindow : public QMainWindow {
   // flash it; hidden a moment after the load queue drains.
   IngestProgressWidget* ingest_progress_ = nullptr;
   QTimer* ingest_show_timer_ = nullptr;
-  // The strip's "Stop loading?" confirmation, alive only while shown (heap +
-  // WA_DeleteOnClose, continued from finished — never a nested exec()). Tracked
-  // so a second stop-click re-raises it instead of stacking a duplicate.
+  // Owned by QObject parentage while open; guards against stacking multiple
+  // stop confirmations from repeated title-bar clicks.
   QPointer<MessageBox> ingest_stop_dialog_;
   // Help ▸ Installed Extensions — informational, rebuilt on aboutToShow.
   QMenu* installed_extensions_menu_ = nullptr;
@@ -990,6 +1034,12 @@ class MainWindow : public QMainWindow {
   QAction* action_load_layout_ = nullptr;
   QAction* action_save_layout_ = nullptr;
   QAction* action_preferences_ = nullptr;
+#ifdef PJ_TARGET_WASM
+  struct BrowserLayoutRuntime;
+  std::unique_ptr<BrowserLayoutRuntime> browser_layout_runtime_;
+  QAction* action_save_source_layout_ = nullptr;
+  bool layout_selection_pending_ = false;
+#endif
   std::deque<CapturedWorkspace> undo_states_;
   std::deque<CapturedWorkspace> redo_states_;
   QSet<QString> history_data_universe_;
@@ -1035,14 +1085,22 @@ class MainWindow : public QMainWindow {
   // the focused DockWidget's content type.
   QStackedWidget* right_panel_stack_ = nullptr;
   QWidget* plot_config_page_ = nullptr;
+#ifdef PJ_WITH_SCENE2D
   QWidget* scene2d_config_page_ = nullptr;
+#endif
+#ifdef PJ_WITH_SCENE3D
   QWidget* scene3d_config_page_ = nullptr;
+#endif
   // Concrete widget instance behind scene3d_config_page_; held as a
   // distinct member so onDockFocused() can call bindDock() on it
   // without an extra qobject_cast.
+#ifdef PJ_WITH_SCENE3D
   class Scene3DConfigPanel* scene3d_config_panel_ = nullptr;
+#endif
   // Same, for the 2D scene's layer panel (binds to the focused Scene2DDockWidget).
+#ifdef PJ_WITH_SCENE2D
   class Scene2DConfigPanel* scene2d_config_panel_ = nullptr;
+#endif
   // Shown when the focused dock holds the 3-icon
   // VisualizationPlaceholderWidget — nothing to configure yet.
   QWidget* empty_dock_page_ = nullptr;

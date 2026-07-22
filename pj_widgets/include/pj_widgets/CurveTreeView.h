@@ -4,10 +4,14 @@
 
 #include <QByteArray>
 #include <QMimeData>
+#ifdef PJ_TARGET_WASM
+#include <QPointer>
+#endif
 #include <QSet>
 #include <QStringList>
 #include <QTreeWidget>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace PJ {
@@ -156,8 +160,10 @@ class CurveTreeView : public QTreeWidget {
   // the catalog-key format, each covering EVERY selected row (not just the row
   // under the cursor). Returns nullptr — and transfers ownership otherwise —
   // when the selection has nothing draggable for `button`. Exposed for tests
-  // because the live drag path ends in a blocking QDrag::exec() that cannot be
-  // driven from a unit test.
+  // because the desktop live drag path ends in a blocking QDrag::exec() that
+  // cannot be driven from a unit test. WASM reuses this payload with a
+  // non-blocking in-app dispatcher (see the wasmDrag* helpers below), which is
+  // covered by the browser (Playwright) suite rather than these native tests.
   [[nodiscard]] QMimeData* createDragMimeData(Qt::MouseButton button) const;
 
   void setValuesColumnHidden(bool hidden);
@@ -190,6 +196,9 @@ class CurveTreeView : public QTreeWidget {
   void placeholderPeekRequested(const QString& catalog_key);
 
  protected:
+#ifdef PJ_TARGET_WASM
+  bool event(QEvent* event) override;
+#endif
   void mousePressEvent(QMouseEvent* event) override;
   void mouseMoveEvent(QMouseEvent* event) override;
   void mouseReleaseEvent(QMouseEvent* event) override;
@@ -239,12 +248,37 @@ class CurveTreeView : public QTreeWidget {
   void updateEmptyMessageChild(QTreeWidgetItem* dataset_node, bool subtree_hidden);
   void setDescendantsExpanded(QTreeWidgetItem* item, bool expanded);
   std::vector<QString> selectedCurveNamesForDrag() const;
+#ifdef PJ_TARGET_WASM
+  // QDrag::exec() needs Qt WASM's Asyncify build because it enters a nested
+  // event loop. The production browser build deliberately avoids Asyncify, so
+  // keep the mouse grab established by the press and dispatch the ordinary Qt
+  // DnD events to the widget under the pointer instead. Drop sites therefore
+  // share their exact MIME validation and mutation paths with desktop. These
+  // helpers are exercised by the browser (Playwright) suite, not native tests.
+  void beginWasmDrag(QMimeData* mime_data, QMouseEvent* event);
+  void updateWasmDrag(const QPoint& global_pos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
+  void finishWasmDrag(QMouseEvent* event);
+  void cancelWasmDrag();
+  void abortWasmDrag(Qt::KeyboardModifiers modifiers);
+  void balanceWasmSourcePress(Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+#endif
 
   QPoint drag_start_pos_;
   Qt::MouseButton drag_button_ = Qt::NoButton;
   std::vector<QString> drag_curve_names_;
   QStringList drag_catalog_keys_;
   bool suppress_next_release_ = false;
+#ifdef PJ_TARGET_WASM
+  std::unique_ptr<QMimeData> wasm_drag_mime_;
+  QPointer<QWidget> wasm_drag_target_;
+  Qt::MouseButton wasm_drag_button_ = Qt::NoButton;
+  // Reentrancy guard for the synchronous drop dispatch: sendEvent into the drop
+  // target runs the drop site's handler inline (e.g. adding a curve rebuilds
+  // this very tree via clearCurves), which can loop back into finishWasmDrag /
+  // beginWasmDrag on the same stack. INVARIANT: while a drop is in flight, no
+  // new drag starts and no nested drop dispatches — those re-entries early-out.
+  bool in_wasm_drop_ = false;
+#endif
   QString last_filter_;
   // setVisibleCurveKinds flags; all true = no type restriction (the default).
   bool show_plot_ = true;

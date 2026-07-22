@@ -29,7 +29,6 @@ add_library(pj_widgets STATIC
     src/ProgressDialog.cpp
     src/RangeSlider.cpp
     src/RasterFrame.cpp
-    src/RasterStreamView.cpp
     src/RecentFilesMenu.cpp
     src/ScrubberBase.cpp
     src/SectionHeaderBand.cpp
@@ -70,7 +69,6 @@ add_library(pj_widgets STATIC
     include/pj_widgets/RealSlider.h
     include/pj_widgets/RangeSlider.h
     include/pj_widgets/RasterFrame.h
-    include/pj_widgets/RasterStreamView.h
     include/pj_widgets/RecentFilesMenu.h
     include/pj_widgets/ScrubberBase.h
     include/pj_widgets/SectionHeaderBand.h
@@ -84,6 +82,14 @@ add_library(pj_widgets STATIC
     include/pj_widgets/ToggleSwitch.h
     include/pj_widgets/VisualizationPlaceholderWidget.h
 )
+
+# The retro helper uses QProcess, QLocalSocket, and QSharedMemory, none of which
+# represent a browser capability. Browser rendering stays in-process.
+if(NOT EMSCRIPTEN)
+    target_sources(pj_widgets PRIVATE
+        src/RasterStreamView.cpp
+        include/pj_widgets/RasterStreamView.h)
+endif()
 
 set_target_properties(pj_widgets PROPERTIES
     AUTOMOC ON
@@ -108,7 +114,7 @@ if(PJ_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-if(PJ_BUILD_DEMOS)
+if(PJ_BUILD_DEMOS AND NOT EMSCRIPTEN)
     add_subdirectory(demos)
 endif()
 

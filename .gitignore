@@ -51,3 +51,7 @@ build_local/
 /.ccache-appimage-docker/
 /.conan2-appimage-docker/
 /build-appimage-docker/
+
+# wasm-reboot local build dirs
+build-desktop/
+build-wasm*/

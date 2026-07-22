@@ -41,6 +41,30 @@ option(PJ_BUILD_TOOLS "Build pj_scene2D dev tools" OFF)
 # engine only costs time on a default/CI build. Configure with
 # -DPJ_BUILD_RASTER_HELPER=ON to build it (also requires the vendored source).
 option(PJ_BUILD_RASTER_HELPER "Build the standalone pj-raster-helper (doomgeneric)" OFF)
+
+# Qt for WebAssembly is selected by the Qt/Emscripten toolchain. Keep this
+# derived from EMSCRIPTEN so a cache option cannot accidentally create a
+# desktop compiler + wasm source-guard combination (or the inverse).
+if(EMSCRIPTEN)
+    set(PJ_TARGET_WASM ON)
+    add_compile_definitions(PJ_TARGET_WASM PJ_STATIC_PLUGINS)
+    option(
+        PJ_WASM_ENABLE_INGRESS_PROBE
+        "Link internal observation probes used by browser acceptance tests"
+        OFF)
+
+    # Qt's wasm_multithread kit links one shared-memory module. Every object in
+    # that module, including FetchContent dependencies with no Qt linkage, must
+    # be compiled with the atomics/bulk-memory feature set selected by
+    # Emscripten's -pthread flag.
+    add_compile_options(-pthread)
+    add_link_options(-pthread)
+
+    # Conan packages in the desktop graph are native binaries. The wasm build
+    # resolves its cross-compiled subset through a pinned FetchContent provider.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmDependencies.cmake)
+endif()
+
 # Foundation build options. PJ_BUILD_TESTS feeds both the plotjuggler_sdk SDK
 # submodule and the pj_datastore module. The rest stay off for the PJ4 app
 # build: the SDK's ported-plugins collection, and pj_datastore's parquet
@@ -49,7 +73,13 @@ option(PJ_BUILD_RASTER_HELPER "Build the standalone pj-raster-helper (doomgeneri
 # Default ON (local and CI builds need the suite); release/packaging
 # pipelines pass -DPJ_BUILD_TESTS=OFF — they never run ctest, and the 271
 # per-fixture static test binaries are ~17 GB of an otherwise ~5 GB tree.
-set(PJ_BUILD_TESTS ON CACHE BOOL "Build foundation (SDK + pj_datastore) tests")
+if(EMSCRIPTEN)
+    set(_PJ_BUILD_TESTS_DEFAULT OFF)
+else()
+    set(_PJ_BUILD_TESTS_DEFAULT ON)
+endif()
+set(PJ_BUILD_TESTS ${_PJ_BUILD_TESTS_DEFAULT} CACHE BOOL "Build foundation (SDK + pj_datastore) tests")
+unset(_PJ_BUILD_TESTS_DEFAULT)
 option(PJ_BUILD_DEMOS "Build the pj_scene3D standalone dev demos" ON)
 set(PJ_BUILD_PARQUET_IMPORT_EXAMPLE OFF CACHE BOOL "" FORCE)
 set(PJ_BUILD_PORTED_PLUGINS OFF CACHE BOOL "" FORCE)
@@ -67,9 +97,15 @@ if(MSVC)
     set(PJ_WARNING_FLAGS /W4 /WX /permissive-)
 else()
     set(PJ_WARNING_FLAGS
-        -Wall -Wextra -Werror -Wshadow -Wnon-virtual-dtor -Wold-style-cast
+        -Wall -Wextra -Wshadow -Wnon-virtual-dtor -Wold-style-cast
         -Wcast-qual -Wconversion -Woverloaded-virtual -Wpedantic
     )
+    # wasm32 makes size_t 32-bit and surfaces the SDK's explicitly tracked
+    # uint64_t ABI conversions. Keep the warnings visible, but do not turn the
+    # cross-compile bring-up into an unrelated warning-cleanup project.
+    if(NOT EMSCRIPTEN)
+        list(APPEND PJ_WARNING_FLAGS -Werror)
+    endif()
 endif()
 
 # Keep frame pointers in all PJ4-owned targets so `perf record --call-graph fp`
@@ -82,7 +118,17 @@ endif()
 # Qt
 # ---------------------------------------------------------------------------
 
-find_package(Qt6 ${PJ_QT_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network OpenGLWidgets Xml Svg SvgWidgets)
+if(EMSCRIPTEN)
+    set(PJ_QT_REQUIRED_VERSION ${PJ_WASM_QT_VERSION})
+    # The installed wasm kit is pinned by versions.env. OpenGLWidgets is
+    # omitted: QOpenGLWidget is unsupported by Qt/WASM and accelerated browser
+    # surfaces are ported to QRhiWidget/WebGL instead.
+    find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS
+        Core Gui GuiPrivate Widgets Concurrent Network Xml Svg SvgWidgets PrintSupport ShaderTools)
+else()
+    set(PJ_QT_REQUIRED_VERSION ${PJ_QT_VERSION})
+    find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network OpenGLWidgets Xml Svg SvgWidgets)
+endif()
 find_package(fmt REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -95,12 +141,23 @@ find_package(fmt REQUIRED)
 # ---------------------------------------------------------------------------
 
 add_subdirectory(plotjuggler_sdk)
+if(EMSCRIPTEN)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmPluginCommon.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmCsv.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmMcap.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmRos.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmProtobuf.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmTransformEditor.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PjWasmDummyStream.cmake)
+endif()
 # pj_datastore: columnar store + DerivedEngine + the data-processor execution
 # substrate (DataProcessor base + ProcessorSisoAdapter, formerly pj_proc).
 add_subdirectory(pj_datastore)
 # pj_scripting: Luau filter engine for Data Processors (self-describing filter
 # classes). Depends on pj_datastore (added above) + Conan Luau. See its CLAUDE.md.
-add_subdirectory(pj_scripting)
+if(NOT EMSCRIPTEN OR PJ_WASM_WITH_LUAU)
+    add_subdirectory(pj_scripting)
+endif()
 
 # ---------------------------------------------------------------------------
 # Vendored third-party
@@ -110,7 +167,8 @@ add_subdirectory(3rdparty/qwt)
 add_subdirectory(3rdparty/nanocdr)
 
 # Qt-Advanced-Docking submodule (PlotJuggler/Qt-Advanced-Docking-System fork
-# tracking upstream master + the Wayland fix on feature/wayland-fix). Pin the
+# tracking upstream master + the Wayland fix + WASM Unix guards on
+# feature/wasm-unix-guards). Pin the
 # version to skip the upstream root CMake's git_describe call (which fails in
 # a submodule checkout), build static, and skip examples/demos.
 set(ADS_VERSION "4.5.0" CACHE STRING "" FORCE)
@@ -145,17 +203,29 @@ endif()
 # ---------------------------------------------------------------------------
 
 # pj_scene2D depends on pj_datastore, which is now always built (above).
-add_subdirectory(pj_scene2D/core)
-add_subdirectory(pj_scene2D/widgets)
+if(NOT EMSCRIPTEN OR PJ_WASM_WITH_SCENE2D)
+    add_subdirectory(pj_scene2D/core)
+    add_subdirectory(pj_scene2D/widgets)
+endif()
 if(PJ_BUILD_TOOLS)
     add_subdirectory(pj_scene2D/tools)
 endif()
-add_subdirectory(pj_scene3D/core)
-add_subdirectory(pj_scene3D/widgets)
-if(PJ_BUILD_DEMOS)
+if(NOT EMSCRIPTEN OR PJ_WASM_WITH_SCENE3D)
+    add_subdirectory(pj_scene3D/core)
+    add_subdirectory(pj_scene3D/widgets)
+endif()
+if(TARGET pj_scene2d_widgets)
+    add_compile_definitions(PJ_WITH_SCENE2D)
+endif()
+if(TARGET pj_scene3d_widgets)
+    add_compile_definitions(PJ_WITH_SCENE3D)
+endif()
+if(PJ_BUILD_DEMOS AND NOT EMSCRIPTEN)
     add_subdirectory(pj_scene3D/demos)
 endif()
-add_subdirectory(pj_marketplace)
+if(NOT EMSCRIPTEN OR PJ_WASM_WITH_MARKETPLACE)
+    add_subdirectory(pj_marketplace)
+endif()
 add_subdirectory(pj_dialog_host)
 add_subdirectory(pj_runtime)
 add_subdirectory(pj_widgets)

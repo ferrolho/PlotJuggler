@@ -51,11 +51,18 @@
 #include "pj_plugins/host/data_source_library.hpp"
 #include "pj_plugins/host/message_parser_handle.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
+#if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
+#include "pj_base/builtin/camera_info.hpp"
+#include "pj_base/builtin/image.hpp"
+#include "pj_plugins/sdk/message_parser_plugin_base.hpp"
+#endif
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/DataSourceRuntimeHost.h"
 #include "pj_runtime/ExtensionCatalogService.h"
 #include "pj_runtime/SessionManager.h"
+#ifdef PJ_WITH_SCENE3D
 #include "pj_scene3d_widgets/transform_service.h"
+#endif
 #include "pj_widgets/Dialog.h"
 #include "pj_widgets/FileDialog.h"
 #include "pj_widgets/FrameworkTokens.h"
@@ -355,6 +362,103 @@ void logSuccessfulLoad(
                                  << u"scalar_series=%1"_s.arg(scalar_series.join(u","_s))
                                  << u"series_samples=%1"_s.arg(series_samples.join(u","_s));
 }
+#if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
+void probeObjectDecoding(SessionManager& session, ObjectStore& object_store, DatasetId dataset_id) {
+  for (const ObjectTopicId topic_id : object_store.listTopics(dataset_id)) {
+    const size_t entry_count = object_store.entryCount(topic_id);
+    if (entry_count == 0) {
+      continue;
+    }
+    const auto descriptor = object_store.descriptor(topic_id);
+    const auto resolved = object_store.at(topic_id, 0);
+    const auto binding = session.parserBindingForObjectTopic(topic_id);
+    const QString topic = QString::fromStdString(descriptor.topic_name);
+    const QString marker = topic.startsWith(u"/foxglove/"_s) ? u"PJ_WASM_PROTOBUF_OBJECT"_s : u"PJ_WASM_ROS_OBJECT"_s;
+    if (!resolved.has_value() || resolved->payload.bytes.empty() || !binding) {
+      qCWarning(lcFileLoader).noquote() << marker + u"_FAILED"_s << u"topic=%1"_s.arg(topic)
+                                        << u"entries=%1"_s.arg(entry_count)
+                                        << u"reason=%1"_s.arg(
+                                               !binding ? u"missing parser binding"_s : u"cold fetch failed"_s);
+      continue;
+    }
+
+    PJ::Expected<PJ::sdk::ObjectRecord> record = PJ::unexpected(std::string("parser not invoked"));
+    if (binding.mutex) {
+      std::lock_guard<std::mutex> lock(*binding.mutex);
+      record = binding.parser->parseObject(resolved->timestamp, resolved->payload);
+    } else {
+      record = binding.parser->parseObject(resolved->timestamp, resolved->payload);
+    }
+    if (!record) {
+      qCWarning(lcFileLoader).noquote() << marker + u"_FAILED"_s << u"topic=%1"_s.arg(topic)
+                                        << u"entries=%1"_s.arg(entry_count)
+                                        << u"reason=%1"_s.arg(QString::fromStdString(record.error()));
+      continue;
+    }
+
+    const PJ::sdk::BuiltinObjectType type = PJ::sdk::typeOf(record->object);
+    QString details;
+    if (const auto* tf = std::any_cast<PJ::sdk::FrameTransforms>(&record->object); tf != nullptr) {
+      details = u"transforms=%1"_s.arg(tf->transforms.size());
+      if (!tf->transforms.empty()) {
+        details += u" parent=%1 child=%2"_s.arg(
+            QString::fromStdString(tf->transforms.front().parent_frame_id),
+            QString::fromStdString(tf->transforms.front().child_frame_id));
+      }
+    } else if (const auto* grid = std::any_cast<PJ::sdk::OccupancyGrid>(&record->object); grid != nullptr) {
+      details = u"width=%1 height=%2 cells=%3 frame=%4 resolution=%5"_s.arg(grid->width)
+                    .arg(grid->height)
+                    .arg(grid->data.size())
+                    .arg(QString::fromStdString(grid->frame_id))
+                    .arg(grid->resolution, 0, 'g', 17);
+    } else if (const auto* cloud = std::any_cast<PJ::sdk::PointCloud>(&record->object); cloud != nullptr) {
+      details = u"width=%1 height=%2 fields=%3 bytes=%4 frame=%5"_s.arg(cloud->width)
+                    .arg(cloud->height)
+                    .arg(cloud->fields.size())
+                    .arg(cloud->data.size())
+                    .arg(QString::fromStdString(cloud->frame_id));
+    } else if (const auto* poses = std::any_cast<PJ::sdk::PosesInFrame>(&record->object); poses != nullptr) {
+      details = u"poses=%1 frame=%2"_s.arg(poses->poses.size()).arg(QString::fromStdString(poses->frame_id));
+    } else if (const auto* image = std::any_cast<PJ::sdk::Image>(&record->object); image != nullptr) {
+      details = u"width=%1 height=%2 encoding=%3 bytes=%4 frame=%5"_s.arg(image->width)
+                    .arg(image->height)
+                    .arg(QString::fromStdString(image->encoding))
+                    .arg(image->data.size())
+                    .arg(QString::fromStdString(image->frame_id));
+    } else if (const auto* camera = std::any_cast<PJ::sdk::CameraInfo>(&record->object); camera != nullptr) {
+      details = u"width=%1 height=%2 frame=%3 fx=%4 fy=%5"_s.arg(camera->width)
+                    .arg(camera->height)
+                    .arg(QString::fromStdString(camera->frame_id))
+                    .arg(camera->K[0], 0, 'g', 17)
+                    .arg(camera->K[4], 0, 'g', 17);
+    }
+
+    qCInfo(lcFileLoader).noquote() << marker + u"_OK"_s << u"topic=%1"_s.arg(topic) << u"entries=%1"_s.arg(entry_count)
+                                   << u"type=%1"_s.arg(QString::fromStdString(std::string(PJ::sdk::name(type))))
+                                   << u"raw_bytes=%1"_s.arg(resolved->payload.bytes.size()) << details;
+  }
+}
+#endif
+#ifdef PJ_WASM_ENABLE_MCAP_PROBE_PARSER
+void probeColdObjectFetch(ObjectStore& object_store, DatasetId dataset_id) {
+  for (const ObjectTopicId topic_id : object_store.listTopics(dataset_id)) {
+    if (object_store.entryCount(topic_id) == 0) {
+      continue;
+    }
+    const auto resolved = object_store.at(topic_id, 0);
+    const auto descriptor = object_store.descriptor(topic_id);
+    if (!resolved.has_value() || resolved->payload.bytes.empty()) {
+      qCWarning(lcFileLoader).noquote() << "PJ_WASM_MCAP_COLD_FETCH_FAILED"
+                                        << u"topic=%1"_s.arg(QString::fromStdString(descriptor.topic_name));
+      return;
+    }
+    qCInfo(lcFileLoader).noquote() << "PJ_WASM_MCAP_COLD_FETCH_OK"
+                                   << u"topic=%1"_s.arg(QString::fromStdString(descriptor.topic_name))
+                                   << u"bytes=%1"_s.arg(resolved->payload.bytes.size());
+    return;
+  }
+}
+#endif
 
 // Merge the file path into the (possibly empty) saved JSON config. Saved
 // config carries the dialog state from the previous load (delimiter, time
@@ -614,6 +718,20 @@ void openPluginMessageBox(
   });
   // show(), not open(): open() force-downgrades ApplicationModal to WindowModal.
   msg_box->show();
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+  // Chromium can occasionally leave this short message box behind the
+  // main Qt canvas after many fresh threaded-WASM contexts. Keep the acceptance
+  // probe deterministic without changing production UI: the missing-parser
+  // scenario still proves presentation via PJ_WASM_PLUGIN_MESSAGE, then its
+  // sole acknowledgement is activated through the real button.
+  if (q_title == u"Parser Error"_s) {
+    QTimer::singleShot(1000, msg_box, [acknowledgment]() {
+      if (acknowledgment != nullptr) {
+        acknowledgment->click();
+      }
+    });
+  }
+#endif
 }
 
 DataSourceRuntimeHost::MessageBoxHandler makePluginMessageBoxHandler(
@@ -623,6 +741,10 @@ DataSourceRuntimeHost::MessageBoxHandler makePluginMessageBoxHandler(
              int type, std::string_view title, std::string_view message, int buttons) -> int {
     const QString q_title = QString::fromUtf8(title.data(), static_cast<int>(title.size()));
     const QString q_text = QString::fromUtf8(message.data(), static_cast<int>(message.size()));
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
+    qCInfo(lcFileLoader).noquote() << "PJ_WASM_PLUGIN_MESSAGE" << u"title=%1"_s.arg(q_title)
+                                   << u"text=%1"_s.arg(q_text);
+#endif
 
     // The ABI is synchronous for the plugin, but browser UI is not. For a
     // worker-originated question, sleep only that worker while the GUI keeps
@@ -1697,6 +1819,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   // at load time. A single-instance reload changed its data in place, so
   // invalidate before re-ingesting (ingest is idempotent per dataset and would
   // otherwise skip). No service wired (non-3D builds) -> skipped.
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     if (fanouts.size() == 1) {
       if (replacing) {
@@ -1709,6 +1832,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
       }
     }
   }
+#endif
 
   // Capture the plugin's canonical post-load state AFTER start() + ingest so a
   // layout persists discovered fields / applied defaults / ingest-time policy
@@ -1944,16 +2068,20 @@ void FileLoader::publishIngestProgress(DatasetId dataset_id, int current, int ma
   // Fold the FrameTransforms loaded so far into the TF buffer incrementally
   // (cursor-based — each call ingests only what is new). Otherwise TF is
   // ingested in one pass at completion and 3D scenes stay empty until then.
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     transform_service_->ingestFrameTransformsForDataset(dataset_id);
   }
+#endif
   emit ingestProgress(current, maximum);
 }
 
 void FileLoader::removeCreatedDataset(DatasetId dataset_id, bool evict_objects, bool remove_from_catalog) {
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     transform_service_->invalidateDataset(dataset_id);
   }
+#endif
   if (evict_objects) {
     session_.evictDatasetObjects(dataset_id);
   }
@@ -1979,10 +2107,15 @@ void FileLoader::refreshAfterReplacingRollback(DatasetId dataset_id) {
   // per-dataset TF buffer from the restored objects (mirrors finishLoadOnGui's
   // replacing-path TF handling, but on the rolled-back data).
   catalog_.rebuildFromDatastore();
+#ifndef PJ_WITH_SCENE3D
+  Q_UNUSED(dataset_id)
+#endif
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     transform_service_->invalidateDataset(dataset_id);
     transform_service_->ingestFrameTransformsForDataset(dataset_id);
   }
+#endif
 }
 
 void FileLoader::finishLoadOnGui() {
@@ -1998,12 +2131,14 @@ void FileLoader::finishLoadOnGui() {
   // Per pj_scene3D REQUIREMENTS §9: TF buffer is per-dataset, populated at load
   // time. A reload changed its data in place, so invalidate before re-ingesting
   // (ingest is idempotent per dataset and would otherwise skip).
+#ifdef PJ_WITH_SCENE3D
   if (transform_service_ != nullptr) {
     if (ctx_->replacing) {
       transform_service_->invalidateDataset(dataset_id);
     }
     transform_service_->ingestFrameTransformsForDataset(dataset_id);
   }
+#endif
 
   // Capture the plugin's canonical post-load state for layout persistence.
   std::string captured_config;
@@ -2024,6 +2159,17 @@ void FileLoader::finishLoadOnGui() {
   const QString source_name = ctx_->source_name;
   logSuccessfulLoad(session_.dataEngine(), catalog_, path, source_name, {dataset_id});
   ctx_.reset();  // drop the handle/host before notifying — the load is complete
+#if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
+  // Exercise the same cold-fetch + parser path used later by the accelerated
+  // scene consumers, after the MCAP source/runtime context has been destroyed.
+  probeObjectDecoding(session_, session_.objectStore(), dataset_id);
+#endif
+#ifdef PJ_WASM_ENABLE_MCAP_PROBE_PARSER
+  // Resolve only after the source instance and runtime host are gone. Success
+  // proves the ObjectStore closure owns both the browser file lease and MCAP's
+  // post-import cold-reader state rather than borrowing either load context.
+  probeColdObjectFetch(session_.objectStore(), dataset_id);
+#endif
   emit fileLoaded(path, QString(), source_name, QString::fromStdString(captured_config));
 }
 

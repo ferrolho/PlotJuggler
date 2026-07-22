@@ -93,6 +93,14 @@ TitleBar::TitleBar(QWidget* parent) : QWidget(parent), ui_(new Ui::TitleBar) {
       w->close();
     }
   });
+
+#ifdef PJ_TARGET_WASM
+  // A browser tab has no host window to minimize/maximize/close — the tab's own
+  // chrome owns that — so the window controls are meaningless here. Hide them.
+  ui_->buttonMinimize->hide();
+  ui_->buttonMaximize->hide();
+  ui_->buttonClose->hide();
+#endif
 }
 
 TitleBar::~TitleBar() {
