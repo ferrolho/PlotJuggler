@@ -119,6 +119,25 @@
     </widget>
    </item>
    <item>
+    <widget class="QToolButton" name="buttonExtensionUpdate">
+     <property name="visible">
+      <bool>false</bool>
+     </property>
+     <property name="focusPolicy">
+      <enum>Qt::FocusPolicy::NoFocus</enum>
+     </property>
+     <property name="cursor">
+      <cursorShape>PointingHandCursor</cursorShape>
+     </property>
+     <property name="toolButtonStyle">
+      <enum>Qt::ToolButtonStyle::ToolButtonTextOnly</enum>
+     </property>
+     <property name="text">
+      <string>UPDATE</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <layout class="QHBoxLayout" name="rightClusterLayout">
      <property name="spacing">
       <number>2</number>

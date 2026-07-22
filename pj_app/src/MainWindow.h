@@ -86,6 +86,7 @@ class Theme;
 class TitleBar;
 class ToastManager;
 class UpdateChecker;
+class RegistryManager;
 class TelemetryPing;
 class CoalescingTrigger;
 
@@ -170,6 +171,15 @@ class MainWindow : public QMainWindow {
   // true = the manual Help ▸ Check for Updates action, which also toasts the
   // "you're up to date" and "couldn't check" outcomes.
   void checkForUpdates(bool interactive);
+
+  // One-shot startup scan for extension/plugin updates (distinct from the app
+  // release check above): fetches the marketplace registry and compares each
+  // entry against the installed version via ExtensionManager::hasUpdate. When
+  // any installed extension has a newer registry version, reveals the magenta
+  // "Update" button in the title bar (tooltip carries the count); clicking it
+  // opens the Marketplace. Fully silent on network/parse failure — no button,
+  // no toast. Lazily creates its own RegistryManager on first call.
+  void checkExtensionUpdates();
 
   // Sends the anonymous daily-user ping (lazily creating the TelemetryPing).
   // Fully silent — no user-facing notification. `installation` is the
@@ -959,6 +969,9 @@ class MainWindow : public QMainWindow {
   QMetaObject::Connection update_available_conn_;
   QMetaObject::Connection up_to_date_conn_;
   QMetaObject::Connection check_failed_conn_;
+  // Registry fetcher for the startup extension-update scan (separate instance
+  // from the Marketplace window's own, so neither aborts the other's fetch).
+  RegistryManager* update_scan_registry_ = nullptr;
   QAction* undo_action_ = nullptr;
   QAction* redo_action_ = nullptr;
   // App-wide QSettings instance injected into each Scene3DDockWidget

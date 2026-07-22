@@ -59,6 +59,11 @@ class TitleBar : public QWidget {
   // label tracks the latest record and the popup observes the buffer.
   void setDiagnosticHistory(DiagnosticHistory* history);
 
+  // Shows/hides the magenta "Update" affordance sitting left of the bell.
+  // count > 0 reveals the button and sets its tooltip to the pluralized
+  // count; count <= 0 hides it. Clicking it emits extensionUpdateRequested().
+  void setExtensionUpdateCount(int count);
+
  signals:
   // Forwarded from buttonNotifications. Kept for callers that still want
   // the raw click event in addition to the built-in popup behaviour.
@@ -67,6 +72,10 @@ class TitleBar : public QWidget {
   // Emitted when the user clicks a card in the diagnostics popup. The
   // owner (MainWindow) opens a frameless detail dialog in response.
   void diagnosticActivated(const DiagnosticRecord& item);
+
+  // Emitted when the user clicks the "Update" button. The owner
+  // (MainWindow) opens the Marketplace and hides the button in response.
+  void extensionUpdateRequested();
 
  public slots:
   void onStylesheetChanged(QString theme);

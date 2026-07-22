@@ -82,6 +82,7 @@ TitleBar::TitleBar(QWidget* parent) : QWidget(parent), ui_(new Ui::TitleBar) {
     diagnostics_popup_->showAt(ui_->buttonNotifications);
     emit notificationsClicked();
   });
+  connect(ui_->buttonExtensionUpdate, &QToolButton::clicked, this, &TitleBar::extensionUpdateRequested);
   connect(ui_->buttonMinimize, &QToolButton::clicked, this, [this]() {
     if (auto* w = window()) {
       w->showMinimized();
@@ -162,6 +163,15 @@ void TitleBar::setDiagnosticHistory(DiagnosticHistory* history) {
   connect(diagnostic_history_, &DiagnosticHistory::recorded, this, &TitleBar::onDiagnosticRecorded);
 }
 
+void TitleBar::setExtensionUpdateCount(int count) {
+  if (count <= 0) {
+    ui_->buttonExtensionUpdate->hide();
+    return;
+  }
+  ui_->buttonExtensionUpdate->setToolTip(tr("%n extension update(s) available", nullptr, count));
+  ui_->buttonExtensionUpdate->show();
+}
+
 void TitleBar::onDiagnosticRecorded(const DiagnosticRecord& /*r*/) {
   // Flip to the "Notifications Active" icon for 5 s. Restarting the
   // timer on each new record means a steady stream of logs keeps the
@@ -211,6 +221,12 @@ void TitleBar::applyIconMetrics() {
     btn->setMaximumSize(button_extent, button_extent);
     btn->setIconSize(icon_sz);
   }
+  // The "Update" button keeps its natural (text) width but matches the square
+  // chrome buttons' height, so it fills the bar like its icon neighbours. The
+  // height is pinned here — not in QSS — because the two must not both constrain
+  // it (a QSS max-height would cap it below button_extent).
+  ui_->buttonExtensionUpdate->setMinimumHeight(button_extent);
+  ui_->buttonExtensionUpdate->setMaximumHeight(button_extent);
   ui_->appIcon->setMinimumHeight(button_extent);
   ui_->appIcon->setMaximumHeight(button_extent);
   ui_->appIcon->setIconSize(icon_sz);

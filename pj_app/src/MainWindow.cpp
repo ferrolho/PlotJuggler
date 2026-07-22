@@ -112,10 +112,12 @@
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/reader.hpp"
 #include "pj_datastore/writer.hpp"
+#include "pj_marketplace/extension_manager.hpp"
 #ifndef PJ_TARGET_WASM
 #include "pj_marketplace/marketplace_window.hpp"
 #endif
 #include "pj_marketplace/qt_diagnostic_bridge.hpp"
+#include "pj_marketplace/registry_manager.hpp"
 #include "pj_plotting/CurveEditor.h"
 #include "pj_plotting/CurveTracker.h"
 #include "pj_plotting/DockWidget.h"
@@ -1730,6 +1732,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
 #endif
   connect(ui_->actionExit, &QAction::triggered, this, &QWidget::close);
 
+  // The title-bar "Update" button is a one-shot: clicking it hides the badge
+  // (per session) and opens the Marketplace where the user applies updates. The
+  // next launch's startup scan decides whether to show it again.
+  connect(title_bar_, &TitleBar::extensionUpdateRequested, this, [this]() {
+    title_bar_->setExtensionUpdateCount(0);
+    onOpenMarketplace();
+  });
+
   // Undo/Redo apply to plot-layout snapshots. They are keyboard-only
   // (Ctrl+Z / Ctrl+Y) and deliberately NOT in any menu. Registering them on
   // the main window via addAction is what makes the shortcuts fire window-wide;
@@ -3026,6 +3036,28 @@ void MainWindow::checkForUpdates(bool interactive) {
 
 void MainWindow::onCheckForUpdates() {
   checkForUpdates(/*interactive=*/true);
+}
+
+void MainWindow::checkExtensionUpdates() {
+  if (update_scan_registry_ == nullptr) {
+    update_scan_registry_ = new RegistryManager(this);
+    // Wired once (the scan runs at most once per launch). A failed fetch
+    // (offline / parse error) leaves the badge hidden — no user-facing noise.
+    connect(update_scan_registry_, &RegistryManager::fetchFinished, this, [this](bool ok) {
+      if (!ok) {
+        return;
+      }
+      const ExtensionManager& manager = session_->extensionCatalog().extensionManager();
+      int updatable = 0;
+      for (const Extension& ext : update_scan_registry_->extensions()) {
+        if (manager.hasUpdate(ext)) {
+          ++updatable;
+        }
+      }
+      title_bar_->setExtensionUpdateCount(updatable);
+    });
+  }
+  update_scan_registry_->fetchRegistry(effectiveRegistryUrl());
 }
 
 void MainWindow::sendTelemetryPing(const QString& installation) {

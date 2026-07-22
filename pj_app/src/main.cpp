@@ -375,6 +375,10 @@ int main(int argc, char* argv[]) {
   if (!parser.isSet(screenshot_option) &&
       QSettings().value(u"Preferences::check_updates_on_startup"_s, true).toBool()) {
     QTimer::singleShot(0, &window, [&window]() { window.checkForUpdates(/*interactive=*/false); });
+    // Same gate: scan the marketplace registry for installed-extension updates
+    // and reveal the title-bar "Update" badge if any are available (silent on
+    // failure). Deferred for the event loop just like the release check.
+    QTimer::singleShot(0, &window, [&window]() { window.checkExtensionUpdates(); });
   }
 
   // Anonymous daily-user ping (see docs/TELEMETRY.md): opt-out via Preferences

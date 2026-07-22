@@ -1403,6 +1403,29 @@ QSlider#timeSlider::handle:horizontal:disabled {
     border: 1px solid ${separation};
 }
 
+/* Extension-update affordance in the title bar (left of the notification bell):
+   a recessed neutral chip — ${neutral_checked} fill reads as a distinct chip on
+   the near-black ${banner} chrome — with ${icon_ink} "Update" text so the label
+   reads in the same ink as the neighbouring chrome icons. Height is pinned to the
+   square chrome buttons' extent in TitleBar::applyIconMetrics (NOT capped here),
+   so it fills the bar like its icon neighbours while still sizing its width to the
+   text. Hidden until the startup registry scan finds an installed extension with a
+   newer registry version. The two-id selector outranks the generic #TitleBar
+   QToolButton chrome rules. */
+#TitleBar QToolButton#buttonExtensionUpdate {
+    background: ${neutral_checked};
+    color: ${icon_ink};
+    border: none;
+    border-radius: ${radius_card}px;
+    padding: 0px ${space_comfortable}px;
+    font-weight: 600;
+}
+
+#TitleBar QToolButton#buttonExtensionUpdate:hover {
+    background: ${neutral_checked_hovered};
+    color: ${icon_ink};
+}
+
 /* --------------------------------------------------------------------------- */
 
 /* Tables read as the data backdrop surface with a
