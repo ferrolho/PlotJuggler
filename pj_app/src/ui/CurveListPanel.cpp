@@ -135,9 +135,9 @@ CurveTreeView::CurvePath treePathFromCatalogItem(
       .topic = item.topic_name,
       .field = scalar != nullptr ? scalar->field_name : QString{},
       .selectable = scalar != nullptr || (advertised != nullptr && !placeholder_is_object),
-      // String fields show their value but can't be plotted, so they aren't
-      // draggable for now (shown read-only in the list).
-      .draggable = !(scalar != nullptr && scalar->is_string),
+      // String fields drag onto the State Transitions strip (plots keep
+      // refusing them via the curveDescriptor gate, so a plot drop is a no-op).
+      .draggable = true,
       .is_image_topic = isImageFamilyObjectType(object_type),
       .is_3d_object_topic = is3dSceneObjectType(object_type),
       .is_placeholder = advertised != nullptr,

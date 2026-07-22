@@ -473,9 +473,14 @@ void DockWidget::onCatalogItemsDropped(const QStringList& keys) {
   }
 
   if (isScalarField(*first_item)) {
-    // A committed object dock (2D/3D) hosts no scalar curves — reject the drop
-    // rather than replacing the object view with a plot.
+    // A committed object dock hosts no plot curves — but a widget that consumes
+    // scalar series itself (the state-transitions strip) may absorb the keys in
+    // place. Refused ⇒ reject the drop rather than replacing the object view.
     if (object_widget_ != nullptr) {
+      if (object_widget_->tryAcceptSeriesKeys(keys)) {
+        emit undoableChange();
+        focusSelf();
+      }
       return;
     }
     // Materialize the plot lazily — only once a dropped key is actually a
@@ -494,7 +499,12 @@ void DockWidget::onCatalogItemsDropped(const QStringList& keys) {
       changed = plot->addCurve(key) != nullptr || changed;
     }
     if (plot == nullptr) {
-      return;  // nothing plottable in the drop — leave the placeholder untouched
+      // Nothing plottable — but a discrete-only drop on an empty tile
+      // materializes the state-transitions strip instead of dying. (Plottable
+      // wins the tie: an integer/bool key creates a plot above and never
+      // reaches here; only strings are discrete-and-not-plottable today.)
+      maybeCreateStateTransitionsFromDrop(keys);
+      return;
     }
     if (changed) {
       plot->zoomOut(true);
@@ -597,6 +607,29 @@ void DockWidget::onCatalogItemsDropped(const QStringList& keys) {
   if (object_widget_ != nullptr && keys.size() > 1) {
     offer_keys_to(object_widget_, /*start_index=*/1);
   }
+  emit undoableChange();
+  focusSelf();
+}
+
+void DockWidget::maybeCreateStateTransitionsFromDrop(const QStringList& keys) {
+  // Only from an empty tile, and only when the drop actually carries a discrete
+  // series; the factory owns construction + wiring (the shell's one construct
+  // site), seeded through the same tryAcceptSeriesKeys hook a mounted strip uses.
+  if (plot_widget_ != nullptr || object_widget_ != nullptr || !object_widget_factory_ || catalog_ == nullptr) {
+    return;
+  }
+  const bool any_discrete =
+      std::ranges::any_of(keys, [this](const QString& key) { return catalog_->isDiscreteKey(key); });
+  if (!any_discrete) {
+    return;
+  }
+  IDataWidget* widget = object_widget_factory_(u"state_transitions"_s, nullptr, this);
+  if (widget == nullptr || widget->widget() == nullptr) {
+    return;  // family not hostable — keep the placeholder affordance
+  }
+  setObjectWidget(widget);
+  setName(u"..."_s);
+  widget->tryAcceptSeriesKeys(keys);
   emit undoableChange();
   focusSelf();
 }

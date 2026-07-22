@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "pj_base/builtin/builtin_object.hpp"
+#include "pj_base/type_tree.hpp"  // PrimitiveType
 #include "pj_datastore/object_store.hpp"
 #include "pj_runtime/CurveDescriptor.h"
 #include "pj_runtime/SessionManager.h"  // DatasetIdentityResolution (returned by value below)
@@ -26,14 +27,78 @@ namespace PJ {
 [[nodiscard]] sdk::BuiltinObjectType objectTypeFromMetadata(std::string_view metadata_json);
 
 // Scalar-field payload: a single value-per-timestamp series read from the data
-// engine. Numeric by default; `is_string` marks a string-typed column, which the
-// curve list shows (with its text value) but excludes from plottable curves().
+// engine. `logical_type` is the column's schema-declared primitive
+// (ColumnDescriptor::logical_type — narrow integer widths survive here even
+// though storage widens them); it decides which consumer families the field
+// belongs to — see isPlottablePrimitive / isDiscretePrimitive.
 struct ScalarFieldPayload {
   QString field_name;
   QString field_path;
   TopicId topic_id = 0;
   std::size_t column_index = 0;
-  bool is_string = false;
+  PrimitiveType logical_type = PrimitiveType::kUnspecified;
+};
+
+// Consumer-family predicates over a scalar column's schema-declared primitive.
+// These are capability filters, NOT a type partition: integers and bool belong
+// to BOTH families (plottable as numeric curves AND displayable as discrete
+// state series); floats are plottable-only, strings discrete-only. Exhaustive
+// switches with no default, so a new PrimitiveType fails to compile here
+// instead of silently landing in neither family.
+[[nodiscard]] constexpr bool isPlottablePrimitive(PrimitiveType type) noexcept {
+  switch (type) {
+    case PrimitiveType::kFloat32:
+    case PrimitiveType::kFloat64:
+    case PrimitiveType::kInt8:
+    case PrimitiveType::kInt16:
+    case PrimitiveType::kInt32:
+    case PrimitiveType::kInt64:
+    case PrimitiveType::kUint8:
+    case PrimitiveType::kUint16:
+    case PrimitiveType::kUint32:
+    case PrimitiveType::kUint64:
+    case PrimitiveType::kBool:
+      return true;
+    case PrimitiveType::kString:
+    case PrimitiveType::kUnspecified:
+      return false;
+  }
+  return false;
+}
+
+// Discrete = the values form a finite label set a state-series consumer (the
+// State Transitions strip) can display: strings, every integer width, and
+// bool. Floats are excluded by design — a continuous value would emit one
+// state segment per sample.
+[[nodiscard]] constexpr bool isDiscretePrimitive(PrimitiveType type) noexcept {
+  switch (type) {
+    case PrimitiveType::kString:
+    case PrimitiveType::kInt8:
+    case PrimitiveType::kInt16:
+    case PrimitiveType::kInt32:
+    case PrimitiveType::kInt64:
+    case PrimitiveType::kUint8:
+    case PrimitiveType::kUint16:
+    case PrimitiveType::kUint32:
+    case PrimitiveType::kUint64:
+    case PrimitiveType::kBool:
+      return true;
+    case PrimitiveType::kFloat32:
+    case PrimitiveType::kFloat64:
+    case PrimitiveType::kUnspecified:
+      return false;
+  }
+  return false;
+}
+
+// Which consumer family a saved series identity may (re)bind to — the resolver
+// filter of resolveCurveKey / descriptorForPath. A capability selector over the
+// predicates above, so the overlap is deliberate: a strip series saved against
+// a string field rebinds fine onto an integer field at the same path after a
+// reload (both are kDiscrete), while a plot curve can never bind a string.
+enum class SeriesCapability : uint8_t {
+  kPlottable,  // numeric curves a plot can draw (floats, integers, bool)
+  kDiscrete,   // state series the strip can display (strings, integers, bool)
 };
 
 // Object-topic payload: time-indexed canonical-object stream from the object
@@ -155,6 +220,11 @@ class CatalogModel : public QObject {
   // The value column reads it via stringValueAt instead of scalarValueAt.
   [[nodiscard]] bool isStringKey(const QString& key) const;
 
+  // True iff `key` names a scalar field the State Transitions strip can display
+  // (string / integer / bool — see isDiscretePrimitive). Superset of
+  // isStringKey; overlaps the plottable family on integers and bools.
+  [[nodiscard]] bool isDiscreteKey(const QString& key) const;
+
   // Latest string value at or before display-axis time `display_seconds` for the
   // string curve `key` (zero-order hold). nullopt when the key is unknown / not a
   // string field, or no sample exists at or before that time. The string sibling
@@ -162,7 +232,12 @@ class CatalogModel : public QObject {
   [[nodiscard]] std::optional<QString> stringValueAt(const QString& key, double display_seconds) const;
 
   std::vector<CurveDescriptor> curves() const;
-  [[nodiscard]] std::optional<CurveDescriptor> curveDescriptor(const QString& key) const;
+  // The descriptor for `key` when its field satisfies `capability`; nullopt
+  // otherwise. The kPlottable default is the plot-side gate ("string keys have
+  // no curve descriptor"); the strip passes kDiscrete to build its row
+  // descriptors through the same single constructor.
+  [[nodiscard]] std::optional<CurveDescriptor> curveDescriptor(
+      const QString& key, SeriesCapability capability = SeriesCapability::kPlottable) const;
 
   // Loaded datasets as (id, display name) pairs, ordered by load (dataset id
   // ascending). Derived from current catalog contents.
@@ -189,10 +264,12 @@ class CatalogModel : public QObject {
   //   * Unqualified (legacy/generic): bind only when topic+field is globally
   //     unique across datasets.
   // Returns nullopt when there is no session, when the intended dataset lacks the
-  // series, or when the candidates are ambiguous.
+  // series, or when the candidates are ambiguous. `capability` selects the
+  // consumer family the identity may bind to (see SeriesCapability) — a plot
+  // curve can never bind a string field, a strip series can never bind a float.
   [[nodiscard]] std::optional<QString> resolveCurveKey(
       DatasetId saved_id, const QString& saved_source, const QString& saved_path, const QString& topic,
-      const QString& field) const;
+      const QString& field, SeriesCapability capability = SeriesCapability::kPlottable) const;
 
   // Resolves the same persisted (id, raw-source, full-path) identity used by
   // scene widgets (delegates to SessionManager::resolveDatasetIdentity — see
@@ -205,11 +282,13 @@ class CatalogModel : public QObject {
   // there is no session or the dataset has no file-backed path.
   [[nodiscard]] QString datasetSourcePath(DatasetId dataset_id) const;
 
-  // Resolves a stable topic+field path to the matching scalar curve within a
+  // Resolves a stable topic+field path to the matching scalar field within a
   // specific dataset. Lets a layout rebind across similar datasets where the
   // opaque per-load key differs but the topic/field path is identical.
+  // `capability` selects which consumer family may match (see SeriesCapability).
   [[nodiscard]] std::optional<CurveDescriptor> descriptorForPath(
-      DatasetId dataset_id, const QString& topic, const QString& field) const;
+      DatasetId dataset_id, const QString& topic, const QString& field,
+      SeriesCapability capability = SeriesCapability::kPlottable) const;
 
   // Clears the whole catalog. With tombstone=true (default) every dataset id is recorded
   // so a later rebuildFromDatastore stays empty while data still lingers in the engine;

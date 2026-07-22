@@ -5,6 +5,7 @@
 #include <QDomDocument>
 #include <QDomElement>
 #include <QString>
+#include <QStringList>
 
 #include "pj_base/builtin/builtin_object.hpp"
 #include "pj_datastore/object_store.hpp"
@@ -50,6 +51,16 @@ class IDataWidget {
   // accept compatible types in place. Return true if the topic was accepted.
   virtual bool tryAcceptObjectTopic(
       ObjectTopicId /*topic_id*/, sdk::BuiltinObjectType /*object_type*/, const QString& /*title*/) {
+    return false;
+  }
+
+  // Optional hook, sibling of tryAcceptObjectTopic for SCALAR catalog keys: a
+  // host (DockWidget) offers the keys of a curve-list drop to a mounted widget
+  // that consumes scalar series itself (the state-transitions strip takes
+  // discrete series this way). The widget filters to the keys it can host and
+  // returns whether it accepted any. Default = refuse, preserving the
+  // historical scalar-drop behavior (plots are built by the host, not offered).
+  virtual bool tryAcceptSeriesKeys(const QStringList& /*catalog_keys*/) {
     return false;
   }
 

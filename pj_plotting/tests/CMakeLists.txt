@@ -23,6 +23,48 @@ target_link_libraries(plot_sample_reducer_test PRIVATE
 
 add_test(NAME PlotSampleReducerTest COMMAND plot_sample_reducer_test)
 
+add_executable(state_series_adapter_test
+    state_series_adapter_test.cpp
+)
+
+target_link_libraries(state_series_adapter_test PRIVATE
+    pj_plotting_core
+    GTest::gtest_main
+)
+
+add_test(NAME StateSeriesAdapterTest COMMAND state_series_adapter_test)
+
+# GUI test: the controller drives a real StateTransitionsView (QApplication).
+find_package(Qt6 REQUIRED COMPONENTS Test)
+add_executable(state_transitions_controller_test
+    state_transitions_controller_test.cpp
+)
+set_target_properties(state_transitions_controller_test PROPERTIES AUTOMOC ON)
+
+target_link_libraries(state_transitions_controller_test PRIVATE
+    pj_plotting
+    GTest::gtest_main
+    Qt6::Test
+    Qt6::Widgets
+)
+
+add_test(NAME StateTransitionsControllerTest COMMAND state_transitions_controller_test)
+
+# GUI test: dock-widget persistence + drop seeding (QApplication).
+add_executable(state_transitions_dock_widget_test
+    state_transitions_dock_widget_test.cpp
+)
+set_target_properties(state_transitions_dock_widget_test PROPERTIES AUTOMOC ON)
+
+target_link_libraries(state_transitions_dock_widget_test PRIVATE
+    pj_plotting
+    GTest::gtest_main
+    Qt6::Test
+    Qt6::Widgets
+)
+
+add_test(NAME StateTransitionsDockWidgetTest COMMAND state_transitions_dock_widget_test)
+
 add_executable(filtered_curve_adapter_test
     filtered_curve_adapter_test.cpp
 )

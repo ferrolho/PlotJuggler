@@ -783,7 +783,7 @@ TEST(CatalogModelTest, StringFieldIsCatalogedAsScalarReadableButNotPlottable) {
   for (const auto& item : items) {
     const auto* scalar = PJ::asScalarField(item);
     ASSERT_NE(scalar, nullptr);
-    (scalar->is_string ? string_key : numeric_key) = item.key;
+    (scalar->logical_type == PJ::PrimitiveType::kString ? string_key : numeric_key) = item.key;
   }
   ASSERT_FALSE(numeric_key.isEmpty());
   ASSERT_FALSE(string_key.isEmpty());
@@ -815,6 +815,96 @@ TEST(CatalogModelTest, StringFieldIsCatalogedAsScalarReadableButNotPlottable) {
   EXPECT_DOUBLE_EQ(*numeric_value, 10.0);
   EXPECT_FALSE(catalog.scalarValueAt(string_key, displayOf(2'500'000'000)).has_value());
   EXPECT_FALSE(catalog.stringValueAt(numeric_key, displayOf(2'500'000'000)).has_value());
+}
+
+// The two consumer families over one topic carrying every kind of field:
+// integers/bool are BOTH plottable and discrete, floats plottable-only,
+// strings discrete-only — and the resolver's SeriesCapability enforces exactly
+// that split, with no type attribute persisted anywhere.
+TEST(CatalogModelTest, CapabilityMatrixSplitsPlottableAndDiscrete) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+
+  auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "mixed.mcap"});
+  ASSERT_TRUE(dataset.has_value()) << dataset.error();
+
+  PJ::DataWriter writer = session.dataEngine().createWriter();
+  auto schema = PJ::makeStruct(
+      "mixed", {
+                   PJ::makePrimitive("speed", PJ::PrimitiveType::kFloat64),
+                   PJ::makePrimitive("mode", PJ::PrimitiveType::kInt32),
+                   PJ::makePrimitive("level", PJ::PrimitiveType::kUint8),  // narrow width — must surface too
+                   PJ::makePrimitive("estop", PJ::PrimitiveType::kBool),
+                   PJ::makePrimitive("label", PJ::PrimitiveType::kString),
+               });
+  auto schema_or = writer.registerSchema("mixed", schema);
+  ASSERT_TRUE(schema_or.has_value()) << schema_or.error();
+  PJ::TopicDescriptor descriptor;
+  descriptor.name = "/robot/status";
+  descriptor.schema_id = *schema_or;
+  auto topic_or = writer.registerTopic(*dataset, descriptor);
+  ASSERT_TRUE(topic_or.has_value()) << topic_or.error();
+  ASSERT_TRUE(writer.bindTopicWriter(*topic_or).has_value());
+  ASSERT_TRUE(writer.beginRow(*topic_or, 1'000'000'000).has_value());
+  writer.set(*topic_or, 0, 1.5);
+  writer.set(*topic_or, 1, static_cast<int32_t>(2));
+  writer.set(*topic_or, 2, static_cast<uint64_t>(3));
+  writer.set(*topic_or, 3, true);
+  writer.set(*topic_or, 4, std::string_view{"OK"});
+  ASSERT_TRUE(writer.finishRow(*topic_or).has_value());
+  ASSERT_FALSE(session.commitChunks(writer.flushAll()).empty());
+
+  // Every field surfaces (narrow integer widths included); only the string is
+  // excluded from plottable curves.
+  ASSERT_EQ(catalog.items().size(), 5U);
+  EXPECT_EQ(catalog.curves().size(), 4U);
+
+  QHash<QString, QString> key_by_field;
+  for (const PJ::CatalogItem& item : catalog.items()) {
+    const auto* scalar = PJ::asScalarField(item);
+    ASSERT_NE(scalar, nullptr);
+    key_by_field.insert(scalar->field_path, item.key);
+  }
+  EXPECT_FALSE(catalog.isDiscreteKey(key_by_field[u"speed"_s]));
+  EXPECT_TRUE(catalog.isDiscreteKey(key_by_field[u"mode"_s]));
+  EXPECT_TRUE(catalog.isDiscreteKey(key_by_field[u"level"_s]));
+  EXPECT_TRUE(catalog.isDiscreteKey(key_by_field[u"estop"_s]));
+  EXPECT_TRUE(catalog.isDiscreteKey(key_by_field[u"label"_s]));
+  EXPECT_TRUE(catalog.isStringKey(key_by_field[u"label"_s]));
+  EXPECT_FALSE(catalog.isStringKey(key_by_field[u"mode"_s]));
+  EXPECT_TRUE(catalog.curveDescriptor(key_by_field[u"level"_s]).has_value());
+  EXPECT_FALSE(catalog.curveDescriptor(key_by_field[u"label"_s]).has_value());
+
+  // Resolver capability filter: kDiscrete binds string/int/bool but never the
+  // float; the kPlottable default binds the float but never the string.
+  const auto resolve = [&](const QString& field, PJ::SeriesCapability capability) {
+    return catalog.resolveCurveKey(*dataset, u"mixed.mcap"_s, {}, u"/robot/status"_s, field, capability);
+  };
+  EXPECT_TRUE(resolve(u"label"_s, PJ::SeriesCapability::kDiscrete).has_value());
+  EXPECT_TRUE(resolve(u"mode"_s, PJ::SeriesCapability::kDiscrete).has_value());
+  EXPECT_TRUE(resolve(u"estop"_s, PJ::SeriesCapability::kDiscrete).has_value());
+  EXPECT_FALSE(resolve(u"speed"_s, PJ::SeriesCapability::kDiscrete).has_value());
+  EXPECT_TRUE(resolve(u"speed"_s, PJ::SeriesCapability::kPlottable).has_value());
+  EXPECT_FALSE(resolve(u"label"_s, PJ::SeriesCapability::kPlottable).has_value());
+  EXPECT_TRUE(resolve(u"mode"_s, PJ::SeriesCapability::kPlottable).has_value());
+
+  // The capability filter must hold on every resolver tier, not just the
+  // id-qualified one: a reminted DatasetId (dead saved id + live full path)
+  // goes through the path leg, an unqualified legacy layout through the
+  // global-unique scan — both are what a strip layout restore hits after a
+  // same-file reload.
+  session.setDatasetSourcePath(*dataset, u"/data/mixed.mcap"_s);
+  const auto by_path = catalog.resolveCurveKey(
+      999, u"gone.mcap"_s, u"/data/mixed.mcap"_s, u"/robot/status"_s, u"label"_s, PJ::SeriesCapability::kDiscrete);
+  EXPECT_TRUE(by_path.has_value());
+  EXPECT_FALSE(catalog
+                   .resolveCurveKey(
+                       999, u"gone.mcap"_s, u"/data/mixed.mcap"_s, u"/robot/status"_s, u"label"_s,
+                       PJ::SeriesCapability::kPlottable)
+                   .has_value());
+  const auto unqualified =
+      catalog.resolveCurveKey(0, {}, {}, u"/robot/status"_s, u"label"_s, PJ::SeriesCapability::kDiscrete);
+  EXPECT_TRUE(unqualified.has_value());
 }
 
 // --- Advertised (available-but-unsubscribed) placeholders (per-topic pause) ---

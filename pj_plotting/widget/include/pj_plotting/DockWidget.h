@@ -132,6 +132,10 @@ class DockWidget : public ads::CDockWidget, public IDataWidget {
   bool eventFilter(QObject* watched, QEvent* event) override;
   DockWidget* splitInto(ads::DockWidgetArea area, PlotWidget* plot);
   PlotWidget* ensurePlotWidget();
+  // A discrete-only curve drop (no plottable key) on an empty tile materializes
+  // the state-transitions strip via the factory and seeds it through
+  // IDataWidget::tryAcceptSeriesKeys.
+  void maybeCreateStateTransitionsFromDrop(const QStringList& keys);
   void clearCurrentContent(bool delete_content);
   void installObjectContextMenuFilter(QWidget* root);
   void removeObjectContextMenuFilter(QWidget* root);

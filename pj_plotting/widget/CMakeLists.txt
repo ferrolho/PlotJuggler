@@ -25,6 +25,8 @@ add_library(pj_plotting STATIC
     src/PlotWidgetBase.cpp
     src/PlotZoomer.cpp
     src/RasterTextEngine.cpp
+    src/StateTransitionsController.cpp
+    src/StateTransitionsDockWidget.cpp
     src/TabbedPlotWidget.cpp
     src/WidgetClipboard.cpp
     src/XYCurveDialog.cpp
@@ -47,6 +49,8 @@ add_library(pj_plotting STATIC
     include/pj_plotting/PlotWidgetBase.h
     include/pj_plotting/PlotZoomer.h
     include/pj_plotting/RasterTextEngine.h
+    include/pj_plotting/StateTransitionsController.h
+    include/pj_plotting/StateTransitionsDockWidget.h
     include/pj_plotting/TabbedPlotWidget.h
 )
 

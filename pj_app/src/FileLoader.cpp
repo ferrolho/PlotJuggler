@@ -337,7 +337,7 @@ void logSuccessfulLoad(
       }
       const QString series_name = item.topic_name + u"/"_s + field->field_path;
       scalar_series.push_back(series_name);
-      if (!field->is_string) {
+      if (isPlottablePrimitive(field->logical_type)) {
         auto series_or = reader.series(field->topic_id, field->column_index);
         if (series_or.has_value() && !series_or->empty()) {
           const auto first = series_or->sampleAt(0);

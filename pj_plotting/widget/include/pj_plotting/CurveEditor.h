@@ -21,6 +21,7 @@ namespace PJ {
 
 class ColorPickerPopup;
 class PlotWidget;
+class StateTransitionsController;
 
 // Side panel listing the curves of a single PlotWidget. One row per
 // curve: color swatch (click for picker) | name | visibility eye |
@@ -40,6 +41,12 @@ class CurveEditor : public QWidget {
   ~CurveEditor() override;
 
   void setPlot(PlotWidget* plot);
+
+  /// Alternative binding: the SAME table lists a State Transitions strip's
+  /// series — name | eye | trash, with NO color swatch (state colors are
+  /// hash-derived, not editable). A non-null bind here releases the plot
+  /// binding and vice versa; a null only releases the strip binding.
+  void setStateTransitions(StateTransitionsController* controller);
 
   [[nodiscard]] PlotWidget* plot() const noexcept {
     return plot_;
@@ -90,6 +97,10 @@ class CurveEditor : public QWidget {
 
   Ui::CurveEditor* ui_;
   PlotWidget* plot_ = nullptr;
+  // The strip binding (see setStateTransitions); mutually exclusive with plot_.
+  StateTransitionsController* state_controller_ = nullptr;
+  QMetaObject::Connection state_series_connection_;
+  QMetaObject::Connection state_destroyed_connection_;
   // Tracks the active theme so per-row visibility-toggle icons can be
   // rendered in the right ink at row-creation time without having to
   // walk back up to qApp / Theme. Updated via onStylesheetChanged.

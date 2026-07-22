@@ -36,6 +36,7 @@
 #include <optional>
 #include <utility>
 
+#include "TimelineItems.h"
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/Hatch.h"
 #include "pj_widgets/Scrollbar.h"
@@ -52,15 +53,6 @@ namespace {
 constexpr double kMinPxPerNs = 1e-12;
 constexpr double kMaxPxPerNs = 1e-1;
 constexpr int kMaxTicks = 10000;  // runaway guard
-
-theme::Theme frameworkTheme() {
-  const QColor window = QGuiApplication::palette().color(QPalette::Window);
-  return theme::themeFor(window.lightness() >= 128);
-}
-
-QColor timelineBackdrop() {
-  return theme::surface(theme::Surface::DataBackdrop, frameworkTheme());
-}
 
 // Human-friendly tick intervals in ns: 100 us / 200 us / 500 us / 1/2/5/10/20/50 ms ... up to 1 h.
 constexpr std::array<qint64, 23> kTickLadder = {
@@ -90,6 +82,11 @@ qint64 ceilToMultiple(qint64 value, qint64 interval) noexcept {
   return (value > 0) ? floored + interval : floored;
 }
 }  // namespace
+
+// Shared time-strip theme helpers (TimelineItems.h), pulled to this scope so the
+// widget code below keeps its unqualified call sites.
+using timeline_detail::frameworkTheme;
+using timeline_detail::timelineBackdrop;
 
 void TimelineScene::setTracks(std::vector<TimelineSpanInput> tracks) {
   tracks_ = std::move(tracks);
@@ -254,60 +251,6 @@ TimelineScene::EdgeSnap TimelineScene::snapToEdges(
 
 namespace timeline_detail {
 
-namespace {
-// Chrono-derived (no drift from the unit it measures); kSecondNs == 1e9.
-constexpr qint64 kSecondNs = std::chrono::nanoseconds::period::den;
-constexpr qint64 kMillisecondNs = kSecondNs / 1000;
-constexpr qint64 kMinuteNs = 60 * kSecondNs;
-constexpr qint64 kHourNs = 60 * kMinuteNs;
-
-// Absolute Unix-timestamp label (seconds) for a display-ns value read as epoch
-// ns — the SAME value the plot axis shows in absolute mode (not a wall-clock
-// HH:mm:ss, which would be timezone-dependent and hide the absolute value). The
-// value is ROUNDED to the nearest millisecond — matching the playback readout's
-// QString::number('f', 3) rounding, NOT truncated (truncation read a ms low and
-// made the timeline disagree with playback by 0.001 s). Integer math (with carry
-// into seconds) keeps it exact at epoch scale. `fixed_ms` forces a 3-decimal
-// fraction even on a whole second (the marker pills, so they match the playback
-// readout character-for-character); the ruler leaves it off for clean tick labels.
-inline QString formatAbsoluteSeconds(qint64 epoch_ns, bool fixed_ms = false) {
-  const qint64 half_ms = kMillisecondNs / 2;
-  const qint64 total_ms = (epoch_ns + (epoch_ns >= 0 ? half_ms : -half_ms)) / kMillisecondNs;
-  const qint64 sec = total_ms / 1000;
-  const qint64 ms = (total_ms < 0 ? -total_ms : total_ms) % 1000;
-  if (ms == 0 && !fixed_ms) {
-    return QString::number(sec);
-  }
-  return u"%1.%2"_s.arg(sec).arg(ms, 3, 10, QChar('0'));
-}
-
-// Theme-derived timeline colours. A self-painting data view reads the same
-// framework data-backdrop/outline/text tokens used by stylesheet-driven views.
-struct TimelineColors {
-  QColor bg;          // rows + ruler background
-  QColor ruler_data;  // subtle tint over the data (OR) span
-  QColor grid_line;   // faint full-height tick gridlines
-  // (the empty-area diagonal hatch ink comes from the shared PJ::appHatchColor())
-  QColor text;          // frame numbers + bar labels — "like any other text"
-  QColor ruler_border;  // ruler bottom separator
-  QColor bar_border;    // bar outline
-};
-
-TimelineColors timelineColors() {
-  const auto fw_theme = frameworkTheme();
-  const QColor bg = theme::surface(theme::Surface::DataBackdrop, fw_theme);
-  const QColor text = theme::onSurface(theme::Surface::DataBackdrop, theme::Emphasis::Default, fw_theme);
-  return {
-      .bg = bg,
-      .ruler_data = theme::overlay(theme::Overlay::Selected, fw_theme),
-      .grid_line = theme::surface(PJ::theme::Surface::Separation, fw_theme),
-      .text = text,
-      .ruler_border = theme::surface(PJ::theme::Surface::Separation, fw_theme),
-      .bar_border = theme::surface(PJ::theme::Surface::Separation, fw_theme),
-  };
-}
-}  // namespace
-
 /// One source rendered as a draggable bar. Ported from the PJ3 prototype's
 /// TopicItem and rebound: it no longer reads a model — the widget feeds it pixel
 /// geometry (from TimelineScene::barSpan) plus the SourceId/label/color for
@@ -366,20 +309,11 @@ class TimelineBarItem : public QGraphicsRectItem {
     // Dim the fill while a drag preview is active so the original position stays
     // legible underneath the moving ghost.
     fill.setAlphaF(std::abs(ghost_dx_px_) < 0.001 ? 0.8f : 0.5f);
-    painter->setBrush(fill);
 
     // Selected/grouped bars get a slightly heavier accent border as a hint.
     QPen border(highlighted_ ? theme::surface(PJ::theme::Surface::Separation, frameworkTheme()) : col.bar_border);
     border.setWidth(highlighted_ ? 2 : 1);
-    painter->setPen(border);
-    painter->drawRect(r);
-
-    if (r.width() > 8.0) {
-      const QFontMetricsF fm(painter->font());
-      const QString text = fm.elidedText(label_, Qt::ElideRight, r.width() - 6.0);
-      painter->setPen(col.text);
-      painter->drawText(r.adjusted(4, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
-    }
+    paintTimelineBar(painter, r, fill, border, label_);
   }
 
  private:
@@ -388,352 +322,6 @@ class TimelineBarItem : public QGraphicsRectItem {
   QColor fill_;
   double ghost_dx_px_ = 0.0;
   bool highlighted_ = false;
-};
-
-/// Time ruler row across the top of the timeline. Ported from the prototype's
-/// TimeRulerItem, rebound to render a core-computed TimelineRuler (tick positions
-/// + the chosen interval) rather than recomputing the tick ladder itself. Tick
-/// x's are mapped through the same viewport the bars use, so labels line up.
-class TimelineRulerItem : public QGraphicsItem {
- public:
-  static constexpr double kRulerHeight = 18.0;  // compact header (Blender-style)
-
-  TimelineRulerItem() {
-    setZValue(100);
-  }
-
-  /// Lay out for the current viewport: `width_px` visible width, `ruler` the
-  /// core's tick layout, `epoch_ns` the display-ns subtracted from labels so they
-  /// read 0:00 at the scene origin, and [data_min_ns, data_max_ns] the span
-  /// covered by data (the union of all datasets) — tinted distinctly from the
-  /// empty buffer. Pass data_max <= data_min for "no data" (no tint).
-  void setLayout(
-      const TimelineViewport& viewport, double width_px, const TimelineRuler& ruler, qint64 epoch_ns,
-      qint64 data_min_ns, qint64 data_max_ns) {
-    prepareGeometryChange();
-    viewport_ = viewport;
-    width_px_ = width_px;
-    ruler_ = ruler;
-    epoch_ns_ = epoch_ns;
-    data_min_ns_ = data_min_ns;
-    data_max_ns_ = data_max_ns;
-    update();
-  }
-
-  /// Switch tick labels between elapsed (false) and absolute wall-clock (true).
-  /// Pure relabel — tick positions/layout are unchanged, so just repaint.
-  void setAbsoluteFormat(bool absolute) {
-    if (absolute_ != absolute) {
-      absolute_ = absolute;
-      update();
-    }
-  }
-
-  /// Update only the tinted data span (display-ns), keeping the rest of the
-  /// layout — used to track the band live during a bar drag without a rebuild.
-  void setDataSpan(qint64 data_min_ns, qint64 data_max_ns) {
-    data_min_ns_ = data_min_ns;
-    data_max_ns_ = data_max_ns;
-    update();
-  }
-
-  [[nodiscard]] QRectF boundingRect() const override {
-    return QRectF(0, 0, width_px_, kRulerHeight);
-  }
-
-  void paint(QPainter* painter, const QStyleOptionGraphicsItem* /*option*/, QWidget* /*widget*/) override {
-    const TimelineColors col = timelineColors();
-    painter->fillRect(boundingRect(), col.bg);
-    // Subtle tint over the data-covered span (earliest start .. latest end — the
-    // union/"OR" region) so the ±buffer padding still reads as empty up here too.
-    if (data_max_ns_ > data_min_ns_) {
-      const double x0 = TimelineScene::nsToPx(data_min_ns_, viewport_);
-      const double x1 = TimelineScene::nsToPx(data_max_ns_, viewport_);
-      painter->fillRect(QRectF(x0, 0, x1 - x0, kRulerHeight), col.ruler_data);
-    }
-    // Thin bottom separator; the full-height tick gridlines are drawn by the
-    // background item below, so the header itself stays uncluttered.
-    painter->setPen(col.ruler_border);
-    painter->drawLine(QLineF(0, kRulerHeight - 0.5, width_px_, kRulerHeight - 0.5));
-
-    // Compact frame numbers: small, centered over each tick's gridline, vertically
-    // centered in the thin header (Blender-style — no large tick stubs).
-    QFont font = painter->font();
-    font.setPixelSize(11);
-    painter->setFont(font);
-    const QFontMetricsF fm(font);
-    const double baseline = (kRulerHeight + fm.ascent() - fm.descent()) / 2.0;
-    for (const qint64 tick : ruler_.ticks_ns) {
-      const double x = TimelineScene::nsToPx(tick, viewport_);
-      // The full-height gridline (drawn by the background item, starting flush
-      // under this separator) is the tick — the ruler shows only the number,
-      // horizontally centered on the gridline (no nub poking up through the
-      // separator line). Absolute mode shows the tick's epoch-ns as a unix timestamp.
-      const QString label = absolute_ ? formatAbsoluteSeconds(tick) : formatLabel(tick - epoch_ns_);
-      const double tw = fm.horizontalAdvance(label);
-      painter->setPen(col.text);
-      painter->drawText(QPointF(x - (tw / 2.0), baseline), label);
-    }
-  }
-
- private:
-  static QString formatLabel(qint64 ns_relative) {
-    // Pick the format from the value's magnitude (not the tick interval) so labels
-    // stay readable whether the visible span is milliseconds or hours.
-    const qint64 abs_ns = std::abs(ns_relative);
-    if (abs_ns >= kHourNs) {
-      const qint64 sec = ns_relative / kSecondNs;
-      const qint64 hh = sec / 3600;
-      const qint64 mm = (sec / 60) % 60;
-      return QString("%1:%2").arg(hh).arg(mm, 2, 10, QChar('0'));
-    }
-    if (abs_ns >= kMinuteNs) {
-      const qint64 sec = ns_relative / kSecondNs;
-      const qint64 mm = sec / 60;
-      const qint64 ss = sec % 60;
-      return QString("%1:%2").arg(mm).arg(ss, 2, 10, QChar('0'));
-    }
-    if (abs_ns >= kSecondNs) {
-      return QString::number(static_cast<double>(ns_relative) / static_cast<double>(kSecondNs), 'f', 1) + "s";
-    }
-    return QString::number(static_cast<double>(ns_relative) / static_cast<double>(kMillisecondNs), 'f', 1) + "ms";
-  }
-
-  TimelineViewport viewport_;
-  double width_px_ = 0.0;
-  TimelineRuler ruler_;
-  qint64 epoch_ns_ = 0;
-  qint64 data_min_ns_ = 0;  // data-covered span (display-ns); data_max_<=data_min_ means "no data"
-  qint64 data_max_ns_ = 0;
-  bool absolute_ = false;  // tick labels: false = elapsed (epoch_ns_-relative), true = wall-clock
-};
-
-/// Vertical marker needle, used for both the playhead and the reference line. No
-/// top handle/arrow: the line starts at the header bottom (just below the frame
-/// numbers — never overlapping the text) and runs down through the rows. Idle it
-/// paints `idle_color_`, under the cursor it lifts to `hovered_color_`, and while
-/// grabbed it darkens to `grabbed_color_` and shows a current-time pill in the
-/// header, on the SAME baseline/font as the ruler numbers (so the number lines
-/// up). A ±6px column stays grabbable for seek-drags.
-class TimelineNeedleItem : public QGraphicsItem {
- public:
-  static constexpr double kGrabHalfWidth = 6.0;
-  static constexpr double kPillHalfWidth = 52.0;  // paint room for the timestamp pill
-
-  TimelineNeedleItem(
-      const QColor& idle_color, const QColor& hovered_color, const QColor& grabbed_color,
-      const QColor& grabbed_text_color)
-      : idle_color_(idle_color),
-        hovered_color_(hovered_color),
-        grabbed_color_(grabbed_color),
-        grabbed_text_color_(grabbed_text_color) {
-    setFlag(ItemIsSelectable, false);
-    setCursor(Qt::SizeHorCursor);
-    setAcceptHoverEvents(true);
-  }
-
-  // Re-resolve on a live theme switch (Timeline::changeEvent) — the colors are
-  // captured at construction and would otherwise keep the previous theme's ink.
-  void setColors(
-      const QColor& idle_color, const QColor& hovered_color, const QColor& grabbed_color,
-      const QColor& grabbed_text_color) {
-    idle_color_ = idle_color;
-    hovered_color_ = hovered_color;
-    grabbed_color_ = grabbed_color;
-    grabbed_text_color_ = grabbed_text_color;
-    update();
-  }
-
-  void setHeight(double height) {
-    if (qFuzzyCompare(height, height_)) {
-      return;
-    }
-    prepareGeometryChange();
-    height_ = height;
-  }
-
-  /// Scene-y of the (sticky) header's top — the timeline keeps it at the visible
-  /// viewport top as the rows scroll, so the time pill and the needle's start
-  /// follow the ruler instead of scrolling away. Within [0, height_].
-  void setHeaderTop(double scene_y) {
-    if (qFuzzyCompare(scene_y, header_top_)) {
-      return;
-    }
-    header_top_ = scene_y;
-    update();
-  }
-
-  /// Grabbed state: darken to grabbed_color_ + show the timestamp pill.
-  void setGrabbed(bool on) {
-    if (on == grabbed_) {
-      return;
-    }
-    grabbed_ = on;
-    update();
-  }
-
-  /// Hover state: the needle answers the pointer before it is grabbed, so a
-  /// draggable marker is discoverable without pressing first. Ignored while
-  /// grabbed, where the pressed colour must win.
-  void hoverEnterEvent(QGraphicsSceneHoverEvent* /*event*/) override {
-    hovered_ = true;
-    update();
-  }
-
-  void hoverLeaveEvent(QGraphicsSceneHoverEvent* /*event*/) override {
-    hovered_ = false;
-    update();
-  }
-
-  /// Current-time text for the pill (formatted by the widget).
-  void setLabel(const QString& text) {
-    if (text == label_) {
-      return;
-    }
-    label_ = text;
-    if (grabbed_) {
-      update();
-    }
-  }
-
-  [[nodiscard]] QRectF boundingRect() const override {
-    // Wide enough to paint the centered pill; hit area is narrowed in shape().
-    return QRectF(-kPillHalfWidth, 0, 2 * kPillHalfWidth, height_);
-  }
-
-  // Narrow hit area (just the needle column) so the wide pill region never
-  // shadows bars underneath; the pill only appears mid-grab anyway.
-  [[nodiscard]] QPainterPath shape() const override {
-    QPainterPath path;
-    path.addRect(-kGrabHalfWidth, 0, 2 * kGrabHalfWidth, height_);
-    return path;
-  }
-
-  void paint(QPainter* painter, const QStyleOptionGraphicsItem* /*option*/, QWidget* /*widget*/) override {
-    const QColor color = grabbed_ ? grabbed_color_ : (hovered_ ? hovered_color_ : idle_color_);
-    const double rh = TimelineRulerItem::kRulerHeight;
-    // Start at the (sticky) header bottom so the needle reaches up to — never into —
-    // the numbers, even when the rows are scrolled and the header floats down. Use a
-    // flat cap so the 2px pen doesn't square-cap a pixel up past the ruler separator.
-    QPen needle_pen(color, 2.0);
-    needle_pen.setCapStyle(Qt::FlatCap);
-    painter->setPen(needle_pen);
-    painter->drawLine(QLineF(0, header_top_ + rh, 0, height_));
-
-    if (!grabbed_ || label_.isEmpty()) {
-      return;
-    }
-    // Current-time pill, centered on the needle, sitting in the header on the
-    // EXACT same baseline + font as the ruler frame numbers (so it lines up).
-    QFont font = painter->font();
-    font.setPixelSize(11);
-    painter->setFont(font);
-    const QFontMetricsF fm(font);
-    const double tw = fm.horizontalAdvance(label_);
-    const QRectF pill(-tw / 2.0 - 5.0, header_top_ + 0.5, tw + 10.0, rh - 1.0);
-    painter->setPen(Qt::NoPen);
-    painter->setBrush(color);
-    const qreal pill_radius = theme::radius(theme::Radius::Input);
-    painter->drawRoundedRect(pill, pill_radius, pill_radius);
-    const double baseline = header_top_ + ((rh + fm.ascent() - fm.descent()) / 2.0);
-    painter->setPen(grabbed_text_color_);
-    painter->drawText(QPointF(-tw / 2.0, baseline), label_);
-  }
-
- private:
-  double height_ = 200.0;
-  double header_top_ = 0.0;  // scene-y of the sticky header top (see setHeaderTop)
-  bool hovered_ = false;
-  bool grabbed_ = false;
-  QString label_;
-  QColor idle_color_;
-  QColor hovered_color_;
-  QColor grabbed_color_;
-  QColor grabbed_text_color_;
-};
-
-/// Full-height background that fills the EMPTY span (outside the data union) with
-/// a diagonal stripe hatch, so the ±buffer padding reads as "nothing here" while
-/// the data span stays clean. Sits below every other item; never hit-tested.
-class TimelineBackgroundItem : public QGraphicsItem {
- public:
-  TimelineBackgroundItem() {
-    setZValue(-50);
-  }
-
-  void setLayout(
-      double width, double height, const TimelineViewport& viewport, const TimelineRuler& ruler, qint64 data_min_ns,
-      qint64 data_max_ns) {
-    prepareGeometryChange();
-    width_ = width;
-    height_ = height;
-    viewport_ = viewport;
-    ruler_ = ruler;  // shared with the ruler item so gridlines and numbers can't desync
-    data_min_ns_ = data_min_ns;
-    data_max_ns_ = data_max_ns;
-    update();
-  }
-
-  /// Live-update only the data span (during a drag; layout otherwise unchanged).
-  void setDataSpan(qint64 data_min_ns, qint64 data_max_ns) {
-    data_min_ns_ = data_min_ns;
-    data_max_ns_ = data_max_ns;
-    update();
-  }
-
-  [[nodiscard]] QRectF boundingRect() const override {
-    return QRectF(0, 0, width_, height_);
-  }
-
-  [[nodiscard]] QPainterPath shape() const override {
-    return {};  // decorative; never hit-tested
-  }
-
-  void paint(QPainter* painter, const QStyleOptionGraphicsItem* /*option*/, QWidget* widget) override {
-    const TimelineColors col = timelineColors();
-    // 1) Solid theme background under everything (white in light theme).
-    painter->fillRect(boundingRect(), col.bg);
-
-    // 2) Hatch the empty area (outside the data span) with the shared app hatch
-    // (PJ::drawHatch). Phased to this item's GLOBAL origin so its diagonal lines line
-    // up with every other widget that paints the hatch (the Mosaico RangeSlider, ...)
-    // — all are windows into one continuous hatch layer. Mapping item(0,0) through the
-    // painter's world transform and the viewport widget gives that global origin.
-    const QPointF hatch_origin =
-        widget != nullptr ? widget->mapToGlobal(painter->worldTransform().map(QPointF(0, 0))) : QPointF(0, 0);
-    const QColor hatch_ink = appHatchColor();
-    if (data_max_ns_ <= data_min_ns_) {
-      PJ::drawHatch(*painter, QRectF(0, 0, width_, height_), hatch_origin, hatch_ink);
-    } else {
-      const double x_lo = TimelineScene::nsToPx(data_min_ns_, viewport_);
-      const double x_hi = TimelineScene::nsToPx(data_max_ns_, viewport_);
-      if (x_lo > 0.0) {
-        PJ::drawHatch(*painter, QRectF(0, 0, x_lo, height_), hatch_origin, hatch_ink);
-      }
-      if (x_hi < width_) {
-        PJ::drawHatch(*painter, QRectF(x_hi, 0, width_ - x_hi, height_), hatch_origin, hatch_ink);
-      }
-    }
-
-    // 3) Faint full-height vertical tick gridlines (the "ticks"), at the SAME
-    // tick positions the ruler numbers use — the Timeline computes the ruler once
-    // and feeds it to both items via setLayout, so the two can never desync (and
-    // we don't re-run the tick ladder on this hot paint path).
-    painter->setPen(col.grid_line);
-    const double top = TimelineRulerItem::kRulerHeight;
-    for (const qint64 tick : ruler_.ticks_ns) {
-      const double x = TimelineScene::nsToPx(tick, viewport_);
-      painter->drawLine(QLineF(x, top, x, height_));
-    }
-  }
-
- private:
-  double width_ = 0.0;
-  double height_ = 0.0;
-  TimelineViewport viewport_;
-  TimelineRuler ruler_;  // tick list shared with the ruler item (set via setLayout)
-  qint64 data_min_ns_ = 0;
-  qint64 data_max_ns_ = 0;
 };
 
 /// One name-column row: where to paint it (viewport-local y/height, supplied by

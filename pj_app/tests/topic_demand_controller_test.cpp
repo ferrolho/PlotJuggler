@@ -13,7 +13,9 @@
 
 #include "PendingDisplayBinder.h"
 #include "TopicDemandController.h"
+#include "pj_base/type_tree.hpp"
 #include "pj_datastore/writer.hpp"
+#include "pj_plotting/StateTransitionsDockWidget.h"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/DataProcessorService.h"
@@ -189,6 +191,41 @@ class StubSceneDockWidget : public PJ::SceneDockWidget {
 
 void wireSceneDock(StubSceneDockWidget& dock, PJ::AppSession& app_session) {
   dock.setSessionManager(&app_session.sessionManager());
+}
+
+// A committed single-column STRING topic; returns its catalog key. The
+// discrete counterpart of addScalarTopic for the state-strip demand tests.
+QString addStringTopic(PJ::AppSession& app_session, DatasetId dataset_id, std::string_view topic_name) {
+  PJ::DataWriter writer = app_session.sessionManager().dataEngine().createWriter();
+  auto schema_or =
+      writer.registerSchema(std::string(topic_name), PJ::makePrimitive("state", PJ::PrimitiveType::kString));
+  if (!schema_or.has_value()) {
+    ADD_FAILURE() << schema_or.error();
+    return {};
+  }
+  PJ::TopicDescriptor descriptor;
+  descriptor.name = std::string(topic_name);
+  descriptor.schema_id = *schema_or;
+  auto topic_or = writer.registerTopic(dataset_id, descriptor);
+  if (!topic_or.has_value() || !writer.bindTopicWriter(*topic_or).has_value()) {
+    ADD_FAILURE() << "string topic registration failed";
+    return {};
+  }
+  EXPECT_TRUE(writer.beginRow(*topic_or, 100).has_value());
+  writer.set(*topic_or, 0, std::string_view{"IDLE"});
+  EXPECT_TRUE(writer.finishRow(*topic_or).has_value());
+  if (app_session.sessionManager().commitChunks(writer.flushAll()).empty()) {
+    ADD_FAILURE() << "commit produced no changed topics";
+    return {};
+  }
+  auto& catalog = app_session.catalogModel();
+  catalog.rebuildFromDatastore();
+  for (const PJ::CatalogItem& item : catalog.items()) {
+    if (catalog.isDiscreteKey(item.key) && item.dataset_id == dataset_id) {
+      return item.key;
+    }
+  }
+  return {};
 }
 
 // --- fixture -----------------------------------------------------------------
@@ -386,6 +423,41 @@ TEST_F(TopicDemandControllerTest, SceneDockPlaceholderDropCompletesOnRealTopicWi
 
   dock.reset();
   EXPECT_FALSE(referencesTopic(tracker, dataset_id_, u"/points"_s));
+}
+
+TEST_F(TopicDemandControllerTest, StateStripSeriesAddRemoveTracksDemand) {
+  const QString key = addStringTopic(*app_session_, dataset_id_, "/robot/state");
+  ASSERT_FALSE(key.isEmpty());
+
+  PJ::StateTransitionsDockWidget dock(
+      &app_session_->sessionManager(), &app_session_->catalogModel(), &app_session_->playbackEngine());
+  controller_->registerStateTransitionsDock(&dock);
+  // Double registration is a no-op (mirrors registerPlot's guard).
+  controller_->registerStateTransitionsDock(&dock);
+
+  ASSERT_TRUE(dock.controller()->addSeries(key));
+  auto& tracker = app_session_->topicDemandTracker();
+  EXPECT_TRUE(referencesTopic(tracker, dataset_id_, u"/robot/state"_s));
+
+  const auto entries = dock.controller()->seriesEntries();
+  ASSERT_EQ(entries.size(), 1U);
+  EXPECT_TRUE(dock.controller()->removeSeries(entries.front().row_id));
+  EXPECT_FALSE(referencesTopic(tracker, dataset_id_, u"/robot/state"_s));
+}
+
+TEST_F(TopicDemandControllerTest, StateStripDestructionReleasesReferences) {
+  const QString key = addStringTopic(*app_session_, dataset_id_, "/robot/state");
+  ASSERT_FALSE(key.isEmpty());
+
+  auto dock = std::make_unique<PJ::StateTransitionsDockWidget>(
+      &app_session_->sessionManager(), &app_session_->catalogModel(), &app_session_->playbackEngine());
+  controller_->registerStateTransitionsDock(dock.get());
+  ASSERT_TRUE(dock->controller()->addSeries(key));
+  auto& tracker = app_session_->topicDemandTracker();
+  EXPECT_TRUE(referencesTopic(tracker, dataset_id_, u"/robot/state"_s));
+
+  dock.reset();
+  EXPECT_FALSE(referencesTopic(tracker, dataset_id_, u"/robot/state"_s));
 }
 
 TEST_F(TopicDemandControllerTest, PlaceholderPlotDropBindsConventionalValueFieldTopic) {

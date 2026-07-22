@@ -125,6 +125,7 @@
 #include "pj_plotting/PlotRhiCanvas.h"
 #endif
 #include "pj_plotting/PlotWidget.h"
+#include "pj_plotting/StateTransitionsDockWidget.h"
 #ifdef PJ_WASM_ENABLE_INGRESS_PROBE
 #include "pj_plotting/XYCurveDialog.h"
 #include "pj_widgets/LayerListView.h"
@@ -1923,8 +1924,18 @@ IDataWidget* MainWindow::makeSceneDock(const QString& kind, QWidget* parent) {
     return widget;
   }
 #endif
-  Q_UNUSED(kind);
-  Q_UNUSED(parent);
+  if (kind == "state_transitions"_L1) {
+    auto* widget = new StateTransitionsDockWidget(
+        &session_->sessionManager(), &session_->catalogModel(), &session_->playbackEngine(), parent);
+    // Series add/remove + committed view-chrome changes ride the same debounced
+    // workspace-undo snapshot route the scene docks use.
+    connect(widget, &StateTransitionsDockWidget::workspaceChanged, &scene_undo_debounce_, qOverload<>(&QTimer::start));
+    connect(
+        widget->view(), &StateTransitionsView::visibleRangeChanged, this,
+        [this, widget](double t_min, double t_max) { onStateTransitionsRangeChanged(widget, t_min, t_max); });
+    topic_demand_controller_->registerStateTransitionsDock(widget);
+    return widget;
+  }
   return nullptr;
 }
 
@@ -1951,6 +1962,9 @@ void MainWindow::onObjectFamilyRequested(DockWidget* dock, VisualizationKind fam
       break;
     case VisualizationKind::kScene3D:
       kind = u"scene3d"_s;
+      break;
+    case VisualizationKind::kStateTransitions:
+      kind = u"state_transitions"_s;
       break;
     case VisualizationKind::kPlot:
       return;
@@ -3547,6 +3561,31 @@ void MainWindow::onPlotZoomChanged(PlotWidget* modified, QRectF rect) {
     plot->setZoomRectangle(peer_rect, false);
     plot->replot();
   });
+  // The State Transitions strips share the plots' time axis (setVisibleRange
+  // never echoes back, so no feedback loop).
+  forEachStateStrip(
+      [rect](StateTransitionsDockWidget* strip) { strip->view()->setVisibleRange(rect.left(), rect.right()); });
+}
+
+void MainWindow::onStateTransitionsRangeChanged(StateTransitionsDockWidget* source, double t_min, double t_max) {
+  if (!button_link_->isChecked() || !(t_max > t_min)) {
+    return;
+  }
+  forEachPlot([t_min, t_max](PlotWidget* plot) {
+    if (plot->isEmpty() || plot->isXYPlot() || !plot->isZoomLinkEnabled()) {
+      return;
+    }
+    QRectF peer_rect = plot->currentBoundingRect();
+    peer_rect.setLeft(t_min);
+    peer_rect.setRight(t_max);
+    plot->setZoomRectangle(peer_rect, false);
+    plot->replot();
+  });
+  forEachStateStrip([source, t_min, t_max](StateTransitionsDockWidget* strip) {
+    if (strip != source) {
+      strip->view()->setVisibleRange(t_min, t_max);
+    }
+  });
 }
 
 void MainWindow::onTrackerMovedFromWidget(QPointF point) {
@@ -3659,6 +3698,17 @@ void MainWindow::forEachDocker(const std::function<void(PlotDocker*)>& operation
   }
 }
 
+void MainWindow::forEachStateStrip(const std::function<void(StateTransitionsDockWidget*)>& operation) {
+  forEachDock([&operation](DockWidget* dock) {
+    if (dock->objectWidget() == nullptr) {
+      return;
+    }
+    if (auto* strip = qobject_cast<StateTransitionsDockWidget*>(dock->objectWidget()->widget())) {
+      operation(strip);
+    }
+  });
+}
+
 void MainWindow::forEachDock(const std::function<void(DockWidget*)>& operation) {
   forEachDocker([&operation](PlotDocker* docker) {
     for (int index = 0; index < docker->plotCount(); ++index) {
@@ -3762,35 +3812,55 @@ void MainWindow::linkedZoomOut() {
       return (plot != nullptr && !plot->isEmpty()) ? plot : nullptr;
     };
 
-    std::optional<Range<double>> x_union;
-    for (int index = 0; index < docker->plotCount(); ++index) {
-      PlotWidget* plot = plot_at(index);
-      if (plot == nullptr || plot->isXYPlot()) {
-        continue;
+    auto strip_at = [docker](int index) -> StateTransitionsDockWidget* {
+      DockWidget* dock = docker->plotAt(index);
+      if (dock == nullptr || dock->objectWidget() == nullptr) {
+        return nullptr;
       }
-      const QRectF rect = plot->maxZoomRect();
+      return qobject_cast<StateTransitionsDockWidget*>(dock->objectWidget()->widget());
+    };
+
+    // Collect the X union across BOTH widget kinds first (State Transitions
+    // strips contribute their data extent, so a strip-only tab still zooms out
+    // to its own content), then apply it — the union must be complete before
+    // any widget moves.
+    std::optional<Range<double>> x_union;
+    const auto fold = [&x_union](double min, double max) {
       if (!x_union) {
-        x_union = Range<double>{rect.left(), rect.right()};
+        x_union = Range<double>{min, max};
       } else {
-        x_union->min = std::min(x_union->min, rect.left());
-        x_union->max = std::max(x_union->max, rect.right());
+        x_union->min = std::min(x_union->min, min);
+        x_union->max = std::max(x_union->max, max);
+      }
+    };
+    for (int index = 0; index < docker->plotCount(); ++index) {
+      if (PlotWidget* plot = plot_at(index); plot != nullptr && !plot->isXYPlot()) {
+        const QRectF rect = plot->maxZoomRect();
+        fold(rect.left(), rect.right());
+      }
+      if (StateTransitionsDockWidget* strip = strip_at(index)) {
+        if (const auto extent = strip->view()->dataExtentSeconds()) {
+          fold(extent->first, extent->second);
+        }
       }
     }
 
     for (int index = 0; index < docker->plotCount(); ++index) {
-      PlotWidget* plot = plot_at(index);
-      if (plot == nullptr) {
-        continue;
+      if (PlotWidget* plot = plot_at(index)) {
+        if (plot->isXYPlot() || !x_union) {
+          plot->zoomOut(false);
+        } else {
+          QRectF rect = plot->maxZoomRect();
+          rect.setLeft(x_union->min);
+          rect.setRight(x_union->max);
+          plot->setZoomRectangle(rect, false);
+          plot->replot();
+        }
       }
-      if (plot->isXYPlot() || !x_union) {
-        plot->zoomOut(false);
-        continue;
+      StateTransitionsDockWidget* strip = strip_at(index);
+      if (strip != nullptr && x_union) {
+        strip->view()->setVisibleRange(x_union->min, x_union->max);
       }
-      QRectF rect = plot->maxZoomRect();
-      rect.setLeft(x_union->min);
-      rect.setRight(x_union->max);
-      plot->setZoomRectangle(rect, false);
-      plot->replot();
     }
   });
 }
@@ -6926,6 +6996,7 @@ void MainWindow::onDockFocused(DockWidget* dock) {
 #ifdef PJ_WITH_SCENE2D
   SceneDockWidget* scene2d_dock = nullptr;
 #endif
+  StateTransitionsController* strip_controller = nullptr;
   if (dock != nullptr) {
     if (dock->plotWidget() != nullptr) {
       target = plot_config_page_;
@@ -6941,10 +7012,30 @@ void MainWindow::onDockFocused(DockWidget* dock) {
           if (auto* s3d = qobject_cast<Scene3DDockWidget*>(obj); s3d != nullptr) {
         target = scene3d_config_page_;
         scene3d_dock = s3d;
-      }
-#else
-      Q_UNUSED(obj);
+      } else
 #endif
+          if (auto* strip = qobject_cast<StateTransitionsDockWidget*>(obj); strip != nullptr) {
+        // The strip reuses the plot page: the SAME curves table (eye + trash,
+        // no color swatch); the width/style strips stay disabled via the
+        // bindEditorToPlot(nullptr) call above.
+        target = plot_config_page_;
+        strip_controller = strip->controller();
+      }
+    }
+  }
+  if (curve_editor_ != nullptr) {
+    curve_editor_->setStateTransitions(strip_controller);  // null releases the strip binding
+  }
+  // Width/style sections are meaningless for a state strip — remove them from
+  // the page entirely (the Curves table alone remains). Everything in the
+  // plot-config layout except the CurveEditor is such a section.
+  if (plot_config_page_ != nullptr && plot_config_page_->layout() != nullptr) {
+    QLayout* page_layout = plot_config_page_->layout();
+    for (int index = 0; index < page_layout->count(); ++index) {
+      QWidget* section = page_layout->itemAt(index)->widget();
+      if (section != nullptr && section != curve_editor_) {
+        section->setVisible(strip_controller == nullptr);
+      }
     }
   }
   // Bind / unbind the config panels BEFORE switching the stack so the page is

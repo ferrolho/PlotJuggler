@@ -13,6 +13,7 @@
 #include "pj_datastore/engine.hpp"
 #include "pj_plotting/PlotWidget.h"
 #include "pj_plotting/PointSeriesXY.h"
+#include "pj_plotting/StateTransitionsDockWidget.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/DataProcessorService.h"
 #include "pj_runtime/TopicDemandTracker.h"
@@ -110,9 +111,12 @@ void TopicDemandController::syncPlot(PlotWidget* plot) {
     const TopicId topic_id = isScalarField(*item) ? asScalarField(*item)->topic_id : 0;
     appendTopicRefs(current, item->dataset_id, item->topic_name, topic_id);
   }
-  std::sort(current.begin(), current.end());
+  applyTopicDelta(std::move(current), plot_topics_[plot]);
+}
 
-  std::vector<std::pair<DatasetId, QString>>& previous = plot_topics_[plot];
+void TopicDemandController::applyTopicDelta(
+    std::vector<std::pair<DatasetId, QString>> current, std::vector<std::pair<DatasetId, QString>>& previous) {
+  std::sort(current.begin(), current.end());
   std::sort(previous.begin(), previous.end());
 
   std::vector<std::pair<DatasetId, QString>> added;
@@ -179,6 +183,37 @@ void TopicDemandController::registerSceneDock(SceneDockWidget* dock) {
     }
     scene_layer_topics_.erase(dock_it);
   });
+}
+
+void TopicDemandController::registerStateTransitionsDock(StateTransitionsDockWidget* dock) {
+  if (dock == nullptr || state_dock_topics_.count(dock) > 0) {
+    return;  // idempotent, mirroring registerPlot
+  }
+  state_dock_topics_.emplace(dock, std::vector<std::pair<DatasetId, QString>>{});
+  connect(dock->controller(), &StateTransitionsController::seriesListChanged, this, [this, dock]() {
+    syncStateTransitionsDock(dock);
+  });
+  connect(dock, &QObject::destroyed, this, [this, dock]() {
+    auto it = state_dock_topics_.find(dock);
+    if (it == state_dock_topics_.end()) {
+      return;
+    }
+    for (const auto& [dataset_id, topic_name] : it->second) {
+      tracker_.removeReference(dataset_id, topic_name);
+    }
+    state_dock_topics_.erase(it);
+  });
+  syncStateTransitionsDock(dock);  // covers rows restored before this call
+}
+
+void TopicDemandController::syncStateTransitionsDock(StateTransitionsDockWidget* dock) {
+  std::vector<std::pair<DatasetId, QString>> current;
+  const auto displayed = dock->controller()->displayedTopics();
+  current.reserve(static_cast<std::size_t>(displayed.size()));
+  for (const auto& [dataset_id, topic_name] : displayed) {
+    current.emplace_back(dataset_id, topic_name);
+  }
+  applyTopicDelta(std::move(current), state_dock_topics_[dock]);
 }
 
 void TopicDemandController::handlePlaceholderPlotDrop(

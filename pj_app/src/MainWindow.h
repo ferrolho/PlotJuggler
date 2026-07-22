@@ -70,6 +70,7 @@ class IDataWidget;
 class PanelEngine;
 class PlotDocker;
 class PlotWidget;
+class StateTransitionsDockWidget;
 class PendingDisplayBinder;
 class QtDiagnosticBridge;
 class SceneDockWidget;
@@ -385,6 +386,10 @@ class MainWindow : public QMainWindow {
 
   // Mirrors X zoom to linked plots.
   void onPlotZoomChanged(PlotWidget* modified, QRectF rect);
+  // Linked-zoom feed from a State Transitions strip: fan its visible window's X
+  // onto plots and the other strips (mirror of onPlotZoomChanged, gated by the
+  // same link toggle).
+  void onStateTransitionsRangeChanged(StateTransitionsDockWidget* source, double t_min, double t_max);
 
   // Updates playback time from a plot tracker move.
   void onTrackerMovedFromWidget(QPointF point);
@@ -507,6 +512,8 @@ class MainWindow : public QMainWindow {
 
   // Applies operation to each plot widget.
   void forEachPlot(const std::function<void(PlotWidget*)>& operation);
+  // Every mounted State Transitions strip across all tabs.
+  void forEachStateStrip(const std::function<void(StateTransitionsDockWidget*)>& operation);
 
   // Re-syncs every data widget to the catalog after a removal: each prunes its
   // own dead pieces (plots drop dead curves; object viewers drop dead layers,

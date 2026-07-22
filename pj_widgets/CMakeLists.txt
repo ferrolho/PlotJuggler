@@ -32,6 +32,7 @@ add_library(pj_widgets STATIC
     src/RecentFilesMenu.cpp
     src/ScrubberBase.cpp
     src/SectionHeaderBand.cpp
+    src/StateTransitionsView.cpp
     src/SvgButton.cpp
     src/Scrollbar.cpp
     src/Timeline.cpp
@@ -72,6 +73,8 @@ add_library(pj_widgets STATIC
     include/pj_widgets/RecentFilesMenu.h
     include/pj_widgets/ScrubberBase.h
     include/pj_widgets/SectionHeaderBand.h
+    include/pj_widgets/StateColors.h
+    include/pj_widgets/StateTransitionsView.h
     include/pj_widgets/Style.h
     include/pj_widgets/SvgButton.h
     include/pj_widgets/SvgUtil.h

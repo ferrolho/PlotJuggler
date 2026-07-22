@@ -30,14 +30,17 @@
 #include <utility>
 #include <vector>
 
+#include "pj_base/type_tree.hpp"
 #include "pj_datastore/writer.hpp"
 #include "pj_plotting/DockToolbar.h"
 #include "pj_plotting/DockWidget.h"
 #include "pj_plotting/PlotDocker.h"
 #include "pj_plotting/PlotWidget.h"
+#include "pj_plotting/StateTransitionsDockWidget.h"
 #include "pj_plotting/TabbedPlotWidget.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/IDataWidget.h"
+#include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/SessionManager.h"
 #include "pj_widgets/CurveTreeView.h"
 #include "pj_widgets/VisualizationKind.h"
@@ -782,6 +785,104 @@ TEST(DockWidgetPlaceholderTest, ScalarDropConvertsPlaceholderToPlot) {
   ASSERT_NE(dock->plotWidget(), nullptr);
   EXPECT_EQ(dock->objectWidget(), nullptr);
   EXPECT_EQ(dock->plotWidget()->curveList().size(), 1U);
+}
+
+// A single-column topic of an arbitrary primitive, via the schema path (the
+// registerScalarSeries shortcut is float-only).
+PJ::TopicId addTypedTopic(
+    PJ::SessionManager& session, PJ::DatasetId dataset_id, std::string_view topic_name, PJ::PrimitiveType type) {
+  PJ::DataWriter writer = session.dataEngine().createWriter();
+  auto schema_or = writer.registerSchema(std::string(topic_name), PJ::makePrimitive("value", type));
+  EXPECT_TRUE(schema_or.has_value());
+  PJ::TopicDescriptor descriptor;
+  descriptor.name = std::string(topic_name);
+  descriptor.schema_id = *schema_or;
+  auto topic_or = writer.registerTopic(dataset_id, descriptor);
+  EXPECT_TRUE(topic_or.has_value());
+  EXPECT_TRUE(writer.bindTopicWriter(*topic_or).has_value());
+  EXPECT_TRUE(writer.beginRow(*topic_or, 100).has_value());
+  if (type == PJ::PrimitiveType::kString) {
+    writer.set(*topic_or, 0, std::string_view{"IDLE"});
+  } else {
+    writer.set(*topic_or, 0, static_cast<int64_t>(3));
+  }
+  EXPECT_TRUE(writer.finishRow(*topic_or).has_value());
+  EXPECT_FALSE(session.commitChunks(writer.flushAll()).empty());
+  return *topic_or;
+}
+
+// An integer field is discrete AND plottable; plottable wins the empty-tile
+// tie, so the drop builds a plot — never a state-transitions strip.
+TEST(DockWidgetPlaceholderTest, IntegerDropConvertsPlaceholderToPlotNotStrip) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+  auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "drive.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  ASSERT_NE(addTypedTopic(session, *dataset, "/robot/mode", PJ::PrimitiveType::kInt64), 0U);
+  const auto curves = catalog.curves();
+  ASSERT_EQ(curves.size(), 1U);  // integer fields ARE plottable curves
+
+  PJ::PlotDocker docker(u"test"_s, &session, &catalog);
+  PJ::PlaybackEngine playback;
+  docker.setObjectWidgetFactory(
+      [&](const QString& kind, const PJ::ObjectDropSeed*, QWidget* parent) -> PJ::IDataWidget* {
+        if (kind != u"state_transitions"_s) {
+          return nullptr;
+        }
+        return new PJ::StateTransitionsDockWidget(&session, &catalog, &playback, parent);
+      });
+  auto* dock = docker.plotAt(0);
+  ASSERT_NE(dock, nullptr);
+  ASSERT_TRUE(
+      QMetaObject::invokeMethod(
+          dock, "onCatalogItemsDropped", Qt::DirectConnection, Q_ARG(QStringList, QStringList{curves[0].name})));
+
+  EXPECT_NE(dock->plotWidget(), nullptr);
+  EXPECT_EQ(dock->objectWidget(), nullptr);
+}
+
+// String-only drop mounts the strip (nothing plottable); a follow-up integer
+// drop routes through tryAcceptSeriesKeys into the SAME mounted strip.
+TEST(DockWidgetPlaceholderTest, IntegerDropOntoMountedStripAddsRow) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+  auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "drive.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  ASSERT_NE(addTypedTopic(session, *dataset, "/robot/state", PJ::PrimitiveType::kString), 0U);
+  ASSERT_NE(addTypedTopic(session, *dataset, "/robot/mode", PJ::PrimitiveType::kInt64), 0U);
+  QString string_key;
+  QString int_key;
+  for (const PJ::CatalogItem& item : catalog.items()) {
+    (item.topic_name == u"/robot/state"_s ? string_key : int_key) = item.key;
+  }
+  ASSERT_FALSE(string_key.isEmpty());
+  ASSERT_FALSE(int_key.isEmpty());
+
+  PJ::PlotDocker docker(u"test"_s, &session, &catalog);
+  PJ::PlaybackEngine playback;
+  docker.setObjectWidgetFactory(
+      [&](const QString& kind, const PJ::ObjectDropSeed*, QWidget* parent) -> PJ::IDataWidget* {
+        if (kind != u"state_transitions"_s) {
+          return nullptr;
+        }
+        return new PJ::StateTransitionsDockWidget(&session, &catalog, &playback, parent);
+      });
+  auto* dock = docker.plotAt(0);
+  ASSERT_NE(dock, nullptr);
+
+  ASSERT_TRUE(
+      QMetaObject::invokeMethod(
+          dock, "onCatalogItemsDropped", Qt::DirectConnection, Q_ARG(QStringList, QStringList{string_key})));
+  ASSERT_NE(dock->objectWidget(), nullptr);
+  EXPECT_EQ(dock->plotWidget(), nullptr);
+  auto* mounted = qobject_cast<PJ::StateTransitionsDockWidget*>(dock->objectWidget()->widget());
+  ASSERT_NE(mounted, nullptr);
+  EXPECT_EQ(mounted->controller()->rowCount(), 1);
+
+  ASSERT_TRUE(
+      QMetaObject::invokeMethod(
+          dock, "onCatalogItemsDropped", Qt::DirectConnection, Q_ARG(QStringList, QStringList{int_key})));
+  EXPECT_EQ(mounted->controller()->rowCount(), 2);
 }
 
 // Shared setup for the DockToolbar inline-rename behaviour: a PlotDocker with one

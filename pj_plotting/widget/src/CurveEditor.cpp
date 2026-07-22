@@ -6,6 +6,8 @@
 #include <qwt_plot_curve.h>
 #include <qwt_text.h>
 
+#include <QAbstractItemView>
+#include <QDropEvent>
 #include <QEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -25,6 +27,7 @@
 
 #include "pj_plotting/PlotWidget.h"
 #include "pj_plotting/PlotWidgetBase.h"
+#include "pj_plotting/StateTransitionsController.h"
 #include "pj_widgets/ColorPickerPopup.h"
 #include "pj_widgets/ElidingLabel.h"
 #include "pj_widgets/FrameworkTokens.h"
@@ -48,6 +51,10 @@ namespace {
 // size and the original compact-list design.
 constexpr int kDefaultRowHeight = 20;
 constexpr int kRowSpacing = 2;
+// Horizontal breathing room between a row's content and the panel edges —
+// without it the name text (and a swatch-less strip row especially) sits flush
+// against the panel border.
+constexpr int kRowEdgeInset = 6;
 
 constexpr auto kCurveNameRole = Qt::UserRole;
 constexpr auto kCurveDisplayNameRole = Qt::UserRole + 1;
@@ -107,7 +114,9 @@ class CurveRowWidget : public QWidget {
   CurveRowWidget(
       QPushButton* swatch, ElidingLabel* name, QToolButton* eye, QToolButton* trash, int row_height, QWidget* parent)
       : QWidget(parent), swatch_(swatch), name_(name), eye_(eye), trash_(trash), row_height_(row_height) {
-    swatch_->setParent(this);
+    if (swatch_ != nullptr) {
+      swatch_->setParent(this);
+    }
     name_->setParent(this);
     eye_->setParent(this);
     trash_->setParent(this);
@@ -136,17 +145,20 @@ class CurveRowWidget : public QWidget {
 
     // Every inner widget is a square of side `h` (the row height), so
     // each one is 1:1 and flush with the top + bottom borders. The
-    // swatch anchors left, the two action buttons anchor right.
-    swatch_->setGeometry(0, 0, h, h);
+    // swatch anchors left (when the row has one), the two action buttons
+    // anchor right; both ends keep kRowEdgeInset off the panel border.
+    if (swatch_ != nullptr) {
+      swatch_->setGeometry(kRowEdgeInset, 0, h, h);
+    }
 
-    const int trash_x = total_w - h;
+    const int trash_x = total_w - h - kRowEdgeInset;
     trash_->setGeometry(trash_x, 0, h, h);
     const int eye_x = trash_x - kRowSpacing - h;
     eye_->setGeometry(eye_x, 0, h, h);
 
-    // Name lives between the swatch and the eye. If the gap is too
-    // small to be readable, hide it — eye + trash stay put.
-    const int name_x = h + kRowSpacing;
+    // Name lives between the swatch (when present) and the eye. If the gap
+    // is too small to be readable, hide it — eye + trash stay put.
+    const int name_x = kRowEdgeInset + (swatch_ != nullptr ? h + kRowSpacing : 0);
     const int name_right = eye_x - kRowSpacing;
     const int name_width = name_right - name_x;
     if (name_width < 1) {
@@ -185,6 +197,10 @@ CurveEditor::CurveEditor(QWidget* parent) : QWidget(parent), ui_(new Ui::CurveEd
   clear_all_button->setIcon(loadSvg(":/resources/svg/trash.svg", current_theme_));
   connect(clear_all_button, &QPushButton::clicked, this, [this, curves_menu]() {
     curves_menu->hide();
+    if (state_controller_ != nullptr) {
+      state_controller_->removeAllSeries();
+      return;
+    }
     if (plot_ == nullptr) {
       return;
     }
@@ -241,6 +257,12 @@ CurveEditor::CurveEditor(QWidget* parent) : QWidget(parent), ui_(new Ui::CurveEd
   ui_->listWidget->setResizeMode(QListView::Adjust);
   // Rows sit flush against each other — no inter-item gap.
   ui_->listWidget->setSpacing(PJ::theme::space(theme::Space::None));
+  // Strip-mode drag-reorder (see eventFilter): InternalMove supplies the drop
+  // indicator, but the drop itself is intercepted and re-routed through the
+  // controller — the exact LayerListView pattern, which keeps the item widgets
+  // alive (a real InternalMove would strip them).
+  ui_->listWidget->setDefaultDropAction(Qt::MoveAction);
+  ui_->listWidget->viewport()->installEventFilter(this);
 
   // QHBoxLayout's minimumSize is the sum of every child's natural
   // minimum. The QLabel ("Curves") and the QLineEdit have non-zero
@@ -274,6 +296,14 @@ void CurveEditor::setPlot(PlotWidget* plot) {
   }
   plot_ = plot;
   clearActivePicker();
+  if (plot_ != nullptr && state_controller_ != nullptr) {
+    // The two bindings are mutually exclusive; a real plot bind wins.
+    QObject::disconnect(state_series_connection_);
+    QObject::disconnect(state_destroyed_connection_);
+    state_controller_ = nullptr;
+  }
+  // Plot curves keep a fixed list order; only strip rows drag-reorder.
+  ui_->listWidget->setDragDropMode(QAbstractItemView::NoDragDrop);
   if (plot_ != nullptr) {
     curve_list_connection_ = connect(plot_, &PlotWidgetBase::curveListChanged, this, &CurveEditor::refresh);
     curve_color_connection_ = connect(plot_, &PlotWidget::curveColorChanged, this, &CurveEditor::onCurveColorChanged);
@@ -286,6 +316,41 @@ void CurveEditor::setPlot(PlotWidget* plot) {
   refresh();
 }
 
+void CurveEditor::setStateTransitions(StateTransitionsController* controller) {
+  if (state_controller_ == controller) {
+    return;
+  }
+  QObject::disconnect(state_series_connection_);
+  QObject::disconnect(state_destroyed_connection_);
+  state_controller_ = controller;
+  if (state_controller_ != nullptr) {
+    // Strip bind wins: release any plot binding (same exclusivity as setPlot).
+    if (plot_ != nullptr) {
+      QObject::disconnect(curve_list_connection_);
+      QObject::disconnect(curve_color_connection_);
+      QObject::disconnect(plot_destroyed_connection_);
+      plot_ = nullptr;
+      clearActivePicker();
+    }
+    state_series_connection_ =
+        connect(state_controller_, &StateTransitionsController::seriesListChanged, this, &CurveEditor::refresh);
+    state_destroyed_connection_ = connect(state_controller_, &QObject::destroyed, this, [this]() {
+      state_controller_ = nullptr;
+      ui_->listWidget->setDragDropMode(QAbstractItemView::NoDragDrop);
+      ui_->listWidget->clear();
+    });
+    // Rows reorder by drag, mirroring the 3D panel's layer list; the actual
+    // move happens in the controller (see eventFilter's Drop branch).
+    ui_->listWidget->setDragDropMode(QAbstractItemView::InternalMove);
+    refresh();
+  } else {
+    ui_->listWidget->setDragDropMode(QAbstractItemView::NoDragDrop);
+    if (plot_ == nullptr) {
+      ui_->listWidget->clear();
+    }
+  }
+}
+
 void CurveEditor::refresh() {
   // Clear without firing selection-change handlers; we re-evaluate at the end.
   QSignalBlocker block_list(ui_->listWidget);
@@ -293,6 +358,15 @@ void CurveEditor::refresh() {
   // Row swatches are about to be destroyed — invalidate any cached pointer.
   clearActivePicker();
 
+  if (state_controller_ != nullptr) {
+    // Strip rows: keyed by the numeric row id; an invalid color = no swatch
+    // (state colors are hash-derived, deliberately not editable).
+    for (const auto& entry : state_controller_->seriesEntries()) {
+      appendRow(QString::number(entry.row_id), entry.name, QColor(), entry.visible);
+    }
+    applyFilter();
+    return;
+  }
   if (plot_ == nullptr) {
     return;
   }
@@ -315,9 +389,14 @@ void CurveEditor::appendRow(const QString& curve_key, const QString& display_nam
   // Children are constructed without a parent — CurveRowWidget's ctor
   // reparents them in one place so resizeEvent can pin geometry directly
   // (sizes scale to the row height, so no setFixedSize here).
-  auto* swatch = new CurveColorButton(color);
-  swatch->setProperty(kColorButtonProperty, curve_key);
-  connect(swatch, &QPushButton::clicked, this, [this, curve_key, swatch]() { onSwatchClicked(curve_key, swatch); });
+  // An invalid color means "this row has no editable color" (strip series):
+  // no swatch is created and the name starts at the row's left edge.
+  CurveColorButton* swatch = nullptr;
+  if (color.isValid()) {
+    swatch = new CurveColorButton(color);
+    swatch->setProperty(kColorButtonProperty, curve_key);
+    connect(swatch, &QPushButton::clicked, this, [this, curve_key, swatch]() { onSwatchClicked(curve_key, swatch); });
+  }
 
   auto* visibility = new QToolButton();
   // The objectName drives the curveVisibilityToggle QSS rule that strips
@@ -354,6 +433,10 @@ void CurveEditor::appendRow(const QString& curve_key, const QString& display_nam
   trash->setIcon(loadSvg(kTrashIconPath, current_theme_));
   trash->setToolTip(tr("Remove this curve from its plot"));
   connect(trash, &QToolButton::clicked, this, [this, curve_key]() {
+    if (state_controller_ != nullptr) {
+      state_controller_->removeSeries(curve_key.toULongLong());
+      return;
+    }
     if (plot_ == nullptr) {
       return;
     }
@@ -414,6 +497,10 @@ void CurveEditor::clearActivePicker() {
 }
 
 void CurveEditor::onVisibilityToggled(const QString& curve_name, bool visible) {
+  if (state_controller_ != nullptr) {
+    state_controller_->setSeriesVisible(curve_name.toULongLong(), visible);
+    return;
+  }
   if (plot_ == nullptr) {
     return;
   }
@@ -506,6 +593,31 @@ bool CurveEditor::eventFilter(QObject* watched, QEvent* event) {
     // visible — it never gets pushed out.
     const bool focused = (type == QEvent::FocusIn);
     ui_->labelCurves->setVisible(!focused);
+  }
+  if (watched == ui_->listWidget->viewport() && type == QEvent::Drop && state_controller_ != nullptr) {
+    // Strip-row drag-reorder: swallow the InternalMove drop (which would strip
+    // the item widgets) and route the move through the controller instead —
+    // seriesListChanged then rebuilds the list in the new order. Same drop
+    // arithmetic as the 3D layer list: below a row's midline inserts after it.
+    auto* drop = static_cast<QDropEvent*>(event);
+    if (drop->source() != ui_->listWidget) {
+      return QWidget::eventFilter(watched, event);  // foreign drag, not a reorder
+    }
+    const int from = ui_->listWidget->currentRow();
+    int to = ui_->listWidget->count();
+    const QPoint pos = drop->position().toPoint();
+    if (QListWidgetItem* target = ui_->listWidget->itemAt(pos); target != nullptr) {
+      to = ui_->listWidget->row(target);
+      if (pos.y() > ui_->listWidget->visualItemRect(target).center().y()) {
+        ++to;
+      }
+    }
+    drop->setDropAction(Qt::IgnoreAction);
+    drop->accept();
+    if (from >= 0) {
+      state_controller_->reorderSeries(from, to);
+    }
+    return true;
   }
   return QWidget::eventFilter(watched, event);
 }

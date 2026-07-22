@@ -7,6 +7,7 @@
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
+#include <QDir>
 #include <QFileInfo>
 #include <QHash>
 #include <QLoggingCategory>
@@ -42,23 +43,12 @@ struct QStringHash {
   }
 };
 
-[[nodiscard]] bool isCatalogNumeric(PrimitiveType type) noexcept {
-  switch (type) {
-    case PrimitiveType::kFloat32:
-    case PrimitiveType::kFloat64:
-    case PrimitiveType::kInt32:
-    case PrimitiveType::kInt64:
-    case PrimitiveType::kUint64:
-    case PrimitiveType::kBool:
-      return true;
-    case PrimitiveType::kInt8:
-    case PrimitiveType::kInt16:
-    case PrimitiveType::kUint8:
-    case PrimitiveType::kUint16:
-    case PrimitiveType::kUint32:
-    case PrimitiveType::kString:
-    case PrimitiveType::kUnspecified:
-      return false;
+[[nodiscard]] bool matchesCapability(PrimitiveType type, SeriesCapability capability) noexcept {
+  switch (capability) {
+    case SeriesCapability::kPlottable:
+      return isPlottablePrimitive(type);
+    case SeriesCapability::kDiscrete:
+      return isDiscretePrimitive(type);
   }
   return false;
 }
@@ -88,13 +78,13 @@ struct QStringHash {
 
 // True when `live_path` and `saved_path` name the same on-disk source. Replicates
 // pj_app's layout_xml::isSamePath semantics without depending on it (pj_runtime is
-// below pj_app): the normalized-equality short-circuit first, then a QFileInfo
-// canonical fallback. Both sides are normally already normalized (the source-path
-// registry stores normalized paths and layout load normalizes dataset_path), so the
-// literal-equality leg is the load-bearing one; the canonical fallback only matters
-// for symlink/relative variants, and it fails on a file that no longer exists on disk
-// (canonicalFilePath returns empty), which is why the equality leg keeps a
-// deleted-source dataset resolvable by path. Empty inputs never match.
+// below pj_app): literal-equality short-circuit first, then a QFileInfo-based
+// normalisation fallback. Both sides are normalised with the absoluteFilePath
+// fallback (matching normalizedSourcePath) so that a Windows path with a drive
+// letter ("C:/data/foo.mcap", from the registry) compares equal to its raw
+// "/data/foo.mcap" form from a saved layout. canonicalFilePath is preferred when
+// the file exists (resolves symlinks), and falls back to absoluteFilePath
+// otherwise. Empty inputs never match.
 [[nodiscard]] bool isSamePathLike(const QString& live_path, const QString& saved_path) {
   if (live_path.isEmpty() || saved_path.isEmpty()) {
     return false;
@@ -102,9 +92,18 @@ struct QStringHash {
   if (live_path == saved_path) {
     return true;
   }
-  const QString canon_live = QFileInfo(live_path).canonicalFilePath();
-  const QString canon_saved = QFileInfo(saved_path).canonicalFilePath();
-  return !canon_live.isEmpty() && !canon_saved.isEmpty() && canon_live == canon_saved;
+  // canonicalFilePath resolves symlinks but returns empty for non-existent paths
+  // (e.g. a deleted recording). Fall back to absoluteFilePath so that Windows
+  // drive-letter normalisation (stored paths gain "C:/" via normalizedSourcePath)
+  // compares equal to their raw "/data/…" forms from a saved layout.
+  const auto normalize = [](const QString& p) -> QString {
+    const QFileInfo info(p);
+    const QString canonical = info.canonicalFilePath();
+    return QDir::cleanPath(canonical.isEmpty() ? info.absoluteFilePath() : canonical);
+  };
+  const QString norm_live = normalize(live_path);
+  const QString norm_saved = normalize(saved_path);
+  return !norm_live.isEmpty() && !norm_saved.isEmpty() && norm_live == norm_saved;
 }
 
 [[nodiscard]] CurveDescriptor curveFromItem(const CatalogItem& item) {
@@ -335,7 +334,7 @@ std::optional<double> CatalogModel::scalarValueAt(const QString& key, double dis
     return std::nullopt;
   }
   const ScalarFieldPayload* scalar = asScalarField(it->second);
-  if (scalar == nullptr || scalar->is_string) {
+  if (scalar == nullptr || !isPlottablePrimitive(scalar->logical_type)) {
     return std::nullopt;  // object topics carry no scalar value; strings → stringValueAt
   }
   // Display-axis seconds -> raw ns through this dataset's display offset, then a
@@ -374,7 +373,16 @@ bool CatalogModel::isStringKey(const QString& key) const {
     return false;
   }
   const ScalarFieldPayload* scalar = asScalarField(it->second);
-  return scalar != nullptr && scalar->is_string;
+  return scalar != nullptr && scalar->logical_type == PrimitiveType::kString;
+}
+
+bool CatalogModel::isDiscreteKey(const QString& key) const {
+  const auto it = impl_->items.find(key);
+  if (it == impl_->items.end()) {
+    return false;
+  }
+  const ScalarFieldPayload* scalar = asScalarField(it->second);
+  return scalar != nullptr && isDiscretePrimitive(scalar->logical_type);
 }
 
 std::optional<QString> CatalogModel::stringValueAt(const QString& key, double display_seconds) const {
@@ -386,7 +394,7 @@ std::optional<QString> CatalogModel::stringValueAt(const QString& key, double di
     return std::nullopt;
   }
   const ScalarFieldPayload* scalar = asScalarField(it->second);
-  if (scalar == nullptr || !scalar->is_string) {
+  if (scalar == nullptr || scalar->logical_type != PrimitiveType::kString) {
     return std::nullopt;  // only string fields carry a string value
   }
   const DisplayOffset offset = impl_->session->displayOffset(it->second.dataset_id);
@@ -406,7 +414,8 @@ std::vector<CurveDescriptor> CatalogModel::curves() const {
   for (const auto& [key, item] : impl_->items) {
     (void)key;
     // String fields are catalog items but not plottable curves.
-    if (const ScalarFieldPayload* scalar = asScalarField(item); scalar != nullptr && !scalar->is_string) {
+    if (const ScalarFieldPayload* scalar = asScalarField(item);
+        scalar != nullptr && isPlottablePrimitive(scalar->logical_type)) {
       curves.push_back(curveFromItem(item));
     }
   }
@@ -422,14 +431,13 @@ std::vector<CurveDescriptor> CatalogModel::curves() const {
   return curves;
 }
 
-std::optional<CurveDescriptor> CatalogModel::curveDescriptor(const QString& key) const {
+std::optional<CurveDescriptor> CatalogModel::curveDescriptor(const QString& key, SeriesCapability capability) const {
   const auto it = impl_->items.find(key);
   if (it == impl_->items.end()) {
     return std::nullopt;
   }
-  // String fields are not plottable curves, so they have no CurveDescriptor.
   const ScalarFieldPayload* scalar = asScalarField(it->second);
-  if (scalar == nullptr || scalar->is_string) {
+  if (scalar == nullptr || !matchesCapability(scalar->logical_type, capability)) {
     return std::nullopt;
   }
   return curveFromItem(it->second);
@@ -461,7 +469,7 @@ std::optional<QString> CatalogModel::datasetSourceName(DatasetId dataset_id) con
 
 std::optional<QString> CatalogModel::resolveCurveKey(
     DatasetId saved_id, const QString& saved_source, const QString& saved_path, const QString& topic,
-    const QString& field) const {
+    const QString& field, SeriesCapability capability) const {
   if (impl_->session == nullptr) {
     return std::nullopt;
   }
@@ -472,7 +480,7 @@ std::optional<QString> CatalogModel::resolveCurveKey(
   if (saved_id != 0 || !saved_source.isEmpty() || !saved_path.isEmpty()) {
     const DatasetIdentityResolution identity = resolveDatasetIdentity(saved_id, saved_source, saved_path);
     if (identity.id.has_value()) {
-      if (const auto descriptor = descriptorForPath(*identity.id, topic, field)) {
+      if (const auto descriptor = descriptorForPath(*identity.id, topic, field, capability)) {
         return descriptor->name;
       }
       // The intended dataset exists but this series has not materialized (or
@@ -492,7 +500,7 @@ std::optional<QString> CatalogModel::resolveCurveKey(
         if (!isSamePathLike(datasetSourcePath(dataset_id), saved_path)) {
           continue;
         }
-        if (const auto descriptor = descriptorForPath(dataset_id, topic, field)) {
+        if (const auto descriptor = descriptorForPath(dataset_id, topic, field, capability)) {
           if (unique_path_match.has_value()) {
             return std::nullopt;
           }
@@ -510,7 +518,7 @@ std::optional<QString> CatalogModel::resolveCurveKey(
   std::optional<QString> unique_match;
   for (const auto& [id, name] : datasets()) {
     (void)name;
-    if (const auto descriptor = descriptorForPath(id, topic, field)) {
+    if (const auto descriptor = descriptorForPath(id, topic, field, capability)) {
       if (unique_match.has_value()) {
         return std::nullopt;
       }
@@ -531,15 +539,18 @@ QString CatalogModel::datasetSourcePath(DatasetId dataset_id) const {
 }
 
 std::optional<CurveDescriptor> CatalogModel::descriptorForPath(
-    DatasetId dataset_id, const QString& topic, const QString& field) const {
+    DatasetId dataset_id, const QString& topic, const QString& field, SeriesCapability capability) const {
   for (const auto& [key, item] : impl_->items) {
     (void)key;
     if (item.dataset_id != dataset_id || item.topic_name != topic || !isScalarField(item)) {
       continue;
     }
-    // A saved numeric curve must never rebind onto a same-named string field.
+    // The consumer's capability gates the match: a plot curve never binds a
+    // string field, a strip series never binds a float — but the overlap is
+    // deliberate (a strip series saved against a string field may rebind onto
+    // an integer field at the same path after a reload).
     const ScalarFieldPayload* scalar = asScalarField(item);
-    if (scalar->field_path == field && !scalar->is_string) {
+    if (scalar->field_path == field && matchesCapability(scalar->logical_type, capability)) {
       return curveFromItem(item);
     }
   }
@@ -742,10 +753,9 @@ void CatalogModel::rebuildNow() {
       }
       for (std::size_t column_index = 0; column_index < columns.size(); ++column_index) {
         const ColumnDescriptor& column = columns[column_index];
-        // Surface numeric columns (plottable curves) and string columns (shown in
-        // the value column as read-only text). Other non-numeric types stay out.
-        const bool is_string = column.logical_type == PrimitiveType::kString;
-        if (!isCatalogNumeric(column.logical_type) && !is_string) {
+        // Surface every column in a consumer family (plottable curves and/or
+        // discrete state series); only kUnspecified stays out.
+        if (!isPlottablePrimitive(column.logical_type) && !isDiscretePrimitive(column.logical_type)) {
           continue;
         }
 
@@ -765,7 +775,7 @@ void CatalogModel::rebuildNow() {
                              .field_path = QString::fromStdString(column.field_path),
                              .topic_id = topic_id,
                              .column_index = column_index,
-                             .is_string = is_string,
+                             .logical_type = column.logical_type,
                          },
                  });
       }

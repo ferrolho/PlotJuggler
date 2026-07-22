@@ -101,6 +101,8 @@ VisualizationPlaceholderWidget::VisualizationPlaceholderWidget(QWidget* parent) 
     VisualizationKind kind;
   } specs[] = {
       {":/resources/svg/line_axis.svg", QT_TR_NOOP("Plot"), "buttonVizPlot", VisualizationKind::kPlot},
+      {":/resources/svg/state_transitions.svg", QT_TR_NOOP("State Transitions"), "buttonVizStateTransitions",
+       VisualizationKind::kStateTransitions},
       {":/resources/svg/image.svg", QT_TR_NOOP("2D"), "buttonVizScene2D", VisualizationKind::kScene2D},
       {":/resources/svg/cube.svg", QT_TR_NOOP("3D"), "buttonVizScene3D", VisualizationKind::kScene3D},
   };

@@ -26,6 +26,7 @@ class DataProcessorService;
 class PendingDisplayBinder;
 class PlotWidget;
 class SceneDockWidget;
+class StateTransitionsDockWidget;
 class TopicDemandTracker;
 
 // Thin glue between displayed widgets and TopicDemandTracker: resolves a
@@ -68,6 +69,11 @@ class TopicDemandController : public QObject {
   // xmlLoadState()/addTopic()) so no layerAdded is missed.
   void registerSceneDock(SceneDockWidget* dock);
 
+  // Starts tracking a state-transitions strip's displayed discrete series: diffs
+  // its (dataset, topic) set on every seriesListChanged, mirroring registerPlot
+  // (the initial sync covers rows restored before this call). Idempotent.
+  void registerStateTransitionsDock(StateTransitionsDockWidget* dock);
+
   // M3-UI placeholder drop path: `plot` (a curve-less or already-populated
   // PlotWidget) had an advertised SCALAR placeholder dropped on it. Stages a
   // pending bind via PendingDisplayBinder, which holds the demand reference
@@ -101,6 +107,13 @@ class TopicDemandController : public QObject {
   // Rebuilds `plot`'s current topic multiset and diffs it against
   // plot_topics_[plot], add/removeReference-ing exactly the delta.
   void syncPlot(PlotWidget* plot);
+  // Same delta sync for a state-transitions strip, against state_dock_topics_.
+  void syncStateTransitionsDock(StateTransitionsDockWidget* dock);
+  // The shared tail of both syncs: multiset-diff `current` against `previous`
+  // (a reference into the per-widget map), add/removeReference the delta, and
+  // store `current` as the new previous.
+  void applyTopicDelta(
+      std::vector<std::pair<DatasetId, QString>> current, std::vector<std::pair<DatasetId, QString>>& previous);
   // Appends (dataset_id, topic_name) plus, when topic_id names a displayed Data
   // Processor output, its resolved source topics too (v1 derived-input
   // resolution — see DataProcessorService::sourceTopicsForOutput).
@@ -157,6 +170,9 @@ class TopicDemandController : public QObject {
   // added regardless of catalog churn in between. Erased when the dock is
   // destroyed (each entry's reference released first).
   std::unordered_map<SceneDockWidget*, std::unordered_map<uint32_t, std::pair<DatasetId, QString>>> scene_layer_topics_;
+  // Last-seen (dataset, topic) set per tracked state-transitions strip — see
+  // syncStateTransitionsDock(). Erased when the strip is destroyed.
+  std::unordered_map<StateTransitionsDockWidget*, std::vector<std::pair<DatasetId, QString>>> state_dock_topics_;
 
   // --- bounded field-preview subscriptions (census + double-click peek) ---
   // Preview identity is (DatasetId, topic_name), matching TopicDemandTracker.
