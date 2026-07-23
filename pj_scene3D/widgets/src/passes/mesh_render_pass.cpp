@@ -20,6 +20,7 @@
 #include <variant>
 
 #include "pj_scene3d_widgets/gl/gl_functions.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 namespace {
@@ -983,7 +984,8 @@ void MeshRenderPass::drawBatch(
   if (shadows_on) {
     program_->setMat4("u_light_vp", view_params.light_view_proj);
     program_->setInt("u_shadow_map", 5);
-    program_->setFloat("u_shadow_normal_offset", view_params.shadow_world_units_per_texel * 1.5f);
+    program_->setFloat(
+        "u_shadow_normal_offset", view_params.shadow_world_units_per_texel * look::kShadowNormalOffsetTexels);
     program_->setFloat("u_shadow_softness", look::kShadowSoftnessTexels);
     withGlFunctions([&view_params](auto& functions) {
       functions.glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + 5));

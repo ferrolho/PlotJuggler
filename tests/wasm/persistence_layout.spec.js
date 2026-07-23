@@ -312,7 +312,7 @@ test('browser layouts open transactionally and download with exact round-trip st
     () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
     { timeout: 15000 },
   ).toContain('layout-open/temp:3@');
-  await page.mouse.click(screen.x + 748, screen.y + 390);
+  await page.mouse.click(screen.x + 713, screen.y + 390);
   await page.waitForTimeout(1500);
   await page.keyboard.press('F9');
   await expect.poll(
@@ -684,7 +684,7 @@ test('source-bound browser layouts download logical references and replay after 
     () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
     { timeout: 15000 },
   ).toContain('source-reselect/temp:3@');
-  await page.mouse.click(screen.x + 748, screen.y + 390);
+  await page.mouse.click(screen.x + 713, screen.y + 390);
   await page.waitForTimeout(1500);
   await page.keyboard.press('F9');
   await expect.poll(

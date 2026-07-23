@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QFontMetrics>
+#include <QLabel>
 #include <QResizeEvent>
 #include <QScopedValueRollback>
 #include <QSettings>
@@ -286,6 +287,15 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
       view_->resetCamera();
     }
   });
+
+  rendering_warning_label_ = new QLabel(this);
+  rendering_warning_label_->setObjectName(u"scene3dRenderingWarning"_s);
+  rendering_warning_label_->setWordWrap(true);
+  rendering_warning_label_->setAlignment(Qt::AlignCenter);
+  rendering_warning_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
+  rendering_warning_label_->setStyleSheet(
+      u"QLabel { color: #fff4d6; background: rgba(116, 70, 0, 220); border-radius: 4px; padding: 6px; }"_s);
+  rendering_warning_label_->hide();
   connect(this, &SceneDockWidget::layerRemoved, this, [this](ObjectTopicId topic_id) {
     local_robot_layer_ids_.erase(topic_id.id);
     scene_topic_datasets_.erase(topic_id.id);
@@ -444,6 +454,14 @@ QWidget* Scene3DDockWidget::createSceneView() {
   }
   connect(view_, &pj::scene3d::SceneViewWidget::framesChanged, this, &Scene3DDockWidget::onAvailableFrames);
   connect(view_, &pj::scene3d::SceneViewWidget::presentationChanged, this, &Scene3DDockWidget::notifyWorkspaceChanged);
+  connect(view_, &pj::scene3d::SceneViewWidget::renderingWarningChanged, this, [this](const QString& warning) {
+    if (rendering_warning_label_ == nullptr) {
+      return;
+    }
+    rendering_warning_label_->setText(warning);
+    rendering_warning_label_->setVisible(!warning.isEmpty());
+    layoutOverlayControls();
+  });
   view_->setTransformBuffer(tf_buffer_);
   refreshFrameOverlayCombo();
   emit sceneViewReady();
@@ -858,6 +876,14 @@ void Scene3DDockWidget::layoutOverlayControls() {
   const int camera_width = std::clamp(camera_model_combo_->sizeHint().width(), 90, std::max(90, view_->width() / 3));
   camera_model_combo_->setGeometry(
       origin.x() + view_->width() - margin - camera_width, origin.y() + margin, camera_width, height);
+  if (rendering_warning_label_ != nullptr && rendering_warning_label_->isVisible()) {
+    const int warning_width = std::max(120, view_->width() - 2 * margin);
+    rendering_warning_label_->setFixedWidth(warning_width);
+    const int warning_height = rendering_warning_label_->heightForWidth(warning_width);
+    rendering_warning_label_->setGeometry(
+        origin.x() + margin, origin.y() + view_->height() - margin - warning_height, warning_width, warning_height);
+    rendering_warning_label_->raise();
+  }
   frame_overlay_combo_->raise();
   home_button_->raise();
   camera_model_combo_->raise();

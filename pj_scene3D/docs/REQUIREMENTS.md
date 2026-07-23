@@ -56,19 +56,20 @@ PJ4's 3D visualization module — the sibling family to `pj_scene2D`, focused on
 - **TF axes** as 3D gizmos — substituting for the URDF mesh path since real mesh assets are not available for the Phase 1 input data. This is a permanent first-class display, not a placeholder. Hovering a triad shows the frame's name in a small label (screen-space pick of the nearest frame origin; see ARCHITECTURE.md "TF frame hover labels").
 - **Pointclouds** (`sensor_msgs/PointCloud2`).
 
-**WebAssembly status (W19a):** the browser product implements TF axes/parent
-connections, line/checker grid, raw and Draco/Cloudini-compressed canonical
-point clouds, pose arrays, occupancy grids with incremental updates, and dense
-voxel grids. This includes fixed-frame selection, Position follow, shared camera
-models and interaction, tracker-time replay, progressive/live TF updates,
-per-layer style, bounded resource policies, and layout persistence. Compressed
-clouds decode on a worker and enter the same browser point conversion/render
-path as raw clouds. Voxel grids use sampled WebGL2 3D textures and GPU
-instancing; the actual per-browser 3D-texture dimension ceiling is checked
-before allocation. The normal desktop application still selects the complete
-native OpenGL implementation and behavior. Other listed layers remain explicit
-later browser work packages and must not be inferred from parser availability
-alone.
+**WebAssembly status (W19m):** the browser product implements TF axes/parent
+connections, line/checker grid, raw and Draco/Cloudini-compressed point clouds,
+pose arrays, occupancy updates, dense voxel grids, procedural SceneEntities,
+PBR ModelPrimitives, and topic/file/URL URDF robot models. It uses the shared
+camera, fixed/follow, tracker replay, style, and layout contracts while enforcing
+browser-specific decode, retained-memory, texture, model, and network budgets.
+The QRhi/WebGL2 renderer provides mesh shadows and an HDR presentation chain
+with SSAO and mesh-masked EDL; each optional pass fails independently to a live
+lower-quality or direct-render path. Browser-selected local model bytes are
+capabilities for the current session and are never persisted as reopenable host
+paths. The desktop application continues to select the native OpenGL
+implementation and dependency graph unchanged. Paths, laser scans, and the
+Image+Pinhole view remain future work and must not be inferred from parser
+availability alone.
 
 Image+Pinhole (camera frustum + textured near-plane) from the original `PJ4_PLAN.md` §5.5 list is dropped from v1.
 

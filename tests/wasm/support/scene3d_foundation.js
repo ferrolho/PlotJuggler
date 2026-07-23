@@ -121,6 +121,41 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
     }];
   }));
 
+  const qualityMessages = () => consoleMessages.filter(
+    message => message.includes('PJ_WASM_SCENE3D_QUALITY')
+      && message.includes(`sequence=${sequence} `),
+  );
+  await expect.poll(() => qualityMessages().length).toBe(dockCount);
+  const qualityByIndex = new Map(qualityMessages().map((message) => {
+    const fields = Object.fromEntries(
+      [...message.matchAll(/(?:^| )([a-z_]+)=([^ ]*)/g)].map(match => [match[1], match[2]]),
+    );
+    const quality = (fields.quality || '').split(',').map(Number);
+    expect(quality, `invalid quality state: ${message}`).toHaveLength(19);
+    expect(quality.every(Number.isFinite), `non-numeric quality state: ${message}`).toBe(true);
+    const errors = decodeURIComponent(fields.errors || '').split('|');
+    return [Number(fields.index), {
+      hdr: {
+        active: quality[0] === 1, ready: quality[1] === 1,
+        width: quality[2], height: quality[3], bytes: quality[4], generation: quality[5],
+        error: errors[0] || '',
+      },
+      ssao: {
+        active: quality[6] === 1, ready: quality[7] === 1, generation: quality[8],
+        error: errors[1] || '',
+      },
+      edl: {
+        active: quality[9] === 1, ready: quality[10] === 1, generation: quality[11],
+        error: errors[2] || '',
+      },
+      shadow: {
+        active: quality[12] === 1, ready: quality[13] === 1, fit: quality[14] === 1,
+        size: quality[15], draws: quality[16], triangles: quality[17],
+        generation: quality[18], error: errors[3] || '',
+      },
+    }];
+  }));
+
   const docks = dockMessages().map((message) => {
     const match = message.match(
       /index=(\d+) identity=(\d+) view=(-?\d+),(-?\d+),(\d+)x(\d+) visible=(\d+) frames=([^ ]*) fixed=([^ ]*) auto=(\d+) follow=([^ ]*) model=(-?\d+) camera=([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^ ]+) vertices=(\d+),(\d+) resolved=(\d+) fixed_control=(-?\d+),(-?\d+),(\d+)x(\d+) camera_control=(-?\d+),(-?\d+),(\d+)x(\d+) home=(-?\d+),(-?\d+),(\d+)x(\d+) frame_hash=(\d+) rgb_sum=(\d+) framebuffer=(\d+)x(\d+)/,
@@ -167,7 +202,10 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
         height: Number(match[38]),
       },
       data: dataByIndex.get(Number(match[1])),
-      models: modelsByIndex.get(Number(match[1])),
+      models: {
+        ...modelsByIndex.get(Number(match[1])),
+        quality: qualityByIndex.get(Number(match[1])),
+      },
     };
   });
 

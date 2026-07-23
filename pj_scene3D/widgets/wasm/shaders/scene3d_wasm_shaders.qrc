@@ -16,5 +16,13 @@
     <file>marker.frag.qsb</file>
     <file>model.vert.qsb</file>
     <file>model.frag.qsb</file>
+    <file>mesh_mask.frag.qsb</file>
+    <file>ssao.frag.qsb</file>
+    <file>shadow.vert.qsb</file>
+    <file>shadow.frag.qsb</file>
+    <file>grid_shadow.vert.qsb</file>
+    <file>grid_shadow.frag.qsb</file>
+    <file>present.vert.qsb</file>
+    <file>present.frag.qsb</file>
   </qresource>
 </RCC>

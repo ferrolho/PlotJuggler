@@ -23,6 +23,7 @@
 #include "pj_scene_common/scene_dock_widget.h"
 
 class QResizeEvent;
+class QLabel;
 class QSettings;
 class QToolButton;
 class QWidget;
@@ -172,6 +173,7 @@ class Scene3DDockWidget : public SceneDockWidget {
   ComboBox* frame_overlay_combo_ = nullptr;
   ComboBox* camera_model_combo_ = nullptr;
   QToolButton* home_button_ = nullptr;
+  QLabel* rendering_warning_label_ = nullptr;
 
   QSettings* settings_ = nullptr;
   QMap<QString, QByteArray> embedded_assets_;

@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "pj_scene3d_core/shadow_camera.h"
 #include "pj_scene3d_core/tf/tf_connections.h"
 #include "pj_scene3d_widgets/cube_mesh.h"
 #include "pj_scene3d_widgets/gizmos/arrow_mesh.h"
@@ -43,6 +44,7 @@
 #include "pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h"
 #include "pj_widgets/Colormap.h"
 #include "pj_widgets/FrameworkTokens.h"
+#include "scene_view_widget_rhi_quality_p.h"
 
 // The resource object lives in a static archive.  Explicit initialization both
 // retains it at link time and keeps Q_INIT_RESOURCE's generated symbol lookup in
@@ -90,7 +92,10 @@ constexpr quint32 kPointUniformBytes = 272U;
 constexpr quint32 kPoseUniformBytes = 192U;
 constexpr quint32 kOccupancyUniformBytes = 144U;
 constexpr quint32 kVoxelUniformBytes = 256U;
-constexpr quint32 kModelUniformBytes = 48U;
+constexpr quint32 kModelUniformBytes = 128U;
+constexpr quint32 kRenderModeUniformBytes = 16U;
+static_assert(look::kTonemapMode == 1, "WASM composite implements the native application's ACES default");
+
 constexpr std::size_t kModelTextureSlotCount = 5U;
 constexpr std::size_t kBaseColorSlot = 0U;
 constexpr std::size_t kMetallicRoughnessSlot = 1U;
@@ -141,8 +146,15 @@ struct alignas(16) ModelUniforms {
   std::array<float, 4> camera_position{};
   std::array<float, 4> lighting{};
   std::array<float, 4> environment{};
+  std::array<float, 16> light_view_projection{};
+  std::array<float, 4> shadow_params{};
 };
 static_assert(sizeof(ModelUniforms) == kModelUniformBytes);
+
+struct alignas(16) RenderModeUniforms {
+  std::array<std::int32_t, 4> mode{};
+};
+static_assert(sizeof(RenderModeUniforms) == kRenderModeUniformBytes);
 
 std::array<const TextureSource*, kModelTextureSlotCount> modelTextureSources(const Material& material) {
   return {
@@ -354,6 +366,30 @@ AABB transformedModelBounds(const AABB& source, const glm::dmat4& fixed_from_mod
         (corner & 4) != 0 ? source.max.z : source.min.z,
     };
     const glm::dvec3 transformed = glm::dvec3(fixed_from_model * glm::dvec4(point, 1.0));
+    if (std::isfinite(transformed.x) && std::isfinite(transformed.y) && std::isfinite(transformed.z)) {
+      expandAABB(output, glm::vec3(transformed));
+    }
+  }
+  return output;
+}
+
+AABB transformedModelBoundsRelative(
+    const AABB& source, const glm::dmat4& fixed_from_model, const glm::dvec3& render_origin) {
+  if (!source.valid) {
+    return {};
+  }
+  AABB output;
+  for (int corner = 0; corner < 8; ++corner) {
+    const glm::dvec3 point{
+        (corner & 1) != 0 ? source.max.x : source.min.x,
+        (corner & 2) != 0 ? source.max.y : source.min.y,
+        (corner & 4) != 0 ? source.max.z : source.min.z,
+    };
+    // Subtract the camera-relative origin while the transform is still double
+    // precision. Casting world coordinates to float first makes a far-away
+    // caster's bounds collapse and its light frustum swim independently of the
+    // model matrix, which performs this same subtraction before narrowing.
+    const glm::dvec3 transformed = glm::dvec3(fixed_from_model * glm::dvec4(point, 1.0)) - render_origin;
     if (std::isfinite(transformed.x) && std::isfinite(transformed.y) && std::isfinite(transformed.z)) {
       expandAABB(output, glm::vec3(transformed));
     }
@@ -782,7 +818,8 @@ void SceneViewWidget::setMeshShadingParams(const MeshShadingParams& params) {
   const bool changed = shading_params_.meshes_visible != params.meshes_visible ||
                        shading_params_.mesh_opacity != params.mesh_opacity ||
                        shading_params_.collisions_visible != params.collisions_visible ||
-                       shading_params_.collision_opacity != params.collision_opacity;
+                       shading_params_.collision_opacity != params.collision_opacity ||
+                       shading_params_.shadows_enabled != params.shadows_enabled;
   shading_params_ = params;
   if (changed) {
     update();
@@ -887,6 +924,8 @@ void SceneViewWidget::appendTriangle(
 void SceneViewWidget::buildGeometry(const glm::dvec3& render_origin) {
   line_vertices_.clear();
   triangle_vertices_.clear();
+  grid_line_vertex_count_ = 0;
+  grid_triangle_vertex_count_ = 0;
   last_resolved_frame_count_ = 0;
 
   if (grid_visible_) {
@@ -907,6 +946,8 @@ void SceneViewWidget::buildGeometry(const glm::dvec3& render_origin) {
               static_cast<float>(point.x), static_cast<float>(point.y), static_cast<float>(point.z),
               look::kGridLineColor.r, look::kGridLineColor.g, look::kGridLineColor.b, 1.0F});
     }
+    grid_line_vertex_count_ = static_cast<quint32>(line_vertices_.size());
+    grid_triangle_vertex_count_ = static_cast<quint32>(triangle_vertices_.size());
   }
 
   tf_triad_instances_.clear();
@@ -990,6 +1031,8 @@ bool SceneViewWidget::ensurePointLayerGpu(QRhi* owner, WasmPointRenderable* /*la
             0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, gpu.uniform_buffer),
         QRhiShaderResourceBinding::sampledTexture(
             1, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+        QRhiShaderResourceBinding::uniformBuffer(
+            8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
     });
     if (!gpu.shader_resources->create()) {
       releasePointLayerGpu(gpu);
@@ -1021,6 +1064,8 @@ bool SceneViewWidget::ensurePoseLayerGpu(QRhi* owner, PoseLayerGpu& gpu) {
     gpu.shader_resources = owner->newShaderResourceBindings();
     gpu.shader_resources->setBindings({
         QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, gpu.uniform_buffer),
+        QRhiShaderResourceBinding::uniformBuffer(
+            8, QRhiShaderResourceBinding::FragmentStage, annotation_render_mode_uniform_buffer_),
     });
     if (!gpu.shader_resources->create()) {
       releasePoseLayerGpu(gpu);
@@ -1086,6 +1131,8 @@ bool SceneViewWidget::ensureOccupancyLayerGpu(
             0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, gpu.uniform_buffer),
         QRhiShaderResourceBinding::sampledTexture(
             1, QRhiShaderResourceBinding::FragmentStage, gpu.texture, occupancy_sampler_),
+        QRhiShaderResourceBinding::uniformBuffer(
+            8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
     });
     if (!gpu.shader_resources->create()) {
       layer->noteRenderFailure(tr("Could not create occupancy-grid shader bindings"));
@@ -1165,6 +1212,8 @@ bool SceneViewWidget::ensureVoxelLayerGpu(
             1, QRhiShaderResourceBinding::VertexStage, gpu.texture, voxel_sampler_),
         QRhiShaderResourceBinding::sampledTexture(
             2, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+        QRhiShaderResourceBinding::uniformBuffer(
+            8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
     });
     if (!gpu.shader_resources->create()) {
       layer->noteRenderFailure(tr("Could not create voxel-grid shader bindings"));
@@ -1238,6 +1287,76 @@ void SceneViewWidget::releaseModelLayerGpu(ModelLayerGpu& gpu) {
     releaseModelMeshGpu(mesh);
   }
   gpu = {};
+}
+
+QRhiShaderResourceBindings* SceneViewWidget::createModelMaterialBindings(
+    QRhi* owner, const ModelMaterialGpu& material) {
+  if (owner == nullptr || uniform_buffer_ == nullptr || model_uniform_buffer_ == nullptr ||
+      model_white_texture_ == nullptr || model_sampler_ == nullptr) {
+    return nullptr;
+  }
+  QRhiTexture* shadow_texture = shadow_texture_ != nullptr ? shadow_texture_ : model_white_texture_;
+  QRhiSampler* shadow_sampler = shadow_sampler_ != nullptr ? shadow_sampler_ : model_sampler_;
+  QRhiShaderResourceBindings* replacement = owner->newShaderResourceBindings();
+  replacement->setBindings({
+      QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, uniform_buffer_),
+      QRhiShaderResourceBinding::sampledTexture(
+          1, QRhiShaderResourceBinding::FragmentStage, material.textures[kBaseColorSlot].texture, model_sampler_),
+      QRhiShaderResourceBinding::sampledTexture(
+          2, QRhiShaderResourceBinding::FragmentStage, material.textures[kMetallicRoughnessSlot].texture,
+          model_sampler_),
+      QRhiShaderResourceBinding::sampledTexture(
+          3, QRhiShaderResourceBinding::FragmentStage, material.textures[kNormalSlot].texture, model_sampler_),
+      QRhiShaderResourceBinding::sampledTexture(
+          4, QRhiShaderResourceBinding::FragmentStage, material.textures[kOcclusionSlot].texture, model_sampler_),
+      QRhiShaderResourceBinding::sampledTexture(
+          5, QRhiShaderResourceBinding::FragmentStage, material.textures[kEmissiveSlot].texture, model_sampler_),
+      QRhiShaderResourceBinding::uniformBuffer(6, QRhiShaderResourceBinding::FragmentStage, model_uniform_buffer_),
+      QRhiShaderResourceBinding::sampledTexture(
+          7, QRhiShaderResourceBinding::FragmentStage, shadow_texture, shadow_sampler),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
+  });
+  if (!replacement->create()) {
+    delete replacement;
+    return nullptr;
+  }
+  return replacement;
+}
+
+bool SceneViewWidget::rebuildModelMaterialBindings(QRhi* owner, ModelMaterialGpu& material) {
+  QRhiShaderResourceBindings* replacement = createModelMaterialBindings(owner, material);
+  if (replacement == nullptr) {
+    return false;
+  }
+  delete material.shader_resources;
+  material.shader_resources = replacement;
+  return true;
+}
+
+bool SceneViewWidget::rebuildAllModelMaterialBindings(QRhi* owner) {
+  std::vector<std::pair<ModelMaterialGpu*, QRhiShaderResourceBindings*>> replacements;
+  for (auto& [_, layer] : model_layer_gpu_) {
+    for (auto& [__, mesh] : layer.meshes) {
+      for (ModelMaterialGpu& material : mesh.materials) {
+        QRhiShaderResourceBindings* replacement = createModelMaterialBindings(owner, material);
+        if (replacement == nullptr) {
+          for (const auto& [___, pending] : replacements) {
+            delete pending;
+          }
+          return false;
+        }
+        replacements.emplace_back(&material, replacement);
+      }
+    }
+  }
+  // Commit only after every replacement exists. A failed shadow enable/disable
+  // must not leave half the materials bound to the old depth texture.
+  for (const auto& [material, replacement] : replacements) {
+    delete material->shader_resources;
+    material->shader_resources = replacement;
+  }
+  return true;
 }
 
 bool SceneViewWidget::ensureModelLayerGpu(QRhi* owner, WasmModelRenderable* layer, ModelLayerGpu& gpu) {
@@ -1415,26 +1534,7 @@ bool SceneViewWidget::ensureModelLayerGpu(QRhi* owner, WasmModelRenderable* laye
         texture_gpu.texture_upload_pending = true;
         shared_textures.emplace(texture, texture_gpu.texture);
       }
-      material_gpu.shader_resources = owner->newShaderResourceBindings();
-      material_gpu.shader_resources->setBindings({
-          QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, uniform_buffer_),
-          QRhiShaderResourceBinding::sampledTexture(
-              1, QRhiShaderResourceBinding::FragmentStage, material_gpu.textures[kBaseColorSlot].texture,
-              model_sampler_),
-          QRhiShaderResourceBinding::sampledTexture(
-              2, QRhiShaderResourceBinding::FragmentStage, material_gpu.textures[kMetallicRoughnessSlot].texture,
-              model_sampler_),
-          QRhiShaderResourceBinding::sampledTexture(
-              3, QRhiShaderResourceBinding::FragmentStage, material_gpu.textures[kNormalSlot].texture, model_sampler_),
-          QRhiShaderResourceBinding::sampledTexture(
-              4, QRhiShaderResourceBinding::FragmentStage, material_gpu.textures[kOcclusionSlot].texture,
-              model_sampler_),
-          QRhiShaderResourceBinding::sampledTexture(
-              5, QRhiShaderResourceBinding::FragmentStage, material_gpu.textures[kEmissiveSlot].texture,
-              model_sampler_),
-          QRhiShaderResourceBinding::uniformBuffer(6, QRhiShaderResourceBinding::FragmentStage, model_uniform_buffer_),
-      });
-      if (!material_gpu.shader_resources->create()) {
+      if (!rebuildModelMaterialBindings(owner, material_gpu)) {
         layer->noteRenderFailure(tr("Could not create model material bindings"));
         releaseModelMeshGpu(mesh);
         releaseModelLayerGpu(gpu);
@@ -1464,9 +1564,10 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
       marker_line_no_depth_pipeline_ != nullptr && model_triangle_pipeline_ != nullptr &&
       model_triangle_no_depth_pipeline_ != nullptr && model_line_pipeline_ != nullptr &&
       model_line_no_depth_pipeline_ != nullptr && model_layout_shader_resources_ != nullptr &&
-      model_uniform_buffer_ != nullptr && model_white_texture_ != nullptr && model_sampler_ != nullptr &&
-      point_pipeline_ != nullptr && cube_pipeline_ != nullptr && pose_pipeline_ != nullptr &&
-      occupancy_pipeline_ != nullptr &&
+      render_mode_uniform_buffer_ != nullptr && annotation_render_mode_uniform_buffer_ != nullptr &&
+      annotation_shader_resources_ != nullptr && model_uniform_buffer_ != nullptr && model_white_texture_ != nullptr &&
+      model_sampler_ != nullptr && point_pipeline_ != nullptr && cube_pipeline_ != nullptr &&
+      pose_pipeline_ != nullptr && occupancy_pipeline_ != nullptr &&
       (!current_rhi->isFeatureSupported(QRhi::ThreeDimensionalTextures) || voxel_pipeline_ != nullptr)) {
     return;
   }
@@ -1497,15 +1598,28 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
   }
 
   uniform_buffer_ = current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, 64);
-  if (!uniform_buffer_->create()) {
+  render_mode_uniform_buffer_ =
+      current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kRenderModeUniformBytes);
+  annotation_render_mode_uniform_buffer_ =
+      current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kRenderModeUniformBytes);
+  if (!uniform_buffer_->create() || !render_mode_uniform_buffer_->create() ||
+      !annotation_render_mode_uniform_buffer_->create()) {
     releaseResources();
     return;
   }
   shader_resources_ = current_rhi->newShaderResourceBindings();
   shader_resources_->setBindings({
       QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, uniform_buffer_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
   });
-  if (!shader_resources_->create()) {
+  annotation_shader_resources_ = current_rhi->newShaderResourceBindings();
+  annotation_shader_resources_->setBindings({
+      QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, uniform_buffer_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, annotation_render_mode_uniform_buffer_),
+  });
+  if (!shader_resources_->create() || !annotation_shader_resources_->create()) {
     releaseResources();
     return;
   }
@@ -1532,6 +1646,10 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
       QRhiShaderResourceBinding::sampledTexture(
           5, QRhiShaderResourceBinding::FragmentStage, model_white_texture_, model_sampler_),
       QRhiShaderResourceBinding::uniformBuffer(6, QRhiShaderResourceBinding::FragmentStage, model_uniform_buffer_),
+      QRhiShaderResourceBinding::sampledTexture(
+          7, QRhiShaderResourceBinding::FragmentStage, model_white_texture_, model_sampler_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
   });
   if (!model_layout_shader_resources_->create()) {
     releaseResources();
@@ -1742,6 +1860,8 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
           point_layout_uniform_buffer_),
       QRhiShaderResourceBinding::sampledTexture(
           1, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
   });
   if (!point_layout_shader_resources_->create()) {
     releaseResources();
@@ -1831,6 +1951,8 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
   pose_layout_shader_resources_ = current_rhi->newShaderResourceBindings();
   pose_layout_shader_resources_->setBindings({
       QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, pose_layout_uniform_buffer_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, annotation_render_mode_uniform_buffer_),
   });
   if (!pose_layout_shader_resources_->create()) {
     releaseResources();
@@ -1897,6 +2019,8 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
           occupancy_layout_uniform_buffer_),
       QRhiShaderResourceBinding::sampledTexture(
           1, QRhiShaderResourceBinding::FragmentStage, occupancy_layout_texture_, occupancy_sampler_),
+      QRhiShaderResourceBinding::uniformBuffer(
+          8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
   });
   if (!occupancy_layout_shader_resources_->create()) {
     releaseResources();
@@ -1948,6 +2072,8 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
             1, QRhiShaderResourceBinding::VertexStage, voxel_layout_texture_, voxel_sampler_),
         QRhiShaderResourceBinding::sampledTexture(
             2, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+        QRhiShaderResourceBinding::uniformBuffer(
+            8, QRhiShaderResourceBinding::FragmentStage, render_mode_uniform_buffer_),
     });
     if (!voxel_layout_shader_resources_->create()) {
       releaseResources();
@@ -2001,6 +2127,12 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   }
 
   const QSize output_size = target->pixelSize();
+  const bool hdr_active = ensureHdrResources(current_rhi, output_size);
+  last_hdr_active_ = hdr_active;
+  bool ssao_active = hdr_active && ensureSsaoResources(current_rhi, output_size);
+  last_ssao_active_ = ssao_active;
+  bool edl_active = hdr_active && ensureEdlResources(current_rhi, output_size);
+  last_edl_active_ = edl_active;
   const float aspect = output_size.height() > 0
                            ? static_cast<float>(output_size.width()) / static_cast<float>(output_size.height())
                            : 1.0F;
@@ -2341,15 +2473,20 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   };
   struct PreparedModelLayer {
     WasmModelRenderable* layer = nullptr;
-    std::vector<PreparedModelCall> calls;
+    std::vector<PreparedModelCall> color_calls;
+    std::vector<PreparedModelCall> shadow_calls;
     std::uint64_t draws = 0;
     std::uint64_t triangles = 0;
+    std::uint64_t shadow_draws = 0;
+    std::uint64_t shadow_triangles = 0;
   };
   std::vector<PreparedModelLayer> prepared_models;
   prepared_models.reserve(model_layers_.size());
   AABB fixed_model_bounds;
   std::uint64_t remaining_model_draws = kBrowserMaxModelDrawsPerView;
   std::uint64_t remaining_model_triangles = kBrowserMaxModelTrianglesPerView;
+  std::uint64_t remaining_shadow_draws = kBrowserMaxModelDrawsPerView;
+  std::uint64_t remaining_shadow_triangles = kBrowserMaxModelTrianglesPerView;
   std::unordered_map<const MeshData*, AABB> model_bounds_cache;
   for (WasmModelRenderable* layer : model_layers_) {
     if (layer == nullptr || !layer->visible() || fixed_frame.empty() || layer->modelDrawCalls().empty()) {
@@ -2357,13 +2494,20 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     }
     PreparedModelLayer prepared;
     prepared.layer = layer;
-    prepared.calls.reserve(layer->modelDrawCalls().size());
+    prepared.color_calls.reserve(layer->modelDrawCalls().size());
+    prepared.shadow_calls.reserve(layer->modelDrawCalls().size());
     AABB layer_bounds;
     for (const WasmModelDrawCall& draw : layer->modelDrawCalls()) {
-      if ((draw.group == WasmModelDrawGroup::kVisual &&
-           (!shading_params_.meshes_visible || shading_params_.mesh_opacity <= 0.0F)) ||
-          (draw.group == WasmModelDrawGroup::kCollision &&
-           (!shading_params_.collisions_visible || shading_params_.collision_opacity <= 0.0F))) {
+      const bool color_requested = (draw.group != WasmModelDrawGroup::kVisual ||
+                                    (shading_params_.meshes_visible && shading_params_.mesh_opacity > 0.0F)) &&
+                                   (draw.group != WasmModelDrawGroup::kCollision ||
+                                    (shading_params_.collisions_visible && shading_params_.collision_opacity > 0.0F));
+      // Native casts SceneEntities model primitives and RobotModel visuals. A
+      // hidden Robot visual still casts there; collisions never do. Keep the
+      // same intentionally asymmetric visibility contract in the browser.
+      const bool shadow_requested =
+          shading_params_.shadows_enabled && tf_ != nullptr && draw.group != WasmModelDrawGroup::kCollision;
+      if (!color_requested && !shadow_requested) {
         continue;
       }
       const auto mesh = layer->modelMeshes().find(draw.mesh_key);
@@ -2383,25 +2527,43 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       }
       const std::uint64_t submesh_draws = mesh->second->submeshes.size();
       const std::uint64_t triangles = mesh->second->indices.size() / 3U;
-      if (submesh_draws > std::numeric_limits<std::uint64_t>::max() - prepared.draws ||
-          triangles > std::numeric_limits<std::uint64_t>::max() - prepared.triangles) {
-        prepared.draws = std::numeric_limits<std::uint64_t>::max();
-        prepared.triangles = std::numeric_limits<std::uint64_t>::max();
-        break;
+      if (color_requested) {
+        if (submesh_draws > std::numeric_limits<std::uint64_t>::max() - prepared.draws ||
+            triangles > std::numeric_limits<std::uint64_t>::max() - prepared.triangles) {
+          prepared.draws = std::numeric_limits<std::uint64_t>::max();
+          prepared.triangles = std::numeric_limits<std::uint64_t>::max();
+          break;
+        }
+        prepared.draws += submesh_draws;
+        prepared.triangles += triangles;
       }
-      prepared.draws += submesh_draws;
-      prepared.triangles += triangles;
+      if (shadow_requested) {
+        if (prepared.shadow_draws == std::numeric_limits<std::uint64_t>::max() ||
+            triangles > std::numeric_limits<std::uint64_t>::max() - prepared.shadow_triangles) {
+          prepared.shadow_draws = std::numeric_limits<std::uint64_t>::max();
+          prepared.shadow_triangles = std::numeric_limits<std::uint64_t>::max();
+          break;
+        }
+        ++prepared.shadow_draws;
+        prepared.shadow_triangles += triangles;
+      }
       const glm::dmat4 fixed_from_model = fixed_from_frame.matrix() * draw.model;
       const auto [bounds, inserted] = model_bounds_cache.try_emplace(mesh->second.get());
       if (inserted) {
         bounds->second = modelBounds(*mesh->second);
       }
-      layer_bounds = unionAABB(layer_bounds, transformedModelBounds(bounds->second, fixed_from_model));
-      prepared.calls.push_back(
-          PreparedModelCall{
-              draw.mesh_key, mesh->second, fixed_from_model, draw.override_color, draw.use_material, draw.group});
+      const AABB draw_bounds = transformedModelBounds(bounds->second, fixed_from_model);
+      const PreparedModelCall call{draw.mesh_key,       mesh->second,      fixed_from_model,
+                                   draw.override_color, draw.use_material, draw.group};
+      if (color_requested) {
+        layer_bounds = unionAABB(layer_bounds, draw_bounds);
+        prepared.color_calls.push_back(call);
+      }
+      if (shadow_requested) {
+        prepared.shadow_calls.push_back(call);
+      }
     }
-    if (prepared.calls.empty()) {
+    if (prepared.color_calls.empty() && prepared.shadow_calls.empty()) {
       continue;
     }
     if (prepared.draws > kBrowserMaxModelDrawsPerLayer || prepared.triangles > kBrowserMaxModelTrianglesPerLayer) {
@@ -2412,7 +2574,8 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
                                        QString::number(kBrowserMaxModelTrianglesPerLayer)));
       continue;
     }
-    if (!tryConsumeBrowserModels(
+    if (!prepared.color_calls.empty() &&
+        !tryConsumeBrowserModels(
             prepared.draws, prepared.triangles, remaining_model_draws, remaining_model_triangles)) {
       layer->noteRenderFailure(
           tr("Models need %1 draws and %2 triangles; the remaining browser view budget is %3 and %4")
@@ -2420,6 +2583,16 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
                   QString::number(prepared.draws), QString::number(prepared.triangles),
                   QString::number(remaining_model_draws), QString::number(remaining_model_triangles)));
       continue;
+    }
+    QString shadow_warning;
+    if (prepared.shadow_draws > kBrowserMaxModelDrawsPerLayer ||
+        prepared.shadow_triangles > kBrowserMaxModelTrianglesPerLayer ||
+        !tryConsumeBrowserModels(
+            prepared.shadow_draws, prepared.shadow_triangles, remaining_shadow_draws, remaining_shadow_triangles)) {
+      shadow_warning = tr("Model shadows exceed the browser draw/triangle budget");
+      prepared.shadow_calls.clear();
+      prepared.shadow_draws = 0;
+      prepared.shadow_triangles = 0;
     }
     if (layer->contributesToSceneBounds()) {
       fixed_model_bounds = unionAABB(fixed_model_bounds, layer_bounds);
@@ -2430,7 +2603,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
         fitted_marker_layers.push_back(marker);
       }
     }
-    layer->noteRenderSuccess();
+    if (shadow_warning.isEmpty()) {
+      layer->noteRenderSuccess();
+    } else {
+      layer->noteRenderFailure(shadow_warning);
+    }
     prepared_models.push_back(std::move(prepared));
   }
   last_model_bounds_ = fixed_model_bounds;
@@ -2467,7 +2644,6 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   const glm::dvec3 render_origin(camera_->state().focal);
   buildGeometry(render_origin);
   const quint32 prelude_line_vertices = static_cast<quint32>(line_vertices_.size());
-  const quint32 prelude_triangle_vertices = static_cast<quint32>(triangle_vertices_.size());
 
   enum class MarkerDrawKind { kInstanceTriangles, kInstanceLines, kStreamTriangles, kStreamLines };
   struct MarkerDrawRange {
@@ -2669,13 +2845,24 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     WasmModelRenderable* layer = nullptr;
     std::vector<ModelDrawRange> ranges;
   };
+  struct ShadowDrawRange {
+    ModelMeshGpu* mesh = nullptr;
+    quint32 instance_offset = 0;
+    quint32 index_count = 0;
+  };
   std::vector<ModelLayerDraw> model_draws;
   model_draws.reserve(prepared_models.size());
+  std::vector<ShadowDrawRange> shadow_draws;
+  shadow_draws.reserve(model_draws.capacity());
   model_instances_.clear();
+  shadow_instances_.clear();
   last_model_layer_count_ = 0;
   last_model_draw_count_ = 0;
   last_model_triangle_count_ = 0;
   last_model_texture_slot_counts_.fill(0);
+  last_shadow_draw_count_ = 0;
+  last_shadow_triangle_count_ = 0;
+  AABB render_shadow_bounds;
   for (const PreparedModelLayer& prepared : prepared_models) {
     WasmModelRenderable* layer = prepared.layer;
     ModelLayerGpu& gpu = model_layer_gpu_[layer];
@@ -2684,7 +2871,7 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     }
     ModelLayerDraw layer_draw;
     layer_draw.layer = layer;
-    for (const PreparedModelCall& call : prepared.calls) {
+    for (const PreparedModelCall& call : prepared.color_calls) {
       const auto gpu_mesh = gpu.meshes.find(call.mesh_key);
       if (gpu_mesh == gpu.meshes.end() || gpu_mesh->second.source == nullptr) {
         continue;
@@ -2762,12 +2949,54 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       last_model_triangle_count_ += static_cast<int>(prepared.triangles);
       model_draws.push_back(std::move(layer_draw));
     }
+    for (const PreparedModelCall& call : prepared.shadow_calls) {
+      const auto gpu_mesh = gpu.meshes.find(call.mesh_key);
+      if (gpu_mesh == gpu.meshes.end() || gpu_mesh->second.source == nullptr ||
+          gpu_mesh->second.triangle_index_buffer == nullptr || call.mesh->indices.empty()) {
+        continue;
+      }
+      glm::dmat4 model = call.fixed_from_model;
+      model[3].x -= render_origin.x;
+      model[3].y -= render_origin.y;
+      model[3].z -= render_origin.z;
+      const glm::mat4 narrowed(model);
+      ShadowInstance instance;
+      std::memcpy(instance.model.data(), &narrowed[0][0], sizeof(narrowed));
+      const quint32 instance_offset = static_cast<quint32>(shadow_instances_.size());
+      shadow_instances_.push_back(instance);
+      const auto cached_bounds = model_bounds_cache.find(call.mesh.get());
+      if (cached_bounds != model_bounds_cache.end()) {
+        render_shadow_bounds = unionAABB(
+            render_shadow_bounds,
+            transformedModelBoundsRelative(cached_bounds->second, call.fixed_from_model, render_origin));
+      }
+      const quint32 index_count = static_cast<quint32>(call.mesh->indices.size());
+      shadow_draws.push_back(ShadowDrawRange{&gpu_mesh->second, instance_offset, index_count});
+      ++last_shadow_draw_count_;
+      last_shadow_triangle_count_ += static_cast<int>(index_count / 3U);
+    }
   }
+
+  if (!shading_params_.shadows_enabled && shadow_texture_ != nullptr) {
+    releaseShadowResources(true);
+  }
+  if (render_shadow_bounds.valid) {
+    render_shadow_bounds = extendAabbToGroundShadow(
+        render_shadow_bounds, shading_params_.key_light_dir, static_cast<float>(-render_origin.z));
+  }
+  last_shadow_bounds_ = render_shadow_bounds;
+  const ShadowCameraFit shadow_fit =
+      fitDirectionalShadowCamera(render_shadow_bounds, shading_params_.key_light_dir, kShadowMapSize);
+  last_shadow_fit_valid_ = shadow_fit.valid;
+  const bool shadow_requested =
+      shading_params_.shadows_enabled && tf_ != nullptr && !shadow_draws.empty() && shadow_fit.valid;
+  const bool shadow_resources_ready = shadow_requested && ensureShadowResources(current_rhi);
 
   const quint32 line_bytes = static_cast<quint32>(line_vertices_.size() * sizeof(Vertex));
   const quint32 triangle_bytes = static_cast<quint32>(triangle_vertices_.size() * sizeof(Vertex));
   const quint32 marker_instance_bytes = static_cast<quint32>(marker_instances_.size() * sizeof(MarkerInstance));
   const quint32 model_instance_bytes = static_cast<quint32>(model_instances_.size() * sizeof(ModelInstance));
+  const quint32 shadow_instance_bytes = static_cast<quint32>(shadow_instances_.size() * sizeof(ShadowInstance));
   const bool buffers_ready =
       ensureVertexBuffer(current_rhi, line_buffer_, line_buffer_capacity_, line_bytes, kInitialVertexBufferBytes) &&
       ensureVertexBuffer(
@@ -2778,8 +3007,38 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       ensureVertexBuffer(
           current_rhi, model_instance_buffer_, model_instance_buffer_capacity_, model_instance_bytes,
           kInitialVertexBufferBytes);
+  bool shadow_buffer_ready = false;
+  if (shadow_resources_ready) {
+    shadow_buffer_ready = ensureVertexBuffer(
+        current_rhi, shadow_instance_buffer_, shadow_instance_buffer_capacity_, shadow_instance_bytes,
+        kInitialVertexBufferBytes);
+    if (!shadow_buffer_ready) {
+      shadow_capability_error_ = tr("Could not allocate the browser shadow instance buffer");
+      qWarning("SceneViewWidget WASM shadows unavailable: %s", qPrintable(shadow_capability_error_));
+      releaseShadowResources(true);
+    }
+  }
+  const bool shadow_active = shadow_requested && shadow_resources_ready && shadow_buffer_ready;
+  last_shadow_active_ = shadow_active;
+  if (shadow_requested && !shadow_active && !shadow_capability_error_.isEmpty()) {
+    if (noted_shadow_failure_ != shadow_capability_error_) {
+      noted_shadow_failure_ = shadow_capability_error_;
+      for (const PreparedModelLayer& prepared : prepared_models) {
+        if (prepared.layer != nullptr && !prepared.shadow_calls.empty()) {
+          prepared.layer->noteRenderFailure(shadow_capability_error_);
+        }
+      }
+    }
+  } else {
+    noted_shadow_failure_.clear();
+  }
 
   QRhiResourceUpdateBatch* updates = current_rhi->nextResourceUpdateBatch();
+  const RenderModeUniforms data_render_mode{{hdr_active ? 1 : 0, 0, 0, 0}};
+  const RenderModeUniforms annotation_render_mode{{hdr_active ? 1 : 0, 1, 0, 0}};
+  updates->updateDynamicBuffer(render_mode_uniform_buffer_, 0, kRenderModeUniformBytes, &data_render_mode);
+  updates->updateDynamicBuffer(
+      annotation_render_mode_uniform_buffer_, 0, kRenderModeUniformBytes, &annotation_render_mode);
   if (buffers_ready && line_bytes != 0) {
     updates->updateDynamicBuffer(line_buffer_, 0, line_bytes, line_vertices_.data());
   }
@@ -2791,6 +3050,9 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   }
   if (buffers_ready && model_instance_bytes != 0) {
     updates->updateDynamicBuffer(model_instance_buffer_, 0, model_instance_bytes, model_instances_.data());
+  }
+  if (shadow_active && shadow_instance_bytes != 0) {
+    updates->updateDynamicBuffer(shadow_instance_buffer_, 0, shadow_instance_bytes, shadow_instances_.data());
   }
   if (model_white_upload_pending_ && model_white_texture_ != nullptr) {
     static constexpr std::array<std::uint8_t, 4> white{255U, 255U, 255U, 255U};
@@ -2867,9 +3129,57 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   const glm::mat4 view = camera_->viewMatrixRelativeTo(render_origin);
   const glm::mat4 view_projection = projection * view;
   const QMatrix4x4 clip_correction = current_rhi->clipSpaceCorrMatrix();
-  const QMatrix4x4 matrix = clip_correction * toQMatrix(view_projection);
+  const QMatrix4x4 corrected_projection = clip_correction * toQMatrix(projection);
+  const QMatrix4x4 matrix = corrected_projection * toQMatrix(view);
+  const QMatrix4x4 shadow_matrix =
+      clip_correction * toQMatrix(shadow_fit.valid ? shadow_fit.light_view_proj : glm::mat4(1.0F));
+  if (hdr_active) {
+    bool inverse_projection_valid = false;
+    const QMatrix4x4 inverse_projection = corrected_projection.inverted(&inverse_projection_valid);
+    ssao_active = ssao_active && inverse_projection_valid;
+    last_ssao_active_ = ssao_active;
+    edl_active = edl_active && inverse_projection_valid;
+    last_edl_active_ = edl_active;
+    CompositeUniforms composite;
+    composite.params = {
+        look::kExposure,
+        look::kSaturation,
+        kBackgroundCoverageThreshold,
+        look::kEdlFloor,
+    };
+    copyMatrix(inverse_projection, composite.inverse_projection);
+    composite.edl_params = {
+        look::kEdlStrength,
+        look::kEdlRadiusPx,
+        look::kEdlMaxGap,
+        edl_active ? 1.0F : 0.0F,
+    };
+    composite.ssao_params = {
+        look::kAoStrength,
+        ssao_active ? 1.0F : 0.0F,
+        0.0F,
+        0.0F,
+    };
+    updates->updateDynamicBuffer(composite_uniform_buffer_, 0, kCompositeUniformBytes, &composite);
+    if (ssao_active && ssao_uniform_buffer_ != nullptr) {
+      SsaoUniforms ssao_uniforms;
+      copyMatrix(corrected_projection, ssao_uniforms.projection);
+      copyMatrix(inverse_projection, ssao_uniforms.inverse_projection);
+      ssao_uniforms.params = {
+          look::kSsaoRadiusM,
+          look::kSsaoPower,
+          look::kSsaoBias,
+          0.0F,
+      };
+      ssao_uniforms.kernel = ssaoKernel();
+      updates->updateDynamicBuffer(ssao_uniform_buffer_, 0, kSsaoUniformBytes, &ssao_uniforms);
+    }
+  }
   if (uniform_buffer_ != nullptr) {
     updates->updateDynamicBuffer(uniform_buffer_, 0, 64, matrix.constData());
+  }
+  if (shadow_active && shadow_uniform_buffer_ != nullptr) {
+    updates->updateDynamicBuffer(shadow_uniform_buffer_, 0, kShadowUniformBytes, shadow_matrix.constData());
   }
   if (model_uniform_buffer_ != nullptr) {
     const glm::dvec3 camera_position = glm::dvec3(camera_->position()) - render_origin;
@@ -2882,6 +3192,10 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
         shading_params_.reflectivity, shading_params_.ambient_scale, shading_params_.direct_scale,
         shading_params_.fill_light_scale};
     model_uniforms.environment = {key_direction.x, key_direction.y, key_direction.z, shading_params_.env_intensity};
+    copyMatrix(shadow_matrix, model_uniforms.light_view_projection);
+    model_uniforms.shadow_params = {
+        shadow_active ? shadow_fit.world_units_per_texel * look::kShadowNormalOffsetTexels : 0.0F,
+        look::kShadowSoftnessTexels, shadow_active ? 1.0F : 0.0F, static_cast<float>(shadow_map_size_)};
     updates->updateDynamicBuffer(model_uniform_buffer_, 0, kModelUniformBytes, &model_uniforms);
   }
 
@@ -3188,242 +3502,401 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     last_voxel_count_ += static_cast<int>(layer->voxelCount());
   }
 
-  command_buffer->beginPass(target, sceneBackdropColor(), {1.0F, 0}, updates);
-  const QRhiViewport viewport(
-      0.0F, 0.0F, static_cast<float>(output_size.width()), static_cast<float>(output_size.height()));
-  last_submitted_layer_ids_.clear();
-  if (buffers_ready && shader_resources_ != nullptr) {
-    // Match native Scene3D's scene-wide prelude: grid cells/axes and TF lines
-    // are annotations beneath the user-ordered object stack.
-    if (prelude_triangle_vertices != 0U && triangle_pipeline_ != nullptr) {
-      command_buffer->setGraphicsPipeline(triangle_pipeline_);
-      command_buffer->setViewport(viewport);
-      command_buffer->setShaderResources(shader_resources_);
-      const QRhiCommandBuffer::VertexInput input(triangle_buffer_, 0);
-      command_buffer->setVertexInput(0, 1, &input);
-      command_buffer->draw(prelude_triangle_vertices);
-    }
-    if (prelude_line_vertices != 0U && line_pipeline_ != nullptr) {
-      command_buffer->setGraphicsPipeline(line_pipeline_);
-      command_buffer->setViewport(viewport);
-      command_buffer->setShaderResources(shader_resources_);
-      const QRhiCommandBuffer::VertexInput input(line_buffer_, 0);
-      command_buffer->setVertexInput(0, 1, &input);
-      command_buffer->draw(prelude_line_vertices);
-    }
-    if (tf_triad_instance_count != 0U && pose_pipeline_ != nullptr && pose_vertex_buffer_ != nullptr &&
-        pose_index_buffer_ != nullptr && tf_triad_gpu_.instance_buffer != nullptr &&
-        tf_triad_gpu_.shader_resources != nullptr) {
-      command_buffer->setGraphicsPipeline(pose_pipeline_);
-      command_buffer->setViewport(viewport);
-      command_buffer->setShaderResources(tf_triad_gpu_.shader_resources);
+  if (shadow_active) {
+    command_buffer->beginPass(shadow_render_target_, Qt::transparent, {1.0F, 0}, updates);
+    command_buffer->setGraphicsPipeline(shadow_pipeline_);
+    command_buffer->setViewport(
+        QRhiViewport(0.0F, 0.0F, static_cast<float>(kShadowMapSize), static_cast<float>(kShadowMapSize)));
+    command_buffer->setShaderResources(shadow_shader_resources_);
+    for (const ShadowDrawRange& range : shadow_draws) {
+      if (range.mesh == nullptr || range.mesh->vertex_buffer == nullptr ||
+          range.mesh->triangle_index_buffer == nullptr || range.index_count == 0U) {
+        continue;
+      }
       const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
-          QRhiCommandBuffer::VertexInput(pose_vertex_buffer_, 0),
-          QRhiCommandBuffer::VertexInput(tf_triad_gpu_.instance_buffer, 0),
+          QRhiCommandBuffer::VertexInput(range.mesh->vertex_buffer, 0),
+          QRhiCommandBuffer::VertexInput(
+              shadow_instance_buffer_, range.instance_offset * static_cast<quint32>(sizeof(ShadowInstance))),
       };
       command_buffer->setVertexInput(
-          0, static_cast<int>(inputs.size()), inputs.data(), pose_index_buffer_, 0, QRhiCommandBuffer::IndexUInt32);
-      command_buffer->drawIndexed(pose_index_count_, tf_triad_instance_count);
+          0, static_cast<int>(inputs.size()), inputs.data(), range.mesh->triangle_index_buffer, 0,
+          QRhiCommandBuffer::IndexUInt32);
+      command_buffer->drawIndexed(range.index_count, 1U);
     }
+    command_buffer->endPass();
+    updates = nullptr;
+  }
 
-    // Preparation and GPU ownership remain family-specific, but command
-    // submission follows the dock's one heterogeneous order exactly. Each
-    // prepared family vector retains that order, so monotonic cursors keep the
-    // submission pass linear while naturally skipping non-drawable layers.
-    std::size_t point_draw_index = 0;
-    std::size_t pose_draw_index = 0;
-    std::size_t occupancy_draw_index = 0;
-    std::size_t voxel_draw_index = 0;
-    std::size_t marker_draw_index = 0;
-    std::size_t model_draw_index = 0;
-    const auto submit_model_layer = [&](WasmModelRenderable* layer) {
-      if (model_draw_index == model_draws.size() || model_draws[model_draw_index].layer != layer) {
-        return false;
-      }
-      bool submitted = false;
-      const ModelLayerDraw& model_draw = model_draws[model_draw_index++];
-      for (const ModelDrawRange& range : model_draw.ranges) {
-        if (range.mesh == nullptr || range.material == nullptr) {
-          continue;
+  // Scene backdrop tracks the active theme (matching the desktop GL view, which
+  // reads the same token per frame). PaletteChange calls update(), so a theme
+  // switch re-applies here. The HDR target is linear-light — the present pass
+  // re-encodes to sRGB — so linearize the display-referred token on write.
+  const QColor scene_bg = sceneBackdropColor();
+  const auto linear_channel = [](float channel) { return std::pow(channel, 2.2F); };
+  const QColor hdr_scene_clear = QColor::fromRgbF(
+      linear_channel(static_cast<float>(scene_bg.redF())), linear_channel(static_cast<float>(scene_bg.greenF())),
+      linear_channel(static_cast<float>(scene_bg.blueF())), 1.0F);
+  const QRhiViewport viewport(
+      0.0F, 0.0F, static_cast<float>(output_size.width()), static_cast<float>(output_size.height()));
+  enum class ScenePass { kDirect, kHdrColor, kDepthReplay };
+  const auto pipeline_for =
+      [this](QRhiGraphicsPipeline* direct, QRhiGraphicsPipeline* hdr, ScenePass scene_pass) -> QRhiGraphicsPipeline* {
+    if (scene_pass == ScenePass::kHdrColor) {
+      return hdr;
+    }
+    if (scene_pass == ScenePass::kDepthReplay) {
+      const auto iterator = hdr_depth_pipelines_.find(direct);
+      return iterator != hdr_depth_pipelines_.end() ? iterator->second : nullptr;
+    }
+    return direct;
+  };
+  const auto render_scene_pass = [&](QRhiRenderTarget* scene_target, ScenePass scene_pass, const QColor& clear,
+                                     QRhiResourceUpdateBatch* pass_updates) {
+    command_buffer->beginPass(scene_target, clear, {1.0F, 0}, pass_updates);
+    last_submitted_layer_ids_.clear();
+    if (buffers_ready && shader_resources_ != nullptr) {
+      // Native grades the grid as data, then draws TF connections/axes with the
+      // annotation alpha blend. Keep the ranges distinct even though they share
+      // one retained vertex buffer.
+      if (grid_triangle_vertex_count_ != 0U && triangle_pipeline_ != nullptr) {
+        QRhiGraphicsPipeline* grid_pipeline = nullptr;
+        if (shadow_active) {
+          grid_pipeline = pipeline_for(grid_shadow_pipeline_, hdr_grid_shadow_pipeline_, scene_pass);
+        } else {
+          grid_pipeline = pipeline_for(triangle_pipeline_, hdr_triangle_pipeline_, scene_pass);
         }
-        QRhiGraphicsPipeline* pipeline =
-            range.lines ? (range.depth_write ? model_line_pipeline_ : model_line_no_depth_pipeline_)
-                        : (range.depth_write ? model_triangle_pipeline_ : model_triangle_no_depth_pipeline_);
-        QRhiBuffer* index_buffer = range.lines ? range.mesh->edge_index_buffer : range.mesh->triangle_index_buffer;
-        if (pipeline == nullptr || range.mesh->vertex_buffer == nullptr || index_buffer == nullptr ||
-            range.material->shader_resources == nullptr || model_instance_buffer_ == nullptr ||
-            range.index_count == 0U) {
-          continue;
-        }
-        const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
-            QRhiCommandBuffer::VertexInput(range.mesh->vertex_buffer, 0),
-            QRhiCommandBuffer::VertexInput(
-                model_instance_buffer_, range.instance_offset * static_cast<quint32>(sizeof(ModelInstance))),
-        };
-        command_buffer->setGraphicsPipeline(pipeline);
+        command_buffer->setGraphicsPipeline(grid_pipeline);
         command_buffer->setViewport(viewport);
-        command_buffer->setShaderResources(range.material->shader_resources);
-        command_buffer->setVertexInput(
-            0, static_cast<int>(inputs.size()), inputs.data(), index_buffer,
-            range.index_offset * static_cast<quint32>(sizeof(quint32)), QRhiCommandBuffer::IndexUInt32);
-        command_buffer->drawIndexed(range.index_count, 1U);
-        submitted = true;
+        command_buffer->setShaderResources(shadow_active ? grid_shadow_shader_resources_ : shader_resources_);
+        const QRhiCommandBuffer::VertexInput input(triangle_buffer_, 0);
+        command_buffer->setVertexInput(0, 1, &input);
+        command_buffer->draw(grid_triangle_vertex_count_);
       }
-      return submitted;
-    };
-    for (const OrderedLayerEntry& ordered : ordered_layers_) {
-      std::visit(
-          [&](auto* layer) {
-            using Layer = std::remove_pointer_t<decltype(layer)>;
-            if constexpr (std::is_same_v<Layer, WasmPointRenderable>) {
-              if (point_pipeline_ == nullptr || cube_pipeline_ == nullptr) {
-                return;
-              }
-              if (point_draw_index == point_draws.size() || point_draws[point_draw_index].layer != layer) {
-                return;
-              }
-              const PointDraw& draw = point_draws[point_draw_index++];
-              command_buffer->setGraphicsPipeline(draw.cubes ? cube_pipeline_ : point_pipeline_);
-              command_buffer->setViewport(viewport);
-              command_buffer->setShaderResources(draw.shader_resources);
-              if (draw.cubes) {
+      if (grid_line_vertex_count_ != 0U && line_pipeline_ != nullptr) {
+        command_buffer->setGraphicsPipeline(pipeline_for(line_pipeline_, hdr_line_pipeline_, scene_pass));
+        command_buffer->setViewport(viewport);
+        command_buffer->setShaderResources(shader_resources_);
+        const QRhiCommandBuffer::VertexInput input(line_buffer_, 0);
+        command_buffer->setVertexInput(0, 1, &input);
+        command_buffer->draw(grid_line_vertex_count_);
+      }
+      const quint32 annotation_line_vertices = prelude_line_vertices - grid_line_vertex_count_;
+      if (annotation_line_vertices != 0U && line_pipeline_ != nullptr) {
+        command_buffer->setGraphicsPipeline(pipeline_for(line_pipeline_, hdr_annotation_line_pipeline_, scene_pass));
+        command_buffer->setViewport(viewport);
+        command_buffer->setShaderResources(annotation_shader_resources_);
+        const QRhiCommandBuffer::VertexInput input(
+            line_buffer_, grid_line_vertex_count_ * static_cast<quint32>(sizeof(Vertex)));
+        command_buffer->setVertexInput(0, 1, &input);
+        command_buffer->draw(annotation_line_vertices);
+      }
+      if (tf_triad_instance_count != 0U && pose_pipeline_ != nullptr && pose_vertex_buffer_ != nullptr &&
+          pose_index_buffer_ != nullptr && tf_triad_gpu_.instance_buffer != nullptr &&
+          tf_triad_gpu_.shader_resources != nullptr) {
+        command_buffer->setGraphicsPipeline(pipeline_for(pose_pipeline_, hdr_pose_pipeline_, scene_pass));
+        command_buffer->setViewport(viewport);
+        command_buffer->setShaderResources(tf_triad_gpu_.shader_resources);
+        const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+            QRhiCommandBuffer::VertexInput(pose_vertex_buffer_, 0),
+            QRhiCommandBuffer::VertexInput(tf_triad_gpu_.instance_buffer, 0),
+        };
+        command_buffer->setVertexInput(
+            0, static_cast<int>(inputs.size()), inputs.data(), pose_index_buffer_, 0, QRhiCommandBuffer::IndexUInt32);
+        command_buffer->drawIndexed(pose_index_count_, tf_triad_instance_count);
+      }
+
+      // Preparation and GPU ownership remain family-specific, but command
+      // submission follows the dock's one heterogeneous order exactly. Each
+      // prepared family vector retains that order, so monotonic cursors keep the
+      // submission pass linear while naturally skipping non-drawable layers.
+      std::size_t point_draw_index = 0;
+      std::size_t pose_draw_index = 0;
+      std::size_t occupancy_draw_index = 0;
+      std::size_t voxel_draw_index = 0;
+      std::size_t marker_draw_index = 0;
+      std::size_t model_draw_index = 0;
+      const auto submit_model_layer = [&](WasmModelRenderable* layer) {
+        if (model_draw_index == model_draws.size() || model_draws[model_draw_index].layer != layer) {
+          return false;
+        }
+        bool submitted = false;
+        const ModelLayerDraw& model_draw = model_draws[model_draw_index++];
+        for (const ModelDrawRange& range : model_draw.ranges) {
+          if (range.mesh == nullptr || range.material == nullptr) {
+            continue;
+          }
+          QRhiGraphicsPipeline* direct_pipeline =
+              range.lines ? (range.depth_write ? model_line_pipeline_ : model_line_no_depth_pipeline_)
+                          : (range.depth_write ? model_triangle_pipeline_ : model_triangle_no_depth_pipeline_);
+          QRhiGraphicsPipeline* hdr_pipeline =
+              range.lines ? (range.depth_write ? hdr_model_line_pipeline_ : hdr_model_line_no_depth_pipeline_)
+                          : (range.depth_write ? hdr_model_triangle_pipeline_ : hdr_model_triangle_no_depth_pipeline_);
+          QRhiGraphicsPipeline* pipeline = pipeline_for(direct_pipeline, hdr_pipeline, scene_pass);
+          QRhiBuffer* index_buffer = range.lines ? range.mesh->edge_index_buffer : range.mesh->triangle_index_buffer;
+          if (pipeline == nullptr || range.mesh->vertex_buffer == nullptr || index_buffer == nullptr ||
+              range.material->shader_resources == nullptr || model_instance_buffer_ == nullptr ||
+              range.index_count == 0U) {
+            continue;
+          }
+          const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+              QRhiCommandBuffer::VertexInput(range.mesh->vertex_buffer, 0),
+              QRhiCommandBuffer::VertexInput(
+                  model_instance_buffer_, range.instance_offset * static_cast<quint32>(sizeof(ModelInstance))),
+          };
+          command_buffer->setGraphicsPipeline(pipeline);
+          command_buffer->setViewport(viewport);
+          command_buffer->setShaderResources(range.material->shader_resources);
+          command_buffer->setVertexInput(
+              0, static_cast<int>(inputs.size()), inputs.data(), index_buffer,
+              range.index_offset * static_cast<quint32>(sizeof(quint32)), QRhiCommandBuffer::IndexUInt32);
+          command_buffer->drawIndexed(range.index_count, 1U);
+          submitted = true;
+        }
+        return submitted;
+      };
+      for (const OrderedLayerEntry& ordered : ordered_layers_) {
+        std::visit(
+            [&](auto* layer) {
+              using Layer = std::remove_pointer_t<decltype(layer)>;
+              if constexpr (std::is_same_v<Layer, WasmPointRenderable>) {
+                if (point_pipeline_ == nullptr || cube_pipeline_ == nullptr) {
+                  return;
+                }
+                if (point_draw_index == point_draws.size() || point_draws[point_draw_index].layer != layer) {
+                  return;
+                }
+                const PointDraw& draw = point_draws[point_draw_index++];
+                command_buffer->setGraphicsPipeline(
+                    draw.cubes ? pipeline_for(cube_pipeline_, hdr_cube_pipeline_, scene_pass)
+                               : pipeline_for(point_pipeline_, hdr_point_pipeline_, scene_pass));
+                command_buffer->setViewport(viewport);
+                command_buffer->setShaderResources(draw.shader_resources);
+                if (draw.cubes) {
+                  const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+                      QRhiCommandBuffer::VertexInput(cube_vertex_buffer_, 0),
+                      QRhiCommandBuffer::VertexInput(draw.vertex_buffer, 0),
+                  };
+                  command_buffer->setVertexInput(
+                      0, static_cast<int>(inputs.size()), inputs.data(), cube_index_buffer_, 0,
+                      QRhiCommandBuffer::IndexUInt16);
+                  command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.vertex_count);
+                } else {
+                  const QRhiCommandBuffer::VertexInput input(draw.vertex_buffer, 0);
+                  command_buffer->setVertexInput(0, 1, &input);
+                  command_buffer->draw(draw.vertex_count);
+                }
+                last_submitted_layer_ids_.push_back(ordered.topic_id);
+              } else if constexpr (std::is_same_v<Layer, WasmPosesInFrameLayer>) {
+                if (pose_pipeline_ == nullptr || pose_vertex_buffer_ == nullptr || pose_index_buffer_ == nullptr) {
+                  return;
+                }
+                if (pose_draw_index == pose_draws.size() || pose_draws[pose_draw_index].layer != layer) {
+                  return;
+                }
+                const PoseDraw& draw = pose_draws[pose_draw_index++];
+                command_buffer->setGraphicsPipeline(pipeline_for(pose_pipeline_, hdr_pose_pipeline_, scene_pass));
+                command_buffer->setViewport(viewport);
+                command_buffer->setShaderResources(draw.shader_resources);
                 const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
-                    QRhiCommandBuffer::VertexInput(cube_vertex_buffer_, 0),
-                    QRhiCommandBuffer::VertexInput(draw.vertex_buffer, 0),
+                    QRhiCommandBuffer::VertexInput(pose_vertex_buffer_, 0),
+                    QRhiCommandBuffer::VertexInput(draw.instance_buffer, 0),
                 };
                 command_buffer->setVertexInput(
-                    0, static_cast<int>(inputs.size()), inputs.data(), cube_index_buffer_, 0,
-                    QRhiCommandBuffer::IndexUInt16);
-                command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.vertex_count);
-              } else {
-                const QRhiCommandBuffer::VertexInput input(draw.vertex_buffer, 0);
+                    0, static_cast<int>(inputs.size()), inputs.data(), pose_index_buffer_, 0,
+                    QRhiCommandBuffer::IndexUInt32);
+                command_buffer->drawIndexed(pose_index_count_, draw.instance_count);
+                last_submitted_layer_ids_.push_back(ordered.topic_id);
+              } else if constexpr (std::is_same_v<Layer, WasmOccupancyGridLayer>) {
+                if (occupancy_pipeline_ == nullptr || occupancy_quad_buffer_ == nullptr) {
+                  return;
+                }
+                if (occupancy_draw_index == occupancy_draws.size() ||
+                    occupancy_draws[occupancy_draw_index].layer != layer) {
+                  return;
+                }
+                const OccupancyDraw& draw = occupancy_draws[occupancy_draw_index++];
+                command_buffer->setGraphicsPipeline(
+                    pipeline_for(occupancy_pipeline_, hdr_occupancy_pipeline_, scene_pass));
+                command_buffer->setViewport(viewport);
+                command_buffer->setShaderResources(draw.shader_resources);
+                const QRhiCommandBuffer::VertexInput input(occupancy_quad_buffer_, 0);
                 command_buffer->setVertexInput(0, 1, &input);
-                command_buffer->draw(draw.vertex_count);
-              }
-              last_submitted_layer_ids_.push_back(ordered.topic_id);
-            } else if constexpr (std::is_same_v<Layer, WasmPosesInFrameLayer>) {
-              if (pose_pipeline_ == nullptr || pose_vertex_buffer_ == nullptr || pose_index_buffer_ == nullptr) {
-                return;
-              }
-              if (pose_draw_index == pose_draws.size() || pose_draws[pose_draw_index].layer != layer) {
-                return;
-              }
-              const PoseDraw& draw = pose_draws[pose_draw_index++];
-              command_buffer->setGraphicsPipeline(pose_pipeline_);
-              command_buffer->setViewport(viewport);
-              command_buffer->setShaderResources(draw.shader_resources);
-              const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
-                  QRhiCommandBuffer::VertexInput(pose_vertex_buffer_, 0),
-                  QRhiCommandBuffer::VertexInput(draw.instance_buffer, 0),
-              };
-              command_buffer->setVertexInput(
-                  0, static_cast<int>(inputs.size()), inputs.data(), pose_index_buffer_, 0,
-                  QRhiCommandBuffer::IndexUInt32);
-              command_buffer->drawIndexed(pose_index_count_, draw.instance_count);
-              last_submitted_layer_ids_.push_back(ordered.topic_id);
-            } else if constexpr (std::is_same_v<Layer, WasmOccupancyGridLayer>) {
-              if (occupancy_pipeline_ == nullptr || occupancy_quad_buffer_ == nullptr) {
-                return;
-              }
-              if (occupancy_draw_index == occupancy_draws.size() ||
-                  occupancy_draws[occupancy_draw_index].layer != layer) {
-                return;
-              }
-              const OccupancyDraw& draw = occupancy_draws[occupancy_draw_index++];
-              command_buffer->setGraphicsPipeline(occupancy_pipeline_);
-              command_buffer->setViewport(viewport);
-              command_buffer->setShaderResources(draw.shader_resources);
-              const QRhiCommandBuffer::VertexInput input(occupancy_quad_buffer_, 0);
-              command_buffer->setVertexInput(0, 1, &input);
-              command_buffer->draw(6U);
-              last_submitted_layer_ids_.push_back(ordered.topic_id);
-            } else if constexpr (std::is_same_v<Layer, WasmVoxelGridLayer>) {
-              if (voxel_pipeline_ == nullptr || cube_vertex_buffer_ == nullptr || cube_index_buffer_ == nullptr) {
-                return;
-              }
-              if (voxel_draw_index == voxel_draws.size() || voxel_draws[voxel_draw_index].layer != layer) {
-                return;
-              }
-              const VoxelDraw& draw = voxel_draws[voxel_draw_index++];
-              command_buffer->setGraphicsPipeline(voxel_pipeline_);
-              command_buffer->setViewport(viewport);
-              command_buffer->setShaderResources(draw.shader_resources);
-              const QRhiCommandBuffer::VertexInput input(cube_vertex_buffer_, 0);
-              command_buffer->setVertexInput(0, 1, &input, cube_index_buffer_, 0, QRhiCommandBuffer::IndexUInt16);
-              command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.instance_count);
-              last_submitted_layer_ids_.push_back(ordered.topic_id);
-            } else if constexpr (std::is_same_v<Layer, WasmSceneEntitiesLayer>) {
-              bool submitted = false;
-              if (marker_draw_index != marker_draws.size() && marker_draws[marker_draw_index].layer == layer) {
-                const MarkerLayerDraw& marker_draw = marker_draws[marker_draw_index++];
-                for (const MarkerDrawRange& range : marker_draw.ranges) {
-                  QRhiGraphicsPipeline* pipeline = nullptr;
-                  if (range.kind == MarkerDrawKind::kInstanceLines) {
-                    pipeline = range.depth_write ? marker_line_pipeline_ : marker_line_no_depth_pipeline_;
-                  } else if (range.kind == MarkerDrawKind::kInstanceTriangles) {
-                    pipeline = range.cull_back ? (range.depth_write ? marker_triangle_cull_pipeline_
-                                                                    : marker_triangle_cull_no_depth_pipeline_)
-                                               : (range.depth_write ? marker_triangle_pipeline_
-                                                                    : marker_triangle_no_depth_pipeline_);
-                  } else if (range.kind == MarkerDrawKind::kStreamLines) {
-                    pipeline = range.depth_write ? line_pipeline_ : line_no_depth_pipeline_;
-                  } else {
-                    pipeline = range.depth_write ? triangle_pipeline_ : triangle_no_depth_pipeline_;
-                  }
-                  if (pipeline == nullptr || range.count == 0U) {
-                    continue;
-                  }
-                  command_buffer->setGraphicsPipeline(pipeline);
-                  command_buffer->setViewport(viewport);
-                  command_buffer->setShaderResources(shader_resources_);
-                  if (range.kind == MarkerDrawKind::kInstanceLines ||
-                      range.kind == MarkerDrawKind::kInstanceTriangles) {
-                    if (range.mesh >= marker_meshes_.size() || marker_instance_buffer_ == nullptr) {
+                command_buffer->draw(6U);
+                last_submitted_layer_ids_.push_back(ordered.topic_id);
+              } else if constexpr (std::is_same_v<Layer, WasmVoxelGridLayer>) {
+                if (voxel_pipeline_ == nullptr || cube_vertex_buffer_ == nullptr || cube_index_buffer_ == nullptr) {
+                  return;
+                }
+                if (voxel_draw_index == voxel_draws.size() || voxel_draws[voxel_draw_index].layer != layer) {
+                  return;
+                }
+                const VoxelDraw& draw = voxel_draws[voxel_draw_index++];
+                command_buffer->setGraphicsPipeline(pipeline_for(voxel_pipeline_, hdr_voxel_pipeline_, scene_pass));
+                command_buffer->setViewport(viewport);
+                command_buffer->setShaderResources(draw.shader_resources);
+                const QRhiCommandBuffer::VertexInput input(cube_vertex_buffer_, 0);
+                command_buffer->setVertexInput(0, 1, &input, cube_index_buffer_, 0, QRhiCommandBuffer::IndexUInt16);
+                command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.instance_count);
+                last_submitted_layer_ids_.push_back(ordered.topic_id);
+              } else if constexpr (std::is_same_v<Layer, WasmSceneEntitiesLayer>) {
+                bool submitted = false;
+                if (marker_draw_index != marker_draws.size() && marker_draws[marker_draw_index].layer == layer) {
+                  const MarkerLayerDraw& marker_draw = marker_draws[marker_draw_index++];
+                  for (const MarkerDrawRange& range : marker_draw.ranges) {
+                    QRhiGraphicsPipeline* pipeline = nullptr;
+                    if (range.kind == MarkerDrawKind::kInstanceLines) {
+                      pipeline =
+                          range.depth_write
+                              ? pipeline_for(marker_line_pipeline_, hdr_marker_line_pipeline_, scene_pass)
+                              : pipeline_for(
+                                    marker_line_no_depth_pipeline_, hdr_marker_line_no_depth_pipeline_, scene_pass);
+                    } else if (range.kind == MarkerDrawKind::kInstanceTriangles) {
+                      pipeline =
+                          range.cull_back
+                              ? (range.depth_write ? pipeline_for(
+                                                         marker_triangle_cull_pipeline_,
+                                                         hdr_marker_triangle_cull_pipeline_, scene_pass)
+                                                   : pipeline_for(
+                                                         marker_triangle_cull_no_depth_pipeline_,
+                                                         hdr_marker_triangle_cull_no_depth_pipeline_, scene_pass))
+                              : (range.depth_write
+                                     ? pipeline_for(
+                                           marker_triangle_pipeline_, hdr_marker_triangle_pipeline_, scene_pass)
+                                     : pipeline_for(
+                                           marker_triangle_no_depth_pipeline_, hdr_marker_triangle_no_depth_pipeline_,
+                                           scene_pass));
+                    } else if (range.kind == MarkerDrawKind::kStreamLines) {
+                      pipeline = range.depth_write
+                                     ? pipeline_for(line_pipeline_, hdr_line_pipeline_, scene_pass)
+                                     : pipeline_for(line_no_depth_pipeline_, hdr_line_no_depth_pipeline_, scene_pass);
+                    } else {
+                      pipeline =
+                          range.depth_write
+                              ? pipeline_for(triangle_pipeline_, hdr_triangle_pipeline_, scene_pass)
+                              : pipeline_for(triangle_no_depth_pipeline_, hdr_triangle_no_depth_pipeline_, scene_pass);
+                    }
+                    if (pipeline == nullptr || range.count == 0U) {
                       continue;
                     }
-                    const MarkerMeshGpu& mesh = marker_meshes_[range.mesh];
-                    const bool lines = range.kind == MarkerDrawKind::kInstanceLines;
-                    QRhiBuffer* index_buffer = lines ? mesh.edge_index_buffer : mesh.triangle_index_buffer;
-                    const quint32 index_count = lines ? mesh.edge_index_count : mesh.triangle_index_count;
-                    if (mesh.vertex_buffer == nullptr || index_buffer == nullptr || index_count == 0U) {
-                      continue;
+                    command_buffer->setGraphicsPipeline(pipeline);
+                    command_buffer->setViewport(viewport);
+                    const bool stream_geometry =
+                        range.kind == MarkerDrawKind::kStreamLines || range.kind == MarkerDrawKind::kStreamTriangles;
+                    command_buffer->setShaderResources(
+                        stream_geometry ? annotation_shader_resources_ : shader_resources_);
+                    if (range.kind == MarkerDrawKind::kInstanceLines ||
+                        range.kind == MarkerDrawKind::kInstanceTriangles) {
+                      if (range.mesh >= marker_meshes_.size() || marker_instance_buffer_ == nullptr) {
+                        continue;
+                      }
+                      const MarkerMeshGpu& mesh = marker_meshes_[range.mesh];
+                      const bool lines = range.kind == MarkerDrawKind::kInstanceLines;
+                      QRhiBuffer* index_buffer = lines ? mesh.edge_index_buffer : mesh.triangle_index_buffer;
+                      const quint32 index_count = lines ? mesh.edge_index_count : mesh.triangle_index_count;
+                      if (mesh.vertex_buffer == nullptr || index_buffer == nullptr || index_count == 0U) {
+                        continue;
+                      }
+                      const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+                          QRhiCommandBuffer::VertexInput(mesh.vertex_buffer, 0),
+                          QRhiCommandBuffer::VertexInput(
+                              marker_instance_buffer_, range.offset * static_cast<quint32>(sizeof(MarkerInstance))),
+                      };
+                      command_buffer->setVertexInput(
+                          0, static_cast<int>(inputs.size()), inputs.data(), index_buffer, 0,
+                          QRhiCommandBuffer::IndexUInt32);
+                      command_buffer->drawIndexed(index_count, range.count);
+                    } else {
+                      QRhiBuffer* buffer = range.kind == MarkerDrawKind::kStreamLines ? line_buffer_ : triangle_buffer_;
+                      const QRhiCommandBuffer::VertexInput input(
+                          buffer, range.offset * static_cast<quint32>(sizeof(Vertex)));
+                      command_buffer->setVertexInput(0, 1, &input);
+                      command_buffer->draw(range.count);
                     }
-                    const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
-                        QRhiCommandBuffer::VertexInput(mesh.vertex_buffer, 0),
-                        QRhiCommandBuffer::VertexInput(
-                            marker_instance_buffer_, range.offset * static_cast<quint32>(sizeof(MarkerInstance))),
-                    };
-                    command_buffer->setVertexInput(
-                        0, static_cast<int>(inputs.size()), inputs.data(), index_buffer, 0,
-                        QRhiCommandBuffer::IndexUInt32);
-                    command_buffer->drawIndexed(index_count, range.count);
-                  } else {
-                    QRhiBuffer* buffer = range.kind == MarkerDrawKind::kStreamLines ? line_buffer_ : triangle_buffer_;
-                    const QRhiCommandBuffer::VertexInput input(
-                        buffer, range.offset * static_cast<quint32>(sizeof(Vertex)));
-                    command_buffer->setVertexInput(0, 1, &input);
-                    command_buffer->draw(range.count);
+                    submitted = true;
                   }
-                  submitted = true;
+                }
+                submitted = submit_model_layer(layer) || submitted;
+                if (submitted) {
+                  last_submitted_layer_ids_.push_back(ordered.topic_id);
+                }
+              } else if constexpr (std::is_same_v<Layer, WasmModelRenderable>) {
+                if (submit_model_layer(layer)) {
+                  last_submitted_layer_ids_.push_back(ordered.topic_id);
                 }
               }
-              submitted = submit_model_layer(layer) || submitted;
-              if (submitted) {
-                last_submitted_layer_ids_.push_back(ordered.topic_id);
-              }
-            } else if constexpr (std::is_same_v<Layer, WasmModelRenderable>) {
-              if (submit_model_layer(layer)) {
-                last_submitted_layer_ids_.push_back(ordered.topic_id);
-              }
-            }
-          },
-          ordered.layer);
+            },
+            ordered.layer);
+      }
     }
+    command_buffer->endPass();
+  };
+
+  if (hdr_active) {
+    render_scene_pass(hdr_render_target_, ScenePass::kHdrColor, hdr_scene_clear, updates);
+    updates = nullptr;
+    // Reusing the same immutable HDR mode keeps both passes independent of
+    // dynamic-buffer update ordering. The replay's RGBA8 alpha records the
+    // shaders' post-discard opacity while its D32F attachment records depth.
+    render_scene_pass(hdr_depth_render_target_, ScenePass::kDepthReplay, Qt::transparent, nullptr);
+    if (ssao_active && ssao_raw_render_target_ != nullptr) {
+      // Preserve replay alpha/red and write native's raw scene-wide AO into the
+      // otherwise-unused green channel. The sampled D32F texture is not attached
+      // to this color-only target, avoiding a read/write feedback loop.
+      command_buffer->beginPass(ssao_raw_render_target_, Qt::transparent, {1.0F, 0});
+      command_buffer->setGraphicsPipeline(ssao_pipeline_);
+      command_buffer->setViewport(viewport);
+      command_buffer->setShaderResources(ssao_shader_resources_);
+      command_buffer->draw(3U);
+      command_buffer->endPass();
+    }
+    if (edl_active && edl_mesh_mask_render_target_ != nullptr) {
+      // Preserve the full-scene replay depth and alpha coverage, then reserve
+      // coverage.r for native's mesh-only EDL mask. Reusing the prepared model
+      // ranges keeps this visibility pass outside all per-frame model budgets.
+      command_buffer->beginPass(edl_mesh_mask_render_target_, Qt::transparent, {1.0F, 0});
+      for (const ModelLayerDraw& model_draw : model_draws) {
+        for (const ModelDrawRange& range : model_draw.ranges) {
+          if (range.mesh == nullptr || range.material == nullptr || range.index_count == 0U) {
+            continue;
+          }
+          QRhiGraphicsPipeline* pipeline =
+              range.lines ? edl_mesh_mask_line_pipeline_ : edl_mesh_mask_triangle_pipeline_;
+          QRhiBuffer* index_buffer = range.lines ? range.mesh->edge_index_buffer : range.mesh->triangle_index_buffer;
+          if (pipeline == nullptr || range.mesh->vertex_buffer == nullptr || index_buffer == nullptr ||
+              range.material->shader_resources == nullptr || model_instance_buffer_ == nullptr) {
+            continue;
+          }
+          const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+              QRhiCommandBuffer::VertexInput(range.mesh->vertex_buffer, 0),
+              QRhiCommandBuffer::VertexInput(
+                  model_instance_buffer_, range.instance_offset * static_cast<quint32>(sizeof(ModelInstance))),
+          };
+          command_buffer->setGraphicsPipeline(pipeline);
+          command_buffer->setViewport(viewport);
+          command_buffer->setShaderResources(range.material->shader_resources);
+          command_buffer->setVertexInput(
+              0, static_cast<int>(inputs.size()), inputs.data(), index_buffer,
+              range.index_offset * static_cast<quint32>(sizeof(quint32)), QRhiCommandBuffer::IndexUInt32);
+          command_buffer->drawIndexed(range.index_count, 1U);
+        }
+      }
+      command_buffer->endPass();
+    }
+    command_buffer->beginPass(target, Qt::transparent, {1.0F, 0});
+    command_buffer->setGraphicsPipeline(present_pipeline_);
+    command_buffer->setViewport(viewport);
+    command_buffer->setShaderResources(present_shader_resources_);
+    command_buffer->draw(3U);
+    command_buffer->endPass();
+  } else {
+    // Direct-to-backing fallback: no HDR encode, so use the theme token as-is.
+    render_scene_pass(target, ScenePass::kDirect, scene_bg, updates);
   }
-  command_buffer->endPass();
 }
 
 void SceneViewWidget::releaseResources() {
+  releaseShadowResources(false);
+  releaseHdrResources();
   for (auto& [layer, gpu] : point_layer_gpu_) {
     (void)layer;
     releasePointLayerGpu(gpu);
@@ -3497,9 +3970,12 @@ void SceneViewWidget::releaseResources() {
   delete triangle_pipeline_;
   delete line_no_depth_pipeline_;
   delete triangle_no_depth_pipeline_;
+  delete annotation_shader_resources_;
   delete shader_resources_;
   delete line_buffer_;
   delete triangle_buffer_;
+  delete annotation_render_mode_uniform_buffer_;
+  delete render_mode_uniform_buffer_;
   delete uniform_buffer_;
   pose_pipeline_ = nullptr;
   pose_layout_shader_resources_ = nullptr;
@@ -3522,9 +3998,12 @@ void SceneViewWidget::releaseResources() {
   triangle_pipeline_ = nullptr;
   line_no_depth_pipeline_ = nullptr;
   triangle_no_depth_pipeline_ = nullptr;
+  annotation_shader_resources_ = nullptr;
   shader_resources_ = nullptr;
   line_buffer_ = nullptr;
   triangle_buffer_ = nullptr;
+  annotation_render_mode_uniform_buffer_ = nullptr;
+  render_mode_uniform_buffer_ = nullptr;
   uniform_buffer_ = nullptr;
   occupancy_pipeline_ = nullptr;
   occupancy_layout_shader_resources_ = nullptr;
@@ -3559,6 +4038,19 @@ void SceneViewWidget::releaseResources() {
   model_instance_buffer_ = nullptr;
   model_instance_buffer_capacity_ = 0;
   model_white_upload_pending_ = false;
+  shadow_capability_error_.clear();
+  shadow_error_target_size_ = {};
+  noted_shadow_failure_.clear();
+  // Preserve an active warning across RHI teardown. Clearing the rejected
+  // size below permits the new RHI to probe again; a successful allocation
+  // then clears the warning through renderingWarningChanged().
+  hdr_rejected_size_ = {};
+  last_shadow_active_ = false;
+  last_hdr_active_ = false;
+  last_shadow_fit_valid_ = false;
+  last_shadow_draw_count_ = 0;
+  last_shadow_triangle_count_ = 0;
+  last_shadow_bounds_ = {};
   line_buffer_capacity_ = 0;
   triangle_buffer_capacity_ = 0;
   resource_rhi_ = nullptr;

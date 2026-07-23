@@ -15,6 +15,16 @@ namespace pj::scene3d {
 // SceneEntities topic. The native layer currently carries the same semantics
 // inline; the browser uses this isolated reducer so its QRhi/Assimp path cannot
 // accidentally leak into procedural marker snapshot behavior.
+// Overflow-safe lifetime expiry shared by the native SceneEntitiesLayer and the
+// browser model reducer (lifetime_ns == 0 means "never expires", per the
+// SceneEntity contract). anchor_ns is the entity's lifetime-expiry origin: the
+// ObjectStore entry timestamp it was folded from (the tracker's clock), NOT
+// entity.timestamp — under streaming the entry is host-stamped while
+// entity.timestamp keeps the original sensor epoch, so comparing the sensor
+// epoch against the tracker would expire every finite-lifetime entity instantly.
+[[nodiscard]] bool sceneEntityExpiredAt(
+    const PJ::sdk::SceneEntity& entity, std::int64_t anchor_ns, std::int64_t time_ns);
+
 class SceneEntitiesModelState {
  public:
   void clear();

@@ -197,7 +197,8 @@ void GridRenderPass::render(const ViewParams& view_params, const FrameContext& f
     if (shadows_on) {
       program_->setMat4("u_light_vp", view_params.light_view_proj);
       program_->setInt("u_shadow_map", 0);
-      program_->setFloat("u_shadow_normal_offset", view_params.shadow_world_units_per_texel * 1.5f);
+      program_->setFloat(
+          "u_shadow_normal_offset", view_params.shadow_world_units_per_texel * look::kShadowNormalOffsetTexels);
       program_->setFloat("u_shadow_softness", look::kShadowSoftnessTexels);
       withGlFunctions([&view_params](auto& functions) {
         functions.glActiveTexture(GL_TEXTURE0);

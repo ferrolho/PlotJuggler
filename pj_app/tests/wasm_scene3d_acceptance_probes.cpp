@@ -372,16 +372,70 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
           static_cast<unsigned long long>(robot_revision), QUrl::toPercentEncoding(robot_source).constData(),
           QUrl::toPercentEncoding(robot_statuses.join(u'|')).constData(),
           source_combo != nullptr ? source_combo->currentIndex() : -1);
+
+      const QSize hdr_size = view != nullptr ? view->hdrRenderSizeForTest() : QSize{};
+      const QByteArray quality_errors = QUrl::toPercentEncoding(
+          (view != nullptr ? view->hdrCapabilityErrorForTest() : QString{}) + u'|' +
+          (view != nullptr ? view->ssaoCapabilityErrorForTest() : QString{}) + u'|' +
+          (view != nullptr ? view->edlCapabilityErrorForTest() : QString{}) + u'|' +
+          (view != nullptr ? view->shadowCapabilityErrorForTest() : QString{}));
+      qInfo(
+          "PJ_WASM_SCENE3D_QUALITY sequence=%llu index=%lld "
+          "quality=%d,%d,%d,%d,%llu,%llu,%d,%d,%llu,%d,%d,%llu,%d,%d,%d,%d,%d,%d,%llu errors=%s",
+          static_cast<unsigned long long>(current_sequence), static_cast<long long>(index),
+          view != nullptr && view->lastHdrActiveForTest() ? 1 : 0,
+          view != nullptr && view->hdrResourcesReadyForTest() ? 1 : 0, hdr_size.width(), hdr_size.height(),
+          static_cast<unsigned long long>(view != nullptr ? view->hdrAllocatedBytesForTest() : 0U),
+          static_cast<unsigned long long>(view != nullptr ? view->hdrResourceGenerationForTest() : 0U),
+          view != nullptr && view->lastSsaoActiveForTest() ? 1 : 0,
+          view != nullptr && view->ssaoResourcesReadyForTest() ? 1 : 0,
+          static_cast<unsigned long long>(view != nullptr ? view->ssaoResourceGenerationForTest() : 0U),
+          view != nullptr && view->lastEdlActiveForTest() ? 1 : 0,
+          view != nullptr && view->edlResourcesReadyForTest() ? 1 : 0,
+          static_cast<unsigned long long>(view != nullptr ? view->edlResourceGenerationForTest() : 0U),
+          view != nullptr && view->lastShadowActiveForTest() ? 1 : 0,
+          view != nullptr && view->shadowResourcesReadyForTest() ? 1 : 0,
+          view != nullptr && view->lastShadowFitValidForTest() ? 1 : 0,
+          view != nullptr ? view->shadowMapSizeForTest() : 0, view != nullptr ? view->lastShadowDrawCountForTest() : 0,
+          view != nullptr ? view->lastShadowTriangleCountForTest() : 0,
+          static_cast<unsigned long long>(view != nullptr ? view->shadowResourceGenerationForTest() : 0U),
+          quality_errors.constData());
     }
     return;
   }
   qWarning("PJ_WASM_SCENE3D_FOUNDATION_FAILED no main window");
 }
 
+void setScene3dFallback(int mode, bool enabled) {
+  for (QWidget* widget : QApplication::topLevelWidgets()) {
+    for (auto* dock : widget->findChildren<PJ::Scene3DDockWidget*>()) {
+      auto* view = dock != nullptr ? dock->sceneView() : nullptr;
+      if (view == nullptr) {
+        continue;
+      }
+      if (mode == 0) {
+        view->setForceHdrFallbackForTest(enabled);
+      } else if (mode == 1) {
+        view->setForceSsaoFallbackForTest(enabled);
+      } else if (mode == 3) {
+        view->setForceShadowFallbackForTest(enabled);
+      } else {
+        view->setForceEdlFallbackForTest(enabled);
+      }
+    }
+  }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_force_scene3d_fallback(int mode, int enabled) {
+  setScene3dFallback(mode, enabled != 0);
+}
+
 // clang-format off
 EM_JS(void, installScene3dFoundationProbe, (), {
   globalThis.pjWasmReportScene3DFoundationProbe = () =>
       Module._pj_wasm_test_report_scene3d_foundation();
+  globalThis.pjWasmForceScene3DFallbackProbe = (mode, enabled) =>
+      Module._pj_wasm_test_force_scene3d_fallback(mode, enabled ? 1 : 0);
 });
 // clang-format on
 

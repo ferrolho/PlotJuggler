@@ -13,6 +13,10 @@ layout(std140, binding = 0) uniform PointUniforms {
 
 layout(binding = 1) uniform sampler2D color_lut;
 
+layout(std140, binding = 8) uniform RenderMode {
+    ivec4 render_mode;  // x: 1 when writing the linear-light HDR target
+};
+
 layout(location = 0) in float normalized_value;
 layout(location = 1) in float outside_range;
 layout(location = 2) in vec4 vertex_color;
@@ -49,5 +53,6 @@ void main() {
     if (base.a <= 0.003) {
         discard;
     }
-    fragment_color = vec4(base.rgb * shading, base.a);
+    vec3 color = render_mode.x != 0 ? pow(max(base.rgb, vec3(0.0)), vec3(2.2)) : base.rgb;
+    fragment_color = vec4(color * shading, base.a);
 }

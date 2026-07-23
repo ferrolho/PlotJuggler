@@ -121,7 +121,7 @@ visible; cleared on a camera gesture and on leave. Occlusion is ignored for now
 (a frame hidden behind geometry still labels); a one-texel depth-reject is the
 planned refinement.
 
-## WebAssembly product backend (W13-W19a)
+## WebAssembly product backend (W13-W19m)
 
 The browser selects a different implementation behind the same
 `SceneViewWidget` and `Scene3DDockWidget` public product names. This is a
@@ -129,10 +129,15 @@ compile-time `PJ_TARGET_WASM` branch, not a preference: desktop continues to use
 the native OpenGL pipeline above and full layer graph unchanged.
 
 The browser view is a `QRhiWidget` configured for Qt's OpenGL/WebGL2 backend
-and 4x renderbuffer MSAA. It owns only QRhi buffers, bindings, and pipelines and
-renders directly to the widget target. Vertex positions are made relative to the
-camera focal point before conversion to float, preserving the existing camera's
-large-world precision model. The current submissions are:
+and 4x renderbuffer MSAA. It owns only QRhi buffers, bindings, and pipelines.
+`scene_view_widget_rhi.cpp` owns scene preparation and command submission;
+`scene_view_widget_rhi_quality.cpp` owns shadow and HDR/SSAO/EDL resource
+creation, fallback, and teardown. Their small private header contains only the
+shared uniform layouts and constants, keeping the shader ABI explicit without
+exposing a second public renderer API.
+Vertex positions are made relative to the camera focal point before conversion
+to float, preserving the existing camera's large-world precision model. The
+current submissions are:
 
 - canonical line or checkerboard grid geometry;
 - RGB axes transformed by every frame resolved against the fixed frame at the
@@ -146,22 +151,74 @@ large-world precision model. The current submissions are:
 - occupancy grids as one R8 texture plus a shared unit quad, including
   incremental dirty-rectangle uploads; and
 - dense voxel grids as one R32F or RGBA8 3D texture plus a shared instanced
-  cube, with the native field/predicate/range/color semantics.
+  cube, with the native field/predicate/range/color semantics;
+- bounded procedural SceneEntities, embedded/remote ModelPrimitives, and
+  RobotModel/URDF visuals and collisions; and
+- visual-mesh shadow casting plus model/checkerboard receiving through a lazy
+  2048-square sampled D32F map.
 
-The twelve shader sources and committed `.qsb` packs contain GLSL ES 300. CMake
-locates the matching host Qt `qsb`, rebuilds every pack during configure, and
-compares SHA-256 before compiling. A stale pack therefore fails closed instead
-of silently shipping a different shader.
+The normal WebGL2 path renders linear light into a 4x RGBA16F color
+renderbuffer with D32F depth, resolves color, and composites with the native
+default exposure, ACES, saturation, annotation marker, and manual sRGB encode.
+Qt's GLES backend did not produce usable depth or second-color MSAA resolves in
+real Chrome despite accepting the targets. The browser therefore replays the
+already-bounded retained draws once into single-sample RGBA8 coverage plus a
+real sampled D32F depth texture. This 64-byte/pixel/view chain is retained per
+size, aggregate-budgeted across docks, and released on RHI teardown.
+
+Browser EDL consumes that replay without another retained attachment. The
+full-scene replay writes alpha only, leaving RGBA8 red at its clear value. A
+second preserving render target aliases the same RGBA8 + D32F textures and
+replays only prepared model ranges with red-only writes, blending disabled,
+`LessOrEqual` depth testing, and no depth writes. Non-mesh depth therefore
+occludes hidden meshes while point clouds, grids, occupancy, voxels, non-model
+marker primitives, poses, axes, and background never enter the mask. The present shader reconstructs
+log view depth with the inverse QRhi-corrected projection and evaluates native's
+eight circular neighbours, strength, 0.6-device-pixel radius, maximum gap, and
+darkening floor before exposure/ACES. The target's pixel size and shader
+`textureSize` are physical framebuffer pixels, matching native at its default
+render scale on high-DPI displays. Mask/depth replay is single-sample while
+native resolves 4x buffers with `GL_NEAREST`; smooth interiors and resolved
+pixel-center depth follow the same equation, but silhouette membership may
+differ by at most the one-pixel sample boundary. EDL construction failure is
+cached and warns independently while HDR remains active. The existing memory
+budget stays exactly 64 B/px because mask red reuses coverage RGBA8. Unsupported
+HDR allocation combinations still warn and use the behavior-preserving direct
+target path.
+
+Browser SSAO also consumes the replay without another retained image. A
+color-only preserving target aliases replay RGBA8 while sampling its unattached
+D32F depth and writes only the otherwise-unused green channel, with blending
+disabled. The shader mirrors native `SsaoPass`: inverse-projection view-position
+reconstruction, closer 5-tap depth normal, the deterministic 32-sample
+hemisphere kernel seeded with `0x55A0`, 4x4 tiled hash rotation, 0.4 m radius,
+0.025 bias, and power 1. The present shader performs native's 16-tap `[-2,1]²`
+box blur from green and applies AO before EDL and ACES. Alpha coverage and the
+red EDL mask are protected by the green-only pipeline state.
+
+Native retains raw and blurred AO as R16F. The browser stores raw AO in one R8
+channel and performs the blur while presenting, so it retains zero additional
+bytes and its per-sample quantization error is bounded by `0.5/255 = 0.001961`;
+the normalized box average cannot increase that bound. Replay depth has the
+same separately documented single-sample versus native 4x `GL_NEAREST` boundary
+at geometry discontinuities. SSAO allocation, rejected-size caching, telemetry,
+warning, and recovery are independent of HDR and EDL; warning priority is HDR,
+then SSAO, then EDL.
+
+The twenty-four shader sources and committed `.qsb` packs contain GLSL ES 300.
+CMake locates the matching host Qt `qsb`, rebuilds every pack during configure,
+and compares SHA-256 before compiling. A stale pack therefore fails closed
+instead of silently shipping a different shader.
 
 Camera models, fixed/follow behavior, `TransformBuffer`, `TransformService`, TF
 hierarchy/connection logic, tracker-time repaint keys, and scene-control values
 are shared with the native product. The browser dock accepts TF config topics,
-raw/compressed point clouds, pose arrays, occupancy grids, and voxel grids.
-Known later layer types are preserved as pending XML but are not rendered until
-their QRhi package lands. The browser source lists deliberately omit native GL
-passes, HDR/SSAO/EDL, Assimp/network model code, and robot layers. Draco 1.5.7
-and Cloudini 1.2.2 enter only the explicitly gated browser compressed-cloud
-graph; the non-Emscripten source graph and runtime behavior are unchanged.
+raw/compressed point clouds, depth clouds, pose arrays, occupancy/voxel grids,
+procedural SceneEntities, models, and RobotModel sources. The browser source
+lists deliberately omit the native GL pass implementations while providing
+equivalent QRhi/WebGL2 post processing. Draco 1.5.7, Cloudini 1.2.2, and bounded Assimp enter only the
+explicitly gated browser graph; the non-Emscripten source graph and runtime
+behavior are unchanged.
 
 Compressed decode never blocks or joins the browser UI thread. Each compressed
 layer has one `QtConcurrent` job in flight and at most one pending request;

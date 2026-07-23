@@ -21,6 +21,7 @@ if(EMSCRIPTEN)
     src/robot_model_bridges.cpp
     src/scene_entities_decode.cpp
     src/scene_entities_model_state.cpp
+    src/shadow_camera.cpp
     src/tf/tf_buffer.cpp
     src/tf/tf_connections.cpp
     src/version.cpp

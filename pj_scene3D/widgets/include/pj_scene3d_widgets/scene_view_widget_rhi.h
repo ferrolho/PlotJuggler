@@ -36,9 +36,12 @@ class QRhi;
 class QRhiBuffer;
 class QRhiCommandBuffer;
 class QRhiGraphicsPipeline;
+class QRhiRenderBuffer;
 class QRhiSampler;
 class QRhiShaderResourceBindings;
 class QRhiTexture;
+class QRhiTextureRenderTarget;
+class QRhiRenderPassDescriptor;
 
 namespace PJ {
 class ISceneLayer;
@@ -251,6 +254,87 @@ class SceneViewWidget : public QRhiWidget {
   [[nodiscard]] AABB lastModelBoundsForTest() const {
     return last_model_bounds_;
   }
+  [[nodiscard]] bool lastShadowActiveForTest() const {
+    return last_shadow_active_;
+  }
+  [[nodiscard]] bool shadowResourcesReadyForTest() const {
+    return shadow_texture_ != nullptr && shadow_render_target_ != nullptr;
+  }
+  [[nodiscard]] bool lastShadowFitValidForTest() const {
+    return last_shadow_fit_valid_;
+  }
+  [[nodiscard]] int shadowMapSizeForTest() const {
+    return shadow_map_size_;
+  }
+  [[nodiscard]] int lastShadowDrawCountForTest() const {
+    return last_shadow_draw_count_;
+  }
+  [[nodiscard]] int lastShadowTriangleCountForTest() const {
+    return last_shadow_triangle_count_;
+  }
+  [[nodiscard]] AABB lastShadowBoundsForTest() const {
+    return last_shadow_bounds_;
+  }
+  [[nodiscard]] const QString& shadowCapabilityErrorForTest() const {
+    return shadow_capability_error_;
+  }
+  [[nodiscard]] std::uint64_t shadowResourceGenerationForTest() const {
+    return shadow_resource_generation_;
+  }
+  [[nodiscard]] bool lastHdrActiveForTest() const {
+    return last_hdr_active_;
+  }
+  [[nodiscard]] bool hdrResourcesReadyForTest() const {
+    return hdr_render_target_ != nullptr && hdr_depth_render_target_ != nullptr && hdr_resolve_color_ != nullptr &&
+           hdr_resolve_depth_ != nullptr && hdr_resolve_coverage_ != nullptr;
+  }
+  [[nodiscard]] QSize hdrRenderSizeForTest() const {
+    return hdr_render_size_;
+  }
+  [[nodiscard]] std::uint64_t hdrAllocatedBytesForTest() const {
+    return hdr_allocated_bytes_;
+  }
+  [[nodiscard]] const QString& hdrCapabilityErrorForTest() const {
+    return hdr_capability_error_;
+  }
+  [[nodiscard]] std::uint64_t hdrResourceGenerationForTest() const {
+    return hdr_resource_generation_;
+  }
+  void setForceHdrFallbackForTest(bool force);
+  [[nodiscard]] bool lastSsaoActiveForTest() const {
+    return last_ssao_active_;
+  }
+  [[nodiscard]] bool ssaoResourcesReadyForTest() const {
+    return ssao_raw_render_target_ != nullptr && ssao_pipeline_ != nullptr && ssao_shader_resources_ != nullptr &&
+           ssao_uniform_buffer_ != nullptr;
+  }
+  [[nodiscard]] const QString& ssaoCapabilityErrorForTest() const {
+    return ssao_capability_error_;
+  }
+  [[nodiscard]] std::uint64_t ssaoResourceGenerationForTest() const {
+    return ssao_resource_generation_;
+  }
+  void setForceSsaoFallbackForTest(bool force);
+  // Same acceptance-only fault injection for the shadow chain: forces the
+  // capability error the specs assert on and releases the shadow resources.
+  void setForceShadowFallbackForTest(bool force);
+  [[nodiscard]] bool lastEdlActiveForTest() const {
+    return last_edl_active_;
+  }
+  [[nodiscard]] bool edlResourcesReadyForTest() const {
+    return edl_mesh_mask_render_target_ != nullptr && edl_mesh_mask_triangle_pipeline_ != nullptr &&
+           edl_mesh_mask_line_pipeline_ != nullptr;
+  }
+  [[nodiscard]] const QString& edlCapabilityErrorForTest() const {
+    return edl_capability_error_;
+  }
+  [[nodiscard]] const QString& renderingWarningForTest() const {
+    return rendering_warning_;
+  }
+  [[nodiscard]] std::uint64_t edlResourceGenerationForTest() const {
+    return edl_resource_generation_;
+  }
+  void setForceEdlFallbackForTest(bool force);
   [[nodiscard]] const std::vector<std::uint32_t>& lastSubmittedLayerIdsForTest() const {
     return last_submitted_layer_ids_;
   }
@@ -258,6 +342,7 @@ class SceneViewWidget : public QRhiWidget {
  signals:
   void framesChanged(const QList<FrameRow>& frames);
   void presentationChanged();
+  void renderingWarningChanged(const QString& warning);
 
  protected:
   void initialize(QRhiCommandBuffer* command_buffer) override;
@@ -362,6 +447,11 @@ class SceneViewWidget : public QRhiWidget {
     std::array<float, 4> emissive_factor{};
   };
 
+  struct ShadowInstance {
+    std::array<float, 16> model{};
+  };
+  static_assert(sizeof(ShadowInstance) == 64U);
+
   struct ModelTextureGpu {
     QRhiTexture* texture = nullptr;
     QImage pending_image;
@@ -411,8 +501,24 @@ class SceneViewWidget : public QRhiWidget {
   void releaseVoxelLayerGpu(VoxelLayerGpu& gpu);
   void releaseMarkerMeshGpu(MarkerMeshGpu& gpu);
   bool ensureModelLayerGpu(QRhi* owner, WasmModelRenderable* layer, ModelLayerGpu& gpu);
+  QRhiShaderResourceBindings* createModelMaterialBindings(QRhi* owner, const ModelMaterialGpu& material);
+  bool rebuildModelMaterialBindings(QRhi* owner, ModelMaterialGpu& material);
+  bool rebuildAllModelMaterialBindings(QRhi* owner);
   void releaseModelMeshGpu(ModelMeshGpu& gpu);
   void releaseModelLayerGpu(ModelLayerGpu& gpu);
+  bool ensureShadowResources(QRhi* owner);
+  void releaseShadowResources(bool restore_model_bindings);
+  bool ensureHdrResources(QRhi* owner, const QSize& size);
+  bool ensureHdrPipelines(QRhi* owner);
+  void releaseHdrTargetResources();
+  void releaseHdrResources();
+  bool ensureSsaoResources(QRhi* owner, const QSize& size);
+  void releaseSsaoTargetResources();
+  void releaseSsaoResources();
+  bool ensureEdlResources(QRhi* owner, const QSize& size);
+  void releaseEdlTargetResources();
+  void releaseEdlResources();
+  void updateRenderingWarning();
   void emitPresentationIfChanged(const CameraState& before);
 
   std::shared_ptr<TransformBuffer> tf_;
@@ -442,9 +548,12 @@ class SceneViewWidget : public QRhiWidget {
 
   QRhi* resource_rhi_ = nullptr;
   QRhiBuffer* uniform_buffer_ = nullptr;
+  QRhiBuffer* render_mode_uniform_buffer_ = nullptr;
+  QRhiBuffer* annotation_render_mode_uniform_buffer_ = nullptr;
   QRhiBuffer* line_buffer_ = nullptr;
   QRhiBuffer* triangle_buffer_ = nullptr;
   QRhiShaderResourceBindings* shader_resources_ = nullptr;
+  QRhiShaderResourceBindings* annotation_shader_resources_ = nullptr;
   QRhiGraphicsPipeline* line_pipeline_ = nullptr;
   QRhiGraphicsPipeline* triangle_pipeline_ = nullptr;
   QRhiGraphicsPipeline* line_no_depth_pipeline_ = nullptr;
@@ -464,6 +573,27 @@ class SceneViewWidget : public QRhiWidget {
   QRhiGraphicsPipeline* model_triangle_no_depth_pipeline_ = nullptr;
   QRhiGraphicsPipeline* model_line_pipeline_ = nullptr;
   QRhiGraphicsPipeline* model_line_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_line_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_annotation_line_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_triangle_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_line_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_triangle_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_point_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_cube_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_pose_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_occupancy_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_voxel_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_triangle_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_triangle_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_triangle_cull_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_triangle_cull_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_line_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_marker_line_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_model_triangle_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_model_triangle_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_model_line_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_model_line_no_depth_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* hdr_grid_shadow_pipeline_ = nullptr;
   QRhiBuffer* point_layout_uniform_buffer_ = nullptr;
   QRhiShaderResourceBindings* point_layout_shader_resources_ = nullptr;
   QRhiBuffer* cube_vertex_buffer_ = nullptr;
@@ -489,6 +619,40 @@ class SceneViewWidget : public QRhiWidget {
   QRhiTexture* model_white_texture_ = nullptr;
   QRhiSampler* model_sampler_ = nullptr;
   QRhiShaderResourceBindings* model_layout_shader_resources_ = nullptr;
+  QRhiTexture* shadow_texture_ = nullptr;
+  QRhiSampler* shadow_sampler_ = nullptr;
+  QRhiTextureRenderTarget* shadow_render_target_ = nullptr;
+  QRhiRenderPassDescriptor* shadow_render_pass_descriptor_ = nullptr;
+  QRhiBuffer* shadow_uniform_buffer_ = nullptr;
+  QRhiBuffer* shadow_instance_buffer_ = nullptr;
+  QRhiShaderResourceBindings* shadow_shader_resources_ = nullptr;
+  QRhiShaderResourceBindings* grid_shadow_shader_resources_ = nullptr;
+  QRhiGraphicsPipeline* shadow_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* grid_shadow_pipeline_ = nullptr;
+  QRhiRenderBuffer* hdr_msaa_color_ = nullptr;
+  QRhiRenderBuffer* hdr_msaa_depth_ = nullptr;
+  QRhiTexture* hdr_resolve_color_ = nullptr;
+  QRhiTexture* hdr_resolve_depth_ = nullptr;
+  QRhiTexture* hdr_resolve_coverage_ = nullptr;
+  QRhiTextureRenderTarget* hdr_render_target_ = nullptr;
+  QRhiTextureRenderTarget* hdr_depth_render_target_ = nullptr;
+  QRhiTextureRenderTarget* ssao_raw_render_target_ = nullptr;
+  QRhiTextureRenderTarget* edl_mesh_mask_render_target_ = nullptr;
+  QRhiRenderPassDescriptor* hdr_render_pass_descriptor_ = nullptr;
+  QRhiRenderPassDescriptor* hdr_depth_render_pass_descriptor_ = nullptr;
+  QRhiRenderPassDescriptor* ssao_render_pass_descriptor_ = nullptr;
+  QRhiRenderPassDescriptor* edl_mesh_mask_render_pass_descriptor_ = nullptr;
+  QRhiSampler* hdr_color_sampler_ = nullptr;
+  QRhiSampler* hdr_coverage_sampler_ = nullptr;
+  QRhiBuffer* composite_uniform_buffer_ = nullptr;
+  QRhiBuffer* ssao_uniform_buffer_ = nullptr;
+  QRhiShaderResourceBindings* present_shader_resources_ = nullptr;
+  QRhiShaderResourceBindings* ssao_shader_resources_ = nullptr;
+  QRhiGraphicsPipeline* present_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* ssao_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* edl_mesh_mask_triangle_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* edl_mesh_mask_line_pipeline_ = nullptr;
+  std::unordered_map<QRhiGraphicsPipeline*, QRhiGraphicsPipeline*> hdr_depth_pipelines_;
   std::array<MarkerMeshGpu, 5> marker_meshes_{};
   bool colormap_upload_pending_ = false;
   bool cube_upload_pending_ = false;
@@ -501,10 +665,14 @@ class SceneViewWidget : public QRhiWidget {
   quint32 triangle_buffer_capacity_ = 0;
   quint32 marker_instance_buffer_capacity_ = 0;
   quint32 model_instance_buffer_capacity_ = 0;
+  quint32 shadow_instance_buffer_capacity_ = 0;
   std::vector<Vertex> line_vertices_;
   std::vector<Vertex> triangle_vertices_;
   std::vector<MarkerInstance> marker_instances_;
   std::vector<ModelInstance> model_instances_;
+  std::vector<ShadowInstance> shadow_instances_;
+  quint32 grid_line_vertex_count_ = 0;
+  quint32 grid_triangle_vertex_count_ = 0;
   int last_line_vertex_count_ = 0;
   int last_triangle_vertex_count_ = 0;
   int last_resolved_frame_count_ = 0;
@@ -568,6 +736,39 @@ class SceneViewWidget : public QRhiWidget {
   int last_model_triangle_count_ = 0;
   std::array<int, 5> last_model_texture_slot_counts_{};
   AABB last_model_bounds_;
+  bool last_shadow_active_ = false;
+  bool last_shadow_fit_valid_ = false;
+  int shadow_map_size_ = 0;
+  int last_shadow_draw_count_ = 0;
+  int last_shadow_triangle_count_ = 0;
+  AABB last_shadow_bounds_;
+  QString shadow_capability_error_;
+  // Output size at the moment shadows last failed: a resize re-probes (same
+  // recovery contract as the HDR/SSAO/EDL rejected-size gates).
+  QSize shadow_error_target_size_;
+  // Last shadow failure already forwarded to the caster layers, so a persistent
+  // error is noted once instead of re-marked every frame.
+  QString noted_shadow_failure_;
+  std::uint64_t shadow_resource_generation_ = 0;
+  bool last_hdr_active_ = false;
+  bool force_hdr_fallback_for_test_ = false;
+  QSize hdr_render_size_;
+  QSize hdr_rejected_size_;
+  QString hdr_capability_error_;
+  std::uint64_t hdr_allocated_bytes_ = 0;
+  std::uint64_t hdr_resource_generation_ = 0;
+  bool last_ssao_active_ = false;
+  bool force_ssao_fallback_for_test_ = false;
+  bool force_shadow_fallback_for_test_ = false;
+  QSize ssao_rejected_size_;
+  QString ssao_capability_error_;
+  std::uint64_t ssao_resource_generation_ = 0;
+  bool last_edl_active_ = false;
+  bool force_edl_fallback_for_test_ = false;
+  QSize edl_rejected_size_;
+  QString edl_capability_error_;
+  QString rendering_warning_;
+  std::uint64_t edl_resource_generation_ = 0;
 
   QPoint last_mouse_position_;
   Qt::MouseButton active_button_ = Qt::NoButton;

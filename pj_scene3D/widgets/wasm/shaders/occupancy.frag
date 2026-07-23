@@ -8,6 +8,10 @@ layout(std140, binding = 0) uniform OccupancyUniforms {
 
 layout(binding = 1) uniform sampler2D grid_texture;
 
+layout(std140, binding = 8) uniform RenderMode {
+    ivec4 render_mode;  // x: 1 when writing the linear-light HDR target
+};
+
 layout(location = 0) in vec2 cell_uv;
 layout(location = 0) out vec4 fragment_color;
 
@@ -24,7 +28,8 @@ void main() {
         float grayscale = 1.0 - occupancy;
         color = vec3(grayscale);
     }
-    // The QRhi widget renders directly to an sRGB display target. The native
-    // pass linearizes here only because its later HDR composite re-encodes.
+    if (render_mode.x != 0) {
+        color = pow(max(color, vec3(0.0)), vec3(2.2));
+    }
     fragment_color = vec4(color, display_params.x);
 }

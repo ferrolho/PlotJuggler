@@ -5,16 +5,16 @@
 
 #include "pj_scene3d_core/shadow_camera.h"  // kShadowMapSize
 #include "pj_scene3d_widgets/gl/gl_functions.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 namespace {
 
-// Slope-scaled depth bias applied while rendering casters so their stored depth is
-// pushed away from the light — kills self-shadowing acne. Paired with a receiver-side
-// world normal offset; both are deliberately conservative defaults (tuning is an
-// open decision in docs/plans/scene3d_mesh_shadows.md, finalized against screenshots).
-constexpr float kPolygonOffsetFactor = 2.0f;
-constexpr float kPolygonOffsetUnits = 4.0f;
+// Caster-side acne suppression: values shared with the browser pipeline via
+// scene_look_defaults.h (tuning remains an open decision in
+// docs/plans/scene3d_mesh_shadows.md, finalized against screenshots).
+constexpr float kPolygonOffsetFactor = look::kShadowSlopeScaledDepthBias;
+constexpr float kPolygonOffsetUnits = look::kShadowDepthBiasUnits;
 
 }  // namespace
 

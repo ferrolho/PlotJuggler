@@ -13,6 +13,8 @@
 #include <variant>
 
 #include "pj_scene3d_widgets/gl/gl_functions.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
+#include "pj_scene3d_widgets/ssao_kernel.h"
 
 namespace pj::scene3d {
 namespace {
@@ -139,18 +141,7 @@ void SsaoPass::initializeGL() {
   attempted_ = true;
   initialized_ = buildPrograms();
   if (kernel_.empty()) {
-    // Hemisphere kernel, denser near the origin (LearnOpenGL lerp-scale).
-    // Deterministic seed: the kernel is a fixed quality knob, not entropy.
-    std::mt19937 rng(0x55A0u);
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-    kernel_.reserve(kKernelSize);
-    for (int i = 0; i < kKernelSize; ++i) {
-      glm::vec3 sample(uni(rng) * 2.0f - 1.0f, uni(rng) * 2.0f - 1.0f, uni(rng));
-      sample = glm::normalize(sample) * uni(rng);
-      const float t = static_cast<float>(i) / static_cast<float>(kKernelSize);
-      sample *= 0.1f + 0.9f * t * t;
-      kernel_.push_back(sample);
-    }
+    kernel_ = ssaoHemisphereKernel(kKernelSize);
   }
 }
 
@@ -208,6 +199,7 @@ void SsaoPass::renderAo(const ViewParams& view_params) {
   ssao_program_->setMat4("u_proj", view_params.proj);
   ssao_program_->setMat4("u_inv_proj", glm::inverse(view_params.proj));
   ssao_program_->setFloat("u_radius", radius_m_);
+  ssao_program_->setFloat("u_bias", look::kSsaoBias);
   ssao_program_->setFloat("u_ao_power", ao_power_);
   ssao_program_->setVec3Array("u_kernel", kernel_.data(), static_cast<int>(kernel_.size()));
   fullscreen_vao_.bind();

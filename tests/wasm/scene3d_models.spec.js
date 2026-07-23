@@ -3,65 +3,16 @@ const { test, expect } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
 
-const { waitForQtApp } = require('./support/app');
-const { dragQtCanvas } = require('./support/canvas');
-const { clickActiveDialogButton } = require('./support/dialogs');
 const { downloadLayoutFromFileMenu } = require('./support/layout_actions');
-const { openFileChooser, openLayoutChooser, openRobotChooser } = require('./support/pickers');
-const { qtPointToCss, requestScene3DFoundationState } = require('./support/scene3d_foundation');
-
-const fixture = name => fs.readFileSync(path.resolve(__dirname, 'fixtures', name));
-const reportCount = messages => messages.filter(
-  message => message.includes('PJ_WASM_SCENE3D_FOUNDATION_SUMMARY'),
-).length;
-
-async function boot(page, messages) {
-  await page.addInitScript(() => { delete window.showOpenFilePicker; });
-  page.on('console', message => messages.push(message.text()));
-  await page.goto(process.env.PJ_WASM_URL || 'http://127.0.0.1:6931/plotjuggler4.html');
-  await waitForQtApp(page, messages);
-  const screen = await page.locator('#screen').boundingBox();
-  expect(screen).not.toBeNull();
-  return screen;
-}
-
-async function loadFixture(page, screen, messages, name) {
-  const chooser = await openFileChooser(page, screen);
-  await chooser.setFiles({
-    name,
-    mimeType: 'application/octet-stream',
-    buffer: fixture(name),
-  });
-  await page.waitForTimeout(800);
-  await clickActiveDialogButton(page, screen, messages, 'ok');
-  await page.waitForTimeout(500);
-}
-
-async function dropRows(page, screen, rows) {
-  await page.mouse.click(screen.x + 10, screen.y + 192);
-  const target = { x: screen.x + 820, y: screen.y + 390 };
-  for (const y of rows) {
-    await dragQtCanvas(page, { x: screen.x + 95, y: screen.y + y }, target);
-    await page.waitForTimeout(300);
-  }
-}
-
-async function waitForModels(page, messages, predicate, timeout = 30000) {
-  let state;
-  await expect.poll(async () => {
-    state = await requestScene3DFoundationState(page, messages, reportCount(messages));
-    return state.docks.length === 1 && predicate(state.docks[0].models, state.docks[0], state);
-  }, { timeout }).toBe(true);
-  return state;
-}
-
-async function clickQtControl(page, screen, state, control) {
-  const center = qtPointToCss(screen, state, {
-    x: control.x + control.width / 2,
-    y: control.y + control.height / 2,
-  });
-  await page.mouse.click(center.x, center.y);
-}
+const { openLayoutChooser, openRobotChooser } = require('./support/pickers');
+const {
+  bootScene3D: boot,
+  clickScene3DControl: clickQtControl,
+  dropScene3DRows: dropRows,
+  fixture,
+  loadScene3DFixture: loadFixture,
+  waitForScene3DModels: waitForModels,
+} = require('./support/scene3d_acceptance');
 
 test('SceneEntities submits procedural geometry and all five PBR maps', async ({ page }) => {
   test.setTimeout(90000);

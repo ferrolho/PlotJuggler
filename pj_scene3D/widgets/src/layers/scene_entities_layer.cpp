@@ -30,6 +30,7 @@
 #include "pj_plugins/sdk/message_parser_plugin_base.hpp"
 #include "pj_runtime/SessionManager.h"
 #include "pj_scene3d_core/scene_entities_decode.h"
+#include "pj_scene3d_core/scene_entities_model_state.h"
 #include "pj_scene3d_widgets/parse_locked.h"
 #include "pj_widgets/ColorPickerWidget.h"
 #include "pj_widgets/DoubleScrubber.h"
@@ -112,26 +113,6 @@ std::string sourceSignature(const PJ::sdk::ModelPrimitive& primitive) {
 // (no per-tick re-check) until the layer re-attaches.
 bool remoteModelFetchAllowed() {
   return QSettings().value(u"pj_scene3d/allow_remote_model_fetch"_s, true).toBool();
-}
-
-// Lifetime expiry with overflow-safe boundary handling (lifetime_ns == 0 means
-// "never expires", per the SceneEntity contract).
-// anchor_ns is the entity's lifetime-expiry origin = the ObjectStore entry
-// timestamp it was folded from (the tracker's clock), NOT entity.timestamp: under
-// streaming the entry is host-stamped while entity.timestamp keeps the original
-// sensor epoch, so comparing entity.timestamp against the tracker would expire
-// every finite-lifetime entity instantly.
-bool expiredAt(const PJ::sdk::SceneEntity& entity, int64_t anchor_ns, int64_t time_ns) {
-  if (entity.lifetime_ns == 0) {
-    return false;
-  }
-  if (entity.lifetime_ns > 0 && anchor_ns > std::numeric_limits<int64_t>::max() - entity.lifetime_ns) {
-    return false;
-  }
-  if (entity.lifetime_ns < 0 && anchor_ns < std::numeric_limits<int64_t>::min() - entity.lifetime_ns) {
-    return true;
-  }
-  return anchor_ns + entity.lifetime_ns < time_ns;
 }
 
 // Rough heap footprint of a decoded batch — the buffers that dominate (embedded
@@ -684,7 +665,7 @@ void SceneEntitiesLayer::applySnapshot(const PJ::sdk::SceneEntities& snapshot, i
   for (const PJ::sdk::SceneEntity& entity : snapshot.entities) {
     entities_[entity.id] = entity;
     // Anchor lifetime expiry on the ingest (tracker-clock) timestamp, not the
-    // entity's embedded sensor epoch — see expiredAt(). Written in lockstep with
+    // entity's embedded sensor epoch — see sceneEntityExpiredAt(). Written in lockstep with
     // every entities_ insert; eraseEntity() drops both together.
     entity_expiry_anchor_ns_[entity.id] = ingest_ns;
   }
@@ -708,7 +689,7 @@ bool SceneEntitiesLayer::dropExpiredEntities(PJ::Timepoint time) {
   for (auto it = entities_.begin(); it != entities_.end();) {
     // .at(): the anchor is written in lockstep with every entities_ insert
     // (applySnapshot) and erased via eraseEntity, so a miss is a broken invariant.
-    if (expiredAt(it->second, entity_expiry_anchor_ns_.at(it->first), time_ns)) {
+    if (sceneEntityExpiredAt(it->second, entity_expiry_anchor_ns_.at(it->first), time_ns)) {
       it = eraseEntity(it);
       dropped = true;
     } else {

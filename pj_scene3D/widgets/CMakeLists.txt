@@ -26,7 +26,8 @@ if(EMSCRIPTEN)
   foreach(_pj_scene3d_shader IN ITEMS
       scene.vert scene.frag point.vert point.frag cube.vert cube.frag
       pose.vert pose.frag occupancy.vert occupancy.frag voxel.vert voxel.frag
-      marker.vert marker.frag model.vert model.frag)
+      marker.vert marker.frag model.vert model.frag shadow.vert shadow.frag
+      mesh_mask.frag ssao.frag grid_shadow.vert grid_shadow.frag present.vert present.frag)
     set(_pj_scene3d_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shaders/${_pj_scene3d_shader}")
     set(_pj_scene3d_shader_pack "${_pj_scene3d_shader_source}.qsb")
     set(_pj_scene3d_shader_rebuilt "${_pj_scene3d_shader_verify_dir}/${_pj_scene3d_shader}.qsb")
@@ -48,6 +49,8 @@ if(EMSCRIPTEN)
 
   add_library(pj_scene3d_widgets STATIC
     wasm/scene_view_widget_rhi.cpp
+    wasm/scene_view_widget_rhi_quality.cpp
+    wasm/scene_view_widget_rhi_quality_p.h
     wasm/scene3d_dock_widget_wasm.cpp
     wasm/depth_cloud_layer_wasm.cpp
     wasm/point_cloud_layer_wasm.cpp

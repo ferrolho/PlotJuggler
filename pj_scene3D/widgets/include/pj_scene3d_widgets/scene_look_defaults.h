@@ -68,6 +68,17 @@ inline constexpr float kEdlMaxGap = 0.02f;
 // the fitted frustum. ~4 texels reads as a soft contact shadow without the banding a
 // sparse box kernel gives.
 inline constexpr float kShadowSoftnessTexels = 4.0f;
+// Slope-scaled depth bias applied while rendering casters so their stored depth
+// is pushed away from the light — kills self-shadowing acne. Paired with the
+// receiver-side world normal offset below; conservative defaults shared by the
+// native GL pass and the browser QRhi pipeline.
+inline constexpr float kShadowSlopeScaledDepthBias = 2.0f;
+inline constexpr float kShadowDepthBiasUnits = 4.0f;
+// Receiver-side normal offset in shadow-texel units (scaled by
+// world_units_per_texel at the call sites).
+inline constexpr float kShadowNormalOffsetTexels = 1.5f;
+// SSAO depth-compare bias (view-space metres).
+inline constexpr float kSsaoBias = 0.025f;
 
 // ---- Scene geometry colors (grid / frame axes / TF connections) ----
 // Shared by the native GL passes and the WASM QRhi geometry builder so the two

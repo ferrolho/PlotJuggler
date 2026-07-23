@@ -12,19 +12,6 @@
 namespace pj::scene3d {
 namespace {
 
-bool expiredAt(const PJ::sdk::SceneEntity& entity, std::int64_t anchor_ns, std::int64_t time_ns) {
-  if (entity.lifetime_ns == 0) {
-    return false;
-  }
-  if (entity.lifetime_ns > 0 && anchor_ns > std::numeric_limits<std::int64_t>::max() - entity.lifetime_ns) {
-    return false;
-  }
-  if (entity.lifetime_ns < 0 && anchor_ns < std::numeric_limits<std::int64_t>::min() - entity.lifetime_ns) {
-    return true;
-  }
-  return anchor_ns + entity.lifetime_ns < time_ns;
-}
-
 std::optional<std::uint64_t> addBytes(std::uint64_t left, std::uint64_t right) {
   if (right > std::numeric_limits<std::uint64_t>::max() - left) {
     return std::nullopt;
@@ -91,6 +78,19 @@ bool deletedBy(const PJ::sdk::SceneEntity& entity, const PJ::sdk::SceneEntityDel
 }
 
 }  // namespace
+
+bool sceneEntityExpiredAt(const PJ::sdk::SceneEntity& entity, std::int64_t anchor_ns, std::int64_t time_ns) {
+  if (entity.lifetime_ns == 0) {
+    return false;
+  }
+  if (entity.lifetime_ns > 0 && anchor_ns > std::numeric_limits<std::int64_t>::max() - entity.lifetime_ns) {
+    return false;
+  }
+  if (entity.lifetime_ns < 0 && anchor_ns < std::numeric_limits<std::int64_t>::min() - entity.lifetime_ns) {
+    return true;
+  }
+  return anchor_ns + entity.lifetime_ns < time_ns;
+}
 
 void SceneEntitiesModelState::clear() {
   entities_.clear();
@@ -188,7 +188,7 @@ bool SceneEntitiesModelState::applySnapshot(const PJ::sdk::SceneEntities& snapsh
 bool SceneEntitiesModelState::dropExpired(std::int64_t time_ns) {
   bool changed = false;
   for (auto iterator = entities_.begin(); iterator != entities_.end();) {
-    if (expiredAt(iterator->second, expiry_anchor_ns_.at(iterator->first), time_ns)) {
+    if (sceneEntityExpiredAt(iterator->second, expiry_anchor_ns_.at(iterator->first), time_ns)) {
       iterator = erase(iterator);
       changed = true;
     } else {
