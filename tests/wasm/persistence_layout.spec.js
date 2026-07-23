@@ -9,6 +9,7 @@ const { downloadLayoutFromFileMenu, saveLayoutActionCenter } = require('./suppor
 const { openFileChooser, openLayoutChooser, openSourceReplayChooser } = require('./support/pickers');
 const { requestPlotState } = require('./support/plot_probes');
 const { sourceLayoutDecisionGeometry, downloadSourceLayoutFromFileMenu } = require('./support/source_layout');
+const { curveRowCenter, placeholderIconCenter } = require('./support/geometry');
 
 async function pickerApisRemainExact(page) {
   return page.evaluate(() => {
@@ -312,7 +313,8 @@ test('browser layouts open transactionally and download with exact round-trip st
     () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
     { timeout: 15000 },
   ).toContain('layout-open/temp:3@');
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   await page.keyboard.press('F9');
   await expect.poll(
@@ -684,7 +686,8 @@ test('source-bound browser layouts download logical references and replay after 
     () => consoleMessages.find(message => message.includes('PJ_FILE_LOAD_OK')) || '',
     { timeout: 15000 },
   ).toContain('source-reselect/temp:3@');
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   await page.keyboard.press('F9');
   await expect.poll(

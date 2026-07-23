@@ -6,6 +6,10 @@
 // Keeping it out of the shell source makes the production ownership boundary
 // explicit while preserving same-translation-unit access to probe helpers.
 
+#include <functional>
+
+#include "pj_widgets/VisualizationPlaceholderWidget.h"
+
 namespace {
 
 QMetaObject::Connection wasm_frame_timing_connection;
@@ -1340,6 +1344,86 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_quit_action() {
   reportWasmMenuAction(u"Quit"_s, "quit");
 }
 
+
+// Reveals every dataset-tree leaf (expandAll) and reports each row's center in
+// MainWindow coordinates, one console line per leaf plus a terminator, so the
+// browser specs drag real rows by NAME instead of hard-coding canvas pixels
+// that break whenever the tree's row pitch or header height changes.
+extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_curve_rows() {
+  PJ::MainWindow* main_window = nullptr;
+  for (QWidget* widget : QApplication::topLevelWidgets()) {
+    if (auto* candidate = qobject_cast<PJ::MainWindow*>(widget)) {
+      main_window = candidate;
+      break;
+    }
+  }
+  QTreeWidget* tree = main_window != nullptr ? main_window->findChild<QTreeWidget*>(u"treeView"_s) : nullptr;
+  if (tree == nullptr) {
+    qWarning("PJ_WASM_CURVE_ROWS_FAILED no dataset tree");
+    return;
+  }
+  tree->expandAll();
+  // Same-frame geometry: force the pending relayout so visualItemRect is final.
+  QCoreApplication::processEvents();
+  int count = 0;
+  std::function<void(QTreeWidgetItem*, const QString&)> visit = [&](QTreeWidgetItem* item, const QString& prefix) {
+    const QString path = prefix.isEmpty() ? item->text(0) : prefix + u"/"_s + item->text(0);
+    const QRect rect = tree->visualItemRect(item);
+    if (!rect.isEmpty()) {
+      const QPoint center =
+          main_window->mapFromGlobal(tree->viewport()->mapToGlobal(QPoint(rect.left() + 40, rect.center().y())));
+      qInfo("PJ_WASM_CURVE_ROW path=%s x=%d y=%d children=%d", qPrintable(path), center.x(), center.y(),
+            item->childCount());
+      ++count;
+    }
+    for (int index = 0; index < item->childCount(); ++index) {
+      visit(item->child(index), path);
+    }
+  };
+  for (int index = 0; index < tree->topLevelItemCount(); ++index) {
+    visit(tree->topLevelItem(index), QString{});
+  }
+  qInfo("PJ_WASM_CURVE_ROWS_DONE count=%d", count);
+}
+
+// Reports the center of each empty-dock placeholder family icon in MainWindow
+// coordinates. The placeholder is looked up in the visible tab, so the specs
+// click the icon they mean regardless of how many families the row holds.
+extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_placeholder_icons() {
+  PJ::MainWindow* main_window = nullptr;
+  for (QWidget* widget : QApplication::topLevelWidgets()) {
+    if (auto* candidate = qobject_cast<PJ::MainWindow*>(widget)) {
+      main_window = candidate;
+      break;
+    }
+  }
+  PJ::VisualizationPlaceholderWidget* placeholder = nullptr;
+  if (main_window != nullptr) {
+    for (auto* candidate : main_window->findChildren<PJ::VisualizationPlaceholderWidget*>()) {
+      if (candidate->isVisible()) {
+        placeholder = candidate;
+        break;
+      }
+    }
+  }
+  if (placeholder == nullptr) {
+    qWarning("PJ_WASM_PLACEHOLDER_ICONS_FAILED no visible placeholder");
+    return;
+  }
+  const auto center = [main_window, placeholder](const char* name) {
+    auto* button = placeholder->findChild<QToolButton*>(QString::fromLatin1(name));
+    return button != nullptr ? main_window->mapFromGlobal(button->mapToGlobal(button->rect().center()))
+                             : QPoint(-1, -1);
+  };
+  const QPoint plot = center("buttonVizPlot");
+  const QPoint transitions = center("buttonVizStateTransitions");
+  const QPoint scene2d = center("buttonVizScene2D");
+  const QPoint scene3d = center("buttonVizScene3D");
+  qInfo(
+      "PJ_WASM_PLACEHOLDER_ICONS plot=%d,%d transitions=%d,%d scene2d=%d,%d scene3d=%d,%d", plot.x(), plot.y(),
+      transitions.x(), transitions.y(), scene2d.x(), scene2d.y(), scene3d.x(), scene3d.y());
+}
+
 // clang-format off
 EM_JS(void, pj_wasm_install_browser_test_probes, (), {
   globalThis.pjWasmOpenLoadProbe = () => Module._pj_wasm_test_open_load();
@@ -1362,6 +1446,8 @@ EM_JS(void, pj_wasm_install_browser_test_probes, (), {
   globalThis.pjWasmReportIngestControlsProbe = () => Module._pj_wasm_test_report_ingest_controls();
   globalThis.pjWasmReportLayoutSnapshotProbe = () => Module._pj_wasm_test_report_layout_snapshot();
   globalThis.pjWasmReportDatasetCountProbe = () => Module._pj_wasm_test_report_dataset_count();
+  globalThis.pjWasmReportCurveRowsProbe = () => Module._pj_wasm_test_report_curve_rows();
+  globalThis.pjWasmReportPlaceholderIconsProbe = () => Module._pj_wasm_test_report_placeholder_icons();
   globalThis.pjWasmReportStreamingStateProbe = () => Module._pj_wasm_test_report_streaming_state();
   globalThis.pjWasmCycleTimeTrackerProbe = () => Module._pj_wasm_test_cycle_time_tracker();
   globalThis.pjWasmShowLegendProbe = () => Module._pj_wasm_test_show_legend();

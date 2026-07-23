@@ -18,6 +18,22 @@ name: WASM CI
 
 on:
   workflow_dispatch:
+  # Wasm breakage is invisible to the standard PR checks (native CI stays green
+  # when shared code calls a native-only API), so run on PRs that can plausibly
+  # affect the browser build. Not a required check; ~20-30 min on warm caches.
+  pull_request:
+    paths:
+      - '**/wasm/**'
+      - 'tests/wasm/**'
+      - 'cmake/PjWasm*'
+      - '.github/workflows/wasm-ci.yml'
+      - 'pj_app/**'
+      - 'pj_widgets/**'
+      - 'pj_scene2D/**'
+      - 'pj_scene3D/**'
+      - 'pj_scene_common/**'
+      - 'pj_runtime/**'
+      - 'plotjuggler_sdk'
 
 concurrency:
   group: wasm-ci-${{ github.ref }}

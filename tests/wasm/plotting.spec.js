@@ -7,6 +7,7 @@ const { clickActiveDialogButton } = require('./support/dialogs');
 const { base64Fixture } = require('./support/fixtures');
 const { openFileChooser } = require('./support/pickers');
 const { requestPlotState, requestMultiPlotState } = require('./support/plot_probes');
+const { curveRowCenter, placeholderIconCenter } = require('./support/geometry');
 
 function unchunkedMcapFixture() {
   return base64Fixture('unchunked_float64.mcap.b64');
@@ -297,7 +298,8 @@ test('QRhi WebGL canvas renders an imported scalar curve', async ({ page }) => {
   // Create the first real PlotWidget through the user-facing placeholder. F9
   // is compiled only into the acceptance probe build and calls addCurve() on
   // that real plot, avoiding a synthetic Qt drag/drop gesture.
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   await page.keyboard.press('F9');
 
@@ -373,7 +375,8 @@ test('QRhi scalar reduction preserves an isolated extremum within its frame budg
     { timeout: 15000 },
   ).toContain('plugin=CSV Loader');
 
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   // F10 is the probe-build variant that also fits the complete series, so the
   // reducer receives all 6,001 points instead of the shared timeline's initial
@@ -437,13 +440,11 @@ test('real curve drag and drop drives the QRhi plot lifecycle', async ({ page })
     { timeout: 15000 },
   ).toContain('scalar_series=drag/temp,drag/time,drag/value');
 
-  // Expand dataset -> topic, then drag the real scalar leaves. No F9/F10 add
+  // Drag the real scalar leaves from probe-reported row centers. No F9/F10 add
   // probe is used: these gestures must traverse CurveTreeView's production
   // QDrag MIME path and the placeholder/live-plot drop handlers.
-  await page.mouse.click(screen.x + 10, screen.y + 196);
-  await page.mouse.click(screen.x + 30, screen.y + 218);
   const placeholder = { x: screen.x + 820, y: screen.y + 390 };
-  await dragQtCanvas(page, { x: screen.x + 95, y: screen.y + 240 }, placeholder);
+  await dragQtCanvas(page, await curveRowCenter(page, screen, consoleMessages, 'drag.csv/drag/temp'), placeholder);
 
   await expect.poll(
     () => consoleMessages.some(message => message.includes('PJ_WASM_PLOT_RHI_READY')),
@@ -460,7 +461,7 @@ test('real curve drag and drop drives the QRhi plot lifecycle', async ({ page })
     x: screen.x + state.canvas.x + (state.canvas.width / 2),
     y: screen.y + state.canvas.y + (state.canvas.height / 2),
   };
-  await dragQtCanvas(page, { x: screen.x + 95, y: screen.y + 284 }, canvasCenter);
+  await dragQtCanvas(page, await curveRowCenter(page, screen, consoleMessages, 'drag.csv/drag/value'), canvasCenter);
   state = await requestPlotState(page, consoleMessages, stateMessages);
   stateMessages += 1;
   expect(state.count).toBe(2);
@@ -491,7 +492,7 @@ test('real curve drag and drop drives the QRhi plot lifecycle', async ({ page })
   stateMessages += 1;
   expect(state.count).toBe(0);
 
-  await dragQtCanvas(page, { x: screen.x + 95, y: screen.y + 240 }, canvasCenter);
+  await dragQtCanvas(page, await curveRowCenter(page, screen, consoleMessages, 'drag.csv/drag/temp'), canvasCenter);
   state = await requestPlotState(page, consoleMessages, stateMessages);
   expect(state.count).toBe(1);
   expect(state.titles).toEqual(['drag/temp']);
@@ -526,10 +527,8 @@ test('multi-selected scalar leaves drag to one plot in a single gesture', async 
     { timeout: 15000 },
   ).toContain('scalar_series=multi-drag/temp,multi-drag/time,multi-drag/value');
 
-  await page.mouse.click(screen.x + 10, screen.y + 196);
-  await page.mouse.click(screen.x + 30, screen.y + 218);
-  const tempRow = { x: screen.x + 95, y: screen.y + 240 };
-  const valueRow = { x: screen.x + 95, y: screen.y + 284 };
+  const tempRow = await curveRowCenter(page, screen, consoleMessages, 'multi-drag.csv/multi-drag/temp');
+  const valueRow = await curveRowCenter(page, screen, consoleMessages, 'multi-drag.csv/multi-drag/value');
   await page.mouse.click(tempRow.x, tempRow.y);
   await page.keyboard.down('Control');
   await page.mouse.click(valueRow.x, valueRow.y);
@@ -580,11 +579,9 @@ test('real curve-style and width controls render every app-exposed QRhi variant'
     { timeout: 15000 },
   ).toContain('scalar_series=styles/signal,styles/time');
 
-  await page.mouse.click(screen.x + 10, screen.y + 196);
-  await page.mouse.click(screen.x + 30, screen.y + 218);
   await dragQtCanvas(
     page,
-    { x: screen.x + 95, y: screen.y + 240 },
+    await curveRowCenter(page, screen, consoleMessages, 'styles.csv/styles/signal'),
     { x: screen.x + 820, y: screen.y + 390 },
   );
   await expect.poll(
@@ -724,7 +721,8 @@ test('dense dotted curves reduce transactionally without committing a front-load
   // The reduction probe creates the real plot/curve and fits the complete
   // series. Only the pen mutation is probe-only; rendering and budgeting use
   // the same Qwt item and PlotRhiCanvas path as production.
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   await page.keyboard.press('F10');
   await expect.poll(
@@ -793,7 +791,8 @@ test('huge offscreen dash phases remain bounded on a visible local segment', asy
     { timeout: 15000 },
   ).toContain('huge-dash-phase/temp:3@');
 
-  await page.mouse.click(screen.x + 713, screen.y + 390);
+  { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
   await page.waitForTimeout(1500);
   await page.keyboard.press('F10');
   await expect.poll(
@@ -1544,7 +1543,8 @@ test.describe('sub-1 DPR QRhi cosmetics', () => {
       { timeout: 15000 },
     ).toContain('scalar_series=lodpi-grid/temp,lodpi-grid/time');
 
-    await page.mouse.click(screen.x + 713, screen.y + 390);
+    { const icon = await placeholderIconCenter(page, screen, consoleMessages, 'plot');
+    await page.mouse.click(icon.x, icon.y); }
     await page.waitForTimeout(1500);
     await page.keyboard.press('F10');
     await expect.poll(
