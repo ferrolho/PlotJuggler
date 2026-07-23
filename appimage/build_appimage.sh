@@ -104,7 +104,12 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plugins-dir)
-      PLUGINS_MODE="local"; PLUGINS_LOCAL_DIR="${2:?--plugins-dir needs a path}"; shift 2 ;;
+      PLUGINS_MODE="local"
+      # Canonicalize to an absolute path against the invocation CWD *now*: step 1
+      # below cd's into SCRIPT_DIR (appimage/) before collect_plugins_local reads
+      # this, so a relative value would otherwise resolve against appimage/ rather
+      # than where the user ran the command, and silently miss.
+      PLUGINS_LOCAL_DIR="$(realpath -m -- "${2:?--plugins-dir needs a path}")"; shift 2 ;;
     --plugins-registry)
       PLUGINS_MODE="registry"
       # Optional URL argument (anything not starting with '-').

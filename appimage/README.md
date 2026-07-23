@@ -99,6 +99,18 @@ image (`Dockerfile.build`). Plugins:
 `ubuntu:22.04` runtime image (`Dockerfile.run`) with only base X/GL libraries;
 the GUI is forwarded to the host display via `xhost`.
 
+`appimage/build_appimage_in_docker.sh` is a lighter alternative for local
+packaging: it builds a plain `ubuntu:22.04` image (`docker/Dockerfile`), then
+runs `install_qt6.sh` (reusing the host `./.qt`), `build.sh`, and
+`build_appimage.sh` inside it — matching the release glibc/libstdc++ baseline
+regardless of the host distro. Being a packaging build, it configures with
+`PJ_BUILD_TESTS=OFF` / `PJ_BUILD_DEMOS=OFF` (neither the test suite nor the
+scene3D dev demos ship). Arguments are forwarded to `build_appimage.sh`:
+`--plugins-registry`, or `--plugins-dir <dir>` where a relative `<dir>` is
+resolved against your current directory and must live inside the repo tree (only
+the repo is bind-mounted into the container). Conan/ccache caches persist across
+runs in host-side `*-appimage-docker/` directories, so rebuilds are incremental.
+
 ## CI
 
 `.github/workflows/linux-appimage-release.yml` (the release build) compiles the
