@@ -86,11 +86,11 @@ QRhiGraphicsPipeline* clonePipelineForRenderPass(
 }  // namespace
 
 void SceneViewWidget::setForceHdrFallbackForTest(bool force) {
-  if (force_hdr_fallback_for_test_ == force) {
+  if (hdr_stage_.force_fallback_for_test == force) {
     return;
   }
-  force_hdr_fallback_for_test_ = force;
-  hdr_rejected_size_ = {};
+  hdr_stage_.force_fallback_for_test = force;
+  hdr_stage_.rejected_size = {};
   if (force) {
     releaseHdrResources();
   }
@@ -98,12 +98,12 @@ void SceneViewWidget::setForceHdrFallbackForTest(bool force) {
 }
 
 void SceneViewWidget::setForceShadowFallbackForTest(bool force) {
-  if (force_shadow_fallback_for_test_ == force) {
+  if (shadow_stage_.force_fallback_for_test == force) {
     return;
   }
-  force_shadow_fallback_for_test_ = force;
-  shadow_capability_error_.clear();
-  shadow_error_target_size_ = {};
+  shadow_stage_.force_fallback_for_test = force;
+  shadow_stage_.capability_error.clear();
+  shadow_stage_.rejected_size = {};
   if (force) {
     releaseShadowResources(true);
   }
@@ -111,11 +111,11 @@ void SceneViewWidget::setForceShadowFallbackForTest(bool force) {
 }
 
 void SceneViewWidget::setForceSsaoFallbackForTest(bool force) {
-  if (force_ssao_fallback_for_test_ == force) {
+  if (ssao_stage_.force_fallback_for_test == force) {
     return;
   }
-  force_ssao_fallback_for_test_ = force;
-  ssao_rejected_size_ = {};
+  ssao_stage_.force_fallback_for_test = force;
+  ssao_stage_.rejected_size = {};
   if (force) {
     releaseSsaoResources();
   }
@@ -123,11 +123,11 @@ void SceneViewWidget::setForceSsaoFallbackForTest(bool force) {
 }
 
 void SceneViewWidget::setForceEdlFallbackForTest(bool force) {
-  if (force_edl_fallback_for_test_ == force) {
+  if (edl_stage_.force_fallback_for_test == force) {
     return;
   }
-  force_edl_fallback_for_test_ = force;
-  edl_rejected_size_ = {};
+  edl_stage_.force_fallback_for_test = force;
+  edl_stage_.rejected_size = {};
   if (force) {
     releaseEdlResources();
   }
@@ -145,17 +145,17 @@ bool SceneViewWidget::ensureShadowResources(QRhi* owner) {
   }
   // A failure blocks retries only while the output size is unchanged — a
   // resize re-probes, mirroring the HDR/SSAO/EDL rejected-size recovery.
-  if (!shadow_capability_error_.isEmpty() && shadow_error_target_size_ == renderTarget()->pixelSize()) {
+  if (shadow_stage_.blockedFor(renderTarget()->pixelSize())) {
     return false;
   }
   const auto fail = [this](QString reason) {
-    shadow_capability_error_ = std::move(reason);
-    shadow_error_target_size_ = renderTarget() != nullptr ? renderTarget()->pixelSize() : QSize{};
-    qWarning("SceneViewWidget WASM shadows unavailable: %s", qPrintable(shadow_capability_error_));
+    shadow_stage_.capability_error = std::move(reason);
+    shadow_stage_.rejected_size = renderTarget() != nullptr ? renderTarget()->pixelSize() : QSize{};
+    qWarning("SceneViewWidget WASM shadows unavailable: %s", qPrintable(shadow_stage_.capability_error));
     releaseShadowResources(true);
     return false;
   };
-  if (force_shadow_fallback_for_test_) {
+  if (shadow_stage_.force_fallback_for_test) {
     return fail(tr("Shadow rendering disabled by the browser acceptance override"));
   }
   const int maximum_texture_size = owner->resourceLimit(QRhi::TextureSizeMax);
@@ -294,8 +294,8 @@ bool SceneViewWidget::ensureShadowResources(QRhi* owner) {
   }
 
   shadow_map_size_ = kShadowMapSize;
-  shadow_capability_error_.clear();
-  ++shadow_resource_generation_;
+  shadow_stage_.capability_error.clear();
+  ++shadow_stage_.resource_generation;
   return true;
 }
 
@@ -357,7 +357,7 @@ void SceneViewWidget::releaseShadowResources(bool restore_model_bindings) {
   shadow_uniform_buffer_ = nullptr;
   shadow_instance_buffer_capacity_ = 0;
   shadow_map_size_ = 0;
-  last_shadow_active_ = false;
+  shadow_stage_.last_active = false;
 }
 
 void SceneViewWidget::releaseHdrTargetResources() {
@@ -385,7 +385,7 @@ void SceneViewWidget::releaseHdrTargetResources() {
   hdr_resolve_depth_ = nullptr;
   hdr_resolve_coverage_ = nullptr;
   hdr_render_size_ = {};
-  last_hdr_active_ = false;
+  hdr_stage_.last_active = false;
 
   if (resource_rhi_ != nullptr && hdr_allocated_bytes_ != 0U) {
     auto iterator = hdr_bytes_by_rhi.find(resource_rhi_);
@@ -408,7 +408,7 @@ void SceneViewWidget::releaseSsaoTargetResources() {
   ssao_pipeline_ = nullptr;
   ssao_shader_resources_ = nullptr;
   ssao_raw_render_target_ = nullptr;
-  last_ssao_active_ = false;
+  ssao_stage_.last_active = false;
 }
 
 void SceneViewWidget::releaseSsaoResources() {
@@ -422,7 +422,7 @@ void SceneViewWidget::releaseSsaoResources() {
 void SceneViewWidget::releaseEdlTargetResources() {
   delete edl_mesh_mask_render_target_;
   edl_mesh_mask_render_target_ = nullptr;
-  last_edl_active_ = false;
+  edl_stage_.last_active = false;
 }
 
 void SceneViewWidget::releaseEdlResources() {
@@ -441,10 +441,10 @@ void SceneViewWidget::releaseEdlResources() {
 void SceneViewWidget::updateRenderingWarning() {
   // SSAO/EDL are probed only while the HDR chain runs, so their stored errors
   // go stale the moment HDR is down — suppress them until HDR is live again.
-  const QString warning = !hdr_capability_error_.isEmpty()    ? hdr_capability_error_
-                          : !last_hdr_active_                 ? QString{}
-                          : !ssao_capability_error_.isEmpty() ? ssao_capability_error_
-                                                              : edl_capability_error_;
+  const QString warning = !hdr_stage_.capability_error.isEmpty()    ? hdr_stage_.capability_error
+                          : !hdr_stage_.last_active                 ? QString{}
+                          : !ssao_stage_.capability_error.isEmpty() ? ssao_stage_.capability_error
+                                                                    : edl_stage_.capability_error;
   if (warning == rendering_warning_) {
     return;
   }
@@ -526,23 +526,23 @@ bool SceneViewWidget::ensureSsaoResources(QRhi* owner, const QSize& size) {
       ssao_uniform_buffer_ != nullptr) {
     return true;
   }
-  if (ssao_rejected_size_ == size && !ssao_capability_error_.isEmpty()) {
+  if (ssao_stage_.blockedFor(size)) {
     return false;
   }
 
   const auto fail = [this, &size](QString reason) {
     releaseSsaoResources();
-    ssao_rejected_size_ = size;
-    const bool changed = ssao_capability_error_ != reason;
-    ssao_capability_error_ = std::move(reason);
+    ssao_stage_.rejected_size = size;
+    const bool changed = ssao_stage_.capability_error != reason;
+    ssao_stage_.capability_error = std::move(reason);
     if (changed) {
-      qWarning("SceneViewWidget WASM SSAO unavailable: %s", qPrintable(ssao_capability_error_));
+      qWarning("SceneViewWidget WASM SSAO unavailable: %s", qPrintable(ssao_stage_.capability_error));
     }
     updateRenderingWarning();
     return false;
   };
 
-  if (force_ssao_fallback_for_test_) {
+  if (ssao_stage_.force_fallback_for_test) {
     return fail(tr("SSAO rendering disabled by the browser acceptance override"));
   }
   if (hdr_resolve_coverage_ == nullptr || hdr_resolve_depth_ == nullptr || hdr_coverage_sampler_ == nullptr) {
@@ -602,12 +602,12 @@ bool SceneViewWidget::ensureSsaoResources(QRhi* owner, const QSize& size) {
     return fail(tr("Could not create the browser SSAO pipeline"));
   }
 
-  ssao_rejected_size_ = {};
-  if (!ssao_capability_error_.isEmpty()) {
-    ssao_capability_error_.clear();
+  ssao_stage_.rejected_size = {};
+  if (!ssao_stage_.capability_error.isEmpty()) {
+    ssao_stage_.capability_error.clear();
     updateRenderingWarning();
   }
-  ++ssao_resource_generation_;
+  ++ssao_stage_.resource_generation;
   return true;
 }
 
@@ -619,23 +619,23 @@ bool SceneViewWidget::ensureEdlResources(QRhi* owner, const QSize& size) {
       edl_mesh_mask_line_pipeline_ != nullptr) {
     return true;
   }
-  if (edl_rejected_size_ == size && !edl_capability_error_.isEmpty()) {
+  if (edl_stage_.blockedFor(size)) {
     return false;
   }
 
   const auto fail = [this, &size](QString reason) {
     releaseEdlResources();
-    edl_rejected_size_ = size;
-    const bool changed = edl_capability_error_ != reason;
-    edl_capability_error_ = std::move(reason);
+    edl_stage_.rejected_size = size;
+    const bool changed = edl_stage_.capability_error != reason;
+    edl_stage_.capability_error = std::move(reason);
     if (changed) {
-      qWarning("SceneViewWidget WASM EDL unavailable: %s", qPrintable(edl_capability_error_));
+      qWarning("SceneViewWidget WASM EDL unavailable: %s", qPrintable(edl_stage_.capability_error));
     }
     updateRenderingWarning();
     return false;
   };
 
-  if (force_edl_fallback_for_test_) {
+  if (edl_stage_.force_fallback_for_test) {
     return fail(tr("EDL rendering disabled by the browser acceptance override"));
   }
   if (hdr_resolve_coverage_ == nullptr || hdr_resolve_depth_ == nullptr || model_triangle_pipeline_ == nullptr ||
@@ -695,12 +695,12 @@ bool SceneViewWidget::ensureEdlResources(QRhi* owner, const QSize& size) {
     return fail(tr("Could not create the browser EDL mesh-mask pipelines"));
   }
 
-  edl_rejected_size_ = {};
-  if (!edl_capability_error_.isEmpty()) {
-    edl_capability_error_.clear();
+  edl_stage_.rejected_size = {};
+  if (!edl_stage_.capability_error.isEmpty()) {
+    edl_stage_.capability_error.clear();
     updateRenderingWarning();
   }
-  ++edl_resource_generation_;
+  ++edl_stage_.resource_generation;
   return true;
 }
 
@@ -787,23 +787,23 @@ bool SceneViewWidget::ensureHdrResources(QRhi* owner, const QSize& size) {
       present_shader_resources_ != nullptr && present_pipeline_ != nullptr && ensureHdrPipelines(owner)) {
     return true;
   }
-  if (hdr_rejected_size_ == size && !hdr_capability_error_.isEmpty()) {
+  if (hdr_stage_.blockedFor(size)) {
     return false;
   }
 
   const auto fail = [this, &size](QString reason) {
     releaseHdrResources();
-    hdr_rejected_size_ = size;
-    const bool changed = hdr_capability_error_ != reason;
-    hdr_capability_error_ = std::move(reason);
+    hdr_stage_.rejected_size = size;
+    const bool changed = hdr_stage_.capability_error != reason;
+    hdr_stage_.capability_error = std::move(reason);
     if (changed) {
-      qWarning("SceneViewWidget WASM HDR unavailable: %s", qPrintable(hdr_capability_error_));
+      qWarning("SceneViewWidget WASM HDR unavailable: %s", qPrintable(hdr_stage_.capability_error));
     }
     updateRenderingWarning();
     return false;
   };
 
-  if (force_hdr_fallback_for_test_) {
+  if (hdr_stage_.force_fallback_for_test) {
     return fail(tr("HDR rendering disabled by the browser acceptance override"));
   }
   if (!owner->supportedSampleCounts().contains(kHdrSampleCount) ||
@@ -938,13 +938,20 @@ bool SceneViewWidget::ensureHdrResources(QRhi* owner, const QSize& size) {
 
   hdr_render_size_ = size;
   hdr_allocated_bytes_ = bytes;
+  if (hdr_bytes_by_rhi.find(owner) == hdr_bytes_by_rhi.end()) {
+    // The aggregate is keyed by a raw QRhi pointer that the allocator can
+    // reuse: purge the entry when the QRhi itself dies so a widget whose
+    // releaseResources() was skipped cannot poison a successor at the same
+    // address with phantom bytes.
+    owner->addCleanupCallback(&hdr_bytes_by_rhi, [](QRhi* dying) { hdr_bytes_by_rhi.erase(dying); });
+  }
   hdr_bytes_by_rhi[owner] = aggregate_without_this + bytes;
-  hdr_rejected_size_ = {};
-  if (!hdr_capability_error_.isEmpty()) {
-    hdr_capability_error_.clear();
+  hdr_stage_.rejected_size = {};
+  if (!hdr_stage_.capability_error.isEmpty()) {
+    hdr_stage_.capability_error.clear();
     updateRenderingWarning();
   }
-  ++hdr_resource_generation_;
+  ++hdr_stage_.resource_generation;
   return true;
 }
 

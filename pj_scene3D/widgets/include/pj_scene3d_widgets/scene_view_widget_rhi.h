@@ -255,7 +255,7 @@ class SceneViewWidget : public QRhiWidget {
     return last_model_bounds_;
   }
   [[nodiscard]] bool lastShadowActiveForTest() const {
-    return last_shadow_active_;
+    return shadow_stage_.last_active;
   }
   [[nodiscard]] bool shadowResourcesReadyForTest() const {
     return shadow_texture_ != nullptr && shadow_render_target_ != nullptr;
@@ -276,13 +276,13 @@ class SceneViewWidget : public QRhiWidget {
     return last_shadow_bounds_;
   }
   [[nodiscard]] const QString& shadowCapabilityErrorForTest() const {
-    return shadow_capability_error_;
+    return shadow_stage_.capability_error;
   }
   [[nodiscard]] std::uint64_t shadowResourceGenerationForTest() const {
-    return shadow_resource_generation_;
+    return shadow_stage_.resource_generation;
   }
   [[nodiscard]] bool lastHdrActiveForTest() const {
-    return last_hdr_active_;
+    return hdr_stage_.last_active;
   }
   [[nodiscard]] bool hdrResourcesReadyForTest() const {
     return hdr_render_target_ != nullptr && hdr_depth_render_target_ != nullptr && hdr_resolve_color_ != nullptr &&
@@ -295,44 +295,44 @@ class SceneViewWidget : public QRhiWidget {
     return hdr_allocated_bytes_;
   }
   [[nodiscard]] const QString& hdrCapabilityErrorForTest() const {
-    return hdr_capability_error_;
+    return hdr_stage_.capability_error;
   }
   [[nodiscard]] std::uint64_t hdrResourceGenerationForTest() const {
-    return hdr_resource_generation_;
+    return hdr_stage_.resource_generation;
   }
   void setForceHdrFallbackForTest(bool force);
   [[nodiscard]] bool lastSsaoActiveForTest() const {
-    return last_ssao_active_;
+    return ssao_stage_.last_active;
   }
   [[nodiscard]] bool ssaoResourcesReadyForTest() const {
     return ssao_raw_render_target_ != nullptr && ssao_pipeline_ != nullptr && ssao_shader_resources_ != nullptr &&
            ssao_uniform_buffer_ != nullptr;
   }
   [[nodiscard]] const QString& ssaoCapabilityErrorForTest() const {
-    return ssao_capability_error_;
+    return ssao_stage_.capability_error;
   }
   [[nodiscard]] std::uint64_t ssaoResourceGenerationForTest() const {
-    return ssao_resource_generation_;
+    return ssao_stage_.resource_generation;
   }
   void setForceSsaoFallbackForTest(bool force);
   // Same acceptance-only fault injection for the shadow chain: forces the
   // capability error the specs assert on and releases the shadow resources.
   void setForceShadowFallbackForTest(bool force);
   [[nodiscard]] bool lastEdlActiveForTest() const {
-    return last_edl_active_;
+    return edl_stage_.last_active;
   }
   [[nodiscard]] bool edlResourcesReadyForTest() const {
     return edl_mesh_mask_render_target_ != nullptr && edl_mesh_mask_triangle_pipeline_ != nullptr &&
            edl_mesh_mask_line_pipeline_ != nullptr;
   }
   [[nodiscard]] const QString& edlCapabilityErrorForTest() const {
-    return edl_capability_error_;
+    return edl_stage_.capability_error;
   }
   [[nodiscard]] const QString& renderingWarningForTest() const {
     return rendering_warning_;
   }
   [[nodiscard]] std::uint64_t edlResourceGenerationForTest() const {
-    return edl_resource_generation_;
+    return edl_stage_.resource_generation;
   }
   void setForceEdlFallbackForTest(bool force);
   [[nodiscard]] const std::vector<std::uint32_t>& lastSubmittedLayerIdsForTest() const {
@@ -355,6 +355,9 @@ class SceneViewWidget : public QRhiWidget {
   void changeEvent(QEvent* event) override;
 
  private:
+  // Shared placement step of the per-family render loops; see the definition.
+  [[nodiscard]] std::optional<Transform> resolveFixedFromSource(
+      const std::string& source_frame, const std::string& fixed_frame) const;
   using OrderedLayer = std::variant<
       WasmPointRenderable*, WasmPosesInFrameLayer*, WasmOccupancyGridLayer*, WasmVoxelGridLayer*,
       WasmSceneEntitiesLayer*, WasmModelRenderable*>;
@@ -736,39 +739,38 @@ class SceneViewWidget : public QRhiWidget {
   int last_model_triangle_count_ = 0;
   std::array<int, 5> last_model_texture_slot_counts_{};
   AABB last_model_bounds_;
-  bool last_shadow_active_ = false;
   bool last_shadow_fit_valid_ = false;
   int shadow_map_size_ = 0;
   int last_shadow_draw_count_ = 0;
   int last_shadow_triangle_count_ = 0;
   AABB last_shadow_bounds_;
-  QString shadow_capability_error_;
-  // Output size at the moment shadows last failed: a resize re-probes (same
-  // recovery contract as the HDR/SSAO/EDL rejected-size gates).
-  QSize shadow_error_target_size_;
   // Last shadow failure already forwarded to the caster layers, so a persistent
   // error is noted once instead of re-marked every frame.
   QString noted_shadow_failure_;
-  std::uint64_t shadow_resource_generation_ = 0;
-  bool last_hdr_active_ = false;
-  bool force_hdr_fallback_for_test_ = false;
   QSize hdr_render_size_;
-  QSize hdr_rejected_size_;
-  QString hdr_capability_error_;
   std::uint64_t hdr_allocated_bytes_ = 0;
-  std::uint64_t hdr_resource_generation_ = 0;
-  bool last_ssao_active_ = false;
-  bool force_ssao_fallback_for_test_ = false;
-  bool force_shadow_fallback_for_test_ = false;
-  QSize ssao_rejected_size_;
-  QString ssao_capability_error_;
-  std::uint64_t ssao_resource_generation_ = 0;
-  bool last_edl_active_ = false;
-  bool force_edl_fallback_for_test_ = false;
-  QSize edl_rejected_size_;
-  QString edl_capability_error_;
   QString rendering_warning_;
-  std::uint64_t edl_resource_generation_ = 0;
+
+  // Bookkeeping every optional quality stage carries: whether it ran last
+  // frame, the acceptance-test fallback override, the size-keyed failure latch
+  // (a resize re-probes — a failure never blocks the stage for the QRhi's whole
+  // lifetime), and the resource generation the probes report.
+  struct QualityStageState {
+    bool last_active = false;
+    bool force_fallback_for_test = false;
+    QSize rejected_size;
+    QString capability_error;
+    std::uint64_t resource_generation = 0;
+    // True while the stage must stay down for this output size: a failure is
+    // latched only against the size it happened at.
+    [[nodiscard]] bool blockedFor(const QSize& size) const {
+      return !capability_error.isEmpty() && rejected_size == size;
+    }
+  };
+  QualityStageState shadow_stage_;
+  QualityStageState hdr_stage_;
+  QualityStageState ssao_stage_;
+  QualityStageState edl_stage_;
 
   QPoint last_mouse_position_;
   Qt::MouseButton active_button_ = Qt::NoButton;

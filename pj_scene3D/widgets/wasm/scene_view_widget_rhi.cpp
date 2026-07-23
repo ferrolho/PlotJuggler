@@ -847,6 +847,28 @@ void SceneViewWidget::refreshAvailableFrames() {
   }
 }
 
+// Places a layer's source frame in the fixed frame at render_time_: identity
+// when the frames match, nullopt when either frame is empty or TF cannot
+// resolve the pair this frame — the caller skips the layer without consuming
+// its per-view budget.
+std::optional<Transform> SceneViewWidget::resolveFixedFromSource(
+    const std::string& source_frame, const std::string& fixed_frame) const {
+  if (source_frame.empty() || fixed_frame.empty()) {
+    return std::nullopt;
+  }
+  if (source_frame == fixed_frame) {
+    return Transform{};
+  }
+  if (tf_ == nullptr) {
+    return std::nullopt;
+  }
+  const auto transform = tf_->tryLookupTransform(fixed_frame, source_frame, render_time_);
+  if (!transform.has_value()) {
+    return std::nullopt;
+  }
+  return *transform;
+}
+
 uint64_t SceneViewWidget::tfRenderKey(PJ::Timepoint time) const {
   const std::string fixed = effectiveFixedFrame();
   if (tf_ == nullptr || fixed.empty() || (!axes_visible_ && !tf_connections_visible_)) {
@@ -2128,11 +2150,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
 
   const QSize output_size = target->pixelSize();
   const bool hdr_active = ensureHdrResources(current_rhi, output_size);
-  last_hdr_active_ = hdr_active;
+  hdr_stage_.last_active = hdr_active;
   bool ssao_active = hdr_active && ensureSsaoResources(current_rhi, output_size);
-  last_ssao_active_ = ssao_active;
+  ssao_stage_.last_active = ssao_active;
   bool edl_active = hdr_active && ensureEdlResources(current_rhi, output_size);
-  last_edl_active_ = edl_active;
+  edl_stage_.last_active = edl_active;
   const float aspect = output_size.height() > 0
                            ? static_cast<float>(output_size.width()) / static_cast<float>(output_size.height())
                            : 1.0F;
@@ -2160,20 +2182,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       }
       continue;
     }
-    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+    const auto placed = resolveFixedFromSource(layer->sourceFrame(), fixed_frame);
+    if (!placed.has_value()) {
       continue;
     }
-    Transform fixed_from_source;
-    if (layer->sourceFrame() != fixed_frame) {
-      if (tf_ == nullptr) {
-        continue;
-      }
-      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
-      if (!transform.has_value()) {
-        continue;
-      }
-      fixed_from_source = *transform;
-    }
+    const Transform& fixed_from_source = *placed;
     // The aggregate applies to actual drawable point-like layers. A temporarily
     // unplaceable point/depth layer must not reserve capacity ahead of a later
     // layer whose source frame resolves in this frame.
@@ -2214,20 +2227,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       }
       continue;
     }
-    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+    const auto placed = resolveFixedFromSource(layer->sourceFrame(), fixed_frame);
+    if (!placed.has_value()) {
       continue;
     }
-    Transform fixed_from_source;
-    if (layer->sourceFrame() != fixed_frame) {
-      if (tf_ == nullptr) {
-        continue;
-      }
-      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
-      if (!transform.has_value()) {
-        continue;
-      }
-      fixed_from_source = *transform;
-    }
+    const Transform& fixed_from_source = *placed;
     // Placement first, budget second: a temporarily unplaceable layer must not
     // reserve capacity and starve a later drawable layer of the same family.
     if (!tryConsumeBrowserPoseArms(static_cast<std::uint64_t>(layer->instances().size()), remaining_pose_arms)) {
@@ -2265,20 +2269,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       }
       continue;
     }
-    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+    const auto placed = resolveFixedFromSource(layer->sourceFrame(), fixed_frame);
+    if (!placed.has_value()) {
       continue;
     }
-    Transform fixed_from_source;
-    if (layer->sourceFrame() != fixed_frame) {
-      if (tf_ == nullptr) {
-        continue;
-      }
-      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
-      if (!transform.has_value()) {
-        continue;
-      }
-      fixed_from_source = *transform;
-    }
+    const Transform& fixed_from_source = *placed;
     // Placement first, budget second: a temporarily unplaceable layer must not
     // reserve capacity and starve a later drawable layer of the same family.
     const std::uint64_t cells = static_cast<std::uint64_t>(grid.width) * grid.height;
@@ -2326,20 +2321,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       }
       continue;
     }
-    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+    const auto placed = resolveFixedFromSource(layer->sourceFrame(), fixed_frame);
+    if (!placed.has_value()) {
       continue;
     }
-    Transform fixed_from_source;
-    if (layer->sourceFrame() != fixed_frame) {
-      if (tf_ == nullptr) {
-        continue;
-      }
-      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
-      if (!transform.has_value()) {
-        continue;
-      }
-      fixed_from_source = *transform;
-    }
+    const Transform& fixed_from_source = *placed;
     // The view budget describes submitted/drawable voxels. An otherwise valid
     // layer whose frame cannot currently be placed must not reserve capacity
     // and starve a later layer that can be rendered in this frame.
@@ -2514,17 +2500,11 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       if (mesh == layer->modelMeshes().end() || mesh->second == nullptr || !mesh->second->ok || draw.frame_id.empty()) {
         continue;
       }
-      Transform fixed_from_frame;
-      if (draw.frame_id != fixed_frame) {
-        if (tf_ == nullptr) {
-          continue;
-        }
-        const auto transform = tf_->tryLookupTransform(fixed_frame, draw.frame_id, render_time_);
-        if (!transform.has_value()) {
-          continue;
-        }
-        fixed_from_frame = *transform;
+      const auto placed = resolveFixedFromSource(draw.frame_id, fixed_frame);
+      if (!placed.has_value()) {
+        continue;
       }
+      const Transform& fixed_from_frame = *placed;
       const std::uint64_t submesh_draws = mesh->second->submeshes.size();
       const std::uint64_t triangles = mesh->second->indices.size() / 3U;
       if (color_requested) {
@@ -3013,19 +2993,19 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
         current_rhi, shadow_instance_buffer_, shadow_instance_buffer_capacity_, shadow_instance_bytes,
         kInitialVertexBufferBytes);
     if (!shadow_buffer_ready) {
-      shadow_capability_error_ = tr("Could not allocate the browser shadow instance buffer");
-      qWarning("SceneViewWidget WASM shadows unavailable: %s", qPrintable(shadow_capability_error_));
+      shadow_stage_.capability_error = tr("Could not allocate the browser shadow instance buffer");
+      qWarning("SceneViewWidget WASM shadows unavailable: %s", qPrintable(shadow_stage_.capability_error));
       releaseShadowResources(true);
     }
   }
   const bool shadow_active = shadow_requested && shadow_resources_ready && shadow_buffer_ready;
-  last_shadow_active_ = shadow_active;
-  if (shadow_requested && !shadow_active && !shadow_capability_error_.isEmpty()) {
-    if (noted_shadow_failure_ != shadow_capability_error_) {
-      noted_shadow_failure_ = shadow_capability_error_;
+  shadow_stage_.last_active = shadow_active;
+  if (shadow_requested && !shadow_active && !shadow_stage_.capability_error.isEmpty()) {
+    if (noted_shadow_failure_ != shadow_stage_.capability_error) {
+      noted_shadow_failure_ = shadow_stage_.capability_error;
       for (const PreparedModelLayer& prepared : prepared_models) {
         if (prepared.layer != nullptr && !prepared.shadow_calls.empty()) {
-          prepared.layer->noteRenderFailure(shadow_capability_error_);
+          prepared.layer->noteRenderFailure(shadow_stage_.capability_error);
         }
       }
     }
@@ -3137,9 +3117,9 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     bool inverse_projection_valid = false;
     const QMatrix4x4 inverse_projection = corrected_projection.inverted(&inverse_projection_valid);
     ssao_active = ssao_active && inverse_projection_valid;
-    last_ssao_active_ = ssao_active;
+    ssao_stage_.last_active = ssao_active;
     edl_active = edl_active && inverse_projection_valid;
-    last_edl_active_ = edl_active;
+    edl_stage_.last_active = edl_active;
     CompositeUniforms composite;
     composite.params = {
         look::kExposure,
@@ -4038,15 +4018,15 @@ void SceneViewWidget::releaseResources() {
   model_instance_buffer_ = nullptr;
   model_instance_buffer_capacity_ = 0;
   model_white_upload_pending_ = false;
-  shadow_capability_error_.clear();
-  shadow_error_target_size_ = {};
+  shadow_stage_.capability_error.clear();
+  shadow_stage_.rejected_size = {};
   noted_shadow_failure_.clear();
   // Preserve an active warning across RHI teardown. Clearing the rejected
   // size below permits the new RHI to probe again; a successful allocation
   // then clears the warning through renderingWarningChanged().
-  hdr_rejected_size_ = {};
-  last_shadow_active_ = false;
-  last_hdr_active_ = false;
+  hdr_stage_.rejected_size = {};
+  shadow_stage_.last_active = false;
+  hdr_stage_.last_active = false;
   last_shadow_fit_valid_ = false;
   last_shadow_draw_count_ = 0;
   last_shadow_triangle_count_ = 0;

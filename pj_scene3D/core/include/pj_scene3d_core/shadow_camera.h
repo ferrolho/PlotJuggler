@@ -11,8 +11,8 @@ namespace pj::scene3d {
 // Square shadow-map resolution in texels. Sized independently of the scene FBO and
 // its render_scale supersampling — the shadow map is a separate target, so doubling
 // scene supersampling must not quadruple shadow-map memory. 2048 gives ~mm texels on
-// a single-robot scene; larger scenes trade sharpness for coverage (open decision in
-// docs/plans/scene3d_mesh_shadows.md). The light frustum is fit at this resolution so
+// a single-robot scene; larger scenes trade sharpness for coverage (resolution
+// remains an open tuning decision). The light frustum is fit at this resolution so
 // the texel-snap in fitDirectionalShadowCamera matches the actual map.
 inline constexpr int kShadowMapSize = 2048;
 

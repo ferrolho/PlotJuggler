@@ -11,8 +11,8 @@ namespace pj::scene3d {
 namespace {
 
 // Caster-side acne suppression: values shared with the browser pipeline via
-// scene_look_defaults.h (tuning remains an open decision in
-// docs/plans/scene3d_mesh_shadows.md, finalized against screenshots).
+// scene_look_defaults.h. Conservative defaults finalized against screenshots;
+// tuning knobs deliberately stay out of the UI.
 constexpr float kPolygonOffsetFactor = look::kShadowSlopeScaledDepthBias;
 constexpr float kPolygonOffsetUnits = look::kShadowDepthBiasUnits;
 
