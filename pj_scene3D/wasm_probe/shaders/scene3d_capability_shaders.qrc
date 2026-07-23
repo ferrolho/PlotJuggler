@@ -1,0 +1,10 @@
+<RCC>
+  <qresource prefix="/scene3d_capability">
+    <file alias="background.vert.qsb">background.vert.qsb</file>
+    <file alias="background.frag.qsb">background.frag.qsb</file>
+    <file alias="point.vert.qsb">point.vert.qsb</file>
+    <file alias="point.frag.qsb">point.frag.qsb</file>
+    <file alias="indexed.vert.qsb">indexed.vert.qsb</file>
+    <file alias="indexed.frag.qsb">indexed.frag.qsb</file>
+  </qresource>
+</RCC>

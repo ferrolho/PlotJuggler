@@ -7,6 +7,11 @@
 
 namespace pj::scene3d {
 
+// Which ground-grid geometry is built and drawn. Shared by the native
+// GridRenderPass and the WASM QRhi widget so the two backends agree on the
+// persisted grid_style meaning by construction.
+enum class GridStyle { kLines, kFilledCells };
+
 // One ground-grid vertex on the z=0 plane plus a checkerboard parity flag
 // (0.0 or 1.0). The grid shader mixes between two tile tones by this flag, so
 // cells with parity 0 get tone A and parity 1 get tone B. Grid-line vertices

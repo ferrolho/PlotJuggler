@@ -8,7 +8,9 @@
 #include "pj_scene3d_widgets/gl/buffer.h"
 #include "pj_scene3d_widgets/gl/program.h"
 #include "pj_scene3d_widgets/gl/vertex_array.h"
+#include "pj_scene3d_widgets/passes/grid_geometry.h"
 #include "pj_scene3d_widgets/render_pass.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 
@@ -25,7 +27,7 @@ namespace pj::scene3d {
 //                  coplanar pass — so they can't z-fight it at grazing angles.
 class GridRenderPass : public IRenderPass {
  public:
-  enum class Style { kLines, kFilledCells };
+  using Style = GridStyle;
 
   void initializeGL() override;
   void render(const ViewParams& view_params, [[maybe_unused]] const FrameContext& frame_ctx) override;
@@ -55,9 +57,9 @@ class GridRenderPass : public IRenderPass {
   // needs the line buffer; kFilledCells builds both the cell and line buffers.
   void rebuildGeometry();
 
-  glm::vec3 color_{0.35f, 0.35f, 0.35f};         // line color
-  glm::vec3 cell_color_a_{0.30f, 0.30f, 0.30f};  // checkerboard tone A
-  glm::vec3 cell_color_b_{0.42f, 0.42f, 0.42f};  // checkerboard tone B
+  glm::vec3 color_{look::kGridLineColor};
+  glm::vec3 cell_color_a_{look::kGridCellToneA};
+  glm::vec3 cell_color_b_{look::kGridCellToneB};
   float extent_m_{10.0f};
   int divisions_{10};
   Style style_{Style::kLines};

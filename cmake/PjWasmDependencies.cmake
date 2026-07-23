@@ -23,13 +23,8 @@ option(PJ_WASM_WITH_TRANSFORM_EDITOR "Build the official Transform Editor toolbo
 option(PJ_WASM_WITH_DUMMY_STREAM "Build the official Dummy Streamer into the wasm app" ON)
 option(PJ_WASM_WITH_SCENE2D "Build the accelerated Scene2D wasm port" OFF)
 option(PJ_WASM_WITH_SCENE3D "Build the accelerated Scene3D wasm port" OFF)
+option(PJ_WASM_SCENE3D_CAPABILITY_PROBE "Build the standalone Scene3D QRhi capability probe" OFF)
 option(PJ_WASM_WITH_MARKETPLACE "Build marketplace support in the wasm app" OFF)
-
-if(PJ_WASM_WITH_SCENE3D)
-    message(FATAL_ERROR
-        "PJ_WASM_WITH_SCENE3D is not supported by the current browser port; "
-        "Scene3D still depends on desktop OpenGL/OpenGLWidgets and will land separately")
-endif()
 
 if(PJ_WASM_WITH_SCENE2D)
     include(${CMAKE_CURRENT_LIST_DIR}/PjWasmScene2DDependencies.cmake)

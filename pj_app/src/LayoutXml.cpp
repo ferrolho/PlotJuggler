@@ -377,11 +377,7 @@ QList<SeriesPath> rebindCurveKeys(QDomDocument& doc, const SeriesKeyResolver& re
 
 namespace {
 
-// A (id, path) attribute-pair prefix that carries a dataset qualifier. The
-// stamp/strip passes below deliberately touch ONLY plot curves and data-processor
-// inputs: scene docks (<layer>/<config_topic>/<robot_model>) persist and REQUIRE
-// their own numeric dataset_id (scene restore treats a missing id as "handled,
-// skip"), so a whole-tree strip would silently delete every restored scene layer.
+// An (id, source, path) attribute triple that carries a dataset qualifier.
 struct DatasetIdentityAttributes {
   const char* id;
   const char* source;
@@ -398,6 +394,9 @@ constexpr std::array<DatasetIdentityAttributes, 3> kCurveIdentityAttributes{{
 constexpr DatasetIdentityAttributes kProcessorInputIdentityAttributes{
     "input_dataset_id", "input_dataset_source", "input_dataset_path"};
 constexpr DatasetIdentityAttributes kTransformInputIdentityAttributes{"dataset_id", "dataset_source", "dataset_path"};
+constexpr DatasetIdentityAttributes kSceneIdentityAttributes{"dataset_id", "dataset_source", "dataset_path"};
+constexpr DatasetIdentityAttributes kSourceIdentityAttributes{
+    "source_dataset_id", "source_dataset_source", "source_dataset_path"};
 
 // Visits every <processor> that is a descendant of <data_processors>.
 template <typename Fn>
@@ -424,9 +423,9 @@ void forEachTransformInput(QDomDocument& doc, Fn&& fn) {
 }
 
 // Applies `visit` to the document element and every descendant, iteratively so a
-// deep layout never overflows the stack. Only resolveDatasetSourcePaths uses this:
-// it merely canonicalizes an existing *_dataset_path attribute (never strips or
-// adds an id), so walking the whole tree is safe for any widget family.
+// deep layout never overflows the stack. Visitors see EVERY widget family's
+// elements, so a visitor must select by exact tagName (or touch only attributes
+// it owns) rather than assume the subtree it was written for.
 template <typename Fn>
 void forEachElement(QDomDocument& doc, Fn&& visit) {
   std::vector<QDomElement> pending;
@@ -444,10 +443,10 @@ void forEachElement(QDomDocument& doc, Fn&& visit) {
 }  // namespace
 
 void removeDatasetQualifiersForGenericLayout(QDomDocument& doc) {
-  // Only plot curves and data-processor inputs are stripped here. Scene docks
-  // (<layer>/<config_topic>/<robot_model>) own their qualifier round-trip through
-  // their own save/restore and require the numeric id even in a generic layout, so
-  // they are deliberately left untouched (a whole-tree strip drops restored layers).
+  // Generic layouts bind structural identities to the unique matching dataset
+  // that is live when the layout is opened. Scene2D/Scene3D loaders implement the
+  // same unique-only fallback as plots and processors; keeping their upload path
+  // would both source-bind the layout and leak an ephemeral browser identity.
   const auto strip_pair = [](QDomElement& element, const DatasetIdentityAttributes& pair) {
     element.removeAttribute(QString::fromLatin1(pair.id));
     element.removeAttribute(QString::fromLatin1(pair.source));
@@ -462,6 +461,13 @@ void removeDatasetQualifiersForGenericLayout(QDomDocument& doc) {
       doc, [&strip_pair](QDomElement& processor) { strip_pair(processor, kProcessorInputIdentityAttributes); });
   forEachTransformInput(
       doc, [&strip_pair](QDomElement& input) { strip_pair(input, kTransformInputIdentityAttributes); });
+  forEachElement(doc, [&strip_pair](QDomElement& element) {
+    if (element.tagName() == "layer"_L1 || element.tagName() == "config_topic"_L1) {
+      strip_pair(element, kSceneIdentityAttributes);
+    } else if (element.tagName() == "robot_model"_L1 || element.tagName() == "trail"_L1) {
+      strip_pair(element, kSourceIdentityAttributes);
+    }
+  });
 }
 
 namespace {

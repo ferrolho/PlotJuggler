@@ -8,6 +8,7 @@
 
 #include "pj_scene3d_core/tf/tf_buffer.h"
 #include "pj_scene3d_widgets/gl/gl_functions.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 namespace {
@@ -54,12 +55,10 @@ void AxisRenderPass::render(const ViewParams& view_params, const FrameContext& f
     gizmo_dirty_ = false;
   }
 
-  // Slightly desaturated R/G/B so adjacent frames don't clash visually with
-  // the HUD overlay (which uses the saturated triplets). The alpha channel
-  // carries the Part-C "Gizmos opacity" (annotation coverage).
+  // The alpha channel carries the Part-C "Gizmos opacity" (annotation coverage).
   const std::array<glm::vec4, 3> colors{
-      glm::vec4{0.95f, 0.30f, 0.30f, opacity_}, glm::vec4{0.30f, 0.85f, 0.30f, opacity_},
-      glm::vec4{0.35f, 0.50f, 1.00f, opacity_}};
+      glm::vec4{look::kAxisTriadX, opacity_}, glm::vec4{look::kAxisTriadY, opacity_},
+      glm::vec4{look::kAxisTriadZ, opacity_}};
 
   // Brightened copy for the hovered frame's triad (luminance highlight), built
   // only when a frame is actually hovered. Alpha (the gizmo-opacity marker) is

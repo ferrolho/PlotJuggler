@@ -46,6 +46,7 @@
 #include "pj_scene3d_widgets/layers/voxel_grid_layer.h"
 #include "pj_scene3d_widgets/object_topic_metadata.h"
 #include "pj_scene3d_widgets/parse_locked.h"
+#include "pj_scene3d_widgets/scene_state_xml.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
 #include "pj_scene3d_widgets/transform_service.h"
 #include "pj_widgets/ComboBox.h"
@@ -64,11 +65,16 @@ using pj::scene3d::FrameRow;
 using pj::scene3d::OccupancyGridLayer;
 using pj::scene3d::PointCloudLayer;
 using pj::scene3d::PosesInFrameLayer;
+using pj::scene3d::readXmlBool;
+using pj::scene3d::readXmlFloat;
+using pj::scene3d::readXmlInt;
 using pj::scene3d::RobotModelLayer;
 using pj::scene3d::Scene3DLayer;
 using pj::scene3d::Scene3DLayerContext;
 using pj::scene3d::SceneEntitiesLayer;
 using pj::scene3d::SceneViewWidget;
+using pj::scene3d::validateCameraState;
+using pj::scene3d::ValidatedCameraState;
 using pj::scene3d::VoxelGridLayer;
 
 // Stable enum <-> on-disk-name table for the camera model, persisted in the
@@ -106,16 +112,6 @@ int cameraModelFromString(const QString& name) {
   return -1;
 }
 
-struct ValidatedCameraState {
-  std::optional<glm::vec3> focal;
-  std::optional<float> radius;
-  std::optional<float> azimuth;
-  std::optional<float> elevation;
-  std::optional<float> fov_y;
-  std::optional<float> ortho_scale;
-  std::optional<bool> perspective;
-};
-
 struct ValidatedSceneControls {
   std::optional<bool> grid_visible;
   std::optional<int> grid_style;
@@ -137,115 +133,6 @@ struct ValidatedSceneState {
   std::optional<ValidatedCameraState> camera_state;
   std::optional<ValidatedSceneControls> controls;
 };
-
-bool readJsonFloat(
-    const nlohmann::json& object, const char* key, float minimum, float maximum, std::optional<float>& output) {
-  const auto iterator = object.find(key);
-  if (iterator == object.end()) {
-    return true;
-  }
-  if (!iterator->is_number()) {
-    return false;
-  }
-  try {
-    const double value = iterator->get<double>();
-    if (!std::isfinite(value) || value < minimum || value > maximum) {
-      return false;
-    }
-    output = static_cast<float>(value);
-    return std::isfinite(*output);
-  } catch (const nlohmann::json::exception&) {
-    return false;
-  }
-}
-
-std::optional<ValidatedCameraState> validateCameraState(const QString& encoded) {
-  const nlohmann::json object = nlohmann::json::parse(encoded.toStdString(), nullptr, false);
-  if (object.is_discarded() || !object.is_object()) {
-    return std::nullopt;
-  }
-  constexpr float kFloatMax = std::numeric_limits<float>::max();
-  constexpr float kMinimumScale = 1e-3f;
-  constexpr float kPolarLimit = std::numbers::pi_v<float> * 0.5f - 0.05f;
-  ValidatedCameraState state;
-  const auto focal = object.find("focal");
-  if (focal != object.end()) {
-    if (!focal->is_array() || focal->size() != 3) {
-      return std::nullopt;
-    }
-    glm::vec3 value{0.0f};
-    for (int index = 0; index < 3; ++index) {
-      const nlohmann::json& component = (*focal)[static_cast<std::size_t>(index)];
-      if (!component.is_number()) {
-        return std::nullopt;
-      }
-      try {
-        const double number = component.get<double>();
-        if (!std::isfinite(number) || number < -kFloatMax || number > kFloatMax) {
-          return std::nullopt;
-        }
-        value[index] = static_cast<float>(number);
-      } catch (const nlohmann::json::exception&) {
-        return std::nullopt;
-      }
-    }
-    state.focal = value;
-  }
-  if (!readJsonFloat(object, "radius", kMinimumScale, kFloatMax, state.radius) ||
-      !readJsonFloat(object, "azimuth", -kFloatMax, kFloatMax, state.azimuth) ||
-      !readJsonFloat(object, "elevation", -kPolarLimit, kPolarLimit, state.elevation) ||
-      !readJsonFloat(object, "fov_y", glm::radians(1.0f), glm::radians(179.0f), state.fov_y) ||
-      !readJsonFloat(object, "ortho_scale", kMinimumScale, kFloatMax, state.ortho_scale)) {
-    return std::nullopt;
-  }
-  const auto perspective = object.find("perspective");
-  if (perspective != object.end()) {
-    if (!perspective->is_boolean()) {
-      return std::nullopt;
-    }
-    state.perspective = perspective->get<bool>();
-  }
-  return state;
-}
-
-bool readXmlBool(const QDomElement& element, const QString& key, std::optional<bool>& output) {
-  if (!element.hasAttribute(key)) {
-    return true;
-  }
-  const QString value = element.attribute(key);
-  if (value != "true"_L1 && value != "false"_L1) {
-    return false;
-  }
-  output = value == "true"_L1;
-  return true;
-}
-
-bool readXmlInt(const QDomElement& element, const QString& key, int minimum, int maximum, std::optional<int>& output) {
-  if (!element.hasAttribute(key)) {
-    return true;
-  }
-  bool ok = false;
-  const int value = element.attribute(key).toInt(&ok);
-  if (!ok || value < minimum || value > maximum) {
-    return false;
-  }
-  output = value;
-  return true;
-}
-
-bool readXmlFloat(
-    const QDomElement& element, const QString& key, float minimum, float maximum, std::optional<float>& output) {
-  if (!element.hasAttribute(key)) {
-    return true;
-  }
-  bool ok = false;
-  const double value = element.attribute(key).toDouble(&ok);
-  if (!ok || !std::isfinite(value) || value < minimum || value > maximum) {
-    return false;
-  }
-  output = static_cast<float>(value);
-  return true;
-}
 
 std::optional<ValidatedSceneState> validateSceneState(const QDomElement& element) {
   ValidatedSceneState state;

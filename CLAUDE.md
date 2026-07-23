@@ -270,9 +270,21 @@ Parity-plus with PJ3: file + streaming sources, 11 built-in transforms, undo/red
 
 The 3D widget family ships as `pj_scene3D` (built and wired into `pj_app` via `Scene3DDockWidget`): TF, pointclouds, occupancy grids, axis/grid render passes, SceneEntities/markers, pluggable camera models, URDF/mesh robot models, the HDR/tonemap/SSAO/EDL rendering pipeline, live/streaming TF+object ingest (`TransformService` + `driveVisibleLayersToLiveEdge`), and per-use parser bindings (`parse_locked.h`) — see `pj_scene3D/docs/ARCHITECTURE.md` for the as-built design, `docs/REQUIREMENTS.md` + plan §5.5 for scope.
 
-Every new static archive linked into the monolithic WASM executable needs an
-ABI/process-global-symbol collision audit; a successful link alone did not
-catch a prior Qt/libjpeg collision.
+For WebAssembly, Scene3D is a compile-time platform split behind those same
+public widget names. Desktop remains the full `QOpenGLWidget`/OpenGL layer graph;
+the browser uses a minimal `QRhiWidget` product backend and must add object
+layers one work package at a time. Do not pull native GL passes, Assimp/network
+model code, or codecs into the browser merely to expose grid/TF. Browser shader
+packs are GLSL ES 300 and must be reproducibly rebuilt with the pinned host
+`qsb` and hash-checked at configure time. Every new static archive in the
+monolithic WASM executable also needs an ABI/process-global-symbol collision
+audit; a successful link alone did not catch the prior Qt/libjpeg collision.
+
+Deterministic browser fixtures must reproduce both bytes and the product state
+needed by the UI. In particular, the global Timeline prefers scalar/object
+bounds; multiple TF samples do not widen it when another object topic provides
+a single timestamp. Scene3D seek fixtures therefore need at least two relevant
+object-bound samples, not just a multi-sample TF buffer.
 
 ## Non-goals (explicitly deferred)
 

@@ -8,12 +8,12 @@
 #   1. Production MVP — Scene2D/Scene3D OFF, probes OFF: the app must
 #      configure, build, package deterministically, and pass the deployment
 #      contract + cold threaded Chromium boot.
-#   2. Acceptance — Scene2D ON, ingress probe ON: the functional browser
-#      suite (file selection, persistence/layout, plotting, scene2D,
-#      streaming) runs against the packaged build.
+#   2. Acceptance — Scene2D/Scene3D ON, ingress probe ON: the retained QRhi
+#      capability probe and functional browser suite run against the same
+#      source graph used by the packaged application.
 #
-# The full release (Scene3D, cross-browser, size/performance budgets) stays in
-# wasm-release.yml.
+# Cross-browser product coverage and size/performance release budgets remain
+# part of the release tranche.
 name: WASM CI
 
 on:
@@ -165,7 +165,7 @@ jobs:
           PJ_WASM_PACKAGE_DIR: ${{ github.workspace }}/build-wasm-mvp/deploy
         run: npm run test:deployment
 
-      - name: Build acceptance configuration (Scene2D on, ingress probe on)
+      - name: Build acceptance configuration (Scene2D/Scene3D on, ingress probe on)
         shell: bash
         run: |
           set -euo pipefail
@@ -183,10 +183,28 @@ jobs:
             -DPJ_BUILD_TESTS=OFF \
             -DPJ_BUILD_DEMOS=OFF \
             -DPJ_WASM_ENABLE_INGRESS_PROBE=ON \
+            -DPJ_WASM_SCENE3D_CAPABILITY_PROBE=ON \
             -DPJ_WASM_WITH_SCENE2D=ON \
-            -DPJ_WASM_WITH_SCENE3D=OFF
-          cmake --build build-wasm-probe --target pj_app --parallel 4
+            -DPJ_WASM_WITH_SCENE3D=ON
+          cmake --build build-wasm-probe \
+            --target pj_app pj_scene3d_wasm_capability_probe --parallel 4
           ccache --show-stats
+
+      - name: Retained Scene3D capability probe (Chromium)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .emsdk/emsdk_env.sh >/dev/null
+          emrun --no-browser --serve-after-exit --port 6932 \
+            build-wasm-probe/pj_app/scene3d_capability_probe.html &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS -o /dev/null http://127.0.0.1:6932/scene3d_capability_probe.html && break
+            sleep 0.2
+          done
+          PJ_WASM_SCENE3D_CAP_URL="http://127.0.0.1:6932/scene3d_capability_probe.html" \
+            npm --prefix tests/wasm run test:scene3d-capability
 
       - name: Functional browser suite (acceptance package)
         shell: bash

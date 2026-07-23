@@ -240,12 +240,14 @@ using SeriesKeyResolver = std::function<std::optional<QString>(const SeriesPath&
 [[nodiscard]] QList<SeriesPath> rebindCurveKeys(QDomDocument& doc, const SeriesKeyResolver& resolve);
 
 // Converts a saved workspace document into a portable generic layout by removing
-// the exact dataset hints (dataset_id / dataset_source / dataset_path and their
-// x_/y_ XY variants) from plotted TS/XY curves, plus input_dataset_* from
-// data-processor <processor> inputs. The topic+field identity remains and may bind
-// at apply time only when unique in the loaded data. Scene docks are deliberately
-// NOT touched — they own their qualifier round-trip and require the numeric id even
-// in a generic layout. Undo snapshots and source-bound layouts keep their qualifiers.
+// the exact dataset hints: dataset_id / dataset_source / dataset_path (and their
+// x_/y_ XY variants) from plotted TS/XY curves, input_dataset_* from
+// data-processor <processor> inputs, dataset_* from scene-dock <layer> /
+// <config_topic> elements, and source_dataset_* from <robot_model> / <trail>. The
+// topic+field (or topic+type) identity remains and binds at apply time only when
+// unique in the loaded data — the scene loaders implement the same unique-only
+// fallback as plots and processors. Undo snapshots and source-bound layouts keep
+// their qualifiers.
 void removeDatasetQualifiersForGenericLayout(QDomDocument& doc);
 
 // Maps a serialized DatasetId to its FileLoader-known full source path (empty for
@@ -255,8 +257,8 @@ using DatasetPathLookup = std::function<QString(std::uint32_t)>;
 
 // Adds the FileLoader-known full-path companion (`*_dataset_path`) next to every
 // persisted `*_dataset_id` on plotted TS/XY curves and data-processor <processor>
-// inputs. Scene docks are NOT visited — they own their qualifier round-trip through
-// their own save/restore (see removeDatasetQualifiersForGenericLayout). A dataset
+// inputs. Scene docks are NOT visited — their xmlSaveState stamps the dataset_path
+// companion itself when the dataset has a source path. A dataset
 // the lookup can't place keeps its id/source qualifier unchanged.
 void stampDatasetSourcePaths(QDomDocument& doc, const DatasetPathLookup& lookup);
 

@@ -111,6 +111,11 @@ if(EMSCRIPTEN)
         target_sources(pj_app_shell PRIVATE
             tests/wasm_acceptance_probes.inc
             tests/wasm_ingress_probe_source.cpp)
+        if(TARGET pj_scene3d_widgets)
+            target_sources(pj_app_shell PRIVATE
+                tests/wasm_scene3d_acceptance_probes.cpp
+                tests/wasm_scene3d_acceptance_probes.h)
+        endif()
         if(TARGET pj_wasm_mcap_source AND NOT TARGET pj_wasm_ros_parser)
             target_sources(pj_app_shell PRIVATE tests/wasm_mcap_probe_parser.cpp)
             target_compile_definitions(pj_app_shell PRIVATE PJ_WASM_ENABLE_MCAP_PROBE_PARSER)

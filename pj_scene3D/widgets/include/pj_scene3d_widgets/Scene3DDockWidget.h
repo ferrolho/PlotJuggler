@@ -2,6 +2,12 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#ifdef PJ_TARGET_WASM
+
+#include "pj_scene3d_widgets/Scene3DDockWidget_wasm.h"
+
+#else
+
 #include <QByteArray>
 #include <QDomDocument>
 #include <QList>
@@ -358,3 +364,5 @@ class Scene3DDockWidget : public SceneDockWidget {
 };
 
 }  // namespace PJ
+
+#endif  // PJ_TARGET_WASM

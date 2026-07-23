@@ -2,6 +2,12 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#ifdef PJ_TARGET_WASM
+
+#include "pj_scene3d_widgets/scene_view_widget_rhi.h"
+
+#else
+
 #include <QElapsedTimer>
 #include <QList>
 #include <QOpenGLWidget>
@@ -49,6 +55,8 @@ class SceneViewWidget : public QOpenGLWidget {
   Q_OBJECT
 
  public:
+  using GridStyle = GridRenderPass::Style;
+
   explicit SceneViewWidget(QWidget* parent = nullptr);
   ~SceneViewWidget() override;
 
@@ -509,3 +517,5 @@ class SceneViewWidget : public QOpenGLWidget {
 };
 
 }  // namespace pj::scene3d
+
+#endif  // PJ_TARGET_WASM

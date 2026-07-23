@@ -56,6 +56,15 @@ PJ4's 3D visualization module — the sibling family to `pj_scene2D`, focused on
 - **TF axes** as 3D gizmos — substituting for the URDF mesh path since real mesh assets are not available for the Phase 1 input data. This is a permanent first-class display, not a placeholder. Hovering a triad shows the frame's name in a small label (screen-space pick of the nearest frame origin; see ARCHITECTURE.md "TF frame hover labels").
 - **Pointclouds** (`sensor_msgs/PointCloud2`).
 
+**WebAssembly status (W13):** the browser product currently implements the first
+half of this subset: TF axes/parent connections plus the line/checker grid,
+fixed-frame selection, Position follow, shared camera models and interaction,
+tracker-time replay, progressive/live TF updates, and layout persistence. It
+uses a platform-selected QRhi/WebGL2 view; the normal desktop application keeps
+the complete OpenGL implementation and behavior. Point clouds and the other
+listed layers remain explicit later browser work packages and must not be
+inferred from parser availability alone.
+
 Image+Pinhole (camera frustum + textured near-plane) from the original `PJ4_PLAN.md` §5.5 list is dropped from v1.
 
 ### 3a. Compressed point clouds (Draco / Cloudini)

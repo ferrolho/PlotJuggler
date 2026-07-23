@@ -194,6 +194,9 @@ using namespace Qt::StringLiterals;
 
 #ifdef PJ_WASM_ENABLE_INGRESS_PROBE
 #include "../tests/wasm_acceptance_probes.inc"
+#ifdef PJ_WITH_SCENE3D
+#include "../tests/wasm_scene3d_acceptance_probes.h"
+#endif
 #endif
 
 namespace PJ {
@@ -1389,6 +1392,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   // invoke the exact application slot / embedded QPushButton. Production WASM
   // and desktop do not expose them.
   pj_wasm_install_browser_test_probes();
+#ifdef PJ_WITH_SCENE3D
+  installWasmScene3dAcceptanceProbes();
+#endif
   const auto run_wasm_plot_probe = [this](bool fit_complete_series) {
     PlotWidget* plot = firstPlotOfActiveTab();
     const auto curves = session_->catalogModel().curves();
@@ -3039,6 +3045,7 @@ void MainWindow::onCheckForUpdates() {
 }
 
 void MainWindow::checkExtensionUpdates() {
+#ifndef PJ_TARGET_WASM
   if (update_scan_registry_ == nullptr) {
     update_scan_registry_ = new RegistryManager(this);
     // Wired once (the scan runs at most once per launch). A failed fetch
@@ -3058,6 +3065,7 @@ void MainWindow::checkExtensionUpdates() {
     });
   }
   update_scan_registry_->fetchRegistry(effectiveRegistryUrl());
+#endif  // PJ_TARGET_WASM: browser builds install nothing dynamically — no updates to badge
 }
 
 void MainWindow::sendTelemetryPing(const QString& installation) {

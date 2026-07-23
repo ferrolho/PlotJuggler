@@ -4,6 +4,30 @@
 
 find_package(glm REQUIRED)
 find_package(nlohmann_json REQUIRED)
+
+if(EMSCRIPTEN)
+  # W13 intentionally exposes only the backend-neutral slice the product QRhi
+  # view uses.  The native branch below remains the complete codec/geometry
+  # library and is kept unchanged; later WASM layer packages grow this list one
+  # dependency at a time instead of pulling Draco/Cloudini into the grid/TF MVP.
+  add_library(pj_scene3d_core STATIC
+    src/camera/camera.cpp
+    src/camera/camera_math.cpp
+    src/tf/tf_buffer.cpp
+    src/tf/tf_connections.cpp
+    src/version.cpp
+  )
+  target_include_directories(pj_scene3d_core PUBLIC include)
+  target_compile_features(pj_scene3d_core PUBLIC cxx_std_20)
+  target_compile_options(pj_scene3d_core PRIVATE
+    ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS}
+  )
+  target_link_libraries(pj_scene3d_core
+    PUBLIC glm::glm pj_base nlohmann_json::nlohmann_json
+  )
+  return()
+endif()
+
 # Compressed-point-cloud decoders (Draco + Cloudini). Linked PRIVATE: the codecs are
 # an implementation detail of pj_scene3d_core, mirroring how pj_scene2d_core links
 # libjpeg-turbo / libpng PRIVATE for image decode.

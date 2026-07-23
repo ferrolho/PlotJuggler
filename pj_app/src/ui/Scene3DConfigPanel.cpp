@@ -25,9 +25,11 @@
 #include <vector>
 
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
+#ifndef PJ_TARGET_WASM
 #include "pj_scene3d_widgets/layers/robot_model_layer.h"
 #include "pj_scene3d_widgets/layers/trail_layer.h"
 #include "pj_scene3d_widgets/mesh_shading_params.h"
+#endif
 #include "pj_scene3d_widgets/scene_view_widget.h"
 #include "pj_scene_common/layer_params.h"
 #include "pj_scene_common/scene_dock_widget.h"
@@ -51,11 +53,13 @@ namespace PJ {
 
 namespace {
 
+#ifndef PJ_TARGET_WASM
 constexpr char kUrdfBrowseDirKey[] = "pj_scene3d/urdf_browse_dir";
-constexpr auto kVisibilityOnPath = ":/resources/svg/visibility.svg";
-constexpr auto kVisibilityOffPath = ":/resources/svg/visibility_off.svg";
 constexpr auto kTrashIconPath = ":/resources/svg/trash.svg";
 constexpr auto kAddIconPath = ":/resources/svg/add.svg";
+#endif
+constexpr auto kVisibilityOnPath = ":/resources/svg/visibility.svg";
+constexpr auto kVisibilityOffPath = ":/resources/svg/visibility_off.svg";
 constexpr auto kTfConnectionsIconPath = ":/resources/svg/graph_4.svg";
 
 // Trailing eye/add/trash button column: the scene-control grids reserve this
@@ -108,6 +112,7 @@ LayerParamClipboard& layerParamClipboard() {
 // Small modal prompt on the shared Dialog chrome: a single field + OK/Cancel.
 // The field is parented into the dialog; values must be read before `dialog`
 // leaves scope, which is why each picker below returns the value, not a bool.
+#ifndef PJ_TARGET_WASM
 bool execFieldDialog(Dialog& dialog, const QString& title, QWidget* field) {
   dialog.setDialogTitle(title);
   auto* layout = new QVBoxLayout(dialog.contentWidget());
@@ -147,6 +152,7 @@ std::optional<QString> promptUrdfUrl(QWidget* parent) {
   const QString url = edit->text().trimmed();
   return url.isEmpty() ? std::nullopt : std::optional<QString>(url);
 }
+#endif
 
 [[nodiscard]] ObjectTopicId topicFromRowId(qint64 id) {
   ObjectTopicId topic_id;
@@ -340,6 +346,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   QGridLayout* camera_grid = add_grid();
   int camera_row = 0;
   follow_frame_combo_ = new ComboBox(this);
+  follow_frame_combo_->setObjectName(u"scene3dFollowFrameCombo"_s);
   follow_frame_combo_->setFocusPolicy(Qt::ClickFocus);
   follow_frame_combo_->setToolTip(tr("Make the camera follow a TF frame's position"));
   follow_frame_combo_->addItem(tr("None"), QString());
@@ -422,7 +429,11 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   addGridRow(grid_grid, grid_row, tr("Divisions"), grid_divisions_);
 
   // --- Transforms and RobotModel --------------------------------------------
+#ifdef PJ_TARGET_WASM
+  add_band(tr("Transforms"));
+#else
   add_band(tr("Transforms and RobotModel"));
+#endif
   QGridLayout* tm_grid = add_grid();
   int tm_row = 0;
 
@@ -461,6 +472,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Frames opacity"), gizmo_opacity_, gizmo_eye_);
 
+#ifndef PJ_TARGET_WASM
   model_source_combo_ = new ComboBox;
   model_source_combo_->addItem(tr("File"));
   model_source_combo_->addItem(tr("Topic"));
@@ -520,6 +532,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
       [this](const QVariant& v) { collision_opacity_->setValue(v.toDouble()); },
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Collision opacity"), collision_opacity_, collision_eye_);
+#endif
 
   // Pin both grids' label column to the widest label across BOTH sections, read
   // back from the labels just added (no separate string list to keep in sync).
@@ -566,8 +579,8 @@ void Scene3DConfigPanel::applySceneControlsTo(Scene3DDockWidget* dock) {
   // xmlSaveState/xmlLoadState (per-dock layout persistence).
   view->setGridVisible(grid_eye_->isChecked());
   view->setGridStyle(
-      grid_cells_button_->isChecked() ? pj::scene3d::GridRenderPass::Style::kFilledCells
-                                      : pj::scene3d::GridRenderPass::Style::kLines);
+      grid_cells_button_->isChecked() ? pj::scene3d::SceneViewWidget::GridStyle::kFilledCells
+                                      : pj::scene3d::SceneViewWidget::GridStyle::kLines);
   view->setGridExtentMetres(static_cast<float>(grid_size_->value()));
   view->setGridDivisions(grid_divisions_->value());
   view->setAxesVisible(gizmo_eye_->isChecked());
@@ -575,6 +588,7 @@ void Scene3DConfigPanel::applySceneControlsTo(Scene3DDockWidget* dock) {
   view->setGizmoOpacity(static_cast<float>(gizmo_opacity_->value()));
   view->setTfConnectionsVisible(tf_lines_button_->isChecked());
 
+#ifndef PJ_TARGET_WASM
   // Per-view look knobs: drives only the bound dock's view. Sibling docks keep
   // their own MeshShadingParams and converge when the panel rebinds and applies.
   auto& shading = view->meshShadingParams();
@@ -582,6 +596,7 @@ void Scene3DConfigPanel::applySceneControlsTo(Scene3DDockWidget* dock) {
   shading.mesh_opacity = static_cast<float>(mesh_opacity_->value());
   shading.collisions_visible = collision_eye_->isChecked();
   shading.collision_opacity = static_cast<float>(collision_opacity_->value());
+#endif
   view->update();
 }
 
@@ -609,24 +624,28 @@ void Scene3DConfigPanel::loadControlsFromDock(Scene3DDockWidget* dock) {
     const QSignalBlocker b_grid_div(grid_divisions_);
     const QSignalBlocker b_gizmo_size(gizmo_size_);
     const QSignalBlocker b_gizmo_op(gizmo_opacity_);
+#ifndef PJ_TARGET_WASM
     const QSignalBlocker b_mesh_op(mesh_opacity_);
     const QSignalBlocker b_coll_op(collision_opacity_);
+#endif
 
     grid_size_->setValue(view->gridExtentMetres());
     grid_divisions_->setValue(view->gridDivisions());
     gizmo_size_->setValue(view->gizmoSize());
     gizmo_opacity_->setValue(view->gizmoOpacity());
 
+#ifndef PJ_TARGET_WASM
     const auto& shading = view->meshShadingParams();
     mesh_opacity_->setValue(shading.mesh_opacity);
     collision_opacity_->setValue(shading.collision_opacity);
     set_eye(mesh_eye_, shading.meshes_visible);
     set_eye(collision_eye_, shading.collisions_visible);
+#endif
   }
 
   // idClicked (the connected signal) fires only on user clicks, not programmatic
   // setChecked, so the exclusive style group needs no blocker.
-  (view->gridStyle() == pj::scene3d::GridRenderPass::Style::kFilledCells ? grid_cells_button_ : grid_lines_button_)
+  (view->gridStyle() == pj::scene3d::SceneViewWidget::GridStyle::kFilledCells ? grid_cells_button_ : grid_lines_button_)
       ->setChecked(true);
   set_eye(grid_eye_, view->gridVisible());
   set_eye(gizmo_eye_, view->axesVisible());
@@ -654,12 +673,14 @@ void Scene3DConfigPanel::applyIcons() {
       setEyeIcon(eye, eye->isChecked());
     }
   }
+#ifndef PJ_TARGET_WASM
   if (add_model_button_ != nullptr) {
     add_model_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
   }
   if (add_trail_button_ != nullptr) {
     add_trail_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
   }
+#endif
   if (tf_lines_button_ != nullptr) {
     tf_lines_button_->setIcon(loadSvg(QLatin1String(kTfConnectionsIconPath), theme_));
   }
@@ -675,14 +696,19 @@ void Scene3DConfigPanel::applyIcons() {
   if (params_apply_all_ != nullptr) {
     params_apply_all_->setIcon(loadSvg(u":/resources/svg/format_paint.svg"_s, theme_));
   }
+#ifndef PJ_TARGET_WASM
   for (const auto& [id, row] : robot_rows_) {
     if (auto* trash = row->findChild<QToolButton*>()) {
       trash->setIcon(loadSvg(QLatin1String(kTrashIconPath), theme_));
     }
   }
+#endif
 }
 
 void Scene3DConfigPanel::onAddModelClicked() {
+#ifdef PJ_TARGET_WASM
+  return;
+#else
   if (bound_dock_ == nullptr) {
     return;
   }
@@ -743,9 +769,16 @@ void Scene3DConfigPanel::onAddModelClicked() {
     default:
       break;
   }
+#endif
 }
 
 void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& label, const QString& tooltip) {
+#ifdef PJ_TARGET_WASM
+  Q_UNUSED(topic_id_value)
+  Q_UNUSED(label)
+  Q_UNUSED(tooltip)
+  return;
+#else
   // Idempotent: rows are derived from dock state and rebuilt on every bind, and
   // both onAddModelClicked and the layerAdded signal can target the same id.
   const auto existing = std::find_if(
@@ -810,6 +843,7 @@ void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& lab
           });
     }
   }
+#endif
 }
 
 void Scene3DConfigPanel::showRobotLayerConfig(uint32_t topic_id_value) {
@@ -848,7 +882,7 @@ void Scene3DConfigPanel::removeRobotRowFor(uint32_t topic_id_value) {
   }
   it->second->deleteLater();
   robot_rows_.erase(it);
-  if (robot_rows_.empty()) {
+  if (robot_rows_.empty() && robot_rows_host_ != nullptr) {
     robot_rows_host_->hide();  // collapse the form row again so no phantom gap remains
   }
 }
@@ -868,7 +902,9 @@ void Scene3DConfigPanel::bindDock(Scene3DDockWidget* dock) {
     row->deleteLater();
   }
   robot_rows_.clear();
-  robot_rows_host_->hide();  // back to collapsed until this dock's rows are rebuilt
+  if (robot_rows_host_ != nullptr) {
+    robot_rows_host_->hide();  // back to collapsed until this dock's rows are rebuilt
+  }
 
   if (dock == nullptr) {
     populateFollowCombo();  // reset to "None"

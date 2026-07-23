@@ -8,7 +8,9 @@ full design rationale). The WHAT lives in [REQUIREMENTS.md](./REQUIREMENTS.md).
 
 ## Rendering pipeline
 
-Per frame, `SceneViewWidget::paintGL`:
+### Native OpenGL path
+
+Per frame, the native `SceneViewWidget::paintGL`:
 
 ```
 layers + passes → SceneHdrFbo (multisample RGBA16F + DEPTH32F + R8 is-mesh mask)
@@ -118,6 +120,41 @@ which luminance-boosts that frame's triad colors. Gated on the triads being
 visible; cleared on a camera gesture and on leave. Occlusion is ignored for now
 (a frame hidden behind geometry still labels); a one-texel depth-reject is the
 planned refinement.
+
+## WebAssembly product backend (W13)
+
+The browser selects a different implementation behind the same
+`SceneViewWidget` and `Scene3DDockWidget` public product names. This is a
+compile-time `PJ_TARGET_WASM` branch, not a preference: desktop continues to use
+the native OpenGL pipeline above and full layer graph unchanged.
+
+The W13 browser view is a `QRhiWidget` configured for Qt's OpenGL/WebGL2 backend
+and 4x renderbuffer MSAA. It owns only QRhi buffers, bindings, and pipelines and
+renders directly to the widget target. Vertex positions are made relative to the
+camera focal point before conversion to float, preserving the existing camera's
+large-world precision model. The current submissions are:
+
+- canonical line or checkerboard grid geometry;
+- RGB axes transformed by every frame resolved against the fixed frame at the
+  tracker time; and
+- magenta parent/child segments from the shared `buildTfConnectionSegments`.
+
+The shader sources and committed `.qsb` packs contain GLSL ES 300. CMake locates
+the matching host Qt `qsb`, rebuilds both packs during configure, and compares
+SHA-256 before compiling. A stale pack therefore fails closed instead of
+silently shipping a different shader.
+
+Camera models, fixed/follow behavior, `TransformBuffer`, `TransformService`, TF
+hierarchy/connection logic, tracker-time repaint keys, and scene-control values
+are shared with the native product. The browser dock accepts TF config topics;
+known later layer types are preserved as pending XML but are not rendered until
+their QRhi package lands. The browser source lists deliberately omit native GL
+passes, HDR/SSAO/EDL, Assimp/network model code, robot layers, and cloud codecs.
+
+Persistence uses the native `<scene3d version="1">` field names for fixed and
+follow frames, camera model/pose, TF config topics, and shared scene controls.
+Browser restore prevalidates all control/camera fields before mutation and rolls
+back the complete previous dock state if topic resolution later proves invalid.
 
 ## Mesh shadows
 

@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/scene3d_wasm">
+    <file>scene.vert.qsb</file>
+    <file>scene.frag.qsb</file>
+  </qresource>
+</RCC>

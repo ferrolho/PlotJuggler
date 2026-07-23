@@ -69,4 +69,17 @@ inline constexpr float kEdlMaxGap = 0.02f;
 // sparse box kernel gives.
 inline constexpr float kShadowSoftnessTexels = 4.0f;
 
+// ---- Scene geometry colors (grid / frame axes / TF connections) ----
+// Shared by the native GL passes and the WASM QRhi geometry builder so the two
+// backends cannot drift apart.
+inline constexpr glm::vec3 kGridLineColor{0.35f, 0.35f, 0.35f};
+inline constexpr glm::vec3 kGridCellToneA{0.30f, 0.30f, 0.30f};
+inline constexpr glm::vec3 kGridCellToneB{0.42f, 0.42f, 0.42f};
+// Slightly desaturated R/G/B so adjacent frames don't clash visually with the
+// HUD overlay (which uses the saturated triplets).
+inline constexpr glm::vec3 kAxisTriadX{0.95f, 0.30f, 0.30f};
+inline constexpr glm::vec3 kAxisTriadY{0.30f, 0.85f, 0.30f};
+inline constexpr glm::vec3 kAxisTriadZ{0.35f, 0.50f, 1.00f};
+inline constexpr glm::vec3 kTfConnectionColor{1.0f, 0.0f, 1.0f};  // magenta
+
 }  // namespace pj::scene3d::look

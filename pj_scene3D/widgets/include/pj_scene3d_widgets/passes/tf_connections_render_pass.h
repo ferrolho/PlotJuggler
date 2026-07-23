@@ -11,6 +11,7 @@
 #include "pj_scene3d_widgets/gl/program.h"
 #include "pj_scene3d_widgets/gl/vertex_array.h"
 #include "pj_scene3d_widgets/render_pass.h"
+#include "pj_scene3d_widgets/scene_look_defaults.h"
 
 namespace pj::scene3d {
 
@@ -40,7 +41,7 @@ class TfConnectionsRenderPass : public IRenderPass {
   }
 
  private:
-  glm::vec3 color_{1.0f, 0.0f, 1.0f};  // magenta
+  glm::vec3 color_{look::kTfConnectionColor};
   bool initialized_{false};
   std::unique_ptr<gl::Program> program_;
   gl::VertexArray vao_;

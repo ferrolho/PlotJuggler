@@ -827,6 +827,16 @@ TEST(GenericLayout, RemovesDatasetQualifiersButKeepsStablePaths) {
   config.setAttribute(u"dataset_path"_s, u"data/old.mcap"_s);
   config.setAttribute(u"topic_name"_s, u"/tf"_s);
   scene.appendChild(config);
+  // A pose-topic trail payload (TrailLayer::xmlSaveState shape): its source_*
+  // qualifiers must strip like <robot_model>'s, its identity and style survive.
+  QDomElement trail = pd.doc.createElement(u"trail"_s);
+  trail.setAttribute(u"source_kind"_s, u"pose_topic"_s);
+  trail.setAttribute(u"source_topic_name"_s, u"/poses"_s);
+  trail.setAttribute(u"source_dataset_id"_s, u"7"_s);
+  trail.setAttribute(u"source_dataset_source"_s, u"old.mcap"_s);
+  trail.setAttribute(u"source_dataset_path"_s, u"data/old.mcap"_s);
+  trail.setAttribute(u"past_color"_s, u"#ff00ff"_s);
+  scene.appendChild(trail);
   pd.doc.documentElement().appendChild(scene);
 
   PJ::layout_xml::removeDatasetQualifiersForGenericLayout(pd.doc);
@@ -857,28 +867,32 @@ TEST(GenericLayout, RemovesDatasetQualifiersButKeepsStablePaths) {
   EXPECT_EQ(input.attribute(u"field"_s), u"x"_s);
   EXPECT_EQ(input.attribute(u"column"_s), u"1"_s);
 
-  // Scene docks own their qualifier round-trip and REQUIRE the numeric id even in a
-  // generic layout, so this pass must not touch <layer>/<config_topic>/<robot_model>.
-  EXPECT_TRUE(layer.hasAttribute(u"dataset_id"_s));
-  EXPECT_TRUE(layer.hasAttribute(u"dataset_source"_s));
-  EXPECT_TRUE(layer.hasAttribute(u"dataset_path"_s));
+  // Scene layers use the same unique-only structural rebind in generic layouts.
+  // Removing all source qualifiers also prevents browser upload identities from
+  // leaking into a downloaded generic layout.
+  EXPECT_FALSE(layer.hasAttribute(u"dataset_id"_s));
+  EXPECT_FALSE(layer.hasAttribute(u"dataset_source"_s));
+  EXPECT_FALSE(layer.hasAttribute(u"dataset_path"_s));
   EXPECT_EQ(layer.attribute(u"topic_name"_s), u"/cloud"_s);
-  EXPECT_TRUE(config.hasAttribute(u"dataset_id"_s));
-  EXPECT_TRUE(config.hasAttribute(u"dataset_source"_s));
-  EXPECT_TRUE(config.hasAttribute(u"dataset_path"_s));
+  EXPECT_FALSE(config.hasAttribute(u"dataset_id"_s));
+  EXPECT_FALSE(config.hasAttribute(u"dataset_source"_s));
+  EXPECT_FALSE(config.hasAttribute(u"dataset_path"_s));
   EXPECT_EQ(config.attribute(u"topic_name"_s), u"/tf"_s);
-  EXPECT_TRUE(robot.hasAttribute(u"source_dataset_id"_s));
-  EXPECT_TRUE(robot.hasAttribute(u"source_dataset_source"_s));
-  EXPECT_TRUE(robot.hasAttribute(u"source_dataset_path"_s));
+  EXPECT_FALSE(robot.hasAttribute(u"source_dataset_id"_s));
+  EXPECT_FALSE(robot.hasAttribute(u"source_dataset_source"_s));
+  EXPECT_FALSE(robot.hasAttribute(u"source_dataset_path"_s));
   EXPECT_EQ(robot.attribute(u"source_topic"_s), u"/robot_description"_s);
+  EXPECT_FALSE(trail.hasAttribute(u"source_dataset_id"_s));
+  EXPECT_FALSE(trail.hasAttribute(u"source_dataset_source"_s));
+  EXPECT_FALSE(trail.hasAttribute(u"source_dataset_path"_s));
+  EXPECT_EQ(trail.attribute(u"source_topic_name"_s), u"/poses"_s);
+  EXPECT_EQ(trail.attribute(u"past_color"_s), u"#ff00ff"_s);
 }
 
-// REGRESSION: loading any old layout with 2D/3D scene layers must not delete them.
-// Scene docks persist dataset_id + dataset_source in their own layer XML, and scene
-// restore treats a MISSING numeric id as "handled, skip" — so a whole-tree strip (as
-// the passes did before this fix) silently dropped every scene layer. All three
-// identity passes must leave a real Scene3D-shaped layer element byte-identical.
-TEST(DatasetIdentityPasses, SceneLayerElementSurvivesAllPassesByteIdentical) {
+// Stamping/removing unvalidated ids are source-bound passes and leave scene-owned
+// identities alone. Generic export then deliberately strips them so the scene
+// rebinds by its unique topic/type structural identity.
+TEST(DatasetIdentityPasses, SceneLayerIdentityIsOnlyStrippedForGenericExport) {
   QTemporaryDir layout_dir;
   ASSERT_TRUE(layout_dir.isValid());
   QDomDocument doc;
@@ -904,14 +918,20 @@ TEST(DatasetIdentityPasses, SceneLayerElementSurvivesAllPassesByteIdentical) {
   config.setAttribute(u"topic_name"_s, u"/tf"_s);
   scene.appendChild(config);
 
-  const QByteArray before = doc.toByteArray(2);
+  const QByteArray before_source_passes = doc.toByteArray(2);
 
   PJ::layout_xml::stampDatasetSourcePaths(doc, [](std::uint32_t) { return u"data/run.mcap"_s; });
   PJ::layout_xml::removeUnvalidatedDatasetIds(doc);
+  EXPECT_EQ(doc.toByteArray(2), before_source_passes);
+
   PJ::layout_xml::removeDatasetQualifiersForGenericLayout(doc);
 
-  EXPECT_EQ(doc.toByteArray(2), before)
-      << "identity passes must not touch scene elements — a stripped id makes restore skip the layer";
+  EXPECT_FALSE(layer.hasAttribute(u"dataset_id"_s));
+  EXPECT_FALSE(layer.hasAttribute(u"dataset_source"_s));
+  EXPECT_FALSE(config.hasAttribute(u"dataset_id"_s));
+  EXPECT_FALSE(config.hasAttribute(u"dataset_source"_s));
+  EXPECT_EQ(layer.attribute(u"topic_name"_s), u"/cloud"_s);
+  EXPECT_EQ(config.attribute(u"topic_name"_s), u"/tf"_s);
 }
 
 TEST(RebindCurveKeys, SetsNameForResolvedTimeSeries) {

@@ -2,10 +2,11 @@
   "name": "plotjuggler-wasm-browser-tests",
   "private": true,
   "scripts": {
-    "test": "playwright test ingress_file_selection.spec.js persistence_layout.spec.js plotting.spec.js scene2d.spec.js editors.spec.js streaming.spec.js --reporter=line --workers=1",
+    "test": "playwright test ingress_file_selection.spec.js persistence_layout.spec.js plotting.spec.js scene2d.spec.js scene3d_foundation.spec.js editors.spec.js streaming.spec.js --reporter=line --workers=1",
     "test:deployment": "playwright test -c deployment.playwright.config.js",
     "test:package": "node --test package_wasm.test.mjs",
-    "test:size": "node --test size_budget.test.mjs"
+    "test:size": "node --test size_budget.test.mjs",
+    "test:scene3d-capability": "playwright test -c scene3d_capability.playwright.config.js"
   },
   "devDependencies": {
     "@playwright/test": "1.61.1"

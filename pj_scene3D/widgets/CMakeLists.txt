@@ -1,5 +1,92 @@
 set(CMAKE_AUTOMOC ON)
 
+if(EMSCRIPTEN)
+  # Product Scene3D uses Qt's RHI/WebGL2 backend in the browser.  Keep this a
+  # deliberately small, platform-selected source set: no QOpenGLWidget, raw GL
+  # pass, Assimp, network model loader, or compressed-cloud codec enters W13.
+  set(CMAKE_AUTORCC ON)
+  find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS Widgets Gui GuiPrivate Xml)
+
+  if(NOT TARGET Qt6::qsb)
+    message(FATAL_ERROR "WASM Scene3D shader verification requires Qt6::qsb")
+  endif()
+  get_target_property(_pj_scene3d_qsb Qt6::qsb IMPORTED_LOCATION)
+  if(NOT _pj_scene3d_qsb OR _pj_scene3d_qsb MATCHES "-NOTFOUND$")
+    get_target_property(_pj_scene3d_qsb Qt6::qsb IMPORTED_LOCATION_RELWITHDEBINFO)
+  endif()
+  if(NOT EXISTS "${_pj_scene3d_qsb}")
+    message(FATAL_ERROR "WASM Scene3D cannot locate the host qsb executable")
+  endif()
+
+  set(_pj_scene3d_shader_verify_dir "${CMAKE_CURRENT_BINARY_DIR}/verified_shaders")
+  file(MAKE_DIRECTORY "${_pj_scene3d_shader_verify_dir}")
+  foreach(_pj_scene3d_shader IN ITEMS scene.vert scene.frag)
+    set(_pj_scene3d_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shaders/${_pj_scene3d_shader}")
+    set(_pj_scene3d_shader_pack "${_pj_scene3d_shader_source}.qsb")
+    set(_pj_scene3d_shader_rebuilt "${_pj_scene3d_shader_verify_dir}/${_pj_scene3d_shader}.qsb")
+    execute_process(
+      COMMAND "${_pj_scene3d_qsb}" --glsl "300 es" -o "${_pj_scene3d_shader_rebuilt}"
+        "${_pj_scene3d_shader_source}"
+      RESULT_VARIABLE _pj_scene3d_qsb_result
+      ERROR_VARIABLE _pj_scene3d_qsb_error)
+    if(NOT _pj_scene3d_qsb_result EQUAL 0)
+      message(FATAL_ERROR "Failed to bake ${_pj_scene3d_shader}: ${_pj_scene3d_qsb_error}")
+    endif()
+    file(SHA256 "${_pj_scene3d_shader_pack}" _pj_scene3d_committed_hash)
+    file(SHA256 "${_pj_scene3d_shader_rebuilt}" _pj_scene3d_rebuilt_hash)
+    if(NOT _pj_scene3d_committed_hash STREQUAL _pj_scene3d_rebuilt_hash)
+      message(FATAL_ERROR
+        "Stale Scene3D shader pack ${_pj_scene3d_shader_pack}; re-bake with the documented qsb command")
+    endif()
+  endforeach()
+
+  add_library(pj_scene3d_widgets STATIC
+    wasm/scene_view_widget_rhi.cpp
+    wasm/scene3d_dock_widget_wasm.cpp
+    src/transform_service.cpp
+    src/object_topic_metadata.cpp
+    src/resolve_object.cpp
+    src/scene_state_xml.cpp
+    src/passes/grid_geometry.cpp
+    include/pj_scene3d_widgets/scene_view_widget.h
+    include/pj_scene3d_widgets/scene_view_widget_rhi.h
+    include/pj_scene3d_widgets/Scene3DDockWidget.h
+    include/pj_scene3d_widgets/Scene3DDockWidget_wasm.h
+    include/pj_scene3d_widgets/transform_service.h
+    include/pj_scene3d_widgets/object_topic_metadata.h
+    include/pj_scene3d_widgets/resolve_object.h
+    wasm/shaders/scene3d_wasm_shaders.qrc
+  )
+  target_include_directories(pj_scene3d_widgets PUBLIC include PRIVATE src)
+  target_compile_features(pj_scene3d_widgets PUBLIC cxx_std_20)
+  target_compile_options(pj_scene3d_widgets PRIVATE
+    ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS}
+  )
+  target_link_libraries(pj_scene3d_widgets
+    PUBLIC
+      pj_scene3d_core
+      pj_scene_common
+      pj_runtime
+      pj_widgets
+      Qt6::Widgets
+      Qt6::Gui
+      Qt6::GuiPrivate
+      Qt6::Xml
+  )
+
+  unset(_pj_scene3d_committed_hash)
+  unset(_pj_scene3d_qsb)
+  unset(_pj_scene3d_qsb_error)
+  unset(_pj_scene3d_qsb_result)
+  unset(_pj_scene3d_rebuilt_hash)
+  unset(_pj_scene3d_shader)
+  unset(_pj_scene3d_shader_pack)
+  unset(_pj_scene3d_shader_rebuilt)
+  unset(_pj_scene3d_shader_source)
+  unset(_pj_scene3d_shader_verify_dir)
+  return()
+endif()
+
 find_package(OpenGL REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS Xml Concurrent Network)
 find_package(assimp REQUIRED)
@@ -49,6 +136,7 @@ set(PJ_SCENE3D_WIDGETS_SOURCES
   src/resolve_object.cpp
   src/url_fetcher.cpp
   src/Scene3DDockWidget.cpp
+  src/scene_state_xml.cpp
   src/transform_service.cpp
   src/hud_overlay.cpp
   include/pj_scene3d_widgets/hud_overlay.h

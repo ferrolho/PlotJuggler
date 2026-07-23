@@ -214,6 +214,11 @@ if(NOT EMSCRIPTEN OR PJ_WASM_WITH_SCENE3D)
     add_subdirectory(pj_scene3D/core)
     add_subdirectory(pj_scene3D/widgets)
 endif()
+if(EMSCRIPTEN AND PJ_WASM_SCENE3D_CAPABILITY_PROBE)
+    # W12 is a retained measurement executable, not part of the product and not
+    # an implicit request to build the production Scene3D renderer.
+    add_subdirectory(pj_scene3D/wasm_probe)
+endif()
 if(TARGET pj_scene2d_widgets)
     add_compile_definitions(PJ_WITH_SCENE2D)
 endif()
