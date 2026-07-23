@@ -8,7 +8,9 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QImage>
+#include <QListWidget>
 #include <QPointer>
+#include <QPushButton>
 #include <QToolButton>
 #include <QUrl>
 #include <algorithm>
@@ -18,7 +20,14 @@
 #include "MainWindow.h"
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
+#include "pj_scene3d_widgets/wasm/depth_cloud_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/point_cloud_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h"
+#include "pj_widgets/LayerListView.h"
 #include "pj_widgets/RealSlider.h"
+#include "ui/Scene3DConfigPanel.h"
 
 using namespace Qt::StringLiterals;
 
@@ -78,14 +87,24 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
 
     const quint64 current_sequence = ++sequence;
     auto* slider = main_window->findChild<PJ::RealSlider*>(u"timeSlider"_s);
+    QPushButton* right_panel_button = nullptr;
+    for (auto* button : main_window->findChildren<QPushButton*>()) {
+      if (button->toolTip() == QObject::tr("Toggle right panel")) {
+        right_panel_button = button;
+        break;
+      }
+    }
+    const QRect right_toggle_geometry = geometryRelativeTo(main_window, right_panel_button);
+    auto* right_panel = main_window->findChild<QWidget*>(u"localToolbarWidget"_s);
     const QRect slider_geometry = geometryRelativeTo(main_window, slider);
     qInfo(
         "PJ_WASM_SCENE3D_FOUNDATION_SUMMARY sequence=%llu docks=%lld slider=%d,%d,%dx%d "
-        "value=%.17g range=%.17g,%.17g enabled=%d",
+        "value=%.17g range=%.17g,%.17g enabled=%d window=%dx%d",
         static_cast<unsigned long long>(current_sequence), static_cast<long long>(docks.size()), slider_geometry.x(),
         slider_geometry.y(), slider_geometry.width(), slider_geometry.height(),
         slider != nullptr ? slider->getValue() : 0.0, slider != nullptr ? slider->getMinimum() : 0.0,
-        slider != nullptr ? slider->getMaximum() : 0.0, slider != nullptr && slider->isEnabled() ? 1 : 0);
+        slider != nullptr ? slider->getMaximum() : 0.0, slider != nullptr && slider->isEnabled() ? 1 : 0,
+        main_window->width(), main_window->height());
 
     for (qsizetype index = 0; index < docks.size(); ++index) {
       auto* dock = docks[index];
@@ -140,6 +159,114 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
           camera_geometry.width(), camera_geometry.height(), home_geometry.x(), home_geometry.y(),
           home_geometry.width(), home_geometry.height(), static_cast<unsigned long long>(frame_hash),
           static_cast<unsigned long long>(rgb_sum), framebuffer.width(), framebuffer.height());
+
+      int point_layers = 0;
+      int compressed_layers = 0;
+      int compressed_decoding = 0;
+      quint64 compressed_starts = 0;
+      quint64 compressed_completed = 0;
+      quint64 compressed_off_main = 0;
+      int depth_layers = 0;
+      int depth_decoding = 0;
+      quint64 depth_starts = 0;
+      quint64 depth_completed = 0;
+      quint64 depth_off_main = 0;
+      int pose_layers = 0;
+      int occupancy_layers = 0;
+      int voxel_layers = 0;
+      QStringList warnings;
+      QStringList ui_order;
+      for (const PJ::SceneLayerInfo& info : dock->layers()) {
+        ui_order.push_back(QString::number(info.topic_id.id));
+        PJ::ISceneLayer* layer = dock->layerFor(info.topic_id);
+        if (auto* point = dynamic_cast<pj::scene3d::WasmPointCloudLayer*>(layer)) {
+          ++point_layers;
+          if (point->isCompressedForTest()) {
+            ++compressed_layers;
+            compressed_decoding += point->compressedDecodeInFlightForTest() ? 1 : 0;
+            compressed_starts += point->compressedDecodeStartsForTest();
+            compressed_completed += point->compressedDecodeCompletionsForTest();
+            compressed_off_main += point->compressedDecodeOffMainCompletionsForTest();
+          }
+          if (!point->warningReason().isEmpty()) {
+            warnings.push_back(point->warningReason());
+          }
+        } else if (auto* depth = dynamic_cast<pj::scene3d::WasmDepthCloudLayer*>(layer)) {
+          ++depth_layers;
+          depth_decoding += depth->decodeInFlightForTest() ? 1 : 0;
+          depth_starts += depth->decodeStartsForTest();
+          depth_completed += depth->decodeCompletionsForTest();
+          depth_off_main += depth->decodeOffMainCompletionsForTest();
+          if (!depth->warningReason().isEmpty()) {
+            warnings.push_back(depth->warningReason());
+          }
+        } else if (auto* poses = dynamic_cast<pj::scene3d::WasmPosesInFrameLayer*>(layer)) {
+          ++pose_layers;
+          if (!poses->warningReason().isEmpty()) {
+            warnings.push_back(poses->warningReason());
+          }
+        } else if (auto* occupancy = dynamic_cast<pj::scene3d::WasmOccupancyGridLayer*>(layer)) {
+          ++occupancy_layers;
+          if (!occupancy->warningReason().isEmpty()) {
+            warnings.push_back(occupancy->warningReason());
+          }
+        } else if (auto* voxels = dynamic_cast<pj::scene3d::WasmVoxelGridLayer*>(layer)) {
+          ++voxel_layers;
+          if (!voxels->warningReason().isEmpty()) {
+            warnings.push_back(voxels->warningReason());
+          }
+        }
+      }
+
+      QStringList submitted_order;
+      if (view != nullptr) {
+        for (const std::uint32_t topic_id : view->lastSubmittedLayerIdsForTest()) {
+          submitted_order.push_back(QString::number(topic_id));
+        }
+      }
+      PJ::LayerListView* layer_list = nullptr;
+      if (auto* panel = main_window->findChild<PJ::Scene3DConfigPanel*>();
+          panel != nullptr && panel->boundDockForTest() == dock) {
+        layer_list = panel->layerListForTest();
+      }
+      QStringList row_centers;
+      if (auto* list = layer_list != nullptr ? layer_list->findChild<QListWidget*>() : nullptr) {
+        const std::vector<qint64> order = layer_list->order();
+        for (int row = 0; row < list->count() && static_cast<std::size_t>(row) < order.size(); ++row) {
+          const QPoint center =
+              main_window->mapFromGlobal(list->viewport()->mapToGlobal(list->visualItemRect(list->item(row)).center()));
+          row_centers.push_back(
+              QString::number(order[static_cast<std::size_t>(row)]) + u':' + QString::number(center.x()) + u':' +
+              QString::number(center.y()));
+        }
+      }
+      const QRect list_geometry = geometryRelativeTo(main_window, layer_list);
+      const QByteArray encoded_warnings = QUrl::toPercentEncoding(warnings.join(u'|'));
+      qInfo(
+          "PJ_WASM_SCENE3D_DATA sequence=%llu index=%lld "
+          "points=%d,%d,%d,%llu,%llu,%llu,%d compressed=%d "
+          "depth=%d,%d,%llu,%llu,%llu,%d poses=%d,%d occupancy=%d,%d,%d,%d voxels=%d,%d,%d,%d "
+          "order=%s submitted=%s list=%d,%d,%dx%d rows=%s toggle=%d,%d,%dx%d right_visible=%d warnings=%s",
+          static_cast<unsigned long long>(current_sequence), static_cast<long long>(index), point_layers,
+          view != nullptr ? view->lastPointLayerCountForTest() : 0,
+          view != nullptr ? view->lastPointVertexCountForTest() : 0, static_cast<unsigned long long>(compressed_starts),
+          static_cast<unsigned long long>(compressed_completed), static_cast<unsigned long long>(compressed_off_main),
+          compressed_decoding, compressed_layers, depth_layers, depth_decoding,
+          static_cast<unsigned long long>(depth_starts), static_cast<unsigned long long>(depth_completed),
+          static_cast<unsigned long long>(depth_off_main), view != nullptr ? view->lastDepthVertexCountForTest() : 0,
+          pose_layers, view != nullptr ? view->lastPoseArmCountForTest() : 0, occupancy_layers,
+          view != nullptr ? view->lastOccupancyCellCountForTest() : 0,
+          view != nullptr ? view->occupancyFullUploadCountForTest() : 0,
+          view != nullptr ? view->occupancyPartialUploadCountForTest() : 0, voxel_layers,
+          view != nullptr ? view->lastVoxelCountForTest() : 0,
+          view != nullptr ? view->voxelFullUploadCountForTest() : 0,
+          view != nullptr ? view->max3DTextureSizeForTest() : 0,
+          QUrl::toPercentEncoding(ui_order.join(u',')).constData(),
+          QUrl::toPercentEncoding(submitted_order.join(u',')).constData(), list_geometry.x(), list_geometry.y(),
+          list_geometry.width(), list_geometry.height(), QUrl::toPercentEncoding(row_centers.join(u',')).constData(),
+          right_toggle_geometry.x(), right_toggle_geometry.y(), right_toggle_geometry.width(),
+          right_toggle_geometry.height(), right_panel != nullptr && right_panel->isVisibleTo(main_window) ? 1 : 0,
+          encoded_warnings.constData());
     }
     return;
   }

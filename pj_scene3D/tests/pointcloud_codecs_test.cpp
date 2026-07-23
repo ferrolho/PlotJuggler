@@ -186,6 +186,34 @@ TEST(PointcloudCodecs, DispatchRoutesByFormat) {
   EXPECT_TRUE(pj::scene3d::decodeCompressedPointCloud(draco).has_value());
 }
 
+TEST(PointcloudCodecs, BoundedDispatchRejectsPointCountBeforePublishingOutput) {
+  const auto pts = makePoints(16);
+  const auto cloudini = wrap(encodeCloudini(pts), "cloudini", "f", 1);
+  const auto draco = wrap(encodeDraco(pts, "intensity"), "draco", "f", 1);
+  const pj::scene3d::PointCloudDecodeLimits limits{.max_points = 15, .max_decoded_bytes = 1024};
+
+  const auto cloudini_result = pj::scene3d::decodeCompressedPointCloud(cloudini, limits);
+  const auto draco_result = pj::scene3d::decodeCompressedPointCloud(draco, limits);
+  ASSERT_FALSE(cloudini_result.has_value());
+  ASSERT_FALSE(draco_result.has_value());
+  EXPECT_NE(cloudini_result.error().find("decoded point count 16 exceeds limit 15"), std::string::npos);
+  EXPECT_NE(draco_result.error().find("decoded point count 16 exceeds limit 15"), std::string::npos);
+}
+
+TEST(PointcloudCodecs, BoundedDispatchRejectsPackedOutputBytes) {
+  const auto pts = makePoints(16);
+  const auto cloudini = wrap(encodeCloudini(pts), "cloudini", "f", 1);
+  const auto draco = wrap(encodeDraco(pts, "intensity"), "draco", "f", 1);
+  const pj::scene3d::PointCloudDecodeLimits limits{.max_points = 16, .max_decoded_bytes = 255};
+
+  const auto cloudini_result = pj::scene3d::decodeCompressedPointCloud(cloudini, limits);
+  const auto draco_result = pj::scene3d::decodeCompressedPointCloud(draco, limits);
+  ASSERT_FALSE(cloudini_result.has_value());
+  ASSERT_FALSE(draco_result.has_value());
+  EXPECT_NE(cloudini_result.error().find("decoded payload 256 bytes exceeds limit 255"), std::string::npos);
+  EXPECT_NE(draco_result.error().find("decoded payload 256 bytes exceeds limit 255"), std::string::npos);
+}
+
 TEST(PointcloudCodecs, DispatchIsCaseInsensitive) {
   const auto pts = makePoints(8);
   const auto cloud = wrap(encodeCloudini(pts), "Cloudini", "f", 1);

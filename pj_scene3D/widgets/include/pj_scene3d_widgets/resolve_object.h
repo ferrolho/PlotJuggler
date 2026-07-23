@@ -15,9 +15,9 @@ namespace pj::scene3d {
 ///
 /// This reports DECODE capability (a pj_base codec exists), NOT that a render
 /// layer consumes the type via the canonical path — it returns true for more
-/// types than are currently wired (only PointCloudLayer, PosesInFrameLayer and
-/// the TF ingest use it today; OccupancyGrid/VoxelGrid/SceneEntities layers still
-/// require a parser). A caller using it as an attach gate must therefore already
+/// types than are currently wired (the browser point, pose, occupancy adapters
+/// and TF ingest use it today; native OccupancyGrid/VoxelGrid/SceneEntities
+/// layers still require a parser). A caller using it as an attach gate must already
 /// know its own layer renders `type`; do not read a true result as "some layer
 /// will render this".
 [[nodiscard]] bool hasCanonical3DCodec(PJ::sdk::BuiltinObjectType type) noexcept;

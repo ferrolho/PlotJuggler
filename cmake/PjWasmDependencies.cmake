@@ -23,6 +23,8 @@ option(PJ_WASM_WITH_TRANSFORM_EDITOR "Build the official Transform Editor toolbo
 option(PJ_WASM_WITH_DUMMY_STREAM "Build the official Dummy Streamer into the wasm app" ON)
 option(PJ_WASM_WITH_SCENE2D "Build the accelerated Scene2D wasm port" OFF)
 option(PJ_WASM_WITH_SCENE3D "Build the accelerated Scene3D wasm port" OFF)
+option(PJ_WASM_WITH_COMPRESSED_POINTCLOUDS
+    "Build Draco and Cloudini compressed point-cloud support into the Scene3D wasm port" ON)
 option(PJ_WASM_SCENE3D_CAPABILITY_PROBE "Build the standalone Scene3D QRhi capability probe" OFF)
 option(PJ_WASM_WITH_MARKETPLACE "Build marketplace support in the wasm app" OFF)
 
@@ -185,7 +187,7 @@ if(PJ_WASM_WITH_ROS)
     unset(_pj_rosx_includes)
 endif()
 
-if(PJ_WASM_WITH_MCAP)
+if(PJ_WASM_WITH_MCAP OR (PJ_WASM_WITH_SCENE3D AND PJ_WASM_WITH_COMPRESSED_POINTCLOUDS))
     # Match the native Conan graph exactly. MCAP uses these libraries for chunk
     # decompression; Cloudini uses the same pinned static targets for its second
     # compression stage. Populate them once when either browser feature needs
@@ -234,6 +236,9 @@ if(PJ_WASM_WITH_MCAP)
     endif()
 endif()
 
+if(PJ_WASM_WITH_SCENE3D)
+    include(${CMAKE_CURRENT_LIST_DIR}/PjWasmScene3DDependencies.cmake)
+endif()
 
 if(PJ_WASM_WITH_LUAU)
     set(LUAU_BUILD_CLI OFF CACHE BOOL "" FORCE)

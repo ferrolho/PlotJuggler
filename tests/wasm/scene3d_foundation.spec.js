@@ -8,23 +8,26 @@ const { dragQtCanvas } = require('./support/canvas');
 const { clickActiveDialogButton } = require('./support/dialogs');
 const { downloadLayoutFromFileMenu } = require('./support/layout_actions');
 const { openFileChooser, openLayoutChooser } = require('./support/pickers');
-const { requestScene3DFoundationState } = require('./support/scene3d_foundation');
+const { qtPointToCss, requestScene3DFoundationState } = require('./support/scene3d_foundation');
 
-async function dragTimeline(page, screen, slider, fromRatio, toRatio) {
-  const x = ratio => screen.x + slider.x + 4 + (ratio * (slider.width - 8));
-  const y = screen.y + slider.y + (slider.height / 2);
-  await page.mouse.move(x(fromRatio), y);
+async function dragTimeline(page, screen, state, fromRatio, toRatio) {
+  const point = ratio => qtPointToCss(screen, state, {
+    x: state.slider.x + 4 + (ratio * (state.slider.width - 8)),
+    y: state.slider.y + (state.slider.height / 2),
+  });
+  await page.mouse.move(point(fromRatio).x, point(fromRatio).y);
   await page.mouse.down({ button: 'left' });
-  await page.mouse.move(x(toRatio), y, { steps: 18 });
+  await page.mouse.move(point(toRatio).x, point(toRatio).y, { steps: 18 });
   await page.mouse.up({ button: 'left' });
   await page.waitForTimeout(300);
 }
 
-async function selectNextComboItem(page, screen, control) {
-  await page.mouse.click(
-    screen.x + control.x + (control.width / 2),
-    screen.y + control.y + (control.height / 2),
-  );
+async function selectNextComboItem(page, screen, state, control) {
+  const center = qtPointToCss(screen, state, {
+    x: control.x + (control.width / 2),
+    y: control.y + (control.height / 2),
+  });
+  await page.mouse.click(center.x, center.y);
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Enter');
   await page.waitForTimeout(200);
@@ -85,16 +88,16 @@ test('Scene3D TF/grid renders, responds to input, and replays a generic layout',
   // Moving the timeline changes TF geometry without replacing the widget.
   const initialRatio = (initial.slider.value - initial.slider.min) / (initial.slider.max - initial.slider.min);
   const seekRatio = initialRatio < 0.5 ? 1 : 0;
-  await dragTimeline(page, screen, initial.slider, initialRatio, seekRatio);
+  await dragTimeline(page, screen, initial, initialRatio, seekRatio);
   const sought = await requestScene3DFoundationState(page, consoleMessages, reportCount());
   expect(sought.docks[0].identity).toBe(initialDock.identity);
   expect(sought.docks[0].readback.frameHash).not.toBe(initialDock.readback.frameHash);
 
   // Real browser input changes the public camera state.
-  const center = {
-    x: screen.x + sought.docks[0].view.x + (sought.docks[0].view.width / 2),
-    y: screen.y + sought.docks[0].view.y + (sought.docks[0].view.height / 2),
-  };
+  const center = qtPointToCss(screen, sought, {
+    x: sought.docks[0].view.x + (sought.docks[0].view.width / 2),
+    y: sought.docks[0].view.y + (sought.docks[0].view.height / 2),
+  });
   await page.mouse.move(center.x, center.y);
   await page.mouse.down({ button: 'left' });
   await page.mouse.move(center.x + 90, center.y - 45, { steps: 12 });
@@ -109,10 +112,10 @@ test('Scene3D TF/grid renders, responds to input, and replays a generic layout',
   const zoomed = await requestScene3DFoundationState(page, consoleMessages, reportCount());
   expect(zoomed.docks[0].camera.radius).not.toBeCloseTo(orbited.docks[0].camera.radius, 4);
 
-  await selectNextComboItem(page, screen, zoomed.docks[0].controls.fixed);
+  await selectNextComboItem(page, screen, zoomed, zoomed.docks[0].controls.fixed);
   const fixedChanged = await requestScene3DFoundationState(page, consoleMessages, reportCount());
   expect(fixedChanged.docks[0]).toMatchObject({ fixed: 'odom', auto: false });
-  await selectNextComboItem(page, screen, fixedChanged.docks[0].controls.camera);
+  await selectNextComboItem(page, screen, fixedChanged, fixedChanged.docks[0].controls.camera);
   const configured = await requestScene3DFoundationState(page, consoleMessages, reportCount());
   expect(configured.docks[0].model).toBe(1);
 
@@ -126,8 +129,8 @@ test('Scene3D TF/grid renders, responds to input, and replays a generic layout',
 
   // Diverge controls, then prove generic replay builds a new dock and uniquely
   // rebinds /tf without a persisted browser dataset identity.
-  await selectNextComboItem(page, screen, configured.docks[0].controls.fixed);
-  await selectNextComboItem(page, screen, configured.docks[0].controls.camera);
+  await selectNextComboItem(page, screen, configured, configured.docks[0].controls.fixed);
+  await selectNextComboItem(page, screen, configured, configured.docks[0].controls.camera);
   const layoutChooser = await openLayoutChooser(page);
   await layoutChooser.setFiles({
     name: 'scene3d-foundation.pj4.xml',

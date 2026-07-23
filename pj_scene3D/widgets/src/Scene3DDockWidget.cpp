@@ -112,15 +112,8 @@ int cameraModelFromString(const QString& name) {
   return -1;
 }
 
-struct ValidatedSceneControls {
-  std::optional<bool> grid_visible;
-  std::optional<int> grid_style;
-  std::optional<float> grid_extent_m;
-  std::optional<int> grid_divisions;
-  std::optional<bool> axes_visible;
-  std::optional<float> gizmo_size_m;
-  std::optional<float> gizmo_opacity;
-  std::optional<bool> tf_parent_lines;
+// The shared backend-neutral controls plus the native-only mesh/collision knobs.
+struct ValidatedSceneControls : pj::scene3d::ValidatedSceneControls {
   std::optional<bool> meshes_visible;
   std::optional<float> mesh_opacity;
   std::optional<bool> collisions_visible;
@@ -173,14 +166,7 @@ std::optional<ValidatedSceneState> validateSceneState(const QDomElement& element
       return std::nullopt;
     }
     ValidatedSceneControls controls;
-    if (!readXmlBool(scene_controls, u"grid_visible"_s, controls.grid_visible) ||
-        !readXmlInt(scene_controls, u"grid_style"_s, 0, 1, controls.grid_style) ||
-        !readXmlFloat(scene_controls, u"grid_extent_m"_s, 1.0f, 1000.0f, controls.grid_extent_m) ||
-        !readXmlInt(scene_controls, u"grid_divisions"_s, 1, 200, controls.grid_divisions) ||
-        !readXmlBool(scene_controls, u"axes_visible"_s, controls.axes_visible) ||
-        !readXmlFloat(scene_controls, u"gizmo_size_m"_s, 0.01f, 5.0f, controls.gizmo_size_m) ||
-        !readXmlFloat(scene_controls, u"gizmo_opacity"_s, 0.0f, 1.0f, controls.gizmo_opacity) ||
-        !readXmlBool(scene_controls, u"tf_parent_lines"_s, controls.tf_parent_lines) ||
+    if (!pj::scene3d::readSceneControls(scene_controls, controls) ||
         !readXmlBool(scene_controls, u"meshes_visible"_s, controls.meshes_visible) ||
         !readXmlFloat(scene_controls, u"mesh_opacity"_s, 0.0f, 1.0f, controls.mesh_opacity) ||
         !readXmlBool(scene_controls, u"collisions_visible"_s, controls.collisions_visible) ||

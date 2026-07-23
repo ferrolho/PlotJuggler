@@ -136,4 +136,15 @@ std::optional<ValidatedCameraState> validateCameraState(const QString& encoded) 
   return state;
 }
 
+bool readSceneControls(const QDomElement& element, ValidatedSceneControls& output) {
+  return readXmlBool(element, u"grid_visible"_s, output.grid_visible) &&
+         readXmlInt(element, u"grid_style"_s, 0, 1, output.grid_style) &&
+         readXmlFloat(element, u"grid_extent_m"_s, kGridExtentMinM, kGridExtentMaxM, output.grid_extent_m) &&
+         readXmlInt(element, u"grid_divisions"_s, 1, 200, output.grid_divisions) &&
+         readXmlBool(element, u"axes_visible"_s, output.axes_visible) &&
+         readXmlFloat(element, u"gizmo_size_m"_s, kGizmoSizeMinM, kGizmoSizeMaxM, output.gizmo_size_m) &&
+         readXmlFloat(element, u"gizmo_opacity"_s, 0.0f, 1.0f, output.gizmo_opacity) &&
+         readXmlBool(element, u"tf_parent_lines"_s, output.tf_parent_lines);
+}
+
 }  // namespace pj::scene3d

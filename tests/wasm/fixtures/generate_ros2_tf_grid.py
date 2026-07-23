@@ -23,10 +23,10 @@ from pathlib import Path
 
 from mcap.reader import make_reader
 from mcap.writer import CompressionType, IndexType, Writer
+from scene3d_data_fixture_support import CdrWriter, STEP_NS, timestamp
 
 
 OUTPUT = Path(__file__).with_name("ros2_tf_grid_real.mcap")
-STEP_NS = 1_000_000_000
 TF_SAMPLE_COUNT = 5
 GRID_WIDTH = 200
 GRID_HEIGHT = 200
@@ -98,46 +98,6 @@ float64 y
 float64 z
 float64 w
 """
-
-
-class CdrWriter:
-    def __init__(self) -> None:
-        self.data = bytearray(b"\x00\x01\x00\x00")
-
-    def align(self, alignment: int) -> None:
-        # XCDR alignment is relative to the payload after the four-byte
-        # encapsulation header, not to the start of the serialized buffer.
-        self.data.extend(b"\x00" * (-(len(self.data) - 4) % alignment))
-
-    def int32(self, value: int) -> None:
-        self.align(4)
-        self.data.extend(struct.pack("<i", value))
-
-    def uint32(self, value: int) -> None:
-        self.align(4)
-        self.data.extend(struct.pack("<I", value))
-
-    def float32(self, value: float) -> None:
-        self.align(4)
-        self.data.extend(struct.pack("<f", value))
-
-    def float64(self, value: float) -> None:
-        self.align(8)
-        self.data.extend(struct.pack("<d", value))
-
-    def string(self, value: str) -> None:
-        encoded = value.encode("utf-8") + b"\x00"
-        self.uint32(len(encoded))
-        self.data.extend(encoded)
-
-    def byte_sequence(self, value: bytes) -> None:
-        self.uint32(len(value))
-        self.data.extend(value)
-
-
-def timestamp(cdr: CdrWriter, timestamp_ns: int) -> None:
-    cdr.int32(timestamp_ns // STEP_NS)
-    cdr.uint32(timestamp_ns % STEP_NS)
 
 
 def quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:

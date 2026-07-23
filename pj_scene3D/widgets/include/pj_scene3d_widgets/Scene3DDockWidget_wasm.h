@@ -10,9 +10,11 @@
 #include <QString>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "pj_base/builtin/builtin_object.hpp"
 #include "pj_datastore/object_store.hpp"
@@ -33,10 +35,9 @@ namespace PJ {
 
 class ComboBox;
 
-// W13 browser dock: the production TF-only Scene3D family.  It intentionally
-// accepts only FrameTransforms until subsequent work packages add QRhi render
-// layers, while retaining the desktop dock's fixed/follow/camera and persistence
-// contracts for the functionality it does expose.
+// Browser Scene3D family. The QRhi path supports raw/compressed PointCloud,
+// DepthCloud, PosesInFrame, OccupancyGrid, and VoxelGrid while structured model
+// and entity families remain deferred.
 class Scene3DDockWidget : public SceneDockWidget {
   Q_OBJECT
 
@@ -85,9 +86,7 @@ class Scene3DDockWidget : public SceneDockWidget {
   void setFollowFrame(const QString& frame);
   void recenterOnFollowFrame();
 
-  [[nodiscard]] bool layerVisible(ObjectTopicId /*topic_id*/) const {
-    return false;
-  }
+  [[nodiscard]] bool layerVisible(ObjectTopicId topic_id) const;
   struct OrphanSnapshot {
     bool is_orphan = false;
     QString reason;
@@ -141,12 +140,15 @@ class Scene3DDockWidget : public SceneDockWidget {
   std::shared_ptr<pj::scene3d::TransformBuffer> tf_buffer_;
   DatasetId dataset_id_ = 0;
   std::unordered_set<uint32_t> config_topics_;
+  std::unordered_set<uint32_t> layer_topics_;
   std::unordered_map<uint32_t, DatasetId> scene_topic_datasets_;
   QMetaObject::Connection live_samples_connection_;
   QMetaObject::Connection transforms_ready_connection_;
   double last_tracker_display_ = 0.0;
 
   QList<pj::scene3d::FrameRow> available_frames_;
+  QList<pj::scene3d::FrameRow> transform_frames_;
+  std::vector<std::string> fallback_frames_;
   FixedFrameMode fixed_frame_mode_ = FixedFrameMode::kAutoRoot;
   ComboBox* frame_overlay_combo_ = nullptr;
   ComboBox* camera_model_combo_ = nullptr;

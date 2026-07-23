@@ -1,29 +1,43 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#include <GLES3/gl3.h>
 #include <rhi/qrhi.h>
 
+#include <QByteArray>
 #include <QEvent>
 #include <QFile>
 #include <QGuiApplication>
 #include <QMatrix4x4>
 #include <QMouseEvent>
 #include <QPalette>
+#include <QVarLengthArray>
 #include <QWheelEvent>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <functional>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <iterator>
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 #include "pj_scene3d_core/tf/tf_connections.h"
+#include "pj_scene3d_widgets/cube_mesh.h"
+#include "pj_scene3d_widgets/gizmos/arrow_mesh.h"
 #include "pj_scene3d_widgets/passes/grid_geometry.h"
 #include "pj_scene3d_widgets/scene_look_defaults.h"
+#include "pj_scene3d_widgets/scene_state_xml.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
+#include "pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/point_renderable_wasm.h"
+#include "pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h"
+#include "pj_widgets/Colormap.h"
 #include "pj_widgets/FrameworkTokens.h"
 
 // The resource object lives in a static archive.  Explicit initialization both
@@ -36,7 +50,88 @@ static void initializeScene3dWasmResources() {
 namespace pj::scene3d {
 namespace {
 
+// Shared body of the four setXxxLayers entry points: prune GPU state and
+// pending-fit marks for layers that left the list (or went invisible), queue a
+// camera-fit for layers that just arrived, then adopt the new list.
+template <typename Layer, typename Gpu, typename Release>
+void adoptLayerList(
+    const std::vector<Layer*>& layers, std::vector<Layer*>& current, std::unordered_map<Layer*, Gpu>& gpu_cache,
+    std::unordered_set<Layer*>& pending_fit, Release&& release_gpu) {
+  for (auto iterator = gpu_cache.begin(); iterator != gpu_cache.end();) {
+    if (std::find(layers.cbegin(), layers.cend(), iterator->first) == layers.cend() || !iterator->first->visible()) {
+      release_gpu(iterator->second);
+      iterator = gpu_cache.erase(iterator);
+    } else {
+      ++iterator;
+    }
+  }
+  for (auto iterator = pending_fit.begin(); iterator != pending_fit.end();) {
+    if (std::find(layers.cbegin(), layers.cend(), *iterator) == layers.cend()) {
+      iterator = pending_fit.erase(iterator);
+    } else {
+      ++iterator;
+    }
+  }
+  for (Layer* layer : layers) {
+    if (std::find(current.cbegin(), current.cend(), layer) == current.cend()) {
+      pending_fit.insert(layer);
+    }
+  }
+  current = layers;
+}
+
 constexpr quint32 kInitialVertexBufferBytes = 64U * 1024U;
+constexpr quint32 kPointInitialVertexBufferBytes = 1024U;
+constexpr quint32 kPointUniformBytes = 272U;
+constexpr quint32 kPoseUniformBytes = 192U;
+constexpr quint32 kOccupancyUniformBytes = 144U;
+constexpr quint32 kVoxelUniformBytes = 256U;
+constexpr std::array<float, 12> kOccupancyQuad = {0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 1.0F,
+                                                  0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 1.0F};
+
+struct alignas(16) PointUniforms {
+  std::array<float, 16> view_projection{};
+  std::array<float, 16> fixed_from_source{};
+  std::array<float, 16> view{};
+  std::array<float, 4> render_origin{};
+  std::array<float, 4> point_params{};
+  std::array<float, 4> range_params{};
+  std::array<float, 4> solid_params{};
+  std::array<std::int32_t, 4> modes{};
+};
+static_assert(sizeof(PointUniforms) == kPointUniformBytes);
+
+struct alignas(16) PoseUniforms {
+  std::array<float, 16> view_projection{};
+  std::array<float, 16> fixed_from_source{};
+  std::array<float, 16> view{};
+};
+static_assert(sizeof(PoseUniforms) == kPoseUniformBytes);
+
+struct alignas(16) OccupancyUniforms {
+  std::array<float, 16> view_projection{};
+  std::array<float, 16> fixed_from_grid{};
+  std::array<float, 4> display_params{};
+};
+static_assert(sizeof(OccupancyUniforms) == kOccupancyUniformBytes);
+
+struct alignas(16) VoxelUniforms {
+  std::array<float, 16> view_projection{};
+  std::array<float, 16> fixed_from_grid{};
+  std::array<float, 16> view{};
+  std::array<float, 4> cell_size_opacity{};
+  std::array<float, 4> dims_kind{};
+  std::array<float, 4> range_params{};
+  std::array<float, 4> mode_params{};
+};
+static_assert(sizeof(VoxelUniforms) == kVoxelUniformBytes);
+
+const ArrowMeshData& unitPoseArrowMesh() {
+  static const ArrowMeshData mesh = buildArrowMesh(
+      ArrowMeshParams{
+          .length = 1.0F, .shaft_radius = 0.04F, .head_length = 0.30F, .head_radius = 0.10F, .segments = 16});
+  return mesh;
+}
 
 QColor sceneBackdropColor() {
   const QColor window_background = QGuiApplication::palette().color(QPalette::Window);
@@ -79,6 +174,46 @@ uint64_t hashTransform(const Transform& transform, uint64_t seed) {
   return hash;
 }
 
+void copyMatrix(const QMatrix4x4& matrix, std::array<float, 16>& output) {
+  std::memcpy(output.data(), matrix.constData(), 16U * sizeof(float));
+}
+
+AABB transformedBounds(const AABB& source, const Transform& fixed_from_source) {
+  if (!source.valid) {
+    return {};
+  }
+  AABB output;
+  for (int corner = 0; corner < 8; ++corner) {
+    const glm::dvec3 point{
+        (corner & 1) != 0 ? source.max.x : source.min.x,
+        (corner & 2) != 0 ? source.max.y : source.min.y,
+        (corner & 4) != 0 ? source.max.z : source.min.z,
+    };
+    const glm::dvec3 transformed = fixed_from_source * point;
+    expandAABB(output, glm::vec3(transformed));
+  }
+  return output;
+}
+
+AABB occupancyBoundsInFixed(const ReconstructedGrid& grid, const Transform& fixed_from_source) {
+  if (grid.empty() || grid.width == 0U || grid.height == 0U || grid.resolution <= 0.0) {
+    return {};
+  }
+  const auto& p = grid.origin.position;
+  const auto& q = grid.origin.orientation;
+  const Transform source_from_grid(glm::dvec3(p.x, p.y, p.z), glm::normalize(glm::dquat(q.w, q.x, q.y, q.z)));
+  const Transform fixed_from_grid = fixed_from_source * source_from_grid;
+  const double width = grid.resolution * static_cast<double>(grid.width);
+  const double height = grid.resolution * static_cast<double>(grid.height);
+  AABB bounds;
+  for (const glm::dvec3 corner :
+       {glm::dvec3(0.0, 0.0, 0.0), glm::dvec3(width, 0.0, 0.0), glm::dvec3(0.0, height, 0.0),
+        glm::dvec3(width, height, 0.0)}) {
+    expandAABB(bounds, glm::vec3(fixed_from_grid * corner));
+  }
+  return bounds;
+}
+
 }  // namespace
 
 SceneViewWidget::SceneViewWidget(QWidget* parent) : QRhiWidget(parent) {
@@ -111,6 +246,67 @@ void SceneViewWidget::setTransformBuffer(std::shared_ptr<TransformBuffer> tf) {
   tf_ = std::move(tf);
   last_frames_revision_ = ~uint64_t{0};
   refreshAvailableFrames();
+  update();
+}
+
+void SceneViewWidget::setLayers(const std::vector<PJ::ISceneLayer*>& ordered_layers) {
+  std::vector<OrderedLayerEntry> order;
+  std::vector<WasmPointRenderable*> points;
+  std::vector<WasmPosesInFrameLayer*> poses;
+  std::vector<WasmOccupancyGridLayer*> occupancy;
+  std::vector<WasmVoxelGridLayer*> voxels;
+  order.reserve(ordered_layers.size());
+  points.reserve(ordered_layers.size());
+  poses.reserve(ordered_layers.size());
+  occupancy.reserve(ordered_layers.size());
+  voxels.reserve(ordered_layers.size());
+  for (PJ::ISceneLayer* layer : ordered_layers) {
+    if (auto* point = dynamic_cast<WasmPointRenderable*>(layer); point != nullptr) {
+      order.push_back({point, layer->info().topic_id.id});
+      points.push_back(point);
+    } else if (auto* pose = dynamic_cast<WasmPosesInFrameLayer*>(layer); pose != nullptr) {
+      order.push_back({pose, layer->info().topic_id.id});
+      poses.push_back(pose);
+    } else if (auto* grid = dynamic_cast<WasmOccupancyGridLayer*>(layer); grid != nullptr) {
+      order.push_back({grid, layer->info().topic_id.id});
+      occupancy.push_back(grid);
+    } else if (auto* voxel = dynamic_cast<WasmVoxelGridLayer*>(layer); voxel != nullptr) {
+      order.push_back({voxel, layer->info().topic_id.id});
+      voxels.push_back(voxel);
+    }
+  }
+  ordered_layers_ = std::move(order);
+  setPointRenderableLayers(points);
+  setPosesInFrameLayers(poses);
+  setOccupancyGridLayers(occupancy);
+  setVoxelGridLayers(voxels);
+}
+
+void SceneViewWidget::setPointRenderableLayers(const std::vector<WasmPointRenderable*>& layers) {
+  adoptLayerList(layers, point_layers_, point_layer_gpu_, point_layers_pending_fit_, [this](PointLayerGpu& gpu) {
+    releasePointLayerGpu(gpu);
+  });
+  update();
+}
+
+void SceneViewWidget::setPosesInFrameLayers(const std::vector<WasmPosesInFrameLayer*>& layers) {
+  adoptLayerList(layers, pose_layers_, pose_layer_gpu_, pose_layers_pending_fit_, [this](PoseLayerGpu& gpu) {
+    releasePoseLayerGpu(gpu);
+  });
+  update();
+}
+
+void SceneViewWidget::setOccupancyGridLayers(const std::vector<WasmOccupancyGridLayer*>& layers) {
+  adoptLayerList(
+      layers, occupancy_layers_, occupancy_layer_gpu_, occupancy_layers_pending_fit_,
+      [this](OccupancyLayerGpu& gpu) { releaseOccupancyLayerGpu(gpu); });
+  update();
+}
+
+void SceneViewWidget::setVoxelGridLayers(const std::vector<WasmVoxelGridLayer*>& layers) {
+  adoptLayerList(layers, voxel_layers_, voxel_layer_gpu_, voxel_layers_pending_fit_, [this](VoxelLayerGpu& gpu) {
+    releaseVoxelLayerGpu(gpu);
+  });
   update();
 }
 
@@ -261,7 +457,7 @@ void SceneViewWidget::setGridDivisions(int divisions) {
 }
 
 void SceneViewWidget::setGridExtentMetres(float extent_m) {
-  extent_m = std::clamp(extent_m, 0.01F, 1.0e7F);
+  extent_m = std::clamp(extent_m, kGridExtentMinM, kGridExtentMaxM);
   if (grid_extent_m_ == extent_m) {
     return;
   }
@@ -289,7 +485,7 @@ void SceneViewWidget::setAxesVisible(bool visible) {
 }
 
 void SceneViewWidget::setGizmoSize(float length_m) {
-  length_m = std::clamp(length_m, 0.001F, 1.0e5F);
+  length_m = std::clamp(length_m, kGizmoSizeMinM, kGizmoSizeMaxM);
   if (gizmo_size_m_ == length_m) {
     return;
   }
@@ -360,11 +556,23 @@ std::string SceneViewWidget::effectiveFixedFrame() const {
   if (!fixed_frame_.empty()) {
     return fixed_frame_;
   }
-  if (tf_ == nullptr) {
-    return {};
+  if (tf_ != nullptr) {
+    const std::vector<FrameRow> hierarchy = tf_->getFrameHierarchy();
+    if (!hierarchy.empty()) {
+      return hierarchy.front().name;
+    }
   }
-  const std::vector<FrameRow> hierarchy = tf_->getFrameHierarchy();
-  return hierarchy.empty() ? std::string{} : hierarchy.front().name;
+  // A raw cloud is useful without /tf: use its own source frame as the fixed
+  // frame and draw with the identity transform, matching native's fallback-frame
+  // behavior instead of silently producing an empty browser view.
+  for (const OrderedLayerEntry& entry : ordered_layers_) {
+    const std::string source = std::visit(
+        [](const auto* layer) { return layer != nullptr ? layer->sourceFrame() : std::string{}; }, entry.layer);
+    if (!source.empty()) {
+      return source;
+    }
+  }
+  return {};
 }
 
 void SceneViewWidget::appendLine(const glm::dvec3& a, const glm::dvec3& b, const glm::vec4& color) {
@@ -459,14 +667,15 @@ void SceneViewWidget::buildGeometry(const glm::dvec3& render_origin) {
   last_triangle_vertex_count_ = static_cast<int>(triangle_vertices_.size());
 }
 
-bool SceneViewWidget::ensureVertexBuffer(QRhi* owner, QRhiBuffer*& buffer, quint32& capacity, quint32 required_bytes) {
+bool SceneViewWidget::ensureVertexBuffer(
+    QRhi* owner, QRhiBuffer*& buffer, quint32& capacity, quint32 required_bytes, quint32 minimum_capacity) {
   if (required_bytes == 0) {
     return true;
   }
   if (buffer != nullptr && capacity >= required_bytes) {
     return true;
   }
-  quint32 next_capacity = std::max(capacity, kInitialVertexBufferBytes);
+  quint32 next_capacity = std::max(capacity, minimum_capacity);
   while (next_capacity < required_bytes && next_capacity <= std::numeric_limits<quint32>::max() / 2U) {
     next_capacity *= 2U;
   }
@@ -485,6 +694,240 @@ bool SceneViewWidget::ensureVertexBuffer(QRhi* owner, QRhiBuffer*& buffer, quint
   return true;
 }
 
+bool SceneViewWidget::ensurePointLayerGpu(QRhi* owner, WasmPointRenderable* /*layer*/, PointLayerGpu& gpu) {
+  if (owner == nullptr || colormap_texture_ == nullptr || colormap_sampler_ == nullptr) {
+    return false;
+  }
+  if (gpu.uniform_buffer == nullptr) {
+    gpu.uniform_buffer = owner->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kPointUniformBytes);
+    if (!gpu.uniform_buffer->create()) {
+      releasePointLayerGpu(gpu);
+      return false;
+    }
+  }
+  if (gpu.shader_resources == nullptr) {
+    gpu.shader_resources = owner->newShaderResourceBindings();
+    gpu.shader_resources->setBindings({
+        QRhiShaderResourceBinding::uniformBuffer(
+            0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, gpu.uniform_buffer),
+        QRhiShaderResourceBinding::sampledTexture(
+            1, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+    });
+    if (!gpu.shader_resources->create()) {
+      releasePointLayerGpu(gpu);
+      return false;
+    }
+  }
+  return true;
+}
+
+void SceneViewWidget::releasePointLayerGpu(PointLayerGpu& gpu) {
+  delete gpu.shader_resources;
+  delete gpu.vertex_buffer;
+  delete gpu.uniform_buffer;
+  gpu = {};
+}
+
+bool SceneViewWidget::ensurePoseLayerGpu(QRhi* owner, PoseLayerGpu& gpu) {
+  if (owner == nullptr) {
+    return false;
+  }
+  if (gpu.uniform_buffer == nullptr) {
+    gpu.uniform_buffer = owner->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kPoseUniformBytes);
+    if (!gpu.uniform_buffer->create()) {
+      releasePoseLayerGpu(gpu);
+      return false;
+    }
+  }
+  if (gpu.shader_resources == nullptr) {
+    gpu.shader_resources = owner->newShaderResourceBindings();
+    gpu.shader_resources->setBindings({
+        QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, gpu.uniform_buffer),
+    });
+    if (!gpu.shader_resources->create()) {
+      releasePoseLayerGpu(gpu);
+      return false;
+    }
+  }
+  return true;
+}
+
+void SceneViewWidget::releasePoseLayerGpu(PoseLayerGpu& gpu) {
+  delete gpu.shader_resources;
+  delete gpu.instance_buffer;
+  delete gpu.uniform_buffer;
+  gpu = {};
+}
+
+bool SceneViewWidget::ensureOccupancyLayerGpu(
+    QRhi* owner, WasmOccupancyGridLayer* layer, OccupancyLayerGpu& gpu, bool& texture_recreated) {
+  texture_recreated = false;
+  if (owner == nullptr || layer == nullptr || occupancy_sampler_ == nullptr) {
+    return false;
+  }
+  const ReconstructedGrid& grid = layer->grid();
+  const int texture_limit = owner->resourceLimit(QRhi::TextureSizeMax);
+  if (texture_limit <= 0 || grid.width == 0U || grid.height == 0U || grid.width > static_cast<quint32>(texture_limit) ||
+      grid.height > static_cast<quint32>(texture_limit)) {
+    layer->noteRenderFailure(
+        tr("Occupancy grid is %1 x %2; this browser GPU supports textures up to %3 x %3")
+            .arg(QString::number(grid.width), QString::number(grid.height), QString::number(texture_limit)));
+    return false;
+  }
+  if (gpu.uniform_buffer == nullptr) {
+    gpu.uniform_buffer = owner->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kOccupancyUniformBytes);
+    if (!gpu.uniform_buffer->create()) {
+      layer->noteRenderFailure(tr("Could not create the occupancy-grid uniform buffer"));
+      releaseOccupancyLayerGpu(gpu);
+      return false;
+    }
+  }
+  if (gpu.texture == nullptr || gpu.width != grid.width || gpu.height != grid.height) {
+    delete gpu.shader_resources;
+    delete gpu.texture;
+    gpu.shader_resources = nullptr;
+    gpu.texture =
+        owner->newTexture(QRhiTexture::R8, QSize(static_cast<int>(grid.width), static_cast<int>(grid.height)));
+    if (!gpu.texture->create()) {
+      delete gpu.texture;
+      gpu.texture = nullptr;
+      gpu.width = 0;
+      gpu.height = 0;
+      layer->noteRenderFailure(tr("Could not allocate the occupancy-grid texture"));
+      return false;
+    }
+    gpu.width = grid.width;
+    gpu.height = grid.height;
+    gpu.uploaded_revision = ~uint64_t{0};
+    texture_recreated = true;
+  }
+  if (gpu.shader_resources == nullptr) {
+    gpu.shader_resources = owner->newShaderResourceBindings();
+    gpu.shader_resources->setBindings({
+        QRhiShaderResourceBinding::uniformBuffer(
+            0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, gpu.uniform_buffer),
+        QRhiShaderResourceBinding::sampledTexture(
+            1, QRhiShaderResourceBinding::FragmentStage, gpu.texture, occupancy_sampler_),
+    });
+    if (!gpu.shader_resources->create()) {
+      layer->noteRenderFailure(tr("Could not create occupancy-grid shader bindings"));
+      releaseOccupancyLayerGpu(gpu);
+      return false;
+    }
+  }
+  layer->noteRenderSuccess();
+  return true;
+}
+
+void SceneViewWidget::releaseOccupancyLayerGpu(OccupancyLayerGpu& gpu) {
+  delete gpu.shader_resources;
+  delete gpu.texture;
+  delete gpu.uniform_buffer;
+  gpu = {};
+}
+
+bool SceneViewWidget::ensureVoxelLayerGpu(
+    QRhi* owner, WasmVoxelGridLayer* layer, VoxelLayerGpu& gpu, bool& texture_recreated) {
+  texture_recreated = false;
+  if (owner == nullptr || layer == nullptr || voxel_sampler_ == nullptr || colormap_texture_ == nullptr ||
+      colormap_sampler_ == nullptr) {
+    return false;
+  }
+  const QString rejection = voxelGpuRejection(owner, layer);
+  if (!rejection.isEmpty()) {
+    layer->noteRenderFailure(rejection);
+    return false;
+  }
+  const quint32 columns = layer->columnCount();
+  const quint32 rows = layer->rowCount();
+  const quint32 slices = layer->sliceCount();
+  if (gpu.uniform_buffer == nullptr) {
+    gpu.uniform_buffer = owner->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kVoxelUniformBytes);
+    if (!gpu.uniform_buffer->create()) {
+      layer->noteRenderFailure(tr("Could not create the voxel-grid uniform buffer"));
+      releaseVoxelLayerGpu(gpu);
+      return false;
+    }
+  }
+
+  const int value_kind = static_cast<int>(layer->valueKind());
+  if (gpu.texture == nullptr || gpu.columns != columns || gpu.rows != rows || gpu.slices != slices ||
+      gpu.value_kind != value_kind) {
+    delete gpu.shader_resources;
+    delete gpu.texture;
+    gpu.shader_resources = nullptr;
+    const QRhiTexture::Format format =
+        layer->valueKind() == VoxelValueKind::kScalar ? QRhiTexture::R32F : QRhiTexture::RGBA8;
+    gpu.texture = owner->newTexture(
+        format, static_cast<int>(columns), static_cast<int>(rows), static_cast<int>(slices), 1,
+        QRhiTexture::ThreeDimensional);
+    if (!gpu.texture->create()) {
+      delete gpu.texture;
+      gpu.texture = nullptr;
+      gpu.columns = 0;
+      gpu.rows = 0;
+      gpu.slices = 0;
+      gpu.value_kind = -1;
+      layer->noteRenderFailure(tr("Could not allocate the voxel-grid 3D texture"));
+      return false;
+    }
+    gpu.columns = columns;
+    gpu.rows = rows;
+    gpu.slices = slices;
+    gpu.value_kind = value_kind;
+    gpu.uploaded_revision = ~uint64_t{0};
+    texture_recreated = true;
+  }
+  if (gpu.shader_resources == nullptr) {
+    gpu.shader_resources = owner->newShaderResourceBindings();
+    gpu.shader_resources->setBindings({
+        QRhiShaderResourceBinding::uniformBuffer(
+            0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, gpu.uniform_buffer),
+        QRhiShaderResourceBinding::sampledTexture(
+            1, QRhiShaderResourceBinding::VertexStage, gpu.texture, voxel_sampler_),
+        QRhiShaderResourceBinding::sampledTexture(
+            2, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+    });
+    if (!gpu.shader_resources->create()) {
+      layer->noteRenderFailure(tr("Could not create voxel-grid shader bindings"));
+      releaseVoxelLayerGpu(gpu);
+      return false;
+    }
+  }
+  layer->noteRenderSuccess();
+  return true;
+}
+
+QString SceneViewWidget::voxelGpuRejection(QRhi* owner, const WasmVoxelGridLayer* layer) {
+  if (owner == nullptr || layer == nullptr) {
+    return tr("The voxel-grid renderer is not available");
+  }
+  if (!owner->isFeatureSupported(QRhi::ThreeDimensionalTextures)) {
+    return tr("This browser GPU does not support 3D textures");
+  }
+  GLint webgl_limit = 0;
+  glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &webgl_limit);
+  max_3d_texture_size_ = std::max(webgl_limit, 0);
+  const int effective_limit = std::min(max_3d_texture_size_, owner->resourceLimit(QRhi::TextureSizeMax));
+  const quint32 columns = layer->columnCount();
+  const quint32 rows = layer->rowCount();
+  const quint32 slices = layer->sliceCount();
+  if (effective_limit > 0 && columns > 0U && rows > 0U && slices > 0U &&
+      columns <= static_cast<quint32>(effective_limit) && rows <= static_cast<quint32>(effective_limit) &&
+      slices <= static_cast<quint32>(effective_limit)) {
+    return {};
+  }
+  return tr("Voxel grid is %1 x %2 x %3; this browser GPU supports 3D textures up to %4 per dimension")
+      .arg(QString::number(columns), QString::number(rows), QString::number(slices), QString::number(effective_limit));
+}
+
+void SceneViewWidget::releaseVoxelLayerGpu(VoxelLayerGpu& gpu) {
+  delete gpu.shader_resources;
+  delete gpu.texture;
+  delete gpu.uniform_buffer;
+  gpu = {};
+}
+
 void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
   QRhi* current_rhi = rhi();
   if (current_rhi == nullptr || renderTarget() == nullptr) {
@@ -494,13 +937,28 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
     releaseResources();
     resource_rhi_ = current_rhi;
   }
-  if (line_pipeline_ != nullptr && triangle_pipeline_ != nullptr) {
+  if (line_pipeline_ != nullptr && triangle_pipeline_ != nullptr && point_pipeline_ != nullptr &&
+      cube_pipeline_ != nullptr && pose_pipeline_ != nullptr && occupancy_pipeline_ != nullptr &&
+      (!current_rhi->isFeatureSupported(QRhi::ThreeDimensionalTextures) || voxel_pipeline_ != nullptr)) {
     return;
   }
 
   const QShader vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/scene.vert.qsb"));
   const QShader fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/scene.frag.qsb"));
-  if (!vertex_shader.isValid() || !fragment_shader.isValid()) {
+  const QShader point_vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/point.vert.qsb"));
+  const QShader point_fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/point.frag.qsb"));
+  const QShader cube_vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/cube.vert.qsb"));
+  const QShader cube_fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/cube.frag.qsb"));
+  const QShader pose_vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/pose.vert.qsb"));
+  const QShader pose_fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/pose.frag.qsb"));
+  const QShader occupancy_vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/occupancy.vert.qsb"));
+  const QShader occupancy_fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/occupancy.frag.qsb"));
+  const QShader voxel_vertex_shader = loadShader(QStringLiteral(":/scene3d_wasm/voxel.vert.qsb"));
+  const QShader voxel_fragment_shader = loadShader(QStringLiteral(":/scene3d_wasm/voxel.frag.qsb"));
+  if (!vertex_shader.isValid() || !fragment_shader.isValid() || !point_vertex_shader.isValid() ||
+      !point_fragment_shader.isValid() || !cube_vertex_shader.isValid() || !cube_fragment_shader.isValid() ||
+      !pose_vertex_shader.isValid() || !pose_fragment_shader.isValid() || !occupancy_vertex_shader.isValid() ||
+      !occupancy_fragment_shader.isValid() || !voxel_vertex_shader.isValid() || !voxel_fragment_shader.isValid()) {
     return;
   }
 
@@ -555,7 +1013,276 @@ void SceneViewWidget::initialize(QRhiCommandBuffer* /*command_buffer*/) {
   };
   line_pipeline_ = create_pipeline(QRhiGraphicsPipeline::Lines);
   triangle_pipeline_ = create_pipeline(QRhiGraphicsPipeline::Triangles);
-  if (line_pipeline_ == nullptr || triangle_pipeline_ == nullptr) {
+
+  colormap_texture_ = current_rhi->newTexture(QRhiTexture::RGBA8, QSize(PJ::kColormapLutWidth, PJ::kColormapCount));
+  colormap_sampler_ = current_rhi->newSampler(
+      QRhiSampler::Linear, QRhiSampler::Linear, QRhiSampler::None, QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge);
+  if (!colormap_texture_->create() || !colormap_sampler_->create()) {
+    releaseResources();
+    return;
+  }
+  colormap_upload_pending_ = true;
+
+  QRhiVertexInputLayout point_layout;
+  point_layout.setBindings({QRhiVertexInputBinding(sizeof(WasmPointVertex))});
+  point_layout.setAttributes({
+      QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, offsetof(WasmPointVertex, x)),
+      QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float, offsetof(WasmPointVertex, scalar)),
+      QRhiVertexInputAttribute(0, 2, QRhiVertexInputAttribute::UNormByte4, offsetof(WasmPointVertex, rgba)),
+  });
+  point_layout_uniform_buffer_ =
+      current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kPointUniformBytes);
+  if (!point_layout_uniform_buffer_->create()) {
+    releaseResources();
+    return;
+  }
+  point_layout_shader_resources_ = current_rhi->newShaderResourceBindings();
+  point_layout_shader_resources_->setBindings({
+      QRhiShaderResourceBinding::uniformBuffer(
+          0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage,
+          point_layout_uniform_buffer_),
+      QRhiShaderResourceBinding::sampledTexture(
+          1, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+  });
+  if (!point_layout_shader_resources_->create()) {
+    releaseResources();
+    return;
+  }
+  point_pipeline_ = current_rhi->newGraphicsPipeline();
+  point_pipeline_->setTopology(QRhiGraphicsPipeline::Points);
+  point_pipeline_->setShaderStages({
+      {QRhiShaderStage::Vertex, point_vertex_shader},
+      {QRhiShaderStage::Fragment, point_fragment_shader},
+  });
+  point_pipeline_->setVertexInputLayout(point_layout);
+  point_pipeline_->setShaderResourceBindings(point_layout_shader_resources_);
+  point_pipeline_->setTargetBlends({blend});
+  point_pipeline_->setCullMode(QRhiGraphicsPipeline::None);
+  point_pipeline_->setDepthTest(true);
+  point_pipeline_->setDepthWrite(true);
+  point_pipeline_->setDepthOp(QRhiGraphicsPipeline::LessOrEqual);
+  point_pipeline_->setSampleCount(sampleCount());
+  point_pipeline_->setRenderPassDescriptor(renderTarget()->renderPassDescriptor());
+  if (!point_pipeline_->create()) {
+    delete point_pipeline_;
+    point_pipeline_ = nullptr;
+  }
+
+  cube_vertex_buffer_ = current_rhi->newBuffer(
+      QRhiBuffer::Immutable, QRhiBuffer::VertexBuffer, static_cast<quint32>(kCubeVertices.size() * sizeof(CubeVertex)));
+  cube_index_buffer_ = current_rhi->newBuffer(
+      QRhiBuffer::Immutable, QRhiBuffer::IndexBuffer,
+      static_cast<quint32>(kCubeIndices.size() * sizeof(std::uint16_t)));
+  if (!cube_vertex_buffer_->create() || !cube_index_buffer_->create()) {
+    releaseResources();
+    return;
+  }
+  cube_upload_pending_ = true;
+
+  QRhiVertexInputLayout cube_layout;
+  cube_layout.setBindings({
+      QRhiVertexInputBinding(sizeof(CubeVertex)),
+      QRhiVertexInputBinding(sizeof(WasmPointVertex), QRhiVertexInputBinding::PerInstance),
+  });
+  cube_layout.setAttributes({
+      QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, offsetof(CubeVertex, px)),
+      QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float3, offsetof(CubeVertex, nx)),
+      QRhiVertexInputAttribute(1, 2, QRhiVertexInputAttribute::Float3, offsetof(WasmPointVertex, x)),
+      QRhiVertexInputAttribute(1, 3, QRhiVertexInputAttribute::Float, offsetof(WasmPointVertex, scalar)),
+      QRhiVertexInputAttribute(1, 4, QRhiVertexInputAttribute::UNormByte4, offsetof(WasmPointVertex, rgba)),
+  });
+  cube_pipeline_ = current_rhi->newGraphicsPipeline();
+  cube_pipeline_->setTopology(QRhiGraphicsPipeline::Triangles);
+  cube_pipeline_->setShaderStages({
+      {QRhiShaderStage::Vertex, cube_vertex_shader},
+      {QRhiShaderStage::Fragment, cube_fragment_shader},
+  });
+  cube_pipeline_->setVertexInputLayout(cube_layout);
+  cube_pipeline_->setShaderResourceBindings(point_layout_shader_resources_);
+  cube_pipeline_->setTargetBlends({blend});
+  cube_pipeline_->setCullMode(QRhiGraphicsPipeline::Back);
+  cube_pipeline_->setDepthTest(true);
+  cube_pipeline_->setDepthWrite(true);
+  cube_pipeline_->setDepthOp(QRhiGraphicsPipeline::LessOrEqual);
+  cube_pipeline_->setSampleCount(sampleCount());
+  cube_pipeline_->setRenderPassDescriptor(renderTarget()->renderPassDescriptor());
+  if (!cube_pipeline_->create()) {
+    delete cube_pipeline_;
+    cube_pipeline_ = nullptr;
+  }
+  const ArrowMeshData& pose_mesh = unitPoseArrowMesh();
+  pose_vertex_buffer_ = current_rhi->newBuffer(
+      QRhiBuffer::Immutable, QRhiBuffer::VertexBuffer, static_cast<quint32>(pose_mesh.vertices.size() * sizeof(float)));
+  pose_index_buffer_ = current_rhi->newBuffer(
+      QRhiBuffer::Immutable, QRhiBuffer::IndexBuffer,
+      static_cast<quint32>(pose_mesh.indices.size() * sizeof(std::uint32_t)));
+  if (!pose_vertex_buffer_->create() || !pose_index_buffer_->create()) {
+    releaseResources();
+    return;
+  }
+  pose_index_count_ = static_cast<quint32>(pose_mesh.indices.size());
+  pose_mesh_upload_pending_ = true;
+
+  pose_layout_uniform_buffer_ =
+      current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kPoseUniformBytes);
+  if (!pose_layout_uniform_buffer_->create()) {
+    releaseResources();
+    return;
+  }
+  pose_layout_shader_resources_ = current_rhi->newShaderResourceBindings();
+  pose_layout_shader_resources_->setBindings({
+      QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage, pose_layout_uniform_buffer_),
+  });
+  if (!pose_layout_shader_resources_->create()) {
+    releaseResources();
+    return;
+  }
+
+  static_assert(sizeof(PoseTriadInstance) == 80U);
+  static_assert(offsetof(PoseTriadInstance, color) == 64U);
+  QRhiVertexInputLayout pose_layout;
+  pose_layout.setBindings({
+      QRhiVertexInputBinding(6U * sizeof(float)),
+      QRhiVertexInputBinding(sizeof(PoseTriadInstance), QRhiVertexInputBinding::PerInstance),
+  });
+  pose_layout.setAttributes({
+      QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, 0),
+      QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float3, 3U * sizeof(float)),
+      QRhiVertexInputAttribute(1, 2, QRhiVertexInputAttribute::Float4, 0U),
+      QRhiVertexInputAttribute(1, 3, QRhiVertexInputAttribute::Float4, 16U),
+      QRhiVertexInputAttribute(1, 4, QRhiVertexInputAttribute::Float4, 32U),
+      QRhiVertexInputAttribute(1, 5, QRhiVertexInputAttribute::Float4, 48U),
+      QRhiVertexInputAttribute(1, 6, QRhiVertexInputAttribute::Float4, 64U),
+  });
+  QRhiGraphicsPipeline::TargetBlend pose_blend = blend;
+  pose_blend.srcAlpha = QRhiGraphicsPipeline::Zero;
+  pose_blend.dstAlpha = QRhiGraphicsPipeline::OneMinusSrcAlpha;
+  pose_pipeline_ = current_rhi->newGraphicsPipeline();
+  pose_pipeline_->setTopology(QRhiGraphicsPipeline::Triangles);
+  pose_pipeline_->setShaderStages({
+      {QRhiShaderStage::Vertex, pose_vertex_shader},
+      {QRhiShaderStage::Fragment, pose_fragment_shader},
+  });
+  pose_pipeline_->setVertexInputLayout(pose_layout);
+  pose_pipeline_->setShaderResourceBindings(pose_layout_shader_resources_);
+  pose_pipeline_->setTargetBlends({pose_blend});
+  pose_pipeline_->setCullMode(QRhiGraphicsPipeline::Back);
+  pose_pipeline_->setDepthTest(true);
+  pose_pipeline_->setDepthWrite(true);
+  pose_pipeline_->setDepthOp(QRhiGraphicsPipeline::LessOrEqual);
+  pose_pipeline_->setSampleCount(sampleCount());
+  pose_pipeline_->setRenderPassDescriptor(renderTarget()->renderPassDescriptor());
+  if (!pose_pipeline_->create()) {
+    delete pose_pipeline_;
+    pose_pipeline_ = nullptr;
+  }
+
+  occupancy_layout_uniform_buffer_ =
+      current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kOccupancyUniformBytes);
+  occupancy_layout_texture_ = current_rhi->newTexture(QRhiTexture::R8, QSize(1, 1));
+  occupancy_sampler_ = current_rhi->newSampler(
+      QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None, QRhiSampler::ClampToEdge,
+      QRhiSampler::ClampToEdge);
+  occupancy_quad_buffer_ = current_rhi->newBuffer(
+      QRhiBuffer::Immutable, QRhiBuffer::VertexBuffer, static_cast<quint32>(kOccupancyQuad.size() * sizeof(float)));
+  if (!occupancy_layout_uniform_buffer_->create() || !occupancy_layout_texture_->create() ||
+      !occupancy_sampler_->create() || !occupancy_quad_buffer_->create()) {
+    releaseResources();
+    return;
+  }
+  occupancy_quad_upload_pending_ = true;
+  occupancy_layout_shader_resources_ = current_rhi->newShaderResourceBindings();
+  occupancy_layout_shader_resources_->setBindings({
+      QRhiShaderResourceBinding::uniformBuffer(
+          0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage,
+          occupancy_layout_uniform_buffer_),
+      QRhiShaderResourceBinding::sampledTexture(
+          1, QRhiShaderResourceBinding::FragmentStage, occupancy_layout_texture_, occupancy_sampler_),
+  });
+  if (!occupancy_layout_shader_resources_->create()) {
+    releaseResources();
+    return;
+  }
+  QRhiVertexInputLayout occupancy_layout;
+  occupancy_layout.setBindings({QRhiVertexInputBinding(2U * sizeof(float))});
+  occupancy_layout.setAttributes({
+      QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float2, 0U),
+  });
+  occupancy_pipeline_ = current_rhi->newGraphicsPipeline();
+  occupancy_pipeline_->setTopology(QRhiGraphicsPipeline::Triangles);
+  occupancy_pipeline_->setShaderStages({
+      {QRhiShaderStage::Vertex, occupancy_vertex_shader},
+      {QRhiShaderStage::Fragment, occupancy_fragment_shader},
+  });
+  occupancy_pipeline_->setVertexInputLayout(occupancy_layout);
+  occupancy_pipeline_->setShaderResourceBindings(occupancy_layout_shader_resources_);
+  occupancy_pipeline_->setTargetBlends({blend});
+  occupancy_pipeline_->setCullMode(QRhiGraphicsPipeline::None);
+  occupancy_pipeline_->setDepthTest(true);
+  occupancy_pipeline_->setDepthWrite(false);
+  occupancy_pipeline_->setDepthOp(QRhiGraphicsPipeline::LessOrEqual);
+  occupancy_pipeline_->setDepthBias(-1);
+  occupancy_pipeline_->setSampleCount(sampleCount());
+  occupancy_pipeline_->setRenderPassDescriptor(renderTarget()->renderPassDescriptor());
+  if (!occupancy_pipeline_->create()) {
+    delete occupancy_pipeline_;
+    occupancy_pipeline_ = nullptr;
+  }
+
+  if (current_rhi->isFeatureSupported(QRhi::ThreeDimensionalTextures)) {
+    voxel_layout_uniform_buffer_ =
+        current_rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kVoxelUniformBytes);
+    voxel_layout_texture_ = current_rhi->newTexture(QRhiTexture::R32F, 1, 1, 1, 1, QRhiTexture::ThreeDimensional);
+    voxel_sampler_ = current_rhi->newSampler(
+        QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None, QRhiSampler::ClampToEdge,
+        QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge);
+    if (!voxel_layout_uniform_buffer_->create() || !voxel_layout_texture_->create() || !voxel_sampler_->create()) {
+      releaseResources();
+      return;
+    }
+    voxel_layout_shader_resources_ = current_rhi->newShaderResourceBindings();
+    voxel_layout_shader_resources_->setBindings({
+        QRhiShaderResourceBinding::uniformBuffer(
+            0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage,
+            voxel_layout_uniform_buffer_),
+        QRhiShaderResourceBinding::sampledTexture(
+            1, QRhiShaderResourceBinding::VertexStage, voxel_layout_texture_, voxel_sampler_),
+        QRhiShaderResourceBinding::sampledTexture(
+            2, QRhiShaderResourceBinding::FragmentStage, colormap_texture_, colormap_sampler_),
+    });
+    if (!voxel_layout_shader_resources_->create()) {
+      releaseResources();
+      return;
+    }
+    QRhiVertexInputLayout voxel_layout;
+    voxel_layout.setBindings({QRhiVertexInputBinding(sizeof(CubeVertex))});
+    voxel_layout.setAttributes({
+        QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, offsetof(CubeVertex, px)),
+        QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float3, offsetof(CubeVertex, nx)),
+    });
+    voxel_pipeline_ = current_rhi->newGraphicsPipeline();
+    voxel_pipeline_->setTopology(QRhiGraphicsPipeline::Triangles);
+    voxel_pipeline_->setShaderStages({
+        {QRhiShaderStage::Vertex, voxel_vertex_shader},
+        {QRhiShaderStage::Fragment, voxel_fragment_shader},
+    });
+    voxel_pipeline_->setVertexInputLayout(voxel_layout);
+    voxel_pipeline_->setShaderResourceBindings(voxel_layout_shader_resources_);
+    voxel_pipeline_->setTargetBlends({blend});
+    voxel_pipeline_->setCullMode(QRhiGraphicsPipeline::Back);
+    voxel_pipeline_->setDepthTest(true);
+    voxel_pipeline_->setDepthWrite(true);
+    voxel_pipeline_->setDepthOp(QRhiGraphicsPipeline::LessOrEqual);
+    voxel_pipeline_->setSampleCount(sampleCount());
+    voxel_pipeline_->setRenderPassDescriptor(renderTarget()->renderPassDescriptor());
+    if (!voxel_pipeline_->create()) {
+      delete voxel_pipeline_;
+      voxel_pipeline_ = nullptr;
+    }
+  }
+  if (line_pipeline_ == nullptr || triangle_pipeline_ == nullptr || point_pipeline_ == nullptr ||
+      cube_pipeline_ == nullptr || pose_pipeline_ == nullptr || occupancy_pipeline_ == nullptr ||
+      (current_rhi->isFeatureSupported(QRhi::ThreeDimensionalTextures) && voxel_pipeline_ == nullptr)) {
     releaseResources();
   }
 }
@@ -567,13 +1294,262 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     return;
   }
 
+  const QSize output_size = target->pixelSize();
+  const float aspect = output_size.height() > 0
+                           ? static_cast<float>(output_size.width()) / static_cast<float>(output_size.height())
+                           : 1.0F;
+
+  struct PreparedPointLayer {
+    WasmPointRenderable* layer = nullptr;
+    Transform fixed_from_source;
+  };
+  std::vector<PreparedPointLayer> prepared_points;
+  prepared_points.reserve(point_layers_.size());
+  std::vector<WasmPointRenderable*> fitted_point_layers;
+  AABB fixed_point_bounds;
+  AABB fixed_depth_bounds;
+  const std::string fixed_frame = effectiveFixedFrame();
+  std::uint64_t remaining_point_vertices = kMaxPointVerticesPerView;
+  for (WasmPointRenderable* layer : point_layers_) {
+    if (layer == nullptr || !layer->visible()) {
+      continue;
+    }
+    layer->prepareForRender(remaining_point_vertices);
+    if (layer->vertices().empty()) {
+      if (auto gpu = point_layer_gpu_.find(layer); gpu != point_layer_gpu_.end()) {
+        releasePointLayerGpu(gpu->second);
+        point_layer_gpu_.erase(gpu);
+      }
+      continue;
+    }
+    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+      continue;
+    }
+    Transform fixed_from_source;
+    if (layer->sourceFrame() != fixed_frame) {
+      if (tf_ == nullptr) {
+        continue;
+      }
+      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
+      if (!transform.has_value()) {
+        continue;
+      }
+      fixed_from_source = *transform;
+    }
+    // The aggregate applies to actual drawable point-like layers. A temporarily
+    // unplaceable point/depth layer must not reserve capacity ahead of a later
+    // layer whose source frame resolves in this frame.
+    if (!tryConsumeBrowserPointVertices(
+            static_cast<std::uint64_t>(layer->vertices().size()), remaining_point_vertices)) {
+      continue;  // prepareForRender() normally clears this; keep subtraction fail-closed.
+    }
+    if (const auto bounds = layer->sourceBounds(); bounds.has_value()) {
+      AABB& family_bounds = layer->isDepthCloud() ? fixed_depth_bounds : fixed_point_bounds;
+      family_bounds = unionAABB(family_bounds, transformedBounds(*bounds, fixed_from_source));
+      if (point_layers_pending_fit_.contains(layer)) {
+        fitted_point_layers.push_back(layer);
+      }
+    }
+    prepared_points.push_back(PreparedPointLayer{layer, fixed_from_source});
+  }
+  last_point_bounds_ = fixed_point_bounds;
+  last_depth_bounds_ = fixed_depth_bounds;
+
+  struct PreparedPoseLayer {
+    WasmPosesInFrameLayer* layer = nullptr;
+    Transform fixed_from_source;
+  };
+  std::vector<PreparedPoseLayer> prepared_poses;
+  prepared_poses.reserve(pose_layers_.size());
+  std::vector<WasmPosesInFrameLayer*> fitted_pose_layers;
+  AABB fixed_pose_bounds;
+  std::uint64_t remaining_pose_arms = kMaxPoseArmsPerView;
+  for (WasmPosesInFrameLayer* layer : pose_layers_) {
+    if (layer == nullptr || !layer->visible()) {
+      continue;
+    }
+    layer->prepareForRender(remaining_pose_arms);
+    if (layer->instances().empty()) {
+      if (auto gpu = pose_layer_gpu_.find(layer); gpu != pose_layer_gpu_.end()) {
+        releasePoseLayerGpu(gpu->second);
+        pose_layer_gpu_.erase(gpu);
+      }
+      continue;
+    }
+    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+      continue;
+    }
+    Transform fixed_from_source;
+    if (layer->sourceFrame() != fixed_frame) {
+      if (tf_ == nullptr) {
+        continue;
+      }
+      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
+      if (!transform.has_value()) {
+        continue;
+      }
+      fixed_from_source = *transform;
+    }
+    // Placement first, budget second: a temporarily unplaceable layer must not
+    // reserve capacity and starve a later drawable layer of the same family.
+    if (!tryConsumeBrowserPoseArms(static_cast<std::uint64_t>(layer->instances().size()), remaining_pose_arms)) {
+      continue;
+    }
+    if (const auto bounds = layer->sourceBounds(); bounds.has_value()) {
+      fixed_pose_bounds = unionAABB(fixed_pose_bounds, transformedBounds(*bounds, fixed_from_source));
+      if (pose_layers_pending_fit_.contains(layer)) {
+        fitted_pose_layers.push_back(layer);
+      }
+    }
+    prepared_poses.push_back(PreparedPoseLayer{layer, fixed_from_source});
+  }
+  last_pose_bounds_ = fixed_pose_bounds;
+
+  struct PreparedOccupancyLayer {
+    WasmOccupancyGridLayer* layer = nullptr;
+    Transform fixed_from_source;
+  };
+  std::vector<PreparedOccupancyLayer> prepared_occupancy;
+  prepared_occupancy.reserve(occupancy_layers_.size());
+  std::vector<WasmOccupancyGridLayer*> fitted_occupancy_layers;
+  AABB fixed_occupancy_bounds;
+  std::uint64_t remaining_occupancy_cells = kMaxOccupancyCellsPerView;
+  for (WasmOccupancyGridLayer* layer : occupancy_layers_) {
+    if (layer == nullptr || !layer->visible()) {
+      continue;
+    }
+    layer->prepareForRender(remaining_occupancy_cells);
+    const ReconstructedGrid& grid = layer->grid();
+    if (grid.empty()) {
+      if (auto gpu = occupancy_layer_gpu_.find(layer); gpu != occupancy_layer_gpu_.end()) {
+        releaseOccupancyLayerGpu(gpu->second);
+        occupancy_layer_gpu_.erase(gpu);
+      }
+      continue;
+    }
+    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+      continue;
+    }
+    Transform fixed_from_source;
+    if (layer->sourceFrame() != fixed_frame) {
+      if (tf_ == nullptr) {
+        continue;
+      }
+      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
+      if (!transform.has_value()) {
+        continue;
+      }
+      fixed_from_source = *transform;
+    }
+    // Placement first, budget second: a temporarily unplaceable layer must not
+    // reserve capacity and starve a later drawable layer of the same family.
+    const std::uint64_t cells = static_cast<std::uint64_t>(grid.width) * grid.height;
+    if (!tryConsumeBrowserOccupancyCells(cells, remaining_occupancy_cells)) {
+      continue;
+    }
+    const AABB bounds = occupancyBoundsInFixed(grid, fixed_from_source);
+    if (bounds.valid) {
+      fixed_occupancy_bounds = unionAABB(fixed_occupancy_bounds, bounds);
+      if (occupancy_layers_pending_fit_.contains(layer)) {
+        fitted_occupancy_layers.push_back(layer);
+      }
+    }
+    prepared_occupancy.push_back(PreparedOccupancyLayer{layer, fixed_from_source});
+  }
+  last_occupancy_bounds_ = fixed_occupancy_bounds;
+
+  struct PreparedVoxelLayer {
+    WasmVoxelGridLayer* layer = nullptr;
+    Transform fixed_from_source;
+  };
+  std::vector<PreparedVoxelLayer> prepared_voxels;
+  prepared_voxels.reserve(voxel_layers_.size());
+  std::vector<WasmVoxelGridLayer*> fitted_voxel_layers;
+  AABB fixed_voxel_bounds;
+  std::uint64_t remaining_voxels = kMaxVoxelsPerView;
+  for (WasmVoxelGridLayer* layer : voxel_layers_) {
+    if (layer == nullptr || !layer->visible()) {
+      continue;
+    }
+    layer->prepareForRender(remaining_voxels);
+    if (!layer->hasVolume()) {
+      if (auto gpu = voxel_layer_gpu_.find(layer); gpu != voxel_layer_gpu_.end()) {
+        releaseVoxelLayerGpu(gpu->second);
+        voxel_layer_gpu_.erase(gpu);
+      }
+      continue;
+    }
+    const QString gpu_rejection = voxelGpuRejection(current_rhi, layer);
+    if (!gpu_rejection.isEmpty()) {
+      layer->rejectVolumeForRender(gpu_rejection);
+      if (auto gpu = voxel_layer_gpu_.find(layer); gpu != voxel_layer_gpu_.end()) {
+        releaseVoxelLayerGpu(gpu->second);
+        voxel_layer_gpu_.erase(gpu);
+      }
+      continue;
+    }
+    if (layer->sourceFrame().empty() || fixed_frame.empty()) {
+      continue;
+    }
+    Transform fixed_from_source;
+    if (layer->sourceFrame() != fixed_frame) {
+      if (tf_ == nullptr) {
+        continue;
+      }
+      const auto transform = tf_->tryLookupTransform(fixed_frame, layer->sourceFrame(), render_time_);
+      if (!transform.has_value()) {
+        continue;
+      }
+      fixed_from_source = *transform;
+    }
+    // The view budget describes submitted/drawable voxels. An otherwise valid
+    // layer whose frame cannot currently be placed must not reserve capacity
+    // and starve a later layer that can be rendered in this frame.
+    if (!tryConsumeBrowserVoxels(layer->voxelCount(), remaining_voxels)) {
+      continue;
+    }
+    if (const auto bounds = layer->sourceBounds(); bounds.has_value()) {
+      fixed_voxel_bounds = unionAABB(fixed_voxel_bounds, transformedBounds(*bounds, fixed_from_source));
+      if (voxel_layers_pending_fit_.contains(layer)) {
+        fitted_voxel_layers.push_back(layer);
+      }
+    }
+    prepared_voxels.push_back(PreparedVoxelLayer{layer, fixed_from_source});
+  }
+  last_voxel_bounds_ = fixed_voxel_bounds;
+
+  const AABB fixed_scene_bounds = unionAABB(
+      unionAABB(
+          unionAABB(unionAABB(fixed_point_bounds, fixed_depth_bounds), fixed_pose_bounds), fixed_occupancy_bounds),
+      fixed_voxel_bounds);
+  setSceneBounds(fixed_scene_bounds);
+  if ((!fitted_point_layers.empty() || !fitted_pose_layers.empty() || !fitted_occupancy_layers.empty() ||
+       !fitted_voxel_layers.empty()) &&
+      fixed_scene_bounds.valid) {
+    camera_->fitToBoundingBox(fixed_scene_bounds);
+    for (WasmPointRenderable* layer : fitted_point_layers) {
+      point_layers_pending_fit_.erase(layer);
+    }
+    for (WasmPosesInFrameLayer* layer : fitted_pose_layers) {
+      pose_layers_pending_fit_.erase(layer);
+    }
+    for (WasmOccupancyGridLayer* layer : fitted_occupancy_layers) {
+      occupancy_layers_pending_fit_.erase(layer);
+    }
+    for (WasmVoxelGridLayer* layer : fitted_voxel_layers) {
+      voxel_layers_pending_fit_.erase(layer);
+    }
+    ++camera_fit_count_;
+  }
+
   const glm::dvec3 render_origin(camera_->state().focal);
   buildGeometry(render_origin);
   const quint32 line_bytes = static_cast<quint32>(line_vertices_.size() * sizeof(Vertex));
   const quint32 triangle_bytes = static_cast<quint32>(triangle_vertices_.size() * sizeof(Vertex));
   const bool buffers_ready =
-      ensureVertexBuffer(current_rhi, line_buffer_, line_buffer_capacity_, line_bytes) &&
-      ensureVertexBuffer(current_rhi, triangle_buffer_, triangle_buffer_capacity_, triangle_bytes);
+      ensureVertexBuffer(current_rhi, line_buffer_, line_buffer_capacity_, line_bytes, kInitialVertexBufferBytes) &&
+      ensureVertexBuffer(
+          current_rhi, triangle_buffer_, triangle_buffer_capacity_, triangle_bytes, kInitialVertexBufferBytes);
 
   QRhiResourceUpdateBatch* updates = current_rhi->nextResourceUpdateBatch();
   if (buffers_ready && line_bytes != 0) {
@@ -582,21 +1558,336 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
   if (buffers_ready && triangle_bytes != 0) {
     updates->updateDynamicBuffer(triangle_buffer_, 0, triangle_bytes, triangle_vertices_.data());
   }
+  if (colormap_upload_pending_ && colormap_texture_ != nullptr) {
+    static const std::vector<std::uint8_t> colormap_lut = PJ::buildColormapLut();
+    QRhiTextureSubresourceUploadDescription description(colormap_lut.data(), static_cast<quint32>(colormap_lut.size()));
+    description.setSourceSize(QSize(PJ::kColormapLutWidth, PJ::kColormapCount));
+    updates->uploadTexture(colormap_texture_, QRhiTextureUploadDescription({0, 0, description}));
+    colormap_upload_pending_ = false;
+  }
+  if (cube_upload_pending_ && cube_vertex_buffer_ != nullptr && cube_index_buffer_ != nullptr) {
+    static const std::array<std::uint16_t, kCubeIndices.size()> cube_indices = [] {
+      std::array<std::uint16_t, kCubeIndices.size()> indices{};
+      std::copy(kCubeIndices.cbegin(), kCubeIndices.cend(), indices.begin());
+      return indices;
+    }();
+    updates->uploadStaticBuffer(cube_vertex_buffer_, kCubeVertices.data());
+    updates->uploadStaticBuffer(cube_index_buffer_, cube_indices.data());
+    cube_upload_pending_ = false;
+  }
+  if (pose_mesh_upload_pending_ && pose_vertex_buffer_ != nullptr && pose_index_buffer_ != nullptr) {
+    const ArrowMeshData& pose_mesh = unitPoseArrowMesh();
+    updates->uploadStaticBuffer(pose_vertex_buffer_, pose_mesh.vertices.data());
+    updates->uploadStaticBuffer(pose_index_buffer_, pose_mesh.indices.data());
+    pose_mesh_upload_pending_ = false;
+  }
+  if (occupancy_quad_upload_pending_ && occupancy_quad_buffer_ != nullptr) {
+    updates->uploadStaticBuffer(occupancy_quad_buffer_, kOccupancyQuad.data());
+    occupancy_quad_upload_pending_ = false;
+  }
 
-  const QSize output_size = target->pixelSize();
-  const float aspect = output_size.height() > 0
-                           ? static_cast<float>(output_size.width()) / static_cast<float>(output_size.height())
-                           : 1.0F;
-  const glm::mat4 view_projection = camera_->projMatrix(aspect) * camera_->viewMatrixRelativeTo(render_origin);
-  const QMatrix4x4 matrix = current_rhi->clipSpaceCorrMatrix() * toQMatrix(view_projection);
+  const glm::mat4 projection = camera_->projMatrix(aspect);
+  const glm::mat4 view = camera_->viewMatrixRelativeTo(render_origin);
+  const glm::mat4 view_projection = projection * view;
+  const QMatrix4x4 clip_correction = current_rhi->clipSpaceCorrMatrix();
+  const QMatrix4x4 matrix = clip_correction * toQMatrix(view_projection);
   if (uniform_buffer_ != nullptr) {
     updates->updateDynamicBuffer(uniform_buffer_, 0, 64, matrix.constData());
   }
 
+  struct PointDraw {
+    WasmPointRenderable* layer = nullptr;
+    QRhiBuffer* vertex_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 vertex_count = 0;
+    bool cubes = false;
+  };
+  std::vector<PointDraw> point_draws;
+  point_draws.reserve(prepared_points.size());
+  last_point_vertex_count_ = 0;
+  last_point_layer_count_ = 0;
+  last_depth_vertex_count_ = 0;
+  last_depth_layer_count_ = 0;
+  last_cube_layer_count_ = 0;
+  last_cube_instance_count_ = 0;
+  for (const PreparedPointLayer& prepared : prepared_points) {
+    WasmPointRenderable* layer = prepared.layer;
+    PointLayerGpu& gpu = point_layer_gpu_[layer];
+    if (!ensurePointLayerGpu(current_rhi, layer, gpu)) {
+      continue;
+    }
+    if (gpu.uploaded_revision != layer->geometryRevision()) {
+      const auto& vertices = layer->vertices();
+      const quint32 bytes = static_cast<quint32>(vertices.size() * sizeof(WasmPointVertex));
+      const std::uint64_t shrink_threshold =
+          std::max<std::uint64_t>(static_cast<std::uint64_t>(bytes) * 2U, kPointInitialVertexBufferBytes);
+      if (gpu.vertex_buffer != nullptr && gpu.vertex_capacity > shrink_threshold) {
+        delete gpu.vertex_buffer;
+        gpu.vertex_buffer = nullptr;
+        gpu.vertex_capacity = 0;
+      }
+      if (bytes != 0 &&
+          !ensureVertexBuffer(
+              current_rhi, gpu.vertex_buffer, gpu.vertex_capacity, bytes, kPointInitialVertexBufferBytes)) {
+        gpu.vertex_count = 0;
+        continue;
+      }
+      if (bytes != 0) {
+        updates->updateDynamicBuffer(gpu.vertex_buffer, 0, bytes, vertices.data());
+      }
+      gpu.vertex_count = static_cast<quint32>(vertices.size());
+      gpu.uploaded_revision = layer->geometryRevision();
+    }
+    if (gpu.vertex_buffer == nullptr || gpu.vertex_count == 0) {
+      continue;
+    }
+
+    glm::dmat4 relative_model = prepared.fixed_from_source.matrix();
+    relative_model[3].x -= render_origin.x;
+    relative_model[3].y -= render_origin.y;
+    relative_model[3].z -= render_origin.z;
+    const glm::mat4 relative_model_float(relative_model);
+    const glm::mat4 absolute_model(prepared.fixed_from_source.matrix());
+    const auto [range_minimum, range_maximum] = layer->scalarRange(absolute_model);
+    layer->noteRenderedScalarRange(range_minimum, range_maximum);
+
+    PointUniforms point_uniforms;
+    copyMatrix(clip_correction * toQMatrix(view_projection), point_uniforms.view_projection);
+    copyMatrix(toQMatrix(relative_model_float), point_uniforms.fixed_from_source);
+    copyMatrix(toQMatrix(view), point_uniforms.view);
+    point_uniforms.render_origin = {
+        static_cast<float>(render_origin.x), static_cast<float>(render_origin.y), static_cast<float>(render_origin.z),
+        camera_->state().perspective ? 1.0F : 0.0F};
+    point_uniforms.point_params = {
+        layer->sizeMeters() * 0.5F, layer->sizePixels(), static_cast<float>(std::max(output_size.height(), 1)),
+        projection[1][1]};
+    point_uniforms.range_params = {
+        range_minimum, range_maximum, layer->outsideRangeAlpha(),
+        layer->shape() == WasmPointShape::kPoint ? 0.0F : 1.0F};
+    const QColor solid = layer->solidColor();
+    point_uniforms.solid_params = {
+        static_cast<float>(solid.redF()), static_cast<float>(solid.greenF()), static_cast<float>(solid.blueF()),
+        layer->shape() == WasmPointShape::kSphere ? 1.0F : 0.0F};
+    point_uniforms.modes = {
+        static_cast<std::int32_t>(layer->colorType()), static_cast<std::int32_t>(layer->colormap()),
+        layer->invertLut() ? 1 : 0, layer->scalarAxis()};
+    updates->updateDynamicBuffer(gpu.uniform_buffer, 0, kPointUniformBytes, &point_uniforms);
+    point_draws.push_back(
+        PointDraw{
+            layer,
+            gpu.vertex_buffer,
+            gpu.shader_resources,
+            gpu.vertex_count,
+            layer->shape() == WasmPointShape::kCube,
+        });
+    if (layer->isDepthCloud()) {
+      last_depth_vertex_count_ += static_cast<int>(gpu.vertex_count);
+      ++last_depth_layer_count_;
+    } else {
+      last_point_vertex_count_ += static_cast<int>(gpu.vertex_count);
+      ++last_point_layer_count_;
+    }
+    if (!layer->isDepthCloud() && layer->shape() == WasmPointShape::kCube) {
+      last_cube_instance_count_ += static_cast<int>(gpu.vertex_count);
+      ++last_cube_layer_count_;
+    }
+  }
+
+  struct PoseDraw {
+    WasmPosesInFrameLayer* layer = nullptr;
+    QRhiBuffer* instance_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 instance_count = 0;
+  };
+  std::vector<PoseDraw> pose_draws;
+  pose_draws.reserve(prepared_poses.size());
+  last_pose_layer_count_ = 0;
+  last_pose_arm_count_ = 0;
+  for (const PreparedPoseLayer& prepared : prepared_poses) {
+    WasmPosesInFrameLayer* layer = prepared.layer;
+    PoseLayerGpu& gpu = pose_layer_gpu_[layer];
+    if (!ensurePoseLayerGpu(current_rhi, gpu)) {
+      continue;
+    }
+    if (gpu.uploaded_revision != layer->geometryRevision()) {
+      const auto& instances = layer->instances();
+      const quint32 bytes = static_cast<quint32>(instances.size() * sizeof(PoseTriadInstance));
+      const std::uint64_t shrink_threshold = std::max<std::uint64_t>(static_cast<std::uint64_t>(bytes) * 2U, 1024U);
+      if (gpu.instance_buffer != nullptr && gpu.instance_capacity > shrink_threshold) {
+        delete gpu.instance_buffer;
+        gpu.instance_buffer = nullptr;
+        gpu.instance_capacity = 0;
+      }
+      if (bytes != 0 && !ensureVertexBuffer(current_rhi, gpu.instance_buffer, gpu.instance_capacity, bytes, bytes)) {
+        gpu.instance_count = 0;
+        continue;
+      }
+      if (bytes != 0) {
+        updates->updateDynamicBuffer(gpu.instance_buffer, 0, bytes, instances.data());
+      }
+      gpu.instance_count = static_cast<quint32>(instances.size());
+      gpu.uploaded_revision = layer->geometryRevision();
+    }
+    if (gpu.instance_buffer == nullptr || gpu.instance_count == 0) {
+      continue;
+    }
+
+    glm::dmat4 relative_model = prepared.fixed_from_source.matrix();
+    relative_model[3].x -= render_origin.x;
+    relative_model[3].y -= render_origin.y;
+    relative_model[3].z -= render_origin.z;
+    PoseUniforms pose_uniforms;
+    copyMatrix(clip_correction * toQMatrix(view_projection), pose_uniforms.view_projection);
+    copyMatrix(toQMatrix(glm::mat4(relative_model)), pose_uniforms.fixed_from_source);
+    copyMatrix(toQMatrix(view), pose_uniforms.view);
+    updates->updateDynamicBuffer(gpu.uniform_buffer, 0, kPoseUniformBytes, &pose_uniforms);
+    pose_draws.push_back(PoseDraw{layer, gpu.instance_buffer, gpu.shader_resources, gpu.instance_count});
+    ++last_pose_layer_count_;
+    last_pose_arm_count_ += static_cast<int>(gpu.instance_count);
+  }
+
+  struct OccupancyDraw {
+    WasmOccupancyGridLayer* layer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+  };
+  std::vector<OccupancyDraw> occupancy_draws;
+  occupancy_draws.reserve(prepared_occupancy.size());
+  last_occupancy_layer_count_ = 0;
+  last_occupancy_cell_count_ = 0;
+  for (const PreparedOccupancyLayer& prepared : prepared_occupancy) {
+    WasmOccupancyGridLayer* layer = prepared.layer;
+    OccupancyLayerGpu& gpu = occupancy_layer_gpu_[layer];
+    bool texture_recreated = false;
+    if (!ensureOccupancyLayerGpu(current_rhi, layer, gpu, texture_recreated)) {
+      continue;
+    }
+    const ReconstructedGrid& grid = layer->grid();
+    if (gpu.uploaded_revision != layer->textureRevision()) {
+      const bool full_upload = texture_recreated || layer->fullUploadPending();
+      if (full_upload) {
+        QRhiTextureSubresourceUploadDescription description(grid.cells.data(), static_cast<quint32>(grid.cells.size()));
+        description.setSourceSize(QSize(static_cast<int>(grid.width), static_cast<int>(grid.height)));
+        updates->uploadTexture(gpu.texture, QRhiTextureUploadDescription({0, 0, description}));
+        ++occupancy_full_upload_count_;
+      } else {
+        for (const CellRect& rect : layer->dirtyRects()) {
+          const qsizetype rect_width = static_cast<qsizetype>(rect.width);
+          const qsizetype rect_height = static_cast<qsizetype>(rect.height);
+          const qsizetype packed_size = rect_width * rect_height;
+          QByteArray packed(packed_size, Qt::Uninitialized);
+          for (std::uint32_t row = 0; row < rect.height; ++row) {
+            std::memcpy(
+                packed.data() + static_cast<qsizetype>(row) * rect_width,
+                grid.cells.data() + static_cast<std::size_t>(rect.y + row) * grid.width + rect.x, rect.width);
+          }
+          QRhiTextureSubresourceUploadDescription description(packed);
+          description.setSourceSize(QSize(static_cast<int>(rect.width), static_cast<int>(rect.height)));
+          description.setDestinationTopLeft(QPoint(static_cast<int>(rect.x), static_cast<int>(rect.y)));
+          updates->uploadTexture(gpu.texture, QRhiTextureUploadDescription({0, 0, description}));
+        }
+        if (!layer->dirtyRects().empty()) {
+          ++occupancy_partial_upload_count_;
+        }
+      }
+      gpu.uploaded_revision = layer->textureRevision();
+    }
+
+    const auto& p = grid.origin.position;
+    const auto& q = grid.origin.orientation;
+    const Transform source_from_grid(glm::dvec3(p.x, p.y, p.z), glm::normalize(glm::dquat(q.w, q.x, q.y, q.z)));
+    glm::dmat4 fixed_from_grid = prepared.fixed_from_source.matrix() * source_from_grid.matrix();
+    fixed_from_grid = glm::scale(
+        fixed_from_grid, glm::dvec3(
+                             grid.resolution * static_cast<double>(grid.width),
+                             grid.resolution * static_cast<double>(grid.height), 1.0));
+    fixed_from_grid[3].x -= render_origin.x;
+    fixed_from_grid[3].y -= render_origin.y;
+    fixed_from_grid[3].z -= render_origin.z;
+
+    OccupancyUniforms occupancy_uniforms;
+    copyMatrix(clip_correction * toQMatrix(view_projection), occupancy_uniforms.view_projection);
+    copyMatrix(toQMatrix(glm::mat4(fixed_from_grid)), occupancy_uniforms.fixed_from_grid);
+    occupancy_uniforms.display_params = {
+        layer->opacity(), layer->colorScheme() == WasmOccupancyGridLayer::ColorScheme::kCostmap ? 1.0F : 0.0F, 0.0F,
+        0.0F};
+    updates->updateDynamicBuffer(gpu.uniform_buffer, 0, kOccupancyUniformBytes, &occupancy_uniforms);
+    occupancy_draws.push_back(OccupancyDraw{layer, gpu.shader_resources});
+    ++last_occupancy_layer_count_;
+    last_occupancy_cell_count_ += static_cast<int>(grid.cells.size());
+  }
+
+  struct VoxelDraw {
+    WasmVoxelGridLayer* layer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 instance_count = 0;
+  };
+  std::vector<VoxelDraw> voxel_draws;
+  voxel_draws.reserve(prepared_voxels.size());
+  last_voxel_layer_count_ = 0;
+  last_voxel_count_ = 0;
+  for (const PreparedVoxelLayer& prepared : prepared_voxels) {
+    WasmVoxelGridLayer* layer = prepared.layer;
+    VoxelLayerGpu& gpu = voxel_layer_gpu_[layer];
+    bool texture_recreated = false;
+    if (!ensureVoxelLayerGpu(current_rhi, layer, gpu, texture_recreated)) {
+      continue;
+    }
+    if (texture_recreated || gpu.uploaded_revision != layer->textureRevision()) {
+      const std::uint64_t slice_voxels = static_cast<std::uint64_t>(layer->columnCount()) * layer->rowCount();
+      const std::uint64_t slice_bytes = slice_voxels * 4U;
+      QVarLengthArray<QRhiTextureUploadEntry, 32> entries;
+      entries.reserve(static_cast<qsizetype>(layer->sliceCount()));
+      for (std::uint32_t slice = 0; slice < layer->sliceCount(); ++slice) {
+        const std::uint64_t offset = static_cast<std::uint64_t>(slice) * slice_bytes;
+        const void* data =
+            layer->valueKind() == VoxelValueKind::kScalar
+                ? static_cast<const void*>(reinterpret_cast<const std::uint8_t*>(layer->scalarVolume().data()) + offset)
+                : static_cast<const void*>(layer->rgbaVolume().data() + offset);
+        QRhiTextureSubresourceUploadDescription description(data, static_cast<quint32>(slice_bytes));
+        description.setSourceSize(QSize(static_cast<int>(layer->columnCount()), static_cast<int>(layer->rowCount())));
+        entries.append(QRhiTextureUploadEntry(static_cast<int>(slice), 0, description));
+      }
+      QRhiTextureUploadDescription upload;
+      upload.setEntries(entries.cbegin(), entries.cend());
+      updates->uploadTexture(gpu.texture, upload);
+      gpu.uploaded_revision = layer->textureRevision();
+      ++voxel_full_upload_count_;
+    }
+
+    const auto& p = layer->origin().position;
+    const auto& q = layer->origin().orientation;
+    const Transform source_from_grid(glm::dvec3(p.x, p.y, p.z), glm::normalize(glm::dquat(q.w, q.x, q.y, q.z)));
+    glm::dmat4 fixed_from_grid = prepared.fixed_from_source.matrix() * source_from_grid.matrix();
+    fixed_from_grid[3].x -= render_origin.x;
+    fixed_from_grid[3].y -= render_origin.y;
+    fixed_from_grid[3].z -= render_origin.z;
+
+    const glm::vec3 cell_size = layer->cellSize();
+    const auto [color_minimum, color_maximum] = layer->colorRange();
+    VoxelUniforms voxel_uniforms;
+    copyMatrix(clip_correction * toQMatrix(view_projection), voxel_uniforms.view_projection);
+    copyMatrix(toQMatrix(glm::mat4(fixed_from_grid)), voxel_uniforms.fixed_from_grid);
+    copyMatrix(toQMatrix(view), voxel_uniforms.view);
+    voxel_uniforms.cell_size_opacity = {cell_size.x, cell_size.y, cell_size.z, layer->opacity()};
+    voxel_uniforms.dims_kind = {
+        static_cast<float>(layer->columnCount()), static_cast<float>(layer->rowCount()),
+        static_cast<float>(layer->sliceCount()), layer->valueKind() == VoxelValueKind::kRgba ? 1.0F : 0.0F};
+    voxel_uniforms.range_params = {layer->threshold(), layer->rangeMinimum(), layer->rangeMaximum(), color_minimum};
+    voxel_uniforms.mode_params = {
+        color_maximum, static_cast<float>(layer->drawMode()), static_cast<float>(layer->colormap()), 0.0F};
+    updates->updateDynamicBuffer(gpu.uniform_buffer, 0, kVoxelUniformBytes, &voxel_uniforms);
+    voxel_draws.push_back(VoxelDraw{layer, gpu.shader_resources, static_cast<quint32>(layer->voxelCount())});
+    ++last_voxel_layer_count_;
+    last_voxel_count_ += static_cast<int>(layer->voxelCount());
+  }
+
   command_buffer->beginPass(target, sceneBackdropColor(), {1.0F, 0}, updates);
+  const QRhiViewport viewport(
+      0.0F, 0.0F, static_cast<float>(output_size.width()), static_cast<float>(output_size.height()));
+  last_submitted_layer_ids_.clear();
   if (buffers_ready && shader_resources_ != nullptr) {
-    const QRhiViewport viewport(
-        0.0F, 0.0F, static_cast<float>(output_size.width()), static_cast<float>(output_size.height()));
+    // Match native Scene3D's scene-wide prelude: grid cells/axes and TF lines
+    // are annotations beneath the user-ordered object stack.
     if (triangle_bytes != 0 && triangle_pipeline_ != nullptr) {
       command_buffer->setGraphicsPipeline(triangle_pipeline_);
       command_buffer->setViewport(viewport);
@@ -613,23 +1904,191 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
       command_buffer->setVertexInput(0, 1, &input);
       command_buffer->draw(static_cast<quint32>(line_vertices_.size()));
     }
+
+    // Preparation and GPU ownership remain family-specific, but command
+    // submission follows the dock's one heterogeneous order exactly. Each
+    // prepared family vector retains that order, so monotonic cursors keep the
+    // submission pass linear while naturally skipping non-drawable layers.
+    std::size_t point_draw_index = 0;
+    std::size_t pose_draw_index = 0;
+    std::size_t occupancy_draw_index = 0;
+    std::size_t voxel_draw_index = 0;
+    for (const OrderedLayerEntry& ordered : ordered_layers_) {
+      std::visit(
+          [&](auto* layer) {
+            using Layer = std::remove_pointer_t<decltype(layer)>;
+            if constexpr (std::is_same_v<Layer, WasmPointRenderable>) {
+              if (point_pipeline_ == nullptr || cube_pipeline_ == nullptr) {
+                return;
+              }
+              if (point_draw_index == point_draws.size() || point_draws[point_draw_index].layer != layer) {
+                return;
+              }
+              const PointDraw& draw = point_draws[point_draw_index++];
+              command_buffer->setGraphicsPipeline(draw.cubes ? cube_pipeline_ : point_pipeline_);
+              command_buffer->setViewport(viewport);
+              command_buffer->setShaderResources(draw.shader_resources);
+              if (draw.cubes) {
+                const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+                    QRhiCommandBuffer::VertexInput(cube_vertex_buffer_, 0),
+                    QRhiCommandBuffer::VertexInput(draw.vertex_buffer, 0),
+                };
+                command_buffer->setVertexInput(
+                    0, static_cast<int>(inputs.size()), inputs.data(), cube_index_buffer_, 0,
+                    QRhiCommandBuffer::IndexUInt16);
+                command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.vertex_count);
+              } else {
+                const QRhiCommandBuffer::VertexInput input(draw.vertex_buffer, 0);
+                command_buffer->setVertexInput(0, 1, &input);
+                command_buffer->draw(draw.vertex_count);
+              }
+              last_submitted_layer_ids_.push_back(ordered.topic_id);
+            } else if constexpr (std::is_same_v<Layer, WasmPosesInFrameLayer>) {
+              if (pose_pipeline_ == nullptr || pose_vertex_buffer_ == nullptr || pose_index_buffer_ == nullptr) {
+                return;
+              }
+              if (pose_draw_index == pose_draws.size() || pose_draws[pose_draw_index].layer != layer) {
+                return;
+              }
+              const PoseDraw& draw = pose_draws[pose_draw_index++];
+              command_buffer->setGraphicsPipeline(pose_pipeline_);
+              command_buffer->setViewport(viewport);
+              command_buffer->setShaderResources(draw.shader_resources);
+              const std::array<QRhiCommandBuffer::VertexInput, 2> inputs = {
+                  QRhiCommandBuffer::VertexInput(pose_vertex_buffer_, 0),
+                  QRhiCommandBuffer::VertexInput(draw.instance_buffer, 0),
+              };
+              command_buffer->setVertexInput(
+                  0, static_cast<int>(inputs.size()), inputs.data(), pose_index_buffer_, 0,
+                  QRhiCommandBuffer::IndexUInt32);
+              command_buffer->drawIndexed(pose_index_count_, draw.instance_count);
+              last_submitted_layer_ids_.push_back(ordered.topic_id);
+            } else if constexpr (std::is_same_v<Layer, WasmOccupancyGridLayer>) {
+              if (occupancy_pipeline_ == nullptr || occupancy_quad_buffer_ == nullptr) {
+                return;
+              }
+              if (occupancy_draw_index == occupancy_draws.size() ||
+                  occupancy_draws[occupancy_draw_index].layer != layer) {
+                return;
+              }
+              const OccupancyDraw& draw = occupancy_draws[occupancy_draw_index++];
+              command_buffer->setGraphicsPipeline(occupancy_pipeline_);
+              command_buffer->setViewport(viewport);
+              command_buffer->setShaderResources(draw.shader_resources);
+              const QRhiCommandBuffer::VertexInput input(occupancy_quad_buffer_, 0);
+              command_buffer->setVertexInput(0, 1, &input);
+              command_buffer->draw(6U);
+              last_submitted_layer_ids_.push_back(ordered.topic_id);
+            } else if constexpr (std::is_same_v<Layer, WasmVoxelGridLayer>) {
+              if (voxel_pipeline_ == nullptr || cube_vertex_buffer_ == nullptr || cube_index_buffer_ == nullptr) {
+                return;
+              }
+              if (voxel_draw_index == voxel_draws.size() || voxel_draws[voxel_draw_index].layer != layer) {
+                return;
+              }
+              const VoxelDraw& draw = voxel_draws[voxel_draw_index++];
+              command_buffer->setGraphicsPipeline(voxel_pipeline_);
+              command_buffer->setViewport(viewport);
+              command_buffer->setShaderResources(draw.shader_resources);
+              const QRhiCommandBuffer::VertexInput input(cube_vertex_buffer_, 0);
+              command_buffer->setVertexInput(0, 1, &input, cube_index_buffer_, 0, QRhiCommandBuffer::IndexUInt16);
+              command_buffer->drawIndexed(static_cast<quint32>(kCubeIndices.size()), draw.instance_count);
+              last_submitted_layer_ids_.push_back(ordered.topic_id);
+            }
+          },
+          ordered.layer);
+    }
   }
   command_buffer->endPass();
 }
 
 void SceneViewWidget::releaseResources() {
+  for (auto& [layer, gpu] : point_layer_gpu_) {
+    (void)layer;
+    releasePointLayerGpu(gpu);
+  }
+  point_layer_gpu_.clear();
+  for (auto& [layer, gpu] : pose_layer_gpu_) {
+    (void)layer;
+    releasePoseLayerGpu(gpu);
+  }
+  pose_layer_gpu_.clear();
+  for (auto& [layer, gpu] : occupancy_layer_gpu_) {
+    (void)layer;
+    releaseOccupancyLayerGpu(gpu);
+  }
+  occupancy_layer_gpu_.clear();
+  for (auto& [layer, gpu] : voxel_layer_gpu_) {
+    (void)layer;
+    releaseVoxelLayerGpu(gpu);
+  }
+  voxel_layer_gpu_.clear();
+  delete voxel_pipeline_;
+  delete voxel_layout_shader_resources_;
+  delete voxel_layout_uniform_buffer_;
+  delete voxel_sampler_;
+  delete voxel_layout_texture_;
+  delete occupancy_pipeline_;
+  delete occupancy_layout_shader_resources_;
+  delete occupancy_layout_uniform_buffer_;
+  delete occupancy_quad_buffer_;
+  delete occupancy_sampler_;
+  delete occupancy_layout_texture_;
+  delete pose_pipeline_;
+  delete pose_layout_shader_resources_;
+  delete pose_layout_uniform_buffer_;
+  delete pose_index_buffer_;
+  delete pose_vertex_buffer_;
+  delete cube_pipeline_;
+  delete point_pipeline_;
+  delete point_layout_shader_resources_;
+  delete point_layout_uniform_buffer_;
+  delete cube_index_buffer_;
+  delete cube_vertex_buffer_;
+  delete colormap_sampler_;
+  delete colormap_texture_;
   delete line_pipeline_;
   delete triangle_pipeline_;
   delete shader_resources_;
   delete line_buffer_;
   delete triangle_buffer_;
   delete uniform_buffer_;
+  pose_pipeline_ = nullptr;
+  pose_layout_shader_resources_ = nullptr;
+  pose_layout_uniform_buffer_ = nullptr;
+  pose_index_buffer_ = nullptr;
+  pose_vertex_buffer_ = nullptr;
+  pose_mesh_upload_pending_ = false;
+  pose_index_count_ = 0;
+  cube_pipeline_ = nullptr;
+  point_pipeline_ = nullptr;
+  point_layout_shader_resources_ = nullptr;
+  point_layout_uniform_buffer_ = nullptr;
+  cube_index_buffer_ = nullptr;
+  cube_vertex_buffer_ = nullptr;
+  colormap_sampler_ = nullptr;
+  colormap_texture_ = nullptr;
+  colormap_upload_pending_ = false;
+  cube_upload_pending_ = false;
   line_pipeline_ = nullptr;
   triangle_pipeline_ = nullptr;
   shader_resources_ = nullptr;
   line_buffer_ = nullptr;
   triangle_buffer_ = nullptr;
   uniform_buffer_ = nullptr;
+  occupancy_pipeline_ = nullptr;
+  occupancy_layout_shader_resources_ = nullptr;
+  occupancy_layout_uniform_buffer_ = nullptr;
+  occupancy_quad_buffer_ = nullptr;
+  occupancy_sampler_ = nullptr;
+  occupancy_layout_texture_ = nullptr;
+  occupancy_quad_upload_pending_ = false;
+  voxel_pipeline_ = nullptr;
+  voxel_layout_shader_resources_ = nullptr;
+  voxel_layout_uniform_buffer_ = nullptr;
+  voxel_sampler_ = nullptr;
+  voxel_layout_texture_ = nullptr;
+  max_3d_texture_size_ = 0;
   line_buffer_capacity_ = 0;
   triangle_buffer_capacity_ = 0;
   resource_rhi_ = nullptr;

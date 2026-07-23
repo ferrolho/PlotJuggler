@@ -52,6 +52,10 @@ class Scene3DConfigPanel : public QWidget {
   explicit Scene3DConfigPanel(QWidget* parent = nullptr);
 
   void bindDock(Scene3DDockWidget* dock);
+#ifdef PJ_TARGET_WASM
+  [[nodiscard]] Scene3DDockWidget* boundDockForTest() const;
+  [[nodiscard]] LayerListView* layerListForTest() const;
+#endif
 
   // Routes a left-click on a robot row's name field to showRobotLayerConfig.
   // The row's topic id rides on the watched widget's "robot_topic_id" property.

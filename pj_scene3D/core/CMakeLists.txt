@@ -6,17 +6,28 @@ find_package(glm REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 if(EMSCRIPTEN)
-  # W13 intentionally exposes only the backend-neutral slice the product QRhi
-  # view uses.  The native branch below remains the complete codec/geometry
-  # library and is kept unchanged; later WASM layer packages grow this list one
-  # dependency at a time instead of pulling Draco/Cloudini into the grid/TF MVP.
-  add_library(pj_scene3d_core STATIC
+  # Expose only the backend-neutral slice used by the product QRhi view and its
+  # canonical point-cloud, pose-array, occupancy, and voxel layers. Compressed
+  # canonical clouds add only the existing transcoder when their explicit
+  # browser dependency option is enabled. The native branch below is unchanged.
+  set(_pj_scene3d_core_sources
     src/camera/camera.cpp
     src/camera/camera_math.cpp
+    src/depth_backproject.cpp
+    src/occupancy_grid_reconstructor.cpp
+    src/pointcloud_convert.cpp
+    src/poses_in_frame_render.cpp
+    src/scene_entities_decode.cpp
     src/tf/tf_buffer.cpp
     src/tf/tf_connections.cpp
     src/version.cpp
+    src/voxel_grid_view.cpp
+    src/voxel_grid_value.cpp
   )
+  if(PJ_WASM_WITH_COMPRESSED_POINTCLOUDS)
+    list(APPEND _pj_scene3d_core_sources src/pointcloud_codecs.cpp)
+  endif()
+  add_library(pj_scene3d_core STATIC ${_pj_scene3d_core_sources})
   target_include_directories(pj_scene3d_core PUBLIC include)
   target_compile_features(pj_scene3d_core PUBLIC cxx_std_20)
   target_compile_options(pj_scene3d_core PRIVATE
@@ -25,6 +36,14 @@ if(EMSCRIPTEN)
   target_link_libraries(pj_scene3d_core
     PUBLIC glm::glm pj_base nlohmann_json::nlohmann_json
   )
+  if(PJ_WASM_WITH_COMPRESSED_POINTCLOUDS)
+    if(NOT TARGET draco::draco OR NOT TARGET cloudini::cloudini)
+      message(FATAL_ERROR "WASM compressed point clouds require the pinned Draco and Cloudini targets")
+    endif()
+    target_compile_definitions(pj_scene3d_core PUBLIC PJ_WASM_WITH_COMPRESSED_POINTCLOUDS=1)
+    target_link_libraries(pj_scene3d_core PRIVATE draco::draco cloudini::cloudini)
+  endif()
+  unset(_pj_scene3d_core_sources)
   return()
 endif()
 
@@ -66,8 +85,10 @@ if(PJ_BUILD_TESTS)
   set(PJ_SCENE3D_CORE_TESTS
     ../tests/occupancy_grid_reconstructor_test.cpp
     ../tests/occupancy_grid_bounds_test.cpp
+    ../tests/occupancy_grid_budget_test.cpp
     ../tests/depth_backproject_test.cpp
     ../tests/pointcloud_convert_test.cpp
+    ../tests/pointcloud_budget_test.cpp
     ../tests/pointcloud_fast_path_predicate_test.cpp
     ../tests/pointcloud_bounds_scan_equivalence_test.cpp
     ../tests/aabb_gpu_key_test.cpp
@@ -78,6 +99,7 @@ if(PJ_BUILD_TESTS)
     ../tests/camera_state_transfer_test.cpp
     ../tests/camera_follow_test.cpp
     ../tests/poses_in_frame_render_test.cpp
+    ../tests/poses_budget_test.cpp
     ../tests/scene_entities_decode_test.cpp
     ../tests/shadow_camera_test.cpp
     ../tests/tf_buffer_test.cpp
@@ -87,6 +109,7 @@ if(PJ_BUILD_TESTS)
     ../tests/robot_model_bridges_test.cpp
     ../tests/voxel_grid_view_test.cpp
     ../tests/voxel_grid_value_test.cpp
+    ../tests/voxel_grid_budget_test.cpp
   )
   foreach(test_src ${PJ_SCENE3D_CORE_TESTS})
     get_filename_component(test_name ${test_src} NAME_WE)
@@ -103,4 +126,14 @@ if(PJ_BUILD_TESTS)
     pj_scene3d_core draco::draco cloudini::cloudini GTest::gtest_main)
   target_compile_options(pointcloud_codecs_test PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
   add_test(NAME pointcloud_codecs_test COMMAND pointcloud_codecs_test)
+
+  # Reproducibility helper for the checked browser MCAP. EXCLUDE_FROM_ALL keeps
+  # the native application and ordinary test build unchanged; W19a invokes this
+  # target explicitly before the Python ROS2 CDR/MCAP packager.
+  add_executable(wasm_compressed_pointcloud_payload_generator EXCLUDE_FROM_ALL
+    ../../tests/wasm/fixtures/generate_compressed_pointcloud_payloads.cpp)
+  target_link_libraries(wasm_compressed_pointcloud_payload_generator PRIVATE
+    draco::draco cloudini::cloudini)
+  target_compile_options(wasm_compressed_pointcloud_payload_generator PRIVATE
+    ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
 endif()

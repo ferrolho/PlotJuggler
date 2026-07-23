@@ -28,7 +28,8 @@ std::vector<GridVertex> buildCheckerboardCells(float extent_m, int divisions) {
   for (int i = 0; i < divisions; ++i) {
     for (int j = 0; j < divisions; ++j) {
       // Every cell is emitted; parity selects which of the two tile tones the
-      // shader uses, giving a full checkerboard rather than a half one.
+      // native shader uses. The WASM QRhi path resolves the same parity on the
+      // CPU while appending vertices, giving a full checkerboard in both paths.
       const float x0 = -half + static_cast<float>(i) * cell;
       const float y0 = -half + static_cast<float>(j) * cell;
       const float x1 = x0 + cell;

@@ -38,4 +38,12 @@ if(TARGET pj_scene3d_widgets)
   target_compile_features(pointcloud_aabb_benchmark PRIVATE cxx_std_20)
   target_compile_options(pointcloud_aabb_benchmark PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
   target_link_libraries(pointcloud_aabb_benchmark PRIVATE pj_scene3d_widgets pj_scene3d_core Qt6::Gui)
+
+  # Qt/GL-free benchmark for the canonical conversion + WASM-style retained
+  # vertex assembly used by W14. It is part of the ordinary desktop build so
+  # the million-point memory/time evidence stays reproducible.
+  add_executable(pointcloud_convert_benchmark pointcloud_convert_benchmark.cpp)
+  target_compile_features(pointcloud_convert_benchmark PRIVATE cxx_std_20)
+  target_compile_options(pointcloud_convert_benchmark PRIVATE ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS})
+  target_link_libraries(pointcloud_convert_benchmark PRIVATE pj_scene3d_core)
 endif()

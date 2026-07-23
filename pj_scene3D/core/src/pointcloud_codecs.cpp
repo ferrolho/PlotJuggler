@@ -16,8 +16,12 @@
 #include "cloudini_lib/cloudini.hpp"
 #include "draco/attributes/geometry_attribute.h"
 #include "draco/compression/decode.h"
+#include "draco/compression/point_cloud/point_cloud_decoder.h"
+#include "draco/compression/point_cloud/point_cloud_kd_tree_decoder.h"
+#include "draco/compression/point_cloud/point_cloud_sequential_decoder.h"
 #include "draco/core/decoder_buffer.h"
 #include "draco/metadata/geometry_metadata.h"
+#include "draco/metadata/metadata_decoder.h"
 #include "draco/point_cloud/point_cloud.h"
 
 namespace pj::scene3d {
@@ -114,15 +118,148 @@ uint32_t rowStepFor(uint32_t point_step, uint32_t width) {
                                                          : static_cast<uint32_t>(row_step);
 }
 
+bool exceedsLimit(std::uint64_t value, std::uint64_t limit) {
+  return limit != 0 && value > limit;
+}
+
+struct DracoPreflight {
+  std::uint32_t point_count = 0;
+  std::uint8_t encoder_method = 0;
+};
+
+PJ::Expected<DracoPreflight> dracoPreflight(const PJ::sdk::CompressedPointCloud& cloud) {
+  draco::DecoderBuffer buffer;
+  buffer.Init(reinterpret_cast<const char*>(cloud.data.data()), cloud.data.size());
+  draco::DracoHeader header;
+  const draco::Status header_status = draco::PointCloudDecoder::DecodeHeader(&buffer, &header);
+  if (!header_status.ok()) {
+    return PJ::unexpected(std::string("draco header failed: ") + header_status.error_msg());
+  }
+  if (header.encoder_type != draco::POINT_CLOUD) {
+    return PJ::unexpected(std::string("draco: encoded geometry is not a point cloud"));
+  }
+  if (header.encoder_method != draco::POINT_CLOUD_SEQUENTIAL_ENCODING &&
+      header.encoder_method != draco::POINT_CLOUD_KD_TREE_ENCODING) {
+    return PJ::unexpected(std::string("draco: unsupported point-cloud encoding method"));
+  }
+  if ((header.flags & METADATA_FLAG_MASK) != 0) {
+    draco::GeometryMetadata metadata;
+    draco::MetadataDecoder metadata_decoder;
+    if (!metadata_decoder.DecodeGeometryMetadata(&buffer, &metadata)) {
+      return PJ::unexpected(std::string("draco: malformed geometry metadata"));
+    }
+  }
+  std::int32_t point_count = 0;
+  if (!buffer.Decode(&point_count) || point_count < 0) {
+    return PJ::unexpected(std::string("draco: malformed point count"));
+  }
+  return DracoPreflight{
+      .point_count = static_cast<std::uint32_t>(point_count),
+      .encoder_method = header.encoder_method,
+  };
+}
+
+template <typename DecoderBase>
+class BudgetedDracoDecoder final : public DecoderBase {
+ public:
+  BudgetedDracoDecoder(std::uint64_t max_decoded_bytes, std::string* budget_error)
+      : max_decoded_bytes_(max_decoded_bytes), budget_error_(budget_error) {}
+
+ protected:
+  bool DecodeAllAttributes() override {
+    std::uint64_t point_step = 0;
+    for (int index = 0; index < this->point_cloud()->num_attributes(); ++index) {
+      const draco::PointAttribute* attribute = this->point_cloud()->attribute(index);
+      if (attribute == nullptr) {
+        continue;
+      }
+      const std::uint64_t components = static_cast<std::uint64_t>(attribute->num_components());
+      if (components > (std::numeric_limits<std::uint64_t>::max() - point_step) / sizeof(float)) {
+        *budget_error_ = "draco: packed point layout overflows";
+        return false;
+      }
+      point_step += components * sizeof(float);
+    }
+    const std::uint64_t point_count = static_cast<std::uint64_t>(this->point_cloud()->num_points());
+    const std::uint64_t decoded_bytes =
+        point_step != 0 && point_count > std::numeric_limits<std::uint64_t>::max() / point_step
+            ? std::numeric_limits<std::uint64_t>::max()
+            : point_count * point_step;
+    if (exceedsLimit(decoded_bytes, max_decoded_bytes_)) {
+      *budget_error_ = std::string("draco: decoded payload ") + std::to_string(decoded_bytes) +
+                       " bytes exceeds limit " + std::to_string(max_decoded_bytes_);
+      return false;
+    }
+    return draco::PointCloudDecoder::DecodeAllAttributes();
+  }
+
+ private:
+  std::uint64_t max_decoded_bytes_ = 0;
+  std::string* budget_error_ = nullptr;
+};
+
+PJ::Expected<std::unique_ptr<draco::PointCloud>> decodeBudgetedDraco(
+    const PJ::sdk::CompressedPointCloud& cloud, const DracoPreflight& preflight, std::uint64_t max_decoded_bytes) {
+  std::string budget_error;
+  std::unique_ptr<draco::PointCloudDecoder> decoder;
+  if (preflight.encoder_method == draco::POINT_CLOUD_SEQUENTIAL_ENCODING) {
+    decoder =
+        std::make_unique<BudgetedDracoDecoder<draco::PointCloudSequentialDecoder>>(max_decoded_bytes, &budget_error);
+  } else if (preflight.encoder_method == draco::POINT_CLOUD_KD_TREE_ENCODING) {
+    decoder = std::make_unique<BudgetedDracoDecoder<draco::PointCloudKdTreeDecoder>>(max_decoded_bytes, &budget_error);
+  } else {
+    return PJ::unexpected(std::string("draco: unsupported point-cloud encoding method"));
+  }
+
+  draco::DecoderBuffer buffer;
+  buffer.Init(reinterpret_cast<const char*>(cloud.data.data()), cloud.data.size());
+  auto point_cloud = std::make_unique<draco::PointCloud>();
+  const draco::DecoderOptions options;
+  const draco::Status status = decoder->Decode(options, &buffer, point_cloud.get());
+  if (!status.ok()) {
+    if (!budget_error.empty()) {
+      return PJ::unexpected(std::move(budget_error));
+    }
+    return PJ::unexpected(std::string("draco decode failed: ") + status.error_msg());
+  }
+  return point_cloud;
+}
+
 }  // namespace
 
+PJ::Expected<PJ::sdk::PointCloud> decodeCloudiniImpl(
+    const PJ::sdk::CompressedPointCloud& cloud, const PointCloudDecodeLimits* limits);
+PJ::Expected<PJ::sdk::PointCloud> decodeDracoImpl(
+    const PJ::sdk::CompressedPointCloud& cloud, const PointCloudDecodeLimits* limits);
+
 PJ::Expected<PJ::sdk::PointCloud> decodeCloudini(const PJ::sdk::CompressedPointCloud& cloud) {
+  return decodeCloudiniImpl(cloud, nullptr);
+}
+
+PJ::Expected<PJ::sdk::PointCloud> decodeCloudiniImpl(
+    const PJ::sdk::CompressedPointCloud& cloud, const PointCloudDecodeLimits* limits) {
   if (cloud.data.empty()) {
     return PJ::unexpected(std::string("cloudini: empty data"));
   }
   try {
     Cloudini::ConstBufferView input(cloud.data.data(), cloud.data.size());
     const Cloudini::EncodingInfo info = Cloudini::DecodeHeader(input);  // advances `input` past the header
+
+    const std::uint64_t point_count = static_cast<std::uint64_t>(info.width) * info.height;
+    const std::uint64_t decoded_bytes =
+        info.point_step != 0 && point_count > std::numeric_limits<std::uint64_t>::max() / info.point_step
+            ? std::numeric_limits<std::uint64_t>::max()
+            : point_count * info.point_step;
+    if (limits != nullptr && exceedsLimit(point_count, limits->max_points)) {
+      return PJ::unexpected(
+          std::string("cloudini: decoded point count ") + std::to_string(point_count) + " exceeds limit " +
+          std::to_string(limits->max_points));
+    }
+    if (limits != nullptr && exceedsLimit(decoded_bytes, limits->max_decoded_bytes)) {
+      return PJ::unexpected(
+          std::string("cloudini: decoded payload ") + std::to_string(decoded_bytes) + " bytes exceeds limit " +
+          std::to_string(limits->max_decoded_bytes));
+    }
 
     // The header is untrusted and cloudini's own decoder writes each field at
     // dest + offset UNCHECKED — a hostile offset is a heap OOB write. Reject any
@@ -176,6 +313,11 @@ PJ::Expected<PJ::sdk::PointCloud> decodeCloudini(const PJ::sdk::CompressedPointC
 }
 
 PJ::Expected<PJ::sdk::PointCloud> decodeDraco(const PJ::sdk::CompressedPointCloud& cloud) {
+  return decodeDracoImpl(cloud, nullptr);
+}
+
+PJ::Expected<PJ::sdk::PointCloud> decodeDracoImpl(
+    const PJ::sdk::CompressedPointCloud& cloud, const PointCloudDecodeLimits* limits) {
   if (cloud.data.empty()) {
     return PJ::unexpected(std::string("draco: empty data"));
   }
@@ -185,15 +327,37 @@ PJ::Expected<PJ::sdk::PointCloud> decodeDraco(const PJ::sdk::CompressedPointClou
   // caller runs this on a QtConcurrent pool thread — an escaped exception would be
   // rethrown by QFutureWatcher::result() on the GUI thread and terminate the app.
   try {
-    draco::DecoderBuffer buffer;
-    buffer.Init(reinterpret_cast<const char*>(cloud.data.data()), cloud.data.size());
-
-    draco::Decoder decoder;
-    auto status_or = decoder.DecodePointCloudFromBuffer(&buffer);
-    if (!status_or.ok()) {
-      return PJ::unexpected(std::string("draco decode failed: ") + status_or.status().error_msg());
+    std::optional<DracoPreflight> preflight;
+    if (limits != nullptr) {
+      auto inspected = dracoPreflight(cloud);
+      if (!inspected.has_value()) {
+        return PJ::unexpected(inspected.error());
+      }
+      preflight = inspected.value();
+      if (exceedsLimit(preflight->point_count, limits->max_points)) {
+        return PJ::unexpected(
+            std::string("draco: decoded point count ") + std::to_string(preflight->point_count) + " exceeds limit " +
+            std::to_string(limits->max_points));
+      }
     }
-    const std::unique_ptr<draco::PointCloud> pc = std::move(status_or).value();
+
+    std::unique_ptr<draco::PointCloud> pc;
+    if (preflight.has_value()) {
+      auto decoded = decodeBudgetedDraco(cloud, *preflight, limits->max_decoded_bytes);
+      if (!decoded.has_value()) {
+        return PJ::unexpected(decoded.error());
+      }
+      pc = std::move(decoded.value());
+    } else {
+      draco::DecoderBuffer buffer;
+      buffer.Init(reinterpret_cast<const char*>(cloud.data.data()), cloud.data.size());
+      draco::Decoder decoder;
+      auto status_or = decoder.DecodePointCloudFromBuffer(&buffer);
+      if (!status_or.ok()) {
+        return PJ::unexpected(std::string("draco decode failed: ") + status_or.status().error_msg());
+      }
+      pc = std::move(status_or).value();
+    }
     const uint32_t num_points = pc->num_points();
 
     // Plan the packed (interleaved, all-float32) layout. Every Draco attribute becomes a
@@ -236,6 +400,12 @@ PJ::Expected<PJ::sdk::PointCloud> decodeDraco(const PJ::sdk::CompressedPointClou
       offset += static_cast<uint32_t>(nc) * 4u;
     }
     const uint32_t point_step = offset;
+    const std::uint64_t decoded_bytes = static_cast<std::uint64_t>(num_points) * point_step;
+    if (limits != nullptr && exceedsLimit(decoded_bytes, limits->max_decoded_bytes)) {
+      return PJ::unexpected(
+          std::string("draco: decoded payload ") + std::to_string(decoded_bytes) + " bytes exceeds limit " +
+          std::to_string(limits->max_decoded_bytes));
+    }
 
     PJ::sdk::PointCloud out;
     out.timestamp_ns = cloud.timestamp_ns;
@@ -289,6 +459,20 @@ PJ::Expected<PJ::sdk::PointCloud> decodeCompressedPointCloud(const PJ::sdk::Comp
   }
   if (format == "draco") {
     return decodeDraco(cloud);
+  }
+  return PJ::unexpected(std::string("unsupported CompressedPointCloud format: '") + cloud.format + "'");
+}
+
+PJ::Expected<PJ::sdk::PointCloud> decodeCompressedPointCloud(
+    const PJ::sdk::CompressedPointCloud& cloud, PointCloudDecodeLimits limits) {
+  std::string format = cloud.format;
+  std::transform(
+      format.begin(), format.end(), format.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (format == "cloudini") {
+    return decodeCloudiniImpl(cloud, &limits);
+  }
+  if (format == "draco") {
+    return decodeDracoImpl(cloud, &limits);
   }
   return PJ::unexpected(std::string("unsupported CompressedPointCloud format: '") + cloud.format + "'");
 }

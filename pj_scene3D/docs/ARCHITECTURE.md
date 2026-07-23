@@ -121,14 +121,14 @@ visible; cleared on a camera gesture and on leave. Occlusion is ignored for now
 (a frame hidden behind geometry still labels); a one-texel depth-reject is the
 planned refinement.
 
-## WebAssembly product backend (W13)
+## WebAssembly product backend (W13-W19a)
 
 The browser selects a different implementation behind the same
 `SceneViewWidget` and `Scene3DDockWidget` public product names. This is a
 compile-time `PJ_TARGET_WASM` branch, not a preference: desktop continues to use
 the native OpenGL pipeline above and full layer graph unchanged.
 
-The W13 browser view is a `QRhiWidget` configured for Qt's OpenGL/WebGL2 backend
+The browser view is a `QRhiWidget` configured for Qt's OpenGL/WebGL2 backend
 and 4x renderbuffer MSAA. It owns only QRhi buffers, bindings, and pipelines and
 renders directly to the widget target. Vertex positions are made relative to the
 camera focal point before conversion to float, preserving the existing camera's
@@ -137,19 +137,47 @@ large-world precision model. The current submissions are:
 - canonical line or checkerboard grid geometry;
 - RGB axes transformed by every frame resolved against the fixed frame at the
   tracker time; and
-- magenta parent/child segments from the shared `buildTfConnectionSegments`.
+- magenta parent/child segments from the shared `buildTfConnectionSegments`;
+- raw canonical point clouds, plus Draco/Cloudini compressed clouds transcoded
+  to the same canonical representation, as point/sphere sprites or instanced
+  cubes with the native color/range/size controls; and
+- `PosesInFrame` as instanced solid arrow triads using the shared expansion and
+  unit-arrow mesh;
+- occupancy grids as one R8 texture plus a shared unit quad, including
+  incremental dirty-rectangle uploads; and
+- dense voxel grids as one R32F or RGBA8 3D texture plus a shared instanced
+  cube, with the native field/predicate/range/color semantics.
 
-The shader sources and committed `.qsb` packs contain GLSL ES 300. CMake locates
-the matching host Qt `qsb`, rebuilds both packs during configure, and compares
-SHA-256 before compiling. A stale pack therefore fails closed instead of
-silently shipping a different shader.
+The twelve shader sources and committed `.qsb` packs contain GLSL ES 300. CMake
+locates the matching host Qt `qsb`, rebuilds every pack during configure, and
+compares SHA-256 before compiling. A stale pack therefore fails closed instead
+of silently shipping a different shader.
 
 Camera models, fixed/follow behavior, `TransformBuffer`, `TransformService`, TF
 hierarchy/connection logic, tracker-time repaint keys, and scene-control values
-are shared with the native product. The browser dock accepts TF config topics;
-known later layer types are preserved as pending XML but are not rendered until
+are shared with the native product. The browser dock accepts TF config topics,
+raw/compressed point clouds, pose arrays, occupancy grids, and voxel grids.
+Known later layer types are preserved as pending XML but are not rendered until
 their QRhi package lands. The browser source lists deliberately omit native GL
-passes, HDR/SSAO/EDL, Assimp/network model code, robot layers, and cloud codecs.
+passes, HDR/SSAO/EDL, Assimp/network model code, and robot layers. Draco 1.5.7
+and Cloudini 1.2.2 enter only the explicitly gated browser compressed-cloud
+graph; the non-Emscripten source graph and runtime behavior are unchanged.
+
+Compressed decode never blocks or joins the browser UI thread. Each compressed
+layer has one `QtConcurrent` job in flight and at most one pending request;
+scrubbing replaces that pending request with the newest canonical sample.
+Generation tokens invalidate results across hide, detach, and dataset replace,
+while the worker captures only owned canonical bytes and therefore may drain
+safely after the layer disappears. One successful decoded sample is cached.
+One failed sample is memoized with its warning: revisiting it restores empty
+geometry and the same warning without retrying the codec, while moving to a
+different sample can recover normally; a later distinct failure may replace
+that one-entry memo. Cloudini dimensions/bytes and Draco point count plus packed
+attribute layout are bounded before their principal value/output allocations.
+The decoded cloud then follows the exact raw conversion, finite-position
+compaction, per-layer, and per-view budget path. Decoded caches remain per layer,
+not a global RSS quota; the W19 product-envelope audit owns aggregate memory
+measurement and policy.
 
 Persistence uses the native `<scene3d version="1">` field names for fixed and
 follow frames, camera model/pose, TF config topics, and shared scene controls.
@@ -386,6 +414,16 @@ desaturated X/Y/Z colors match the TF "Frames" gizmos.
   checkbox + always-visible "Color:" swatch reuse `SceneEntitiesLayer`'s marker-recolor
   text and layout (picking a color auto-ticks the box) for cross-layer consistency.
   No host edits.
+- **WASM backend.** `WasmPosesInFrameLayer` resolves the same canonical object
+  and calls the same `buildPoseTriadInstances` function. The QRhi path retains
+  the native 80-byte instance format and shared unit-arrow mesh, draws each
+  layer with one UInt32-indexed instanced call, and keeps fixed-from-source TF in
+  a uniform so camera/TF motion does not rebuild instances. It uses direct-sRGB
+  view-space Lambert shading and the native annotation blend. Browser-only
+  limits are 100,000 poses and 32 MiB of wire bytes per layer, plus 300,000
+  expanded arms per view; rejected layers warn visibly and release retained CPU
+  and QRhi buffers. Non-finite instances are compacted in place before bounds and
+  upload. Desktop never compiles this adapter or QRhi pass.
 
 ## Trail layer (`TrailLayer`)
 
@@ -502,6 +540,19 @@ min/max anyway, getting bounds for free in the same pass), a misaligned layout, 
 e.g. Windows software GL). The layer only drops the CPU scan once the pass confirms
 `gpuAabbAvailable()`, so unsupported drivers degrade safely.
 
+The WASM-selected `WasmPointCloudLayer` is deliberately separate from this
+native OpenGL implementation but accepts both `kPointCloud` and, when
+`PJ_WASM_WITH_COMPRESSED_POINTCLOUDS` is enabled, `kCompressedPointCloud`.
+Compressed samples are only transcoded in the core codec boundary; wire/CDR
+parsing remains in the data-source parser. Both object types converge at
+`convertCanonical()` and share point/cube rendering, colors, bounds, warnings,
+visibility cleanup, and `<pointcloud>` persistence. Dock classification,
+interactive acceptance, factory registration, deferred restore, and XML
+validation all use the same feature-gated type predicate; registering a factory
+alone is insufficient because the host otherwise falls through to a modal
+unsupported-topic warning, which cannot call `exec()` in the Asyncify-free
+browser build.
+
 ## Depth-cloud layer (`DepthCloudLayer`)
 
 Back-projects a depth image into a 3D point cloud (one point per valid pixel),
@@ -556,6 +607,20 @@ volumetric data.
   still runs once per voxel.
 - **Qt-free core.** The coordinate/value math (`core/voxel_grid_view.{h,cpp}`,
   `core/voxel_grid_value.{h,cpp}`) is headless unit-tested.
+- **WASM backend.** `WasmVoxelGridLayer` resolves the same canonical object and
+  reuses the same field selection, scalar/RGBA packing, bounds, and draw-mode
+  vocabulary. QRhi retains one packed volume per layer and submits one indexed
+  cube draw with `column*row*slice` instances; the vertex shader performs the
+  same `gl_InstanceID`/`texelFetch` predicate as native. Grid origin, fixed-frame
+  TF, and camera-relative conversion compose in double precision before upload.
+  Browser-only caps are 4 Mi voxels and 32 MiB wire bytes per layer plus 8 Mi
+  voxels per view. Allocation also checks the live WebGL
+  `GL_MAX_3D_TEXTURE_SIZE`; the retained 2026-07-16 Chromium/Firefox/WebKit
+  matrix measured 2,048 on all three engines. Rejected layers warn visibly and
+  release retained CPU/QRhi volume state. The browser direct-sRGB target omits
+  the native HDR composite, but field, predicate, color, opacity, geometry, and
+  XML semantics are preserved. Desktop never compiles this adapter or QRhi
+  pipeline.
 - **Follow-up.** A GPU compute-shader compaction path (`glDrawElementsIndirect` over
   only the accepted voxels, GL ≥ 4.3) is a documented follow-up for very large dense
   grids; not built.

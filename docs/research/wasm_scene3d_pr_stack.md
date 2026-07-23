@@ -33,7 +33,7 @@ independently.
 Code, tests, fixtures, CI, and documentation travel with the capability they
 validate. There is intentionally no tests-only or dependencies-only PR.
 
-## Current slice: PR 1
+## Published base: PR 1
 
 PR 1 establishes only the platform and interaction foundation:
 
@@ -52,36 +52,46 @@ PR 1 deliberately has no Assimp, Draco, Cloudini, network model loading,
 sensor-data layer classes, SceneEntities, robot models, shadows, HDR, SSAO, or
 EDL. Their absence is a review boundary, not a missing implementation.
 
-### PR 1 review focus
+Its retained capability probe and focused product/layout acceptance scenario
+are the baseline for this PR. PR 2 does not replace or weaken those checks.
 
-- Desktop safety: the native `QOpenGLWidget` branch and native dependency graph
-  must remain unchanged.
-- Resource isolation: two live QRhi widgets must not share mutable GPU state.
-- Layout honesty: a generic browser layout must contain no upload URI/path or
-  numeric dataset qualifier; ambiguous rebinding must fail closed.
-- Test ROI: browser tests should prove integration seams and framebuffer
-  transitions, not duplicate parser/budget unit tests or compare PNGs.
-- Dependency altitude: the foundation must not fetch model or compressed-cloud
-  libraries.
-
-## Planned PR 2
+## Current slice: PR 2
 
 PR 2 adds the bounded sensor-data path:
 
 - raw PointCloud2, Cloudini, Draco, depth cloud, poses, occupancy grid/update,
   and voxel grid;
-- asynchronous decode/coalescing, timeline seek, layer configuration,
-  deterministic ordering, and generic-layout replay;
-- CPU-side budget/codec tests and only the shaders/resources needed by these
-  layers;
-- Draco/Cloudini fetched only when
-  `PJ_WASM_WITH_COMPRESSED_POINTCLOUDS=ON`.
+- asynchronous compressed/depth decode with latest-request coalescing,
+  timeline seek, retained GPU uploads, per-layer and per-view budgets, and
+  deterministic heterogeneous submission order;
+- generic layer replay by unique topic plus object type, failing closed on an
+  ambiguous match;
+- Draco and Cloudini only when
+  `PJ_WASM_WITH_COMPRESSED_POINTCLOUDS=ON`, isolated in
+  `cmake/PjWasmScene3DDependencies.cmake`.
 
-The acceptance band will be split by behavior: point/depth decoding, structured
-layers, and heterogeneous ordering. Fixture generators will share common
-ROS2/MCAP utilities and commit minimal native `.mcap` files with reproducible
-provenance. PR 2 will update this document with its actual status and PR 3
-review risks.
+The browser acceptance delta is three behavior scenarios, not one test per
+class or fixture: point/depth worker convergence, occupancy/voxel bounded
+updates, and physical mixed-family reorder plus generic-layout replay. CPU-side
+budget/codec tests retain exhaustive edge cases. The browser probes report
+submitted geometry and decoder lifecycle from a dedicated test translation
+unit; there are no PNG comparisons.
+
+### PR 2 review focus
+
+- Desktop safety: the native `QOpenGLWidget` branch and native dependency graph
+  must remain unchanged.
+- Decode lifecycle: a stale worker result must never replace the latest tracker
+  request, failures must clear only their own layer, and work must complete off
+  the browser main thread.
+- Budget altitude: malformed or over-limit inputs must be rejected before large
+  retained allocations; the view budget is charged only for drawable layers.
+- Ordering: the Settings list, saved XML order, and actual QRhi command
+  submission must remain identical across mixed families.
+- Dependency boundary: no Assimp/model importer, SceneEntities, PBR, or
+  post-processing code belongs in this slice.
+- Layout honesty: generic layer XML contains no browser dataset identity and
+  ambiguous topic/type rebinding fails closed.
 
 ## Planned PR 3
 
@@ -96,6 +106,17 @@ PR 3 completes the product path:
 Assimp enters only this PR. PR 3 deletes this temporary guide after verifying
 that the stacked tree is behaviorally equivalent to the reference integration
 commit, apart from the documented reviewability changes.
+
+### PR 3 review risks
+
+- Model sources are browser content capabilities, not durable local paths;
+  URL/package resolution must be bounded and layout restore must not claim a
+  local file can be reopened automatically.
+- Assimp must be fetched only for Scene3D and only in PR 3.
+- HDR, shadows, SSAO, and EDL must preserve a complete direct-render fallback;
+  resource ceilings and recovery are more important than visual exactness.
+- SceneEntities and robot models must reuse the PR 2 ordering, TF, budget, and
+  generic-layout contracts rather than introduce parallel mechanisms.
 
 ## Cross-stack invariants
 

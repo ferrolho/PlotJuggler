@@ -14,7 +14,7 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
     message => message.includes('PJ_WASM_SCENE3D_FOUNDATION_SUMMARY'),
   ).at(-1) || '';
   const summary = summaryMessage.match(
-    /sequence=(\d+) docks=(\d+) slider=(-?\d+),(-?\d+),(\d+)x(\d+) value=([^ ]+) range=([^,]+),([^ ]+) enabled=(\d+)/,
+    /sequence=(\d+) docks=(\d+) slider=(-?\d+),(-?\d+),(\d+)x(\d+) value=([^ ]+) range=([^,]+),([^ ]+) enabled=(\d+) window=(\d+)x(\d+)/,
   );
   expect(summary, `unparseable Scene3D summary: ${summaryMessage}`).not.toBeNull();
   const sequence = Number(summary[1]);
@@ -24,6 +24,51 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
       && message.includes(`sequence=${sequence} `),
   );
   await expect.poll(() => dockMessages().length).toBe(dockCount);
+  const dataMessages = () => consoleMessages.filter(
+    message => message.includes('PJ_WASM_SCENE3D_DATA')
+      && message.includes(`sequence=${sequence} `),
+  );
+  await expect.poll(() => dataMessages().length).toBe(dockCount);
+  const dataByIndex = new Map(dataMessages().map((message) => {
+    const match = message.match(
+      /index=(\d+) points=(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+) compressed=(\d+) depth=(\d+),(\d+),(\d+),(\d+),(\d+),(\d+) poses=(\d+),(\d+) occupancy=(\d+),(\d+),(\d+),(\d+) voxels=(\d+),(\d+),(\d+),(\d+) order=([^ ]*) submitted=([^ ]*) list=(-?\d+),(-?\d+),(\d+)x(\d+) rows=([^ ]*) toggle=(-?\d+),(-?\d+),(\d+)x(\d+) right_visible=(\d+) warnings=([^ ]*)/,
+    );
+    expect(match, `unparseable Scene3D data state: ${message}`).not.toBeNull();
+    const ids = encoded => decodeURIComponent(encoded).split(',').filter(Boolean).map(Number);
+    return [Number(match[1]), {
+      points: {
+        live: Number(match[2]), rendered: Number(match[3]), vertices: Number(match[4]),
+        starts: Number(match[5]), completed: Number(match[6]), offMain: Number(match[7]),
+        decoding: Number(match[8]), compressed: Number(match[9]),
+      },
+      depth: {
+        live: Number(match[10]), decoding: Number(match[11]), starts: Number(match[12]),
+        completed: Number(match[13]), offMain: Number(match[14]), vertices: Number(match[15]),
+      },
+      poses: { live: Number(match[16]), arms: Number(match[17]) },
+      occupancy: {
+        live: Number(match[18]), cells: Number(match[19]),
+        fullUploads: Number(match[20]), partialUploads: Number(match[21]),
+      },
+      voxels: {
+        live: Number(match[22]), count: Number(match[23]), uploads: Number(match[24]), max3d: Number(match[25]),
+      },
+      order: ids(match[26]),
+      submitted: ids(match[27]),
+      list: { x: Number(match[28]), y: Number(match[29]), width: Number(match[30]), height: Number(match[31]) },
+      rows: decodeURIComponent(match[32]).split(',').filter(Boolean).map((entry) => {
+        const [id, x, y] = entry.split(':').map(Number);
+        return { id, x, y };
+      }),
+      rightPanel: {
+        toggle: {
+          x: Number(match[33]), y: Number(match[34]), width: Number(match[35]), height: Number(match[36]),
+        },
+        visible: match[37] === '1',
+      },
+      warnings: decodeURIComponent(match[38]).trim().split('|').filter(Boolean),
+    }];
+  }));
 
   const docks = dockMessages().map((message) => {
     const match = message.match(
@@ -70,11 +115,13 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
         width: Number(match[37]),
         height: Number(match[38]),
       },
+      data: dataByIndex.get(Number(match[1])),
     };
   });
 
   return {
     sequence,
+    window: { width: Number(summary[11]), height: Number(summary[12]) },
     slider: {
       x: Number(summary[3]), y: Number(summary[4]),
       width: Number(summary[5]), height: Number(summary[6]),
@@ -85,4 +132,11 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
   };
 }
 
-module.exports = { requestScene3DFoundationState };
+function qtPointToCss(screen, state, point) {
+  return {
+    x: screen.x + (point.x * screen.width / state.window.width),
+    y: screen.y + (point.y * screen.height / state.window.height),
+  };
+}
+
+module.exports = { qtPointToCss, requestScene3DFoundationState };

@@ -330,7 +330,7 @@ TEST_F(Scene3DDockStrictXmlTest, RejectsInvalidFixedFrameAndCameraMetadataBefore
 TEST_F(Scene3DDockStrictXmlTest, RejectsMalformedOrOutOfRangeSceneControlsBeforeMutation) {
   const std::vector<std::pair<QString, QString>> invalid_attributes = {
       {u"grid_visible"_s, u"yes"_s},        {u"grid_style"_s, u"2"_s},           {u"grid_extent_m"_s, u"nan"_s},
-      {u"grid_extent_m"_s, u"0"_s},         {u"grid_extent_m"_s, u"1001"_s},     {u"grid_divisions"_s, u"1.5"_s},
+      {u"grid_extent_m"_s, u"0"_s},         {u"grid_extent_m"_s, u"1.0e8"_s},    {u"grid_divisions"_s, u"1.5"_s},
       {u"grid_divisions"_s, u"0"_s},        {u"grid_divisions"_s, u"201"_s},     {u"axes_visible"_s, u"TRUE"_s},
       {u"gizmo_size_m"_s, u"0"_s},          {u"gizmo_size_m"_s, u"5.01"_s},      {u"gizmo_opacity"_s, u"1.01"_s},
       {u"tf_parent_lines"_s, u"false "_s},  {u"meshes_visible"_s, u"0"_s},       {u"mesh_opacity"_s, u"-0.01"_s},
@@ -341,6 +341,22 @@ TEST_F(Scene3DDockStrictXmlTest, RejectsMalformedOrOutOfRangeSceneControlsBefore
       state.firstChildElement(u"scene_controls"_s).setAttribute(name, value);
     });
   }
+}
+
+// The scene_controls grammar is one cross-platform contract: a browser-saved
+// layout may carry sensor-scale values (e.g. a 5 km grid) and must still
+// restore on the desktop instead of dropping the whole dock.
+TEST_F(Scene3DDockStrictXmlTest, AcceptsSensorScaleSceneControlsSharedWithBrowser) {
+  QDomDocument document;
+  QDomElement state = dock_.xmlSaveState(document);
+  document.appendChild(state);
+  QDomElement controls = state.firstChildElement(u"scene_controls"_s);
+  ASSERT_FALSE(controls.isNull());
+  controls.setAttribute(u"grid_extent_m"_s, u"5000"_s);
+  controls.setAttribute(u"gizmo_size_m"_s, u"5"_s);
+  EXPECT_TRUE(dock_.xmlLoadState(state));
+  EXPECT_EQ(dock_.sceneView()->gridExtentMetres(), 5000.0f);
+  EXPECT_EQ(dock_.sceneView()->gizmoSize(), 5.0f);
 }
 
 // Generic layouts intentionally omit dataset qualifiers. Restore is portable

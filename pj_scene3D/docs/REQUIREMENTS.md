@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Status | Shipped (v1 feature-complete: TF, pointclouds, occupancy grids, dense voxel grids, depth-image back-projection, markers, pose arrays, URDF/mesh, HDR/SSAO/EDL, live streaming) |
-| Date | 2026-05-17 (rev. 2026-06-20) |
+| Date | 2026-05-17 (rev. 2026-07-16) |
 | Scope | What, not how |
 | Supersedes | `PJ4_PLAN.md` §5.5 (refinement) |
 
@@ -56,14 +56,19 @@ PJ4's 3D visualization module — the sibling family to `pj_scene2D`, focused on
 - **TF axes** as 3D gizmos — substituting for the URDF mesh path since real mesh assets are not available for the Phase 1 input data. This is a permanent first-class display, not a placeholder. Hovering a triad shows the frame's name in a small label (screen-space pick of the nearest frame origin; see ARCHITECTURE.md "TF frame hover labels").
 - **Pointclouds** (`sensor_msgs/PointCloud2`).
 
-**WebAssembly status (W13):** the browser product currently implements the first
-half of this subset: TF axes/parent connections plus the line/checker grid,
-fixed-frame selection, Position follow, shared camera models and interaction,
-tracker-time replay, progressive/live TF updates, and layout persistence. It
-uses a platform-selected QRhi/WebGL2 view; the normal desktop application keeps
-the complete OpenGL implementation and behavior. Point clouds and the other
-listed layers remain explicit later browser work packages and must not be
-inferred from parser availability alone.
+**WebAssembly status (W19a):** the browser product implements TF axes/parent
+connections, line/checker grid, raw and Draco/Cloudini-compressed canonical
+point clouds, pose arrays, occupancy grids with incremental updates, and dense
+voxel grids. This includes fixed-frame selection, Position follow, shared camera
+models and interaction, tracker-time replay, progressive/live TF updates,
+per-layer style, bounded resource policies, and layout persistence. Compressed
+clouds decode on a worker and enter the same browser point conversion/render
+path as raw clouds. Voxel grids use sampled WebGL2 3D textures and GPU
+instancing; the actual per-browser 3D-texture dimension ceiling is checked
+before allocation. The normal desktop application still selects the complete
+native OpenGL implementation and behavior. Other listed layers remain explicit
+later browser work packages and must not be inferred from parser availability
+alone.
 
 Image+Pinhole (camera frustum + textured near-plane) from the original `PJ4_PLAN.md` §5.5 list is dropped from v1.
 
@@ -75,7 +80,7 @@ through the **same** `PointCloudLayer` and `convertCanonical()` path as a raw cl
 layer, no separate widget.
 
 - **Formats:** `cloudini` (header-embedded schema; via `cloudini/1.2.2`) and `draco`
-  (`draco/1.5.6` — pinned to 1.5.6 to match the `assimp/5.4.3` glTF importer requirement;
+  (`draco/1.5.7` — pinned to 1.5.7 to match the native dependency graph;
   see `conanfile.txt`). Plain `zstd_point_cloud_transport` is **out of scope** — its blob is
   not self-describing (it relies on layout fields the canonical object does not carry).
 - **Wire sources:** the ROS parser emits the canonical object for both
@@ -88,10 +93,20 @@ layer, no separate widget.
   thread pool (`QtConcurrent` + `QFutureWatcher`) with latest-wins coalescing; the decoded cloud is
   cached per sample — identity is (store timestamp, payload byte size) — so repaints and color-field
   changes don't re-decode, and a tracker tick that resolves to the already-pushed sample skips the
-  re-conversion/upload entirely. A sample whose decode fails clears the view (matching the raw
-  path's malformed-cloud behavior) and is never retried. Fast scrubbing of very large clouds may
-  show transient lag (the in-flight sample lands a frame late); async decode + the per-sample cache
-  keep the UI responsive.
+  re-conversion/upload entirely. One failed sample is memoized at a time: revisiting it clears the
+  view (matching the raw path's malformed-cloud behavior) and restores its warning without another
+  codec run; a later distinct failure may replace that memo. Fast scrubbing of very large clouds
+  may show transient lag (the in-flight sample lands a frame late); async decode + the per-sample
+  cache keep the UI responsive.
+- **Browser limits:** the compressed wire payload is rejected before worker
+  dispatch when it exceeds 64 MiB. The bounded codec API rejects Cloudini's
+  declared point count and decoded byte size before its output allocation.
+  Draco's header/metadata/count and packed float32 attribute layout are checked
+  before attribute-value materialization. Both formats must fit 1,000,000 points
+  and 64 MiB of decoded canonical bytes per sample. Each compressed layer owns
+  one decoded-sample cache; this is not a global decoded-cache quota. The
+  existing 1,000,000-vertex per-view budget remains the final aggregate rendering
+  limit, while aggregate browser RSS is part of the W19 product-envelope audit.
 - **Field fidelity:** Cloudini `INT64`/`UINT64` fields (no PJ datatype) are dropped (their bytes
   still occupy `point_step`, so surviving fields keep their offsets). Draco field names are
   recovered from Draco attribute metadata when present (Foxglove / draco_point_cloud_transport store

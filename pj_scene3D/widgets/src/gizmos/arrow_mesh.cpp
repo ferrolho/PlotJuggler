@@ -41,10 +41,13 @@ ArrowMeshData buildArrowMesh(const ArrowMeshParams& params) {
   }
   for (int i = 0; i < segments; ++i) {
     const int next = (i + 1) % segments;
-    const uint32_t a = shaft_back + i;
-    const uint32_t b = shaft_back + next;
-    const uint32_t c = shaft_back + segments + next;
-    const uint32_t d = shaft_back + segments + i;
+    const uint32_t current_index = static_cast<uint32_t>(i);
+    const uint32_t next_index = static_cast<uint32_t>(next);
+    const uint32_t segment_count = static_cast<uint32_t>(segments);
+    const uint32_t a = shaft_back + current_index;
+    const uint32_t b = shaft_back + next_index;
+    const uint32_t c = shaft_back + segment_count + next_index;
+    const uint32_t d = shaft_back + segment_count + current_index;
     index_data.insert(index_data.end(), {a, b, c, a, c, d});
   }
 

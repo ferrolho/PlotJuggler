@@ -2,5 +2,15 @@
   <qresource prefix="/scene3d_wasm">
     <file>scene.vert.qsb</file>
     <file>scene.frag.qsb</file>
+    <file>point.vert.qsb</file>
+    <file>point.frag.qsb</file>
+    <file>cube.vert.qsb</file>
+    <file>cube.frag.qsb</file>
+    <file>pose.vert.qsb</file>
+    <file>pose.frag.qsb</file>
+    <file>occupancy.vert.qsb</file>
+    <file>occupancy.frag.qsb</file>
+    <file>voxel.vert.qsb</file>
+    <file>voxel.frag.qsb</file>
   </qresource>
 </RCC>

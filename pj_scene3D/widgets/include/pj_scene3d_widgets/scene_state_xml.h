@@ -40,4 +40,32 @@ struct ValidatedCameraState {
 // callers treat that as "reject the whole element", never as partial state.
 std::optional<ValidatedCameraState> validateCameraState(const QString& encoded);
 
+// Accepted ranges for the persisted <scene_controls> float attributes. One
+// definition for both platforms: a layout saved by either backend must restore
+// on the other, so neither reader may enforce a narrower range than the widest
+// writer (the browser view clamps its setters to exactly these bounds).
+inline constexpr float kGridExtentMinM = 0.01f;
+inline constexpr float kGridExtentMaxM = 1.0e7f;
+inline constexpr float kGizmoSizeMinM = 0.001f;
+inline constexpr float kGizmoSizeMaxM = 5.0f;
+
+// The backend-neutral <scene_controls> attributes after validation: every field
+// is optional (absence means "keep the current value"). Platform-specific
+// controls (native mesh/collision opacity) are read separately by their owner.
+struct ValidatedSceneControls {
+  std::optional<bool> grid_visible;
+  std::optional<int> grid_style;
+  std::optional<float> grid_extent_m;
+  std::optional<int> grid_divisions;
+  std::optional<bool> axes_visible;
+  std::optional<float> gizmo_size_m;
+  std::optional<float> gizmo_opacity;
+  std::optional<bool> tf_parent_lines;
+};
+
+// Reads and range-checks the backend-neutral <scene_controls> attributes into
+// `output`. False on any malformed or out-of-range value — callers reject the
+// element rather than keep partial state.
+[[nodiscard]] bool readSceneControls(const QDomElement& element, ValidatedSceneControls& output);
+
 }  // namespace pj::scene3d

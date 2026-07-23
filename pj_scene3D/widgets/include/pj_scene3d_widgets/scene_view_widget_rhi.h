@@ -8,11 +8,18 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "pj_base/time.hpp"
 #include "pj_scene3d_core/camera/camera.h"
+#include "pj_scene3d_core/occupancy_grid_budget.h"
+#include "pj_scene3d_core/pointcloud_budget.h"
+#include "pj_scene3d_core/poses_budget.h"
 #include "pj_scene3d_core/tf/tf_buffer.h"
+#include "pj_scene3d_core/voxel_grid_budget.h"
 #include "pj_scene3d_widgets/passes/grid_geometry.h"
 
 class QEvent;
@@ -22,9 +29,20 @@ class QRhi;
 class QRhiBuffer;
 class QRhiCommandBuffer;
 class QRhiGraphicsPipeline;
+class QRhiSampler;
 class QRhiShaderResourceBindings;
+class QRhiTexture;
+
+namespace PJ {
+class ISceneLayer;
+}
 
 namespace pj::scene3d {
+
+class WasmPointRenderable;
+class WasmPosesInFrameLayer;
+class WasmOccupancyGridLayer;
+class WasmVoxelGridLayer;
 
 // WebAssembly product implementation of the public SceneViewWidget contract.
 // The native class with the same name remains a QOpenGLWidget in the other
@@ -34,6 +52,10 @@ class SceneViewWidget : public QRhiWidget {
   Q_OBJECT
 
  public:
+  static constexpr std::uint64_t kMaxPointVerticesPerView = kBrowserMaxPointVerticesPerView;
+  static constexpr std::uint64_t kMaxPoseArmsPerView = kBrowserMaxPoseArmsPerView;
+  static constexpr std::uint64_t kMaxOccupancyCellsPerView = kBrowserMaxOccupancyCellsPerView;
+  static constexpr std::uint64_t kMaxVoxelsPerView = kBrowserMaxVoxelsPerView;
   using GridStyle = pj::scene3d::GridStyle;
   enum class CameraModel { kOrbit, kXyOrbit, kFly, kTopDownOrtho };
 
@@ -66,6 +88,7 @@ class SceneViewWidget : public QRhiWidget {
   }
   void resetCamera();
   void setSceneBounds(const AABB& bounds);
+  void setLayers(const std::vector<PJ::ISceneLayer*>& ordered_layers);
 
   void setGridStyle(GridStyle style);
   [[nodiscard]] GridStyle gridStyle() const {
@@ -115,6 +138,75 @@ class SceneViewWidget : public QRhiWidget {
   [[nodiscard]] int lastResolvedFrameCountForTest() const {
     return last_resolved_frame_count_;
   }
+  [[nodiscard]] int lastPointVertexCountForTest() const {
+    return last_point_vertex_count_;
+  }
+  [[nodiscard]] int lastPointLayerCountForTest() const {
+    return last_point_layer_count_;
+  }
+  [[nodiscard]] int lastCubeLayerCountForTest() const {
+    return last_cube_layer_count_;
+  }
+  [[nodiscard]] int lastCubeInstanceCountForTest() const {
+    return last_cube_instance_count_;
+  }
+  [[nodiscard]] int cameraFitCountForTest() const {
+    return camera_fit_count_;
+  }
+  [[nodiscard]] AABB lastPointBoundsForTest() const {
+    return last_point_bounds_;
+  }
+  [[nodiscard]] int lastDepthLayerCountForTest() const {
+    return last_depth_layer_count_;
+  }
+  [[nodiscard]] int lastDepthVertexCountForTest() const {
+    return last_depth_vertex_count_;
+  }
+  [[nodiscard]] AABB lastDepthBoundsForTest() const {
+    return last_depth_bounds_;
+  }
+  [[nodiscard]] int lastPoseLayerCountForTest() const {
+    return last_pose_layer_count_;
+  }
+  [[nodiscard]] int lastPoseArmCountForTest() const {
+    return last_pose_arm_count_;
+  }
+  [[nodiscard]] AABB lastPoseBoundsForTest() const {
+    return last_pose_bounds_;
+  }
+  [[nodiscard]] int lastOccupancyLayerCountForTest() const {
+    return last_occupancy_layer_count_;
+  }
+  [[nodiscard]] int lastOccupancyCellCountForTest() const {
+    return last_occupancy_cell_count_;
+  }
+  [[nodiscard]] int occupancyFullUploadCountForTest() const {
+    return occupancy_full_upload_count_;
+  }
+  [[nodiscard]] int occupancyPartialUploadCountForTest() const {
+    return occupancy_partial_upload_count_;
+  }
+  [[nodiscard]] AABB lastOccupancyBoundsForTest() const {
+    return last_occupancy_bounds_;
+  }
+  [[nodiscard]] int lastVoxelLayerCountForTest() const {
+    return last_voxel_layer_count_;
+  }
+  [[nodiscard]] int lastVoxelCountForTest() const {
+    return last_voxel_count_;
+  }
+  [[nodiscard]] int voxelFullUploadCountForTest() const {
+    return voxel_full_upload_count_;
+  }
+  [[nodiscard]] int max3DTextureSizeForTest() const {
+    return max_3d_texture_size_;
+  }
+  [[nodiscard]] AABB lastVoxelBoundsForTest() const {
+    return last_voxel_bounds_;
+  }
+  [[nodiscard]] const std::vector<std::uint32_t>& lastSubmittedLayerIdsForTest() const {
+    return last_submitted_layer_ids_;
+  }
 
  signals:
   void framesChanged(const QList<FrameRow>& frames);
@@ -131,6 +223,18 @@ class SceneViewWidget : public QRhiWidget {
   void changeEvent(QEvent* event) override;
 
  private:
+  using OrderedLayer =
+      std::variant<WasmPointRenderable*, WasmPosesInFrameLayer*, WasmOccupancyGridLayer*, WasmVoxelGridLayer*>;
+  struct OrderedLayerEntry {
+    OrderedLayer layer;
+    std::uint32_t topic_id = 0;
+  };
+
+  void setPointRenderableLayers(const std::vector<WasmPointRenderable*>& layers);
+  void setPosesInFrameLayers(const std::vector<WasmPosesInFrameLayer*>& layers);
+  void setOccupancyGridLayers(const std::vector<WasmOccupancyGridLayer*>& layers);
+  void setVoxelGridLayers(const std::vector<WasmVoxelGridLayer*>& layers);
+
   struct Vertex {
     float x = 0.0F;
     float y = 0.0F;
@@ -141,12 +245,61 @@ class SceneViewWidget : public QRhiWidget {
     float a = 1.0F;
   };
 
+  struct PointLayerGpu {
+    QRhiBuffer* vertex_buffer = nullptr;
+    QRhiBuffer* uniform_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 vertex_capacity = 0;
+    quint32 vertex_count = 0;
+    uint64_t uploaded_revision = ~uint64_t{0};
+  };
+
+  struct PoseLayerGpu {
+    QRhiBuffer* instance_buffer = nullptr;
+    QRhiBuffer* uniform_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 instance_capacity = 0;
+    quint32 instance_count = 0;
+    uint64_t uploaded_revision = ~uint64_t{0};
+  };
+
+  struct OccupancyLayerGpu {
+    QRhiTexture* texture = nullptr;
+    QRhiBuffer* uniform_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 width = 0;
+    quint32 height = 0;
+    uint64_t uploaded_revision = ~uint64_t{0};
+  };
+
+  struct VoxelLayerGpu {
+    QRhiTexture* texture = nullptr;
+    QRhiBuffer* uniform_buffer = nullptr;
+    QRhiShaderResourceBindings* shader_resources = nullptr;
+    quint32 columns = 0;
+    quint32 rows = 0;
+    quint32 slices = 0;
+    int value_kind = -1;
+    uint64_t uploaded_revision = ~uint64_t{0};
+  };
+
   void applyFollow();
   [[nodiscard]] std::string effectiveFixedFrame() const;
   void buildGeometry(const glm::dvec3& render_origin);
   void appendLine(const glm::dvec3& a, const glm::dvec3& b, const glm::vec4& color);
   void appendTriangle(const glm::dvec3& a, const glm::dvec3& b, const glm::dvec3& c, const glm::vec4& color);
-  bool ensureVertexBuffer(QRhi* owner, QRhiBuffer*& buffer, quint32& capacity, quint32 required_bytes);
+  bool ensureVertexBuffer(
+      QRhi* owner, QRhiBuffer*& buffer, quint32& capacity, quint32 required_bytes, quint32 minimum_capacity);
+  bool ensurePointLayerGpu(QRhi* owner, WasmPointRenderable* layer, PointLayerGpu& gpu);
+  void releasePointLayerGpu(PointLayerGpu& gpu);
+  bool ensurePoseLayerGpu(QRhi* owner, PoseLayerGpu& gpu);
+  void releasePoseLayerGpu(PoseLayerGpu& gpu);
+  bool ensureOccupancyLayerGpu(
+      QRhi* owner, WasmOccupancyGridLayer* layer, OccupancyLayerGpu& gpu, bool& texture_recreated);
+  void releaseOccupancyLayerGpu(OccupancyLayerGpu& gpu);
+  bool ensureVoxelLayerGpu(QRhi* owner, WasmVoxelGridLayer* layer, VoxelLayerGpu& gpu, bool& texture_recreated);
+  [[nodiscard]] QString voxelGpuRejection(QRhi* owner, const WasmVoxelGridLayer* layer);
+  void releaseVoxelLayerGpu(VoxelLayerGpu& gpu);
   void emitPresentationIfChanged(const CameraState& before);
 
   std::shared_ptr<TransformBuffer> tf_;
@@ -180,6 +333,35 @@ class SceneViewWidget : public QRhiWidget {
   QRhiShaderResourceBindings* shader_resources_ = nullptr;
   QRhiGraphicsPipeline* line_pipeline_ = nullptr;
   QRhiGraphicsPipeline* triangle_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* point_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* cube_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* pose_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* occupancy_pipeline_ = nullptr;
+  QRhiGraphicsPipeline* voxel_pipeline_ = nullptr;
+  QRhiBuffer* point_layout_uniform_buffer_ = nullptr;
+  QRhiShaderResourceBindings* point_layout_shader_resources_ = nullptr;
+  QRhiBuffer* cube_vertex_buffer_ = nullptr;
+  QRhiBuffer* cube_index_buffer_ = nullptr;
+  QRhiBuffer* pose_layout_uniform_buffer_ = nullptr;
+  QRhiShaderResourceBindings* pose_layout_shader_resources_ = nullptr;
+  QRhiBuffer* pose_vertex_buffer_ = nullptr;
+  QRhiBuffer* pose_index_buffer_ = nullptr;
+  QRhiBuffer* occupancy_layout_uniform_buffer_ = nullptr;
+  QRhiShaderResourceBindings* occupancy_layout_shader_resources_ = nullptr;
+  QRhiTexture* occupancy_layout_texture_ = nullptr;
+  QRhiSampler* occupancy_sampler_ = nullptr;
+  QRhiBuffer* occupancy_quad_buffer_ = nullptr;
+  QRhiBuffer* voxel_layout_uniform_buffer_ = nullptr;
+  QRhiShaderResourceBindings* voxel_layout_shader_resources_ = nullptr;
+  QRhiTexture* voxel_layout_texture_ = nullptr;
+  QRhiSampler* voxel_sampler_ = nullptr;
+  QRhiTexture* colormap_texture_ = nullptr;
+  QRhiSampler* colormap_sampler_ = nullptr;
+  bool colormap_upload_pending_ = false;
+  bool cube_upload_pending_ = false;
+  bool pose_mesh_upload_pending_ = false;
+  bool occupancy_quad_upload_pending_ = false;
+  quint32 pose_index_count_ = 0;
   quint32 line_buffer_capacity_ = 0;
   quint32 triangle_buffer_capacity_ = 0;
   std::vector<Vertex> line_vertices_;
@@ -187,6 +369,46 @@ class SceneViewWidget : public QRhiWidget {
   int last_line_vertex_count_ = 0;
   int last_triangle_vertex_count_ = 0;
   int last_resolved_frame_count_ = 0;
+  std::vector<OrderedLayerEntry> ordered_layers_;
+  std::vector<std::uint32_t> last_submitted_layer_ids_;
+
+  std::vector<WasmPointRenderable*> point_layers_;
+  std::unordered_map<WasmPointRenderable*, PointLayerGpu> point_layer_gpu_;
+  std::unordered_set<WasmPointRenderable*> point_layers_pending_fit_;
+  int last_point_vertex_count_ = 0;
+  int last_point_layer_count_ = 0;
+  int last_cube_layer_count_ = 0;
+  int last_cube_instance_count_ = 0;
+  int camera_fit_count_ = 0;
+  AABB last_point_bounds_;
+  int last_depth_vertex_count_ = 0;
+  int last_depth_layer_count_ = 0;
+  AABB last_depth_bounds_;
+
+  std::vector<WasmPosesInFrameLayer*> pose_layers_;
+  std::unordered_map<WasmPosesInFrameLayer*, PoseLayerGpu> pose_layer_gpu_;
+  std::unordered_set<WasmPosesInFrameLayer*> pose_layers_pending_fit_;
+  int last_pose_layer_count_ = 0;
+  int last_pose_arm_count_ = 0;
+  AABB last_pose_bounds_;
+
+  std::vector<WasmOccupancyGridLayer*> occupancy_layers_;
+  std::unordered_map<WasmOccupancyGridLayer*, OccupancyLayerGpu> occupancy_layer_gpu_;
+  std::unordered_set<WasmOccupancyGridLayer*> occupancy_layers_pending_fit_;
+  int last_occupancy_layer_count_ = 0;
+  int last_occupancy_cell_count_ = 0;
+  int occupancy_full_upload_count_ = 0;
+  int occupancy_partial_upload_count_ = 0;
+  AABB last_occupancy_bounds_;
+
+  std::vector<WasmVoxelGridLayer*> voxel_layers_;
+  std::unordered_map<WasmVoxelGridLayer*, VoxelLayerGpu> voxel_layer_gpu_;
+  std::unordered_set<WasmVoxelGridLayer*> voxel_layers_pending_fit_;
+  int last_voxel_layer_count_ = 0;
+  int last_voxel_count_ = 0;
+  int voxel_full_upload_count_ = 0;
+  int max_3d_texture_size_ = 0;
+  AABB last_voxel_bounds_;
 
   QPoint last_mouse_position_;
   Qt::MouseButton active_button_ = Qt::NoButton;

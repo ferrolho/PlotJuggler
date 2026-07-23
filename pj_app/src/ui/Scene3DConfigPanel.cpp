@@ -269,6 +269,16 @@ Scene3DConfigPanel::Scene3DConfigPanel(QWidget* parent) : QWidget(parent) {
   updateSelectedLayerPane();
 }
 
+#ifdef PJ_TARGET_WASM
+Scene3DDockWidget* Scene3DConfigPanel::boundDockForTest() const {
+  return bound_dock_.data();
+}
+
+LayerListView* Scene3DConfigPanel::layerListForTest() const {
+  return layer_list_;
+}
+#endif
+
 void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   QSettings settings;
   settings.beginGroup(QString::fromLatin1(kScene3dSceneControlsGroup));

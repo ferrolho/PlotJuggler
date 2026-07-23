@@ -3,9 +3,12 @@ set(CMAKE_AUTOMOC ON)
 if(EMSCRIPTEN)
   # Product Scene3D uses Qt's RHI/WebGL2 backend in the browser.  Keep this a
   # deliberately small, platform-selected source set: no QOpenGLWidget, raw GL
-  # pass, Assimp, network model loader, or compressed-cloud codec enters W13.
+  # pass, Assimp, or network model loader enters the browser link. W19a adds the
+  # explicitly gated compressed-cloud transcoder; DepthCloud uses Qt Concurrent
+  # independently for bounded back-projection on the browser worker pool.
   set(CMAKE_AUTORCC ON)
-  find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS Widgets Gui GuiPrivate Xml)
+  set(_pj_scene3d_qt_components Widgets Gui GuiPrivate Xml Concurrent)
+  find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS ${_pj_scene3d_qt_components})
 
   if(NOT TARGET Qt6::qsb)
     message(FATAL_ERROR "WASM Scene3D shader verification requires Qt6::qsb")
@@ -20,7 +23,9 @@ if(EMSCRIPTEN)
 
   set(_pj_scene3d_shader_verify_dir "${CMAKE_CURRENT_BINARY_DIR}/verified_shaders")
   file(MAKE_DIRECTORY "${_pj_scene3d_shader_verify_dir}")
-  foreach(_pj_scene3d_shader IN ITEMS scene.vert scene.frag)
+  foreach(_pj_scene3d_shader IN ITEMS
+      scene.vert scene.frag point.vert point.frag cube.vert cube.frag
+      pose.vert pose.frag occupancy.vert occupancy.frag voxel.vert voxel.frag)
     set(_pj_scene3d_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shaders/${_pj_scene3d_shader}")
     set(_pj_scene3d_shader_pack "${_pj_scene3d_shader_source}.qsb")
     set(_pj_scene3d_shader_rebuilt "${_pj_scene3d_shader_verify_dir}/${_pj_scene3d_shader}.qsb")
@@ -43,15 +48,28 @@ if(EMSCRIPTEN)
   add_library(pj_scene3d_widgets STATIC
     wasm/scene_view_widget_rhi.cpp
     wasm/scene3d_dock_widget_wasm.cpp
+    wasm/depth_cloud_layer_wasm.cpp
+    wasm/point_cloud_layer_wasm.cpp
+    wasm/poses_in_frame_layer_wasm.cpp
+    wasm/occupancy_grid_layer_wasm.cpp
+    wasm/voxel_grid_layer_wasm.cpp
     src/transform_service.cpp
     src/object_topic_metadata.cpp
     src/resolve_object.cpp
     src/scene_state_xml.cpp
     src/passes/grid_geometry.cpp
+    src/gizmos/arrow_mesh.cpp
     include/pj_scene3d_widgets/scene_view_widget.h
     include/pj_scene3d_widgets/scene_view_widget_rhi.h
     include/pj_scene3d_widgets/Scene3DDockWidget.h
     include/pj_scene3d_widgets/Scene3DDockWidget_wasm.h
+    include/pj_scene3d_widgets/wasm/depth_cloud_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/point_cloud_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/point_renderable_wasm.h
+    include/pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h
+    include/pj_scene3d_widgets/gizmos/arrow_mesh.h
     include/pj_scene3d_widgets/transform_service.h
     include/pj_scene3d_widgets/object_topic_metadata.h
     include/pj_scene3d_widgets/resolve_object.h
@@ -72,6 +90,8 @@ if(EMSCRIPTEN)
       Qt6::Gui
       Qt6::GuiPrivate
       Qt6::Xml
+    PRIVATE
+      Qt6::Concurrent
   )
 
   unset(_pj_scene3d_committed_hash)
@@ -84,6 +104,7 @@ if(EMSCRIPTEN)
   unset(_pj_scene3d_shader_rebuilt)
   unset(_pj_scene3d_shader_source)
   unset(_pj_scene3d_shader_verify_dir)
+  unset(_pj_scene3d_qt_components)
   return()
 endif()
 
