@@ -146,27 +146,7 @@ std::optional<std::uint64_t> SceneEntitiesModelState::projectedRetainedBytes(
 }
 
 bool SceneEntitiesModelState::applySnapshot(const PJ::sdk::SceneEntities& snapshot, std::int64_t ingest_ns) {
-  bool changed = false;
-  // Deletions operate on prior state. This preserves DELETEALL + re-add in one
-  // batch and matches the native layer's sensor-timestamp deletion gate.
-  for (const PJ::sdk::SceneEntityDeletion& deletion : snapshot.deletions) {
-    if (deletion.type == PJ::sdk::SceneEntityDeletion::Type::kAll) {
-      for (auto iterator = entities_.begin(); iterator != entities_.end();) {
-        if (iterator->second.timestamp <= deletion.timestamp) {
-          iterator = erase(iterator);
-          changed = true;
-        } else {
-          ++iterator;
-        }
-      }
-      continue;
-    }
-    const auto iterator = entities_.find(deletion.id);
-    if (iterator != entities_.end() && iterator->second.timestamp <= deletion.timestamp) {
-      erase(iterator);
-      changed = true;
-    }
-  }
+  bool changed = applySceneEntityDeletions(entities_, snapshot, [this](Iterator iterator) { return erase(iterator); });
   for (const PJ::sdk::SceneEntity& entity : snapshot.entities) {
     // projectedRetainedBytes() already rejected any snapshot whose entity sizes
     // overflow, so modelEntityBytes() cannot be nullopt here; the guards keep

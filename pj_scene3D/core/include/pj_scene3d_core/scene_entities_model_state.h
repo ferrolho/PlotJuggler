@@ -15,6 +15,41 @@ namespace pj::scene3d {
 // SceneEntities topic. The native layer currently carries the same semantics
 // inline; the browser uses this isolated reducer so its QRhi/Assimp path cannot
 // accidentally leak into procedural marker snapshot behavior.
+// Replays a SceneEntities batch's DELETION contract onto an entity map:
+// deletions act on PRIOR state (Foxglove's reference order — the canonical
+// DELETEALL + re-add republish puts the kAll deletion and the replacement
+// entities in one batch at one timestamp, so upserting first would let the
+// deletion's `timestamp <= deletion.timestamp` gate erase the just-added
+// entities), and each deletion removes only entries whose sensor timestamp is
+// <= the deletion's. `erase` receives a map iterator, performs the owner's
+// side effects, and returns the next iterator. Returns true when anything was
+// erased; the caller performs its own upserts afterwards. Shared by the
+// native SceneEntitiesLayer and the browser model reducer so the subtle
+// ordering contract exists exactly once.
+template <typename EntityMap, typename Erase>
+bool applySceneEntityDeletions(EntityMap& entities, const PJ::sdk::SceneEntities& snapshot, Erase&& erase) {
+  bool changed = false;
+  for (const PJ::sdk::SceneEntityDeletion& deletion : snapshot.deletions) {
+    if (deletion.type == PJ::sdk::SceneEntityDeletion::Type::kAll) {
+      for (auto iterator = entities.begin(); iterator != entities.end();) {
+        if (iterator->second.timestamp <= deletion.timestamp) {
+          iterator = erase(iterator);
+          changed = true;
+        } else {
+          ++iterator;
+        }
+      }
+      continue;
+    }
+    const auto iterator = entities.find(deletion.id);
+    if (iterator != entities.end() && iterator->second.timestamp <= deletion.timestamp) {
+      erase(iterator);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // Overflow-safe lifetime expiry shared by the native SceneEntitiesLayer and the
 // browser model reducer (lifetime_ns == 0 means "never expires", per the
 // SceneEntity contract). anchor_ns is the entity's lifetime-expiry origin: the

@@ -636,28 +636,7 @@ void SceneEntitiesLayer::ensureModelStateAt(PJ::Timepoint time) {
 }
 
 void SceneEntitiesLayer::applySnapshot(const PJ::sdk::SceneEntities& snapshot, int64_t ingest_ns) {
-  // Deletions act on PRIOR state (entities accumulated before this batch), per
-  // the SDK scene_entities.hpp contract. Foxglove's reference impl applies
-  // deletions first for exactly this reason: the canonical DELETEALL+re-add
-  // republish pattern puts a kAll deletion and the replacement entities in the
-  // same batch at the same timestamp — if we upserted first, the deletion's
-  // `timestamp <= entity.timestamp` gate would erase the just-added entities.
-  for (const PJ::sdk::SceneEntityDeletion& deletion : snapshot.deletions) {
-    if (deletion.type == PJ::sdk::SceneEntityDeletion::Type::kAll) {
-      for (auto it = entities_.begin(); it != entities_.end();) {
-        if (it->second.timestamp <= deletion.timestamp) {
-          it = eraseEntity(it);
-        } else {
-          ++it;
-        }
-      }
-      continue;
-    }
-    auto it = entities_.find(deletion.id);
-    if (it != entities_.end() && it->second.timestamp <= deletion.timestamp) {
-      eraseEntity(it);
-    }
-  }
+  pj::scene3d::applySceneEntityDeletions(entities_, snapshot, [this](auto it) { return eraseEntity(it); });
   if (!snapshot.deletions.empty()) {
     // A deletion may have pruned a failed model's record — drop it from the notice.
     updateRemoteFetchNotice();
