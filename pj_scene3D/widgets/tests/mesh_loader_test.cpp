@@ -10,8 +10,11 @@
 #include <QFuture>
 #include <QString>
 #include <QTemporaryDir>
+#include <array>
 #include <cmath>
 #include <glm/glm.hpp>
+#include <string>
+#include <unordered_set>
 #include <vector>
 using namespace Qt::StringLiterals;
 
@@ -261,6 +264,72 @@ TEST(MeshLoaderTest, EmbeddedGlbExtractsBaseColorTextureAndPbrFactors) {
   EXPECT_TRUE(material.metallic_roughness.empty());
   EXPECT_TRUE(material.normal.empty());
   EXPECT_TRUE(material.emissive.empty());
+}
+
+// The W19i fixture carries all five glTF metallic-roughness material maps in
+// one GLB. Each must remain an inline encoded capability with a stable content
+// key so both the native and QRhi renderers can apply their slot-specific color
+// space without reopening a path.
+TEST(MeshLoaderTest, EmbeddedPbrGlbExtractsAllFiveMaterialMaps) {
+  MeshLoader loader;
+  const QByteArray bytes = readFixtureBytes("embedded_pbr.glb");
+  ASSERT_FALSE(bytes.isEmpty());
+  const MeshData mesh = loader.loadFromMemory(bytes, u"glb"_s).result();
+  ASSERT_TRUE(mesh.ok) << mesh.error.toStdString();
+  ASSERT_EQ(mesh.submeshes.size(), 1U);
+  ASSERT_NE(mesh.submeshes.front().material, nullptr);
+
+  const Material& material = *mesh.submeshes.front().material;
+  const std::array<const TextureSource*, 5> maps{
+      &material.base_color, &material.metallic_roughness, &material.normal, &material.occlusion, &material.emissive};
+  std::unordered_set<std::string> keys;
+  for (const TextureSource* map : maps) {
+    ASSERT_NE(map, nullptr);
+    EXPECT_FALSE(map->empty());
+    EXPECT_TRUE(map->path.isEmpty());
+    EXPECT_FALSE(map->bytes.empty());
+    EXPECT_TRUE(map->key.rfind("emb:", 0) == 0) << map->key;
+    keys.insert(map->key);
+  }
+  EXPECT_EQ(keys.size(), maps.size()) << "the fixture's five distinct images must retain distinct cache keys";
+  EXPECT_TRUE(material.has_pbr);
+  EXPECT_NEAR(material.metallic_factor, 0.65F, 1e-3F);
+  EXPECT_NEAR(material.roughness_factor, 0.55F, 1e-3F);
+  EXPECT_NEAR(material.emissive_factor.x, 0.0F, 1e-3F);
+  EXPECT_NEAR(material.emissive_factor.y, 1.0F, 1e-3F);
+  EXPECT_NEAR(material.emissive_factor.z, 1.0F, 1e-3F);
+  for (const Vertex& vertex : mesh.vertices) {
+    const glm::vec3 tangent(vertex.tangent);
+    EXPECT_NEAR(glm::length(tangent), 1.0F, 1e-3F);
+    EXPECT_NEAR(glm::dot(glm::normalize(vertex.normal), tangent), 0.0F, 1e-3F);
+    EXPECT_TRUE(std::abs(vertex.tangent.w - 1.0F) < 1e-3F || std::abs(vertex.tangent.w + 1.0F) < 1e-3F);
+  }
+}
+
+TEST(MeshLoaderTest, EmbeddedNeutralGlbIsAMapFreeOpaqueControl) {
+  MeshLoader loader;
+  const QByteArray bytes = readFixtureBytes("embedded_neutral.glb");
+  ASSERT_FALSE(bytes.isEmpty());
+  const MeshData mesh = loader.loadFromMemory(bytes, u"glb"_s).result();
+  ASSERT_TRUE(mesh.ok) << mesh.error.toStdString();
+  ASSERT_EQ(mesh.submeshes.size(), 1U);
+  ASSERT_NE(mesh.submeshes.front().material, nullptr);
+
+  const Material& material = *mesh.submeshes.front().material;
+  EXPECT_TRUE(material.has_pbr);
+  EXPECT_TRUE(material.base_color.empty());
+  EXPECT_TRUE(material.metallic_roughness.empty());
+  EXPECT_TRUE(material.normal.empty());
+  EXPECT_TRUE(material.occlusion.empty());
+  EXPECT_TRUE(material.emissive.empty());
+  EXPECT_EQ(material.alpha_mode, AlphaMode::kOpaque);
+  EXPECT_NEAR(material.base_color_factor.r, 0.65F, 1e-3F);
+  EXPECT_NEAR(material.base_color_factor.g, 0.65F, 1e-3F);
+  EXPECT_NEAR(material.base_color_factor.b, 0.65F, 1e-3F);
+  EXPECT_NEAR(material.base_color_factor.a, 1.0F, 1e-3F);
+  EXPECT_NEAR(material.metallic_factor, 0.0F, 1e-3F);
+  EXPECT_NEAR(material.roughness_factor, 1.0F, 1e-3F);
+  EXPECT_EQ(material.emissive_factor, glm::vec3(0.0F));
 }
 
 // The embedded-texture cache key is a content hash, so re-loading the same bytes

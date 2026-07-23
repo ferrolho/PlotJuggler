@@ -879,8 +879,9 @@ QWidget* WasmPointCloudLayer::createConfigWidget(QWidget* parent) {
   outside_visible->setChecked(outside_range_visible_);
   form->addRow(QString{}, outside_visible);
 
-  // Hide whole rows (field + its label). Hiding only a field leaves the
-  // QFormLayout-owned label visible.
+  // Hide whole rows (field + its label) via setRowVisible — a bare
+  // setVisible on the field orphans the QFormLayout-owned label, which the
+  // desktop layer avoids by hiding labelForField too.
   const auto refresh_visibility = [this, form, solid_color, colormap, invert, automatic, range_min, range_max, outside,
                                    outside_visible]() {
     const bool field = color_type_ == ColorType::kField;

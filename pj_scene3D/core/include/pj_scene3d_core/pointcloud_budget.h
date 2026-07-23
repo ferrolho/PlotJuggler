@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "pj_scene3d_core/browser_budget.h"
+
 namespace pj::scene3d {
 
 // Browser point-cloud limits live in the GL/Qt-free core so the exact boundary
@@ -34,11 +36,7 @@ inline constexpr std::uint64_t kBrowserMaxPointVerticesPerView = 1'000'000;
 // unchanged and cannot wrap an unsigned counter below zero.
 [[nodiscard]] constexpr bool tryConsumeBrowserPointVertices(
     std::uint64_t requested, std::uint64_t& remaining) noexcept {
-  if (requested > remaining) {
-    return false;
-  }
-  remaining -= requested;
-  return true;
+  return tryConsumeBrowserBudget(requested, remaining);
 }
 
 }  // namespace pj::scene3d

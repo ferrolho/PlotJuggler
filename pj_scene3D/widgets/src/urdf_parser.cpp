@@ -71,7 +71,7 @@ void parseOriginInto(const QDomElement& parent, T& out) {
 // Returns false if no recognized child geometry is present.
 bool parseGeometry(
     const QDomElement& parent, UrdfPackageResolver* resolver, const std::string& urdf_dir, bool source_is_url,
-    GeomShape& out) {
+    const UrdfParseLimits* limits, GeomShape& out, std::string& error) {
   const QDomElement geo = parent.firstChildElement(u"geometry"_s);
   if (geo.isNull()) {
     return false;
@@ -101,7 +101,13 @@ bool parseGeometry(
   }
   if (const QDomElement mesh = geo.firstChildElement(u"mesh"_s); !mesh.isNull()) {
     GeomMesh m;
-    m.filename = mesh.attribute(u"filename"_s).toStdString();
+    const QByteArray filename = mesh.attribute(u"filename"_s).toUtf8();
+    if (limits != nullptr && limits->max_string_bytes != 0U &&
+        static_cast<std::size_t>(filename.size()) > limits->max_string_bytes) {
+      error = "URDF mesh reference exceeds the browser string limit";
+      return false;
+    }
+    m.filename = filename.toStdString();
     std::array<double, 3> sc{1, 1, 1};
     if (parseDoubles(mesh.attribute(u"scale"_s), sc)) {
       m.scale = {sc[0], sc[1], sc[2]};
@@ -138,7 +144,8 @@ std::optional<glm::vec4> readColorRgba(const QDomElement& color_el) {
 // Fills geom.color and sets geom.has_color when an inline or named color is
 // found; otherwise leaves the LinkGeom defaults.
 void parseMaterial(
-    const QDomElement& parent, const std::unordered_map<std::string, glm::vec4>& materials, LinkGeom& geom) {
+    const QDomElement& parent, const UrdfParseLimits* limits,
+    const std::unordered_map<std::string, glm::vec4>& materials, LinkGeom& geom, std::string& error) {
   const QDomElement mat = parent.firstChildElement(u"material"_s);
   if (mat.isNull()) {
     return;
@@ -149,7 +156,13 @@ void parseMaterial(
     return;
   }
   // Named material reference: <material name="Foo"/> with no inline color.
-  const std::string name = mat.attribute(u"name"_s).toStdString();
+  const QByteArray name_bytes = mat.attribute(u"name"_s).toUtf8();
+  if (limits != nullptr && limits->max_string_bytes != 0U &&
+      static_cast<std::size_t>(name_bytes.size()) > limits->max_string_bytes) {
+    error = "URDF material reference exceeds the browser string limit";
+    return;
+  }
+  const std::string name = name_bytes.toStdString();
   if (!name.empty()) {
     auto it = materials.find(name);
     if (it != materials.end()) {
@@ -163,13 +176,14 @@ void parseMaterial(
 // has no recognizable geometry.
 bool parseGeomElement(
     const QDomElement& el, UrdfPackageResolver* resolver, const std::string& urdf_dir, bool source_is_url,
-    const std::unordered_map<std::string, glm::vec4>& materials, LinkGeom& out) {
-  if (!parseGeometry(el, resolver, urdf_dir, source_is_url, out.shape)) {
+    const UrdfParseLimits* limits, const std::unordered_map<std::string, glm::vec4>& materials, LinkGeom& out,
+    std::string& error) {
+  if (!parseGeometry(el, resolver, urdf_dir, source_is_url, limits, out.shape, error)) {
     return false;
   }
   parseOriginInto(el, out);
-  parseMaterial(el, materials, out);
-  return true;
+  parseMaterial(el, limits, materials, out, error);
+  return error.empty();
 }
 
 // Map a URDF joint `type` attribute to JointType (unknown/empty ⇒ kOther).
@@ -212,7 +226,7 @@ bool looksLikeXacro(const std::string& xml, const std::string& filename) {
 
 std::pair<std::optional<RobotModel>, std::string> parseUrdf(
     const std::string& xml, UrdfPackageResolver* resolver, const std::string& urdf_dir, bool source_is_url,
-    const std::string& filename) {
+    const std::string& filename, const UrdfParseLimits* limits) {
   if (looksLikeXacro(xml, filename)) {
     return {std::nullopt, "Unsupported format: xacro — run `xacro input.xacro > output.urdf` and load the result."};
   }
@@ -253,9 +267,18 @@ std::pair<std::optional<RobotModel>, std::string> parseUrdf(
 
   // Pass 1 — collect top-level named materials (<robot><material name color>).
   std::unordered_map<std::string, glm::vec4> materials;
+  std::size_t material_count = 0;
   for (QDomElement mat = root.firstChildElement(u"material"_s); !mat.isNull();
        mat = mat.nextSiblingElement(u"material"_s)) {
-    const std::string name = mat.attribute(u"name"_s).toStdString();
+    if (limits != nullptr && limits->max_materials != 0U && ++material_count > limits->max_materials) {
+      return {std::nullopt, "URDF exceeds the browser material limit"};
+    }
+    const QByteArray name_bytes = mat.attribute(u"name"_s).toUtf8();
+    if (limits != nullptr && limits->max_string_bytes != 0U &&
+        static_cast<std::size_t>(name_bytes.size()) > limits->max_string_bytes) {
+      return {std::nullopt, "URDF material name exceeds the browser string limit"};
+    }
+    const std::string name = name_bytes.toStdString();
     if (name.empty()) {
       continue;
     }
@@ -265,22 +288,45 @@ std::pair<std::optional<RobotModel>, std::string> parseUrdf(
   }
 
   // Pass 2 — links. <joint> is intentionally skipped.
+  std::size_t geometry_count = 0;
   for (QDomElement link_el = root.firstChildElement(u"link"_s); !link_el.isNull();
        link_el = link_el.nextSiblingElement(u"link"_s)) {
+    if (limits != nullptr && limits->max_links != 0U && model.links.size() >= limits->max_links) {
+      return {std::nullopt, "URDF exceeds the browser link limit"};
+    }
     RobotLink link;
-    link.name = link_el.attribute(u"name"_s).toStdString();
+    const QByteArray link_name = link_el.attribute(u"name"_s).toUtf8();
+    if (limits != nullptr && limits->max_string_bytes != 0U &&
+        static_cast<std::size_t>(link_name.size()) > limits->max_string_bytes) {
+      return {std::nullopt, "URDF link name exceeds the browser string limit"};
+    }
+    link.name = link_name.toStdString();
 
     for (QDomElement v = link_el.firstChildElement(u"visual"_s); !v.isNull(); v = v.nextSiblingElement(u"visual"_s)) {
       LinkGeom g;
-      if (parseGeomElement(v, resolver, urdf_dir, source_is_url, materials, g)) {
+      std::string error;
+      if (parseGeomElement(v, resolver, urdf_dir, source_is_url, limits, materials, g, error)) {
+        if (limits != nullptr && limits->max_geometries != 0U && geometry_count >= limits->max_geometries) {
+          return {std::nullopt, "URDF exceeds the browser geometry limit"};
+        }
+        ++geometry_count;
         link.visuals.push_back(std::move(g));
+      } else if (!error.empty()) {
+        return {std::nullopt, std::move(error)};
       }
     }
     for (QDomElement c = link_el.firstChildElement(u"collision"_s); !c.isNull();
          c = c.nextSiblingElement(u"collision"_s)) {
       LinkGeom g;
-      if (parseGeomElement(c, resolver, urdf_dir, source_is_url, materials, g)) {
+      std::string error;
+      if (parseGeomElement(c, resolver, urdf_dir, source_is_url, limits, materials, g, error)) {
+        if (limits != nullptr && limits->max_geometries != 0U && geometry_count >= limits->max_geometries) {
+          return {std::nullopt, "URDF exceeds the browser geometry limit"};
+        }
+        ++geometry_count;
         link.collisions.push_back(std::move(g));
+      } else if (!error.empty()) {
+        return {std::nullopt, std::move(error)};
       }
     }
 
@@ -294,13 +340,27 @@ std::pair<std::optional<RobotModel>, std::string> parseUrdf(
   // FIXED joint can later be injected as a static TF bridge for a frame the data
   // never publishes; link poses still come from the live TF tree. A joint missing
   // its parent or child link is skipped (it cannot define an edge).
+  std::size_t joint_count = 0;
   for (QDomElement joint_el = root.firstChildElement(u"joint"_s); !joint_el.isNull();
        joint_el = joint_el.nextSiblingElement(u"joint"_s)) {
+    ++joint_count;
+    if (limits != nullptr && limits->max_joints != 0U && joint_count > limits->max_joints) {
+      return {std::nullopt, "URDF exceeds the browser joint limit"};
+    }
     RobotJoint joint;
-    joint.name = joint_el.attribute(u"name"_s).toStdString();
+    const QByteArray joint_name = joint_el.attribute(u"name"_s).toUtf8();
+    const QByteArray parent_name = joint_el.firstChildElement(u"parent"_s).attribute(u"link"_s).toUtf8();
+    const QByteArray child_name = joint_el.firstChildElement(u"child"_s).attribute(u"link"_s).toUtf8();
+    if (limits != nullptr && limits->max_string_bytes != 0U &&
+        (static_cast<std::size_t>(joint_name.size()) > limits->max_string_bytes ||
+         static_cast<std::size_t>(parent_name.size()) > limits->max_string_bytes ||
+         static_cast<std::size_t>(child_name.size()) > limits->max_string_bytes)) {
+      return {std::nullopt, "URDF joint field exceeds the browser string limit"};
+    }
+    joint.name = joint_name.toStdString();
     joint.type = jointTypeFromString(joint_el.attribute(u"type"_s));
-    joint.parent = joint_el.firstChildElement(u"parent"_s).attribute(u"link"_s).toStdString();
-    joint.child = joint_el.firstChildElement(u"child"_s).attribute(u"link"_s).toStdString();
+    joint.parent = parent_name.toStdString();
+    joint.child = child_name.toStdString();
     if (joint.parent.empty() || joint.child.empty()) {
       continue;
     }

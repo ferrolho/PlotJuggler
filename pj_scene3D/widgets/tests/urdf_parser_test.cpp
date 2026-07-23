@@ -6,9 +6,11 @@
 
 #include <QFile>
 #include <QString>
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <variant>
 
 #include "pj_scene3d_core/robot_model.h"
@@ -261,6 +263,82 @@ TEST(UrdfParser, OversizedInputRejectedWithSizeInMessage) {
   // Error must mention the size so the user understands why it was rejected.
   EXPECT_NE(err.find("MiB"), std::string::npos) << "error was: " << err;
   EXPECT_NE(err.find("32"), std::string::npos) << "error was: " << err;
+}
+
+TEST(UrdfParser, OptionalStructuralLimitsRejectBeforeGrowingTheModel) {
+  const std::string xml = R"(
+    <robot name="bounded">
+      <material name="red"><color rgba="1 0 0 1"/></material>
+      <material name="blue"><color rgba="0 0 1 1"/></material>
+      <link name="a">
+        <visual><geometry><box size="1 1 1"/></geometry></visual>
+        <collision><geometry><sphere radius="1"/></geometry></collision>
+      </link>
+      <link name="b"/>
+      <joint name="a_to_b" type="fixed"><parent link="a"/><child link="b"/></joint>
+      <joint name="b_to_a" type="fixed"><parent link="b"/><child link="a"/></joint>
+    </robot>)";
+  UrdfPackageResolver resolver;
+
+  struct LimitCase {
+    UrdfParseLimits limits;
+    const char* expected_error;
+  };
+  const std::array<LimitCase, 4> cases{{
+      {UrdfParseLimits{.max_links = 1}, "link limit"},
+      {UrdfParseLimits{.max_joints = 1}, "joint limit"},
+      {UrdfParseLimits{.max_geometries = 1}, "geometry limit"},
+      {UrdfParseLimits{.max_materials = 1}, "material limit"},
+  }};
+
+  for (const auto& limit_case : cases) {
+    auto [model, err] = parseUrdf(xml, &resolver, "", false, "", &limit_case.limits);
+    EXPECT_FALSE(model.has_value()) << limit_case.expected_error;
+    EXPECT_NE(err.find(limit_case.expected_error), std::string::npos) << "error was: " << err;
+  }
+
+  // The same input still follows the historical native path when no explicit
+  // browser envelope is supplied.
+  auto [model, err] = parseUrdf(xml, &resolver, "", false);
+  ASSERT_TRUE(model.has_value()) << err;
+  EXPECT_EQ(model->links.size(), 2u);
+  EXPECT_EQ(model->joints.size(), 2u);
+}
+
+TEST(UrdfParser, OptionalStringLimitCoversNamesJointFieldsAndMeshReferences) {
+  UrdfPackageResolver resolver;
+  const UrdfParseLimits limits{.max_string_bytes = 4};
+
+  const std::array<std::pair<std::string, std::string>, 4> cases{{
+      {R"(<robot name="r"><link name="long_link"/></robot>)", "link name"},
+      {R"(<robot name="r"><link name="a"/><link name="b"/><joint name="long_joint" type="fixed"><parent link="a"/><child link="b"/></joint></robot>)",
+       "joint field"},
+      {R"(<robot name="r"><link name="a"><visual><geometry><mesh filename="long.glb"/></geometry></visual></link></robot>)",
+       "mesh reference"},
+      {R"(<robot name="r"><link name="a"><visual><geometry><box size="1 1 1"/></geometry><material name="long_material"/></visual></link></robot>)",
+       "material reference"},
+  }};
+
+  for (const auto& [xml, expected_error] : cases) {
+    auto [model, err] = parseUrdf(xml, &resolver, "", false, "", &limits);
+    EXPECT_FALSE(model.has_value()) << expected_error;
+    EXPECT_NE(err.find(expected_error), std::string::npos) << "error was: " << err;
+  }
+}
+
+TEST(UrdfParser, OptionalJointLimitCountsMalformedJointElements) {
+  const std::string xml = R"(
+    <robot name="bounded">
+      <link name="a"/>
+      <joint name="missing_child" type="fixed"><parent link="a"/></joint>
+      <joint name="missing_parent" type="fixed"><child link="a"/></joint>
+    </robot>)";
+  UrdfPackageResolver resolver;
+  const UrdfParseLimits limits{.max_joints = 1};
+
+  auto [model, err] = parseUrdf(xml, &resolver, "", false, "", &limits);
+  EXPECT_FALSE(model.has_value());
+  EXPECT_NE(err.find("joint limit"), std::string::npos) << "error was: " << err;
 }
 
 }  // namespace

@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "pj_scene3d_core/browser_budget.h"
+
 namespace pj::scene3d {
 
 // Browser-only retained-memory limits. A full pose triad expands to three
@@ -23,11 +25,7 @@ inline constexpr std::uint64_t kBrowserMaxPoseArmsPerView = 300'000;
 }
 
 [[nodiscard]] constexpr bool tryConsumeBrowserPoseArms(std::uint64_t requested, std::uint64_t& remaining) noexcept {
-  if (requested > remaining) {
-    return false;
-  }
-  remaining -= requested;
-  return true;
+  return tryConsumeBrowserBudget(requested, remaining);
 }
 
 }  // namespace pj::scene3d

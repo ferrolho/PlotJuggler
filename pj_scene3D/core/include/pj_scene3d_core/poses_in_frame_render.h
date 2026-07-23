@@ -38,6 +38,13 @@ struct PoseTriadStyle {
   glm::vec3 color = glm::vec3(0.95f, 0.30f, 0.30f);
 };
 
+// Append the arm instances of one triad rooted at `base` (a frame-local or
+// world model matrix) per `style` — a full XYZ triad (X red, Y green, Z blue)
+// or a single X arm (`x_arrow_only`), recolored by `override_color`. The X/Y/Z
+// arm rotations and per-axis colors are the single source of truth for both the
+// PosesInFrame layers and the 3D scene's TF "Frames" gizmos. Pure CPU, no GL.
+void appendTriadArms(const glm::mat4& base, const PoseTriadStyle& style, std::vector<PoseTriadInstance>& out);
+
 // Expand a PosesInFrame into arm instances per `style`. Each pose becomes either
 // a full coordinate triad (X red, Y green, Z blue, in that order -> 3 arms) or a
 // single X-axis arm (`x_arrow_only` -> 1 arm); `override_color` recolors whichever

@@ -6,6 +6,37 @@
 # with the model/rendering slice in PR 3.
 include_guard(GLOBAL)
 
+# Keep browser mesh import format-compatible with the native Scene3D path,
+# while building only the four importers PlotJuggler exposes. This is Assimp
+# 5.4.3, matching the native Conan graph; exporters, tools, tests, and install
+# rules remain outside the browser application graph.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ZLIB OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DRACO OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DRACO_STATIC OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_COLLADA_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_STL_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
+FetchContent_Declare(assimp
+    URL https://codeload.github.com/assimp/assimp/tar.gz/c35200e38ea8f058812b83de2ef32c6093b0ece2
+    URL_HASH SHA256=300fd8614af364bc750706c2b33cb66dee2d99eeb5e10f38cc979ddc9b80051a
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    OVERRIDE_FIND_PACKAGE
+    SYSTEM)
+FetchContent_MakeAvailable(assimp)
+# Assimp uses exceptions internally even for successful imports. Emscripten
+# disables catching in optimized translation units unless explicitly enabled.
+target_compile_options(assimp PRIVATE -fexceptions)
+
 if(PJ_WASM_WITH_COMPRESSED_POINTCLOUDS)
     # Match the native graph (Draco 1.5.7 + Cloudini 1.2.2). The common wasm
     # dependency file has already provided the shared LZ4 and Zstd targets.

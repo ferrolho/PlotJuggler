@@ -68,6 +68,10 @@
 #include "pj_widgets/FrameworkTokens.h"
 #include "pj_widgets/MessageBox.h"
 #include "pj_widgets/SvgUtil.h"
+
+#ifdef PJ_WASM_ENABLE_MCAP_PROBE_PARSER
+#include "../tests/wasm_mcap_probe_topics.h"
+#endif
 using namespace Qt::StringLiterals;
 
 namespace PJ {
@@ -857,6 +861,13 @@ void FileLoader::applyDefaultIngestPolicies(PJ::sdk::ObjectIngestPolicyResolver&
   // until the layer requests the selected description. Fence this to WASM so
   // the desktop application's ingest policy remains exactly unchanged.
   resolver.setForType(BuiltinObjectType::kRobotDescription, ObjectIngestPolicy::kPureLazy);
+#endif
+#ifdef PJ_WASM_ENABLE_MCAP_PROBE_PARSER
+  // The official 50k-message cancellation fixture uses this topic. Force its
+  // acceptance-only parser through the eager scalar route so the browser test
+  // has a deterministic window in which to exercise cooperative cancellation;
+  // normal builds retain the production policy above.
+  resolver.setForTopic(kWasmProbeBulkTopic, ObjectIngestPolicy::kEager);
 #endif
 }
 

@@ -69,6 +69,57 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
       warnings: decodeURIComponent(match[38]).trim().split('|').filter(Boolean),
     }];
   }));
+  const modelMessages = () => consoleMessages.filter(
+    message => message.includes('PJ_WASM_SCENE3D_MODELS')
+      && message.includes(`sequence=${sequence} `),
+  );
+  await expect.poll(() => modelMessages().length).toBe(dockCount);
+  const modelsByIndex = new Map(modelMessages().map((message) => {
+    const fields = Object.fromEntries(
+      [...message.matchAll(/(?:^| )([a-z_]+)=([^ ]*)/g)].map(match => [match[1], match[2]]),
+    );
+    const numbers = (name, count) => {
+      const values = (fields[name] || '').split(',').map(Number);
+      expect(values, `invalid ${name} state: ${message}`).toHaveLength(count);
+      expect(values.every(Number.isFinite), `non-numeric ${name} state: ${message}`).toBe(true);
+      return values;
+    };
+    const markers = numbers('markers', 8);
+    const families = numbers('families', 7);
+    const skipped = numbers('skipped', 3);
+    const model = numbers('models', 6);
+    const maps = numbers('maps', 5);
+    const robots = numbers('robots', 10);
+    return [Number(fields.index), {
+      markers: {
+        live: markers[0], decoding: markers[1], starts: markers[2],
+        completed: markers[3], offMain: markers[4], rendered: markers[5],
+        instances: markers[6], stream: markers[7],
+        families: {
+          cubes: families[0], spheres: families[1], cylinders: families[2],
+          arrows: families[3], axes: families[4],
+          lineVertices: families[5], triangleVertices: families[6],
+        },
+        skipped: { text: skipped[0], models: skipped[1], invalid: skipped[2] },
+      },
+      models: {
+        ready: model[0], live: model[1], bytes: model[2],
+        rendered: model[3], draws: model[4], triangles: model[5],
+        maps: {
+          baseColor: maps[0], metallicRoughness: maps[1], normal: maps[2],
+          occlusion: maps[3], emissive: maps[4],
+        },
+      },
+      robots: {
+        live: robots[0], meshes: robots[1], draws: robots[2],
+        visual: robots[3], collision: robots[4], placeholders: robots[5],
+        bridges: robots[6], sourceType: robots[7], displayMode: robots[8],
+        revision: robots[9], source: decodeURIComponent(fields.source),
+        status: decodeURIComponent(fields.status).split('|').filter(Boolean),
+        sourceIndex: Number(fields.source_index),
+      },
+    }];
+  }));
 
   const docks = dockMessages().map((message) => {
     const match = message.match(
@@ -116,6 +167,7 @@ async function requestScene3DFoundationState(page, consoleMessages, previousCoun
         height: Number(match[38]),
       },
       data: dataByIndex.get(Number(match[1])),
+      models: modelsByIndex.get(Number(match[1])),
     };
   });
 

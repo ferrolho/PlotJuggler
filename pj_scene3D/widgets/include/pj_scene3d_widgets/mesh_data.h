@@ -43,7 +43,7 @@ struct Vertex {
 // base-color/emissive are color data, metallic-roughness/normal/occlusion are
 // linear data.
 // Embedded `bytes` stay resident on the owning MeshData for the mesh's lifetime
-// (copied once per SubMesh that references the material) so the renderer can
+// (copied once per distinct Material and shared by its SubMeshes) so the renderer can
 // re-decode them after a GL-context loss — memory traded for context-recreation
 // robustness, fine for the usual handful of textured submeshes.
 struct TextureSource {

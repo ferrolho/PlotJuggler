@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "pj_scene3d_core/browser_budget.h"
+
 namespace pj::scene3d {
 
 // Browser-only voxel limits. A scalar layer retains one float per voxel on the
@@ -32,11 +34,7 @@ inline constexpr std::uint64_t kBrowserMaxVoxelsPerView = 8ULL * 1024ULL * 1024U
 }
 
 [[nodiscard]] constexpr bool tryConsumeBrowserVoxels(std::uint64_t requested, std::uint64_t& remaining) noexcept {
-  if (requested > remaining) {
-    return false;
-  }
-  remaining -= requested;
-  return true;
+  return tryConsumeBrowserBudget(requested, remaining);
 }
 
 }  // namespace pj::scene3d

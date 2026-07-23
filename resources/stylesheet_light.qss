@@ -1123,7 +1123,10 @@ QToolButton#curveVisibilityToggle:pressed,
 QToolButton#curveVisibilityToggle:checked,
 QToolButton#curveTrashToggle,
 QToolButton#curveTrashToggle:hover,
-QToolButton#curveTrashToggle:pressed {
+QToolButton#curveTrashToggle:pressed,
+QToolButton#scene3dRobotRowTrash,
+QToolButton#scene3dRobotRowTrash:hover,
+QToolButton#scene3dRobotRowTrash:pressed {
     background: transparent;
     border: none;
 }

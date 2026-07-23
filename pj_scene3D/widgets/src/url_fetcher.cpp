@@ -3,7 +3,9 @@
 #include "url_fetcher.h"
 
 #include <QFile>
+#ifndef PJ_TARGET_WASM
 #include <QNetworkDiskCache>
+#endif
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QStandardPaths>
@@ -25,7 +27,26 @@ FetchResult readLocalFile(const QString& path) {
     result.error = file.errorString();
     return result;
   }
+#ifdef PJ_TARGET_WASM
+  // Browser-local sources are MEMFS files supplied by data/layout state. Bound
+  // them before QByteArray allocation; native retains its existing unbounded
+  // local-file behavior below.
+  const qint64 size = file.size();
+  if (size < 0 || size > UrlFetcher::kMaxFetchBytes) {
+    result.error =
+        QString(u"local model exceeds the %1 MiB browser limit"_s).arg(UrlFetcher::kMaxFetchBytes / (1024 * 1024));
+    return result;
+  }
+  result.bytes = file.read(size);
+  if (!file.atEnd()) {
+    result.bytes.clear();
+    result.error =
+        QString(u"local model exceeds the %1 MiB browser limit"_s).arg(UrlFetcher::kMaxFetchBytes / (1024 * 1024));
+    return result;
+  }
+#else
   result.bytes = file.readAll();
+#endif
   result.ok = true;
   return result;
 }
@@ -64,6 +85,7 @@ UrlFetcher::UrlFetcher(QObject* parent) : QObject(parent) {
   // The directory defaults to <AppData>/models, overridable via the
   // PJ_MODEL_CACHE_DIR environment variable — both to relocate the cache and to
   // let tests redirect it to a throwaway dir without touching the real home.
+#ifndef PJ_TARGET_WASM
   QString cache_dir = qEnvironmentVariable("PJ_MODEL_CACHE_DIR");
   if (cache_dir.isEmpty()) {
     cache_dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + u"/models"_s;
@@ -72,6 +94,7 @@ UrlFetcher::UrlFetcher(QObject* parent) : QObject(parent) {
   cache->setCacheDirectory(cache_dir);
   cache->setMaximumCacheSize(256LL * 1024 * 1024);
   manager_.setCache(cache);
+#endif
 }
 
 void UrlFetcher::deliverLater(std::function<void(FetchResult)> on_done, FetchResult result) {

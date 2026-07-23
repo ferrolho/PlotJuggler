@@ -2,12 +2,12 @@ set(CMAKE_AUTOMOC ON)
 
 if(EMSCRIPTEN)
   # Product Scene3D uses Qt's RHI/WebGL2 backend in the browser.  Keep this a
-  # deliberately small, platform-selected source set: no QOpenGLWidget, raw GL
-  # pass, Assimp, or network model loader enters the browser link. W19a adds the
-  # explicitly gated compressed-cloud transcoder; DepthCloud uses Qt Concurrent
-  # independently for bounded back-projection on the browser worker pool.
+  # deliberately small, platform-selected source set: no QOpenGLWidget or raw
+  # GL pass enters the browser link. W19a adds the explicitly gated compressed-
+  # cloud transcoder; W19g adds bounded Assimp model import and HTTP(S) loading;
+  # W19h adds the bounded URDF parser and RobotDescription adapter.
   set(CMAKE_AUTORCC ON)
-  set(_pj_scene3d_qt_components Widgets Gui GuiPrivate Xml Concurrent)
+  set(_pj_scene3d_qt_components Widgets Gui GuiPrivate Xml Concurrent Network)
   find_package(Qt6 ${PJ_QT_REQUIRED_VERSION} REQUIRED COMPONENTS ${_pj_scene3d_qt_components})
 
   if(NOT TARGET Qt6::qsb)
@@ -25,7 +25,8 @@ if(EMSCRIPTEN)
   file(MAKE_DIRECTORY "${_pj_scene3d_shader_verify_dir}")
   foreach(_pj_scene3d_shader IN ITEMS
       scene.vert scene.frag point.vert point.frag cube.vert cube.frag
-      pose.vert pose.frag occupancy.vert occupancy.frag voxel.vert voxel.frag)
+      pose.vert pose.frag occupancy.vert occupancy.frag voxel.vert voxel.frag
+      marker.vert marker.frag model.vert model.frag)
     set(_pj_scene3d_shader_source "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shaders/${_pj_scene3d_shader}")
     set(_pj_scene3d_shader_pack "${_pj_scene3d_shader_source}.qsb")
     set(_pj_scene3d_shader_rebuilt "${_pj_scene3d_shader_verify_dir}/${_pj_scene3d_shader}.qsb")
@@ -53,6 +54,12 @@ if(EMSCRIPTEN)
     wasm/poses_in_frame_layer_wasm.cpp
     wasm/occupancy_grid_layer_wasm.cpp
     wasm/voxel_grid_layer_wasm.cpp
+    wasm/scene_entities_layer_wasm.cpp
+    wasm/robot_model_layer_wasm.cpp
+    src/mesh_loader.cpp
+    src/url_fetcher.cpp
+    src/urdf_parser.cpp
+    src/urdf_package_resolver.cpp
     src/transform_service.cpp
     src/object_topic_metadata.cpp
     src/resolve_object.cpp
@@ -66,9 +73,12 @@ if(EMSCRIPTEN)
     include/pj_scene3d_widgets/wasm/depth_cloud_layer_wasm.h
     include/pj_scene3d_widgets/wasm/point_cloud_layer_wasm.h
     include/pj_scene3d_widgets/wasm/point_renderable_wasm.h
+    include/pj_scene3d_widgets/wasm/model_renderable_wasm.h
     include/pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h
     include/pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h
     include/pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/scene_entities_layer_wasm.h
+    include/pj_scene3d_widgets/wasm/robot_model_layer_wasm.h
     include/pj_scene3d_widgets/gizmos/arrow_mesh.h
     include/pj_scene3d_widgets/transform_service.h
     include/pj_scene3d_widgets/object_topic_metadata.h
@@ -78,7 +88,7 @@ if(EMSCRIPTEN)
   target_include_directories(pj_scene3d_widgets PUBLIC include PRIVATE src)
   target_compile_features(pj_scene3d_widgets PUBLIC cxx_std_20)
   target_compile_options(pj_scene3d_widgets PRIVATE
-    ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS}
+    ${PJ_WARNING_FLAGS} ${PJ_SANITIZER_FLAGS} -fexceptions
   )
   target_link_libraries(pj_scene3d_widgets
     PUBLIC
@@ -92,6 +102,8 @@ if(EMSCRIPTEN)
       Qt6::Xml
     PRIVATE
       Qt6::Concurrent
+      Qt6::Network
+      assimp::assimp
   )
 
   unset(_pj_scene3d_committed_hash)

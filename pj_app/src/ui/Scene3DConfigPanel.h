@@ -42,8 +42,8 @@ inline constexpr char kScene3dSceneControlsGroup[] = "pj_scene3d/scene_controls"
 // in rebuildLayerList()/onLayerAdded() on bind, dock switch, and layout restore
 // (the rows belong to the dock, so a rebind clears and rebuilds them). Robot
 // layers stay OUT of the Topics list; their row is their whole list-side UI.
-// The WASM build exposes the shared grid/transform/camera subset and omits the
-// native-only robot-model and mesh controls until their QRhi layers are ported.
+// The WASM build uses content-based file selection and nonmodal topic/URL
+// prompts; native keeps its path-based dialogs and otherwise shares this UI.
 // Clicking a row binds the Settings host to that layer's config widget, so the
 // source combo / status text / Retry are reachable.
 class Scene3DConfigPanel : public QWidget {

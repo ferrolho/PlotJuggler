@@ -1,84 +1,77 @@
 // SPDX-License-Identifier: MPL-2.0
 const { expect } = require('@playwright/test');
 
-async function openFileChooser(page, screen, useProbe = false) {
+const PICKER_ATTEMPTS = 3;
+const PICKER_DELIVERY_TIMEOUT_MS = 8000;
+const PICKER_RETRY_DELAY_MS = 500;
+
+async function retryChooser(page, trigger) {
   let lastError;
-  for (let attempt = 0; attempt < 5; ++attempt) {
+  for (let attempt = 0; attempt < PICKER_ATTEMPTS; ++attempt) {
+    const chooserPromise = page.waitForEvent('filechooser', { timeout: PICKER_DELIVERY_TIMEOUT_MS });
     try {
-      const chooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
-      if (attempt === 0 && !useProbe) {
-        // Exercise the real user-facing canvas button first.
-        await page.mouse.click(screen.x + 15, screen.y + 80);
-      } else {
-        // Probe builds expose the same MainWindow slot. This avoids turning
-        // a dropped synthetic canvas gesture into a parser/ingest false failure.
-        await page.evaluate(() => window.pjWasmOpenLoadProbe());
-      }
+      await trigger(attempt);
       return await chooserPromise;
     } catch (error) {
       lastError = error;
-      // A cold threaded-WASM page can expose its canvas before Qt has painted
-      // the actionable frame. A just-destroyed Qt dialog can likewise consume
-      // one click while restoring the active window. Retrying a real gesture is
-      // safe in both cases and avoids relying on a fixed machine-speed delay.
-      await page.waitForTimeout(750);
+      // Drain a still-pending waiter before retrying so an earlier attempt
+      // cannot steal the next chooser event.
+      await chooserPromise.catch(() => undefined);
+      if (attempt + 1 < PICKER_ATTEMPTS) {
+        await page.waitForTimeout(PICKER_RETRY_DELAY_MS);
+      }
     }
   }
   throw lastError;
 }
 
+async function openFileChooser(page, screen, useProbe = false) {
+  return retryChooser(page, async (attempt) => {
+    if (attempt === 0 && !useProbe) {
+      // Exercise the real user-facing canvas button first.
+      await page.mouse.click(screen.x + 15, screen.y + 80);
+    } else {
+      // Probe builds expose the same MainWindow slot. This avoids turning
+      // a dropped synthetic canvas gesture into a parser/ingest false failure.
+      await page.evaluate(() => window.pjWasmOpenLoadProbe());
+    }
+  });
+}
+
+async function openProbedChooser(page, probeName) {
+  const hasProbe = await page.evaluate(name => typeof window[name] === 'function', probeName);
+  if (!hasProbe) {
+    throw new Error(`${probeName} not installed — check EM_JS probe installers`);
+  }
+  return retryChooser(page, () => page.evaluate(name => window[name](), probeName));
+}
 
 async function openLayoutChooser(page) {
-  const hasProbe = await page.evaluate(() => typeof window.pjWasmOpenLayoutProbe === 'function');
-  if (!hasProbe) {
-    throw new Error('layout picker probe not installed — check EM_JS probe installers');
-  }
-  let lastError;
-  for (let attempt = 0; attempt < 5; ++attempt) {
-    try {
-      const chooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
-      await page.evaluate(() => window.pjWasmOpenLayoutProbe());
-      return await chooserPromise;
-    } catch (error) {
-      lastError = error;
-      await page.waitForTimeout(750);
-    }
-  }
-  throw lastError;
+  return openProbedChooser(page, 'pjWasmOpenLayoutProbe');
 }
 
+async function openRobotChooser(page) {
+  return openProbedChooser(page, 'pjWasmOpenRobotPickerProbe');
+}
 
 async function openSourceReplayChooser(page, screen, geometry, consoleMessages) {
-  let lastError;
-  for (let attempt = 0; attempt < 5; ++attempt) {
+  return retryChooser(page, async () => {
     const previousRequests = consoleMessages.filter(
       message => message.includes('Opening browser file picker with filter:'),
     ).length;
-    try {
-      // A cold threaded-WASM page can emit the production request before
-      // Chromium delivers its native chooser event. Keep the physical
-      // click/retry path and its established delivery window; the multi-source
-      // stress scenario additionally bounds each independent replay transaction
-      // to a fresh Playwright Page target.
-      const chooserPromise = page.waitForEvent('filechooser', { timeout: 30000 });
-      // Every attempt remains a physical click on the production Reselect
-      // button. The button deliberately stays open until a picker callback, so
-      // a Qt/browser request that emits no chooser can be retried by a user.
-      await page.mouse.click(screen.x + geometry.reselect.x, screen.y + geometry.reselect.y);
-      await expect.poll(
-        () => consoleMessages.filter(
-          message => message.includes('Opening browser file picker with filter:'),
-        ).length,
-        { timeout: 5000 },
-      ).toBeGreaterThan(previousRequests);
-      return await chooserPromise;
-    } catch (error) {
-      lastError = error;
-      await page.waitForTimeout(750);
-    }
-  }
-  throw lastError;
+    // Every attempt remains a physical click on the production Reselect
+    // button. A missing browser event is terminal for that request, so an
+    // eight-second delivery window is more useful than waiting 30 seconds five
+    // times for callbacks that can no longer arrive.
+    await page.mouse.click(screen.x + geometry.reselect.x, screen.y + geometry.reselect.y);
+    await expect.poll(
+      () => consoleMessages.filter(
+        message => message.includes('Opening browser file picker with filter:'),
+      ).length,
+      { timeout: 3000 },
+    ).toBeGreaterThan(previousRequests);
+  });
 }
 
 
-module.exports = { openFileChooser, openLayoutChooser, openSourceReplayChooser };
+module.exports = { openFileChooser, openLayoutChooser, openRobotChooser, openSourceReplayChooser };

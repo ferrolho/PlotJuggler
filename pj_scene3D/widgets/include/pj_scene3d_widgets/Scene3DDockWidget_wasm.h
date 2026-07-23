@@ -9,6 +9,7 @@
 #include <QMetaObject>
 #include <QString>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -36,8 +37,8 @@ namespace PJ {
 class ComboBox;
 
 // Browser Scene3D family. The QRhi path supports raw/compressed PointCloud,
-// DepthCloud, PosesInFrame, OccupancyGrid, and VoxelGrid while structured model
-// and entity families remain deferred.
+// DepthCloud, PosesInFrame, OccupancyGrid, VoxelGrid, SceneEntities, and URDF
+// RobotModel layers.
 class Scene3DDockWidget : public SceneDockWidget {
   Q_OBJECT
 
@@ -95,6 +96,19 @@ class Scene3DDockWidget : public SceneDockWidget {
     return {};
   }
 
+  struct RobotDescriptionTopic {
+    ObjectTopicId topic_id;
+    QString name;
+  };
+  [[nodiscard]] QList<RobotDescriptionTopic> robotDescriptionTopics() const;
+
+ public slots:
+  // Browser-local files are content capabilities, not paths. The selected URDF
+  // bytes stay live only for this layer and are deliberately not embedded in a
+  // saved layout; restored local-file layers ask the user to select again.
+  ObjectTopicId addRobotModelLayerFromContent(QString filename, QByteArray bytes);
+  ObjectTopicId addRobotModelLayerFromUrl(const QString& url);
+
  signals:
   void availableFramesChanged(const QList<pj::scene3d::FrameRow>& frames);
   void currentFixedFrameChanged(const QString& frame);
@@ -134,10 +148,15 @@ class Scene3DDockWidget : public SceneDockWidget {
   void refreshFrameOverlayCombo();
   void layoutOverlayControls();
   [[nodiscard]] RestoreResult restoreConfigTopic(const QDomElement& element);
+  [[nodiscard]] RestoreResult restoreLocalRobotLayer(const QDomElement& element);
+  [[nodiscard]] bool isLocalRobotLayerId(ObjectTopicId topic_id) const;
+  ObjectTopicId allocateLocalRobotLayerId();
+  void ensureLocalTransformBuffer();
 
   pj::scene3d::TransformService* transform_service_ = nullptr;
   pj::scene3d::SceneViewWidget* view_ = nullptr;
   std::shared_ptr<pj::scene3d::TransformBuffer> tf_buffer_;
+  bool tf_buffer_is_local_ = false;
   DatasetId dataset_id_ = 0;
   std::unordered_set<uint32_t> config_topics_;
   std::unordered_set<uint32_t> layer_topics_;
@@ -157,6 +176,8 @@ class Scene3DDockWidget : public SceneDockWidget {
   QSettings* settings_ = nullptr;
   QMap<QString, QByteArray> embedded_assets_;
   QString source_path_;
+  uint32_t next_local_robot_topic_id_ = std::numeric_limits<uint32_t>::max();
+  std::unordered_set<uint32_t> local_robot_layer_ids_;
   bool xml_rollback_in_progress_ = false;
 };
 

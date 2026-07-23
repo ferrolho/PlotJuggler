@@ -11,7 +11,7 @@
 
 namespace pj::scene3d {
 
-std::vector<PoseTriadInstance> buildPoseTriadInstances(const PJ::sdk::PosesInFrame& msg, const PoseTriadStyle& style) {
+void appendTriadArms(const glm::mat4& base, const PoseTriadStyle& style, std::vector<PoseTriadInstance>& out) {
   // The unit arrow points +X. Rotate +X -> +Y (+90 deg about +Z) and +X -> +Z
   // (-90 deg about +Y) — same convention as renderTriadBound, so pose triads
   // look identical to the TF "Frames" gizmos. Per-axis colors mirror
@@ -31,19 +31,23 @@ std::vector<PoseTriadInstance> buildPoseTriadInstances(const PJ::sdk::PosesInFra
   const float alpha = std::clamp(style.opacity, 0.0f, 1.0f);
   const glm::mat4 scale = glm::scale(glm::mat4(1.0f), glm::vec3(std::max(style.axis_length, 0.0f)));
 
-  // Geometry: one X-axis arm per pose (kArm[0] is identity) or the full triad.
-  // Coloring is orthogonal: override_color recolors every produced arm with the
-  // shared color; otherwise each arm keeps its natural per-axis color (so an
+  // Geometry: one X-axis arm (kArm[0] is identity) or the full triad. Coloring
+  // is orthogonal: override_color recolors every produced arm with the shared
+  // color; otherwise each arm keeps its natural per-axis color (so an
   // un-overridden X-only arm is still red).
+  const std::size_t arm_count = style.x_arrow_only ? 1 : 3;
+  for (std::size_t arm = 0; arm < arm_count; ++arm) {
+    const glm::vec3 rgb = style.override_color ? style.color : k_rgb[arm];
+    out.push_back({base * k_arm[arm] * scale, glm::vec4(rgb, alpha)});
+  }
+}
+
+std::vector<PoseTriadInstance> buildPoseTriadInstances(const PJ::sdk::PosesInFrame& msg, const PoseTriadStyle& style) {
   const std::size_t arm_count = style.x_arrow_only ? 1 : 3;
   std::vector<PoseTriadInstance> instances;
   instances.reserve(msg.poses.size() * arm_count);
   for (const PJ::sdk::Pose& pose : msg.poses) {
-    const glm::mat4 base = poseToMat4(pose);
-    for (std::size_t arm = 0; arm < arm_count; ++arm) {
-      const glm::vec3 rgb = style.override_color ? style.color : k_rgb[arm];
-      instances.push_back({base * k_arm[arm] * scale, glm::vec4(rgb, alpha)});
-    }
+    appendTriadArms(poseToMat4(pose), style, instances);
   }
   return instances;
 }

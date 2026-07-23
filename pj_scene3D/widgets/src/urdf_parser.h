@@ -19,6 +19,7 @@
 // Mesh references are dispatched through the resolver: package:// enters the
 // resolver chain, bare/file/http paths go through resolveUri's guard.
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
@@ -27,6 +28,17 @@
 #include "urdf_package_resolver.h"
 
 namespace pj::scene3d {
+
+// Optional structural envelope for untrusted descriptions. A null limits
+// pointer preserves the native parser's existing behavior; the browser passes
+// an explicit bounded profile after applying the source-byte cap.
+struct UrdfParseLimits {
+  std::size_t max_links = 0;
+  std::size_t max_joints = 0;
+  std::size_t max_geometries = 0;
+  std::size_t max_materials = 0;
+  std::size_t max_string_bytes = 0;
+};
 
 // Parse `xml`. `urdf_dir` is the directory (or URL base) the URDF came from,
 // used by the resolver for bare-path and ancestor resolution. `source_is_url`
@@ -39,7 +51,7 @@ namespace pj::scene3d {
 // recorded with resolved=false and resolution is skipped).
 std::pair<std::optional<RobotModel>, std::string> parseUrdf(
     const std::string& xml, UrdfPackageResolver* resolver, const std::string& urdf_dir, bool source_is_url = false,
-    const std::string& filename = {});
+    const std::string& filename = {}, const UrdfParseLimits* limits = nullptr);
 
 // Returns true if `xml` (and/or `filename`) is xacro and must be expanded first.
 bool looksLikeXacro(const std::string& xml, const std::string& filename = {});

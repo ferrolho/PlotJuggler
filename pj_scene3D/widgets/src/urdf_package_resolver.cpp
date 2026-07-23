@@ -90,12 +90,19 @@ ResolvedMesh UrdfPackageResolver::resolveUri(const std::string& uri, const std::
   const QString quri = QString::fromStdString(uri);
 
   if (quri.startsWith("file://")) {
+#ifdef PJ_TARGET_WASM
+    // A browser file picker grants bytes for the selected URDF only, not a
+    // capability to arbitrary host paths named by its contents.
+    out.issue = MeshResolveIssue::kMissingFile;
+    return out;
+#else
     // Absolute local path; skip the package chain entirely. QUrl::toLocalFile
     // percent-decodes (e.g. %20 -> space) and strips an optional localhost
     // authority — a raw mid(7) slice would mangle encoded paths.
     out.resolved = true;
     out.path = QUrl(quri).toLocalFile().toStdString();
     return out;
+#endif
   }
 
   if (quri.startsWith("http://") || quri.startsWith("https://")) {
@@ -138,12 +145,16 @@ ResolvedMesh UrdfPackageResolver::resolveUri(const std::string& uri, const std::
   // same existence-check-else-unresolved policy as the package steps so a
   // missing file surfaces in the status instead of resolving to a dead path.
   if (QDir::isAbsolutePath(quri)) {
+#ifdef PJ_TARGET_WASM
+    out.issue = MeshResolveIssue::kMissingFile;
+#else
     if (QFileInfo::exists(quri)) {
       out.resolved = true;
       out.path = uri;
     } else {
       out.issue = MeshResolveIssue::kMissingFile;
     }
+#endif
     return out;
   }
 

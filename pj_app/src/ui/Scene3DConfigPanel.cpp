@@ -20,16 +20,20 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "pj_scene3d_widgets/Scene3DDockWidget.h"
-#ifndef PJ_TARGET_WASM
+#ifdef PJ_TARGET_WASM
+#include "FileSelectionService.h"
+#include "pj_scene3d_widgets/wasm/robot_model_layer_wasm.h"
+#else
 #include "pj_scene3d_widgets/layers/robot_model_layer.h"
 #include "pj_scene3d_widgets/layers/trail_layer.h"
-#include "pj_scene3d_widgets/mesh_shading_params.h"
 #endif
+#include "pj_scene3d_widgets/mesh_shading_params.h"
 #include "pj_scene3d_widgets/scene_view_widget.h"
 #include "pj_scene_common/layer_params.h"
 #include "pj_scene_common/scene_dock_widget.h"
@@ -55,9 +59,9 @@ namespace {
 
 #ifndef PJ_TARGET_WASM
 constexpr char kUrdfBrowseDirKey[] = "pj_scene3d/urdf_browse_dir";
+#endif
 constexpr auto kTrashIconPath = ":/resources/svg/trash.svg";
 constexpr auto kAddIconPath = ":/resources/svg/add.svg";
-#endif
 constexpr auto kVisibilityOnPath = ":/resources/svg/visibility.svg";
 constexpr auto kVisibilityOffPath = ":/resources/svg/visibility_off.svg";
 constexpr auto kTfConnectionsIconPath = ":/resources/svg/graph_4.svg";
@@ -151,6 +155,84 @@ std::optional<QString> promptUrdfUrl(QWidget* parent) {
   }
   const QString url = edit->text().trimmed();
   return url.isEmpty() ? std::nullopt : std::optional<QString>(url);
+}
+#endif
+
+#ifdef PJ_TARGET_WASM
+void showBrowserDialog(Dialog* dialog) {
+  // QDialog::open() forces WindowModal even after another modality was set.
+  // Browser workflows must remain nonblocking and nonmodal, matching the
+  // dialog host's explicit-modality + show() contract.
+  dialog->setWindowModality(Qt::NonModal);
+  dialog->show();
+  dialog->activateWindow();
+}
+
+// Chrome shared by the browser-only prompts: a self-deleting titled Dialog the
+// caller fills, then finishes with a named button box (Cancel pre-wired) that
+// is appended, sized, and shown nonmodal.
+Dialog* makeBrowserDialog(QWidget* parent, const QString& title) {
+  auto* dialog = new Dialog(parent);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setDialogTitle(title);
+  return dialog;
+}
+
+QDialogButtonBox* finishBrowserDialog(Dialog* dialog, QDialogButtonBox::StandardButtons standard_buttons) {
+  auto* buttons = new QDialogButtonBox(standard_buttons, dialog->contentWidget());
+  buttons->setObjectName(u"buttonBox"_s);
+  dialog->contentLayout()->addWidget(buttons);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+  dialog->contentLayout()->activate();
+  dialog->adjustSize();
+  showBrowserDialog(dialog);
+  return buttons;
+}
+
+void openBrowserInfo(QWidget* parent, const QString& title, const QString& text) {
+  Dialog* dialog = makeBrowserDialog(parent, title);
+  auto* label = new QLabel(text, dialog->contentWidget());
+  label->setWordWrap(true);
+  dialog->contentLayout()->addWidget(label);
+  auto* buttons = finishBrowserDialog(dialog, QDialogButtonBox::Ok);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
+}
+
+void openRobotDescriptionTopicPicker(
+    QWidget* parent, const QList<Scene3DDockWidget::RobotDescriptionTopic>& topics,
+    std::function<void(ObjectTopicId, QString)> callback) {
+  Dialog* dialog = makeBrowserDialog(parent, QObject::tr("Robot description topic"));
+  auto* combo = new ComboBox(dialog->contentWidget());
+  for (const auto& topic : topics) {
+    combo->addItem(topic.name, QVariant::fromValue(static_cast<uint>(topic.topic_id.id)));
+  }
+  dialog->contentLayout()->addWidget(combo);
+  auto* buttons = finishBrowserDialog(dialog, QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+  QObject::connect(
+      buttons, &QDialogButtonBox::accepted, dialog, [dialog, combo, callback = std::move(callback)]() mutable {
+        if (combo->currentIndex() >= 0) {
+          callback(ObjectTopicId{combo->currentData().toUInt()}, combo->currentText());
+        }
+        dialog->accept();
+      });
+}
+
+void openUrdfUrlPrompt(QWidget* parent, std::function<void(QString)> callback) {
+  Dialog* dialog = makeBrowserDialog(parent, QObject::tr("Load URDF from URL"));
+  auto* edit = new QLineEdit(dialog->contentWidget());
+  edit->setObjectName(u"wasmUrdfUrlEdit"_s);
+  edit->setPlaceholderText(u"https://example.com/robot.urdf"_s);
+  edit->setMinimumWidth(360);
+  dialog->contentLayout()->addWidget(edit);
+  auto* buttons = finishBrowserDialog(dialog, QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+  QObject::connect(
+      buttons, &QDialogButtonBox::accepted, dialog, [dialog, edit, callback = std::move(callback)]() mutable {
+        const QString url = edit->text().trimmed();
+        if (!url.isEmpty()) {
+          callback(url);
+        }
+        dialog->accept();
+      });
 }
 #endif
 
@@ -439,11 +521,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   addGridRow(grid_grid, grid_row, tr("Divisions"), grid_divisions_);
 
   // --- Transforms and RobotModel --------------------------------------------
-#ifdef PJ_TARGET_WASM
-  add_band(tr("Transforms"));
-#else
   add_band(tr("Transforms and RobotModel"));
-#endif
   QGridLayout* tm_grid = add_grid();
   int tm_row = 0;
 
@@ -482,12 +560,17 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Frames opacity"), gizmo_opacity_, gizmo_eye_);
 
-#ifndef PJ_TARGET_WASM
   model_source_combo_ = new ComboBox;
+#ifdef PJ_TARGET_WASM
+  model_source_combo_->setObjectName(u"scene3dModelSource"_s);
+#endif
   model_source_combo_->addItem(tr("File"));
   model_source_combo_->addItem(tr("Topic"));
   model_source_combo_->addItem(tr("URL"));
   add_model_button_ = new QToolButton(this);
+#ifdef PJ_TARGET_WASM
+  add_model_button_->setObjectName(u"scene3dAddRobotModel"_s);
+#endif
   add_model_button_->setAutoRaise(true);
   add_model_button_->setFocusPolicy(Qt::NoFocus);
   add_model_button_->setToolTip(tr("Add a robot model from the selected source"));
@@ -495,6 +578,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   addGridRow(tm_grid, tm_row, tr("Model/URDF"), model_source_combo_, add_model_button_);
   connect(add_model_button_, &QToolButton::clicked, this, &Scene3DConfigPanel::onAddModelClicked);
 
+#ifndef PJ_TARGET_WASM
   trail_frame_combo_ = new ComboBox;
   trail_frame_combo_->setFocusPolicy(Qt::ClickFocus);
   trail_frame_combo_->setToolTip(tr("TF frame whose motion trail to draw"));
@@ -513,6 +597,7 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
       bound_dock_->addTrailLayer(pj::scene3d::TrailSource::tfFrame(frame));
     }
   });
+#endif  // PJ_TARGET_WASM: trails are native-only
 
   // One row per panel-added robot model (name + bin), appended below the
   // Model/URDF row by addRobotRow. Hosted in a widget that spans all three
@@ -529,20 +614,31 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   ++tm_row;
 
   mesh_opacity_ = makeScrubber(0.0, 1.0, 0.1, 1.0);
+#ifdef PJ_TARGET_WASM
+  mesh_opacity_->setObjectName(u"scene3dMeshOpacity"_s);
+#endif
   mesh_eye_ = make_eye("meshes_visible", tr("Show/hide visual meshes"));
+#ifdef PJ_TARGET_WASM
+  mesh_eye_->setObjectName(u"scene3dMeshVisible"_s);
+#endif
   wire(
       mesh_opacity_, "mesh_opacity", [this](const QVariant& v) { mesh_opacity_->setValue(v.toDouble()); },
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Meshes opacity"), mesh_opacity_, mesh_eye_);
 
   collision_opacity_ = makeScrubber(0.0, 1.0, 0.1, 0.4);
+#ifdef PJ_TARGET_WASM
+  collision_opacity_->setObjectName(u"scene3dCollisionOpacity"_s);
+#endif
   collision_eye_ = make_eye("collisions_visible", tr("Show/hide collision meshes"));
+#ifdef PJ_TARGET_WASM
+  collision_eye_->setObjectName(u"scene3dCollisionVisible"_s);
+#endif
   wire(
       collision_opacity_, "collision_opacity",
       [this](const QVariant& v) { collision_opacity_->setValue(v.toDouble()); },
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Collision opacity"), collision_opacity_, collision_eye_);
-#endif
 
   // Pin both grids' label column to the widest label across BOTH sections, read
   // back from the labels just added (no separate string list to keep in sync).
@@ -598,7 +694,6 @@ void Scene3DConfigPanel::applySceneControlsTo(Scene3DDockWidget* dock) {
   view->setGizmoOpacity(static_cast<float>(gizmo_opacity_->value()));
   view->setTfConnectionsVisible(tf_lines_button_->isChecked());
 
-#ifndef PJ_TARGET_WASM
   // Per-view look knobs: drives only the bound dock's view. Sibling docks keep
   // their own MeshShadingParams and converge when the panel rebinds and applies.
   auto& shading = view->meshShadingParams();
@@ -606,7 +701,6 @@ void Scene3DConfigPanel::applySceneControlsTo(Scene3DDockWidget* dock) {
   shading.mesh_opacity = static_cast<float>(mesh_opacity_->value());
   shading.collisions_visible = collision_eye_->isChecked();
   shading.collision_opacity = static_cast<float>(collision_opacity_->value());
-#endif
   view->update();
 }
 
@@ -634,23 +728,19 @@ void Scene3DConfigPanel::loadControlsFromDock(Scene3DDockWidget* dock) {
     const QSignalBlocker b_grid_div(grid_divisions_);
     const QSignalBlocker b_gizmo_size(gizmo_size_);
     const QSignalBlocker b_gizmo_op(gizmo_opacity_);
-#ifndef PJ_TARGET_WASM
     const QSignalBlocker b_mesh_op(mesh_opacity_);
     const QSignalBlocker b_coll_op(collision_opacity_);
-#endif
 
     grid_size_->setValue(view->gridExtentMetres());
     grid_divisions_->setValue(view->gridDivisions());
     gizmo_size_->setValue(view->gizmoSize());
     gizmo_opacity_->setValue(view->gizmoOpacity());
 
-#ifndef PJ_TARGET_WASM
     const auto& shading = view->meshShadingParams();
     mesh_opacity_->setValue(shading.mesh_opacity);
     collision_opacity_->setValue(shading.collision_opacity);
     set_eye(mesh_eye_, shading.meshes_visible);
     set_eye(collision_eye_, shading.collisions_visible);
-#endif
   }
 
   // idClicked (the connected signal) fires only on user clicks, not programmatic
@@ -683,14 +773,12 @@ void Scene3DConfigPanel::applyIcons() {
       setEyeIcon(eye, eye->isChecked());
     }
   }
-#ifndef PJ_TARGET_WASM
   if (add_model_button_ != nullptr) {
     add_model_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
   }
   if (add_trail_button_ != nullptr) {
     add_trail_button_->setIcon(loadSvg(QLatin1String(kAddIconPath), theme_));
   }
-#endif
   if (tf_lines_button_ != nullptr) {
     tf_lines_button_->setIcon(loadSvg(QLatin1String(kTfConnectionsIconPath), theme_));
   }
@@ -706,24 +794,38 @@ void Scene3DConfigPanel::applyIcons() {
   if (params_apply_all_ != nullptr) {
     params_apply_all_->setIcon(loadSvg(u":/resources/svg/format_paint.svg"_s, theme_));
   }
-#ifndef PJ_TARGET_WASM
   for (const auto& [id, row] : robot_rows_) {
     if (auto* trash = row->findChild<QToolButton*>()) {
       trash->setIcon(loadSvg(QLatin1String(kTrashIconPath), theme_));
     }
   }
-#endif
 }
 
 void Scene3DConfigPanel::onAddModelClicked() {
-#ifdef PJ_TARGET_WASM
-  return;
-#else
   if (bound_dock_ == nullptr) {
     return;
   }
   switch (model_source_combo_->currentIndex()) {
     case 0: {  // File
+#ifdef PJ_TARGET_WASM
+      QPointer<Scene3DConfigPanel> self(this);
+      QPointer<Scene3DDockWidget> dock(bound_dock_);
+      FileSelectionService::selectFileContent(
+          this, tr("URDF files (*.urdf *.xml);;All files (*)"),
+          [self, dock](FileSelectionService::Selection selection) mutable {
+            if (self.isNull()) {
+              return;
+            }
+            if (dock.isNull() || self->bound_dock_ != dock || selection.browser_name.isEmpty()) {
+              return;
+            }
+            const ObjectTopicId id =
+                dock->addRobotModelLayerFromContent(selection.browser_name, std::move(selection.bytes));
+            if (id.id != 0) {
+              self->addRobotRow(id.id, selection.browser_name, selection.browser_name);
+            }
+          });
+#else
       QSettings settings;
       const QString start_dir = settings.value(QString::fromLatin1(kUrdfBrowseDirKey)).toString();
       const QString path = PJ::FileDialog::getOpenFileName(
@@ -739,14 +841,31 @@ void Scene3DConfigPanel::onAddModelClicked() {
       if (id != 0) {
         addRobotRow(id, QFileInfo(path).fileName(), path);
       }
+#endif
       break;
     }
     case 1: {  // Topic
       const auto topics = bound_dock_->robotDescriptionTopics();
       if (topics.isEmpty()) {
+#ifdef PJ_TARGET_WASM
+        openBrowserInfo(this, tr("Load robot model"), tr("No robot description topic in this dataset."));
+#else
         MessageBox::information(this, tr("Load robot model"), tr("No robot description topic in this dataset."));
+#endif
         return;
       }
+#ifdef PJ_TARGET_WASM
+      QPointer<Scene3DConfigPanel> self(this);
+      QPointer<Scene3DDockWidget> dock(bound_dock_);
+      openRobotDescriptionTopicPicker(this, topics, [self, dock](ObjectTopicId topic_id, const QString& name) {
+        if (self.isNull() || dock.isNull() || self->bound_dock_ != dock) {
+          return;
+        }
+        if (dock->addTopic(topic_id, sdk::BuiltinObjectType::kRobotDescription, name)) {
+          self->addRobotRow(topic_id.id, name, name);
+        }
+      });
+#else
       const auto picked = pickRobotDescriptionTopic(this, topics);
       if (!picked.has_value()) {
         return;
@@ -759,9 +878,24 @@ void Scene3DConfigPanel::onAddModelClicked() {
       if (bound_dock_->addTopic(picked->first, sdk::BuiltinObjectType::kRobotDescription, picked->second)) {
         addRobotRow(picked->first.id, picked->second, picked->second);
       }
+#endif
       break;
     }
     case 2: {  // URL
+#ifdef PJ_TARGET_WASM
+      QPointer<Scene3DConfigPanel> self(this);
+      QPointer<Scene3DDockWidget> dock(bound_dock_);
+      openUrdfUrlPrompt(this, [self, dock](const QString& url) {
+        if (self.isNull() || dock.isNull() || self->bound_dock_ != dock) {
+          return;
+        }
+        const ObjectTopicId id = dock->addRobotModelLayerFromUrl(url);
+        if (id.id != 0) {
+          const QString file_name = QUrl(url).fileName();
+          self->addRobotRow(id.id, file_name.isEmpty() ? url : file_name, url);
+        }
+      });
+#else
       const auto url = promptUrdfUrl(this);
       if (!url.has_value()) {
         return;
@@ -774,21 +908,15 @@ void Scene3DConfigPanel::onAddModelClicked() {
         const QString file_name = QUrl(*url).fileName();
         addRobotRow(id, file_name.isEmpty() ? *url : file_name, *url);
       }
+#endif
       break;
     }
     default:
       break;
   }
-#endif
 }
 
 void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& label, const QString& tooltip) {
-#ifdef PJ_TARGET_WASM
-  Q_UNUSED(topic_id_value)
-  Q_UNUSED(label)
-  Q_UNUSED(tooltip)
-  return;
-#else
   // Idempotent: rows are derived from dock state and rebuilt on every bind, and
   // both onAddModelClicked and the layerAdded signal can target the same id.
   const auto existing = std::find_if(
@@ -805,6 +933,9 @@ void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& lab
   // Match the grid's column gap so the name's right edge lines up.
   layout->setSpacing(PJ::theme::space(kGridHSpacing));
   auto* name = new QLineEdit(label, row);
+#ifdef PJ_TARGET_WASM
+  name->setObjectName(u"scene3dRobotRowName"_s);
+#endif
   name->setReadOnly(true);
   name->setFocusPolicy(Qt::NoFocus);
   name->setAlignment(Qt::AlignCenter);
@@ -817,8 +948,14 @@ void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& lab
   name->installEventFilter(this);
   layout->addWidget(name, 1);
   auto* trash = new QToolButton(row);
-  // Same flat styling as the topic-row trash buttons (QSS keys on this name).
+#ifdef PJ_TARGET_WASM
+  trash->setObjectName(u"scene3dRobotRowTrash"_s);
+  // Same flat styling as the topic-row trash buttons; the QSS also names this
+  // robot-specific id so diagnostics and accessibility retain a stable handle.
+#else
+  // Same flat styling as the topic-row trash buttons.
   trash->setObjectName(u"curveTrashToggle"_s);
+#endif
   trash->setAutoRaise(true);
   trash->setFocusPolicy(Qt::NoFocus);
   trash->setToolTip(tr("Remove this robot model"));
@@ -842,6 +979,19 @@ void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& lab
   if (bound_dock_ != nullptr) {
     ObjectTopicId topic_id;
     topic_id.id = topic_id_value;
+#ifdef PJ_TARGET_WASM
+    if (auto* robot = qobject_cast<pj::scene3d::WasmRobotModelLayer*>(bound_dock_->layerFor(topic_id))) {
+      const QString status = robot->statusText();
+      if (!status.isEmpty()) {
+        name->setToolTip(status);
+      }
+      connect(
+          robot, &pj::scene3d::WasmRobotModelLayer::statusTextChanged, name,
+          [name, tooltip](const QString& status_text) {
+            name->setToolTip(status_text.isEmpty() ? tooltip : status_text);
+          });
+    }
+#else
     if (auto* robot = qobject_cast<pj::scene3d::RobotModelLayer*>(bound_dock_->layerFor(topic_id))) {
       const QString status = robot->statusText();
       if (!status.isEmpty()) {
@@ -852,8 +1002,8 @@ void Scene3DConfigPanel::addRobotRow(uint32_t topic_id_value, const QString& lab
             name->setToolTip(status_text.isEmpty() ? tooltip : status_text);
           });
     }
-  }
 #endif
+  }
 }
 
 void Scene3DConfigPanel::showRobotLayerConfig(uint32_t topic_id_value) {

@@ -1,8 +1,9 @@
 # Scene3D WebAssembly PR stack — reviewer guide
 
-This is a temporary review aid for the three-PR Scene3D WebAssembly stack. It
-is introduced by PR 1, updated by PR 2, and deleted by PR 3 once the complete
-design is represented by the permanent architecture and requirements docs.
+This is a temporary review aid for the four-PR Scene3D WebAssembly stack. It
+is introduced by PR 1, updated as each capability lands, and deleted by PR 4
+once the complete design is represented by permanent architecture and
+requirements docs.
 
 ## Goal and reference implementation
 
@@ -26,9 +27,12 @@ independently.
 2. **PR 2 — sensor-data layers**
    Branch: `feat/wasm-scene3d-data`.
    Initial base: PR 1; retargeted to `main` after PR 1 merges.
-3. **PR 3 — models, SceneEntities, and rendering quality**
+3. **PR 3 — SceneEntities, models, PBR, and URDF**
    Branch: `feat/wasm-scene3d-models`.
    Initial base: PR 2; retargeted to `main` after PR 2 merges.
+4. **PR 4 — shadows and rendering quality**
+   Branch: `feat/wasm-scene3d-quality`.
+   Initial base: PR 3; retargeted to `main` after PR 3 merges.
 
 Code, tests, fixtures, CI, and documentation travel with the capability they
 validate. There is intentionally no tests-only or dependencies-only PR.
@@ -55,7 +59,7 @@ EDL. Their absence is a review boundary, not a missing implementation.
 Its retained capability probe and focused product/layout acceptance scenario
 are the baseline for this PR. PR 2 does not replace or weaken those checks.
 
-## Current slice: PR 2
+## Published base: PR 2
 
 PR 2 adds the bounded sensor-data path:
 
@@ -93,19 +97,20 @@ unit; there are no PNG comparisons.
 - Layout honesty: generic layer XML contains no browser dataset identity and
   ambiguous topic/type rebinding fails closed.
 
-## Planned PR 3
+## Current slice: PR 3
 
-PR 3 completes the product path:
+PR 3 adds the bounded content and model path:
 
 - URDF/robot descriptions, bounded URL/package resolution, Assimp mesh import,
-  SceneEntities, procedural markers, axes, and PBR materials;
-- shadows, HDR presentation, SSAO, and EDL with behavior-preserving fallbacks;
-- focused parser/model tests and compact URDF/model end-to-end scenarios;
-- final permanent architecture and requirements documentation.
+  SceneEntities, procedural markers, axes, and five-map PBR materials;
+- browser file-source semantics that persist a logical name but never claim
+  durable access to host bytes;
+- focused parser/model tests plus two compact product scenarios for mixed
+  SceneEntities/PBR and local-URDF layout replay.
 
-Assimp enters only this PR. PR 3 deletes this temporary guide after verifying
-that the stacked tree is behaviorally equivalent to the reference integration
-commit, apart from the documented reviewability changes.
+Assimp enters only this PR. Shadows, HDR presentation, SSAO, EDL, their shader
+packs, and their resource/fallback probes remain absent so reviewers can first
+audit which geometry reaches the direct renderer.
 
 ### PR 3 review risks
 
@@ -113,10 +118,26 @@ commit, apart from the documented reviewability changes.
   URL/package resolution must be bounded and layout restore must not claim a
   local file can be reopened automatically.
 - Assimp must be fetched only for Scene3D and only in PR 3.
-- HDR, shadows, SSAO, and EDL must preserve a complete direct-render fallback;
-  resource ceilings and recovery are more important than visual exactness.
 - SceneEntities and robot models must reuse the PR 2 ordering, TF, budget, and
   generic-layout contracts rather than introduce parallel mechanisms.
+- Model import and procedural-marker rejection must be charged before retained
+  CPU/GPU allocations, with stale asynchronous results ignored.
+
+## Planned PR 4
+
+PR 4 completes rendering parity with mesh shadows, HDR presentation, SSAO, and
+EDL. It extracts their resource lifecycle from the main QRhi scene-view source,
+adds independent failure/recovery acceptance, and replaces this temporary guide
+with final permanent architecture and requirements documentation.
+
+### PR 4 review risks
+
+- Every quality pass must fail independently while the direct renderer stays
+  live; clearing a forced or capability failure must rebuild resources.
+- Per-view and shared-QRhi resource ceilings must be checked before allocation.
+- Depth replay, mesh-only EDL masking, shadow fitting, and HDR presentation must
+  reuse PR 3 model submissions instead of creating a second scene graph.
+- The native OpenGL implementation and dependency graph must remain unchanged.
 
 ## Cross-stack invariants
 

@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<robot name="browser_robot">
+  <material name="fixture_red">
+    <color rgba="1 0 0 1"/>
+  </material>
+
+  <link name="map">
+    <visual>
+      <geometry>
+        <box size="1.5 1.5 0.5"/>
+      </geometry>
+      <material name="fixture_red"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="1.7 1.7 0.6"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="arm">
+    <visual>
+      <origin xyz="0 0 0.75" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.25" length="1.5"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.75" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.3" length="1.6"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="map_to_arm" type="fixed">
+    <parent link="map"/>
+    <child link="arm"/>
+    <origin xyz="2 0 0.25" rpy="0 0 0"/>
+  </joint>
+
+  <link name="missing_mesh">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/not_granted_by_browser.glb" scale="0.5 0.5 0.5"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="map_to_missing_mesh" type="fixed">
+    <parent link="map"/>
+    <child link="missing_mesh"/>
+    <origin xyz="-2 0 0.5" rpy="0 0 0"/>
+  </joint>
+</robot>

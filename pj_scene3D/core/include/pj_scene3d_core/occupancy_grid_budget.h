@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "pj_scene3d_core/browser_budget.h"
+
 namespace pj::scene3d {
 
 // Browser-only occupancy-grid limits. At the per-layer boundary the
@@ -32,11 +34,7 @@ inline constexpr std::uint64_t kBrowserMaxOccupancyCellsPerView = 16ULL * 1024UL
 
 [[nodiscard]] constexpr bool tryConsumeBrowserOccupancyCells(
     std::uint64_t requested, std::uint64_t& remaining) noexcept {
-  if (requested > remaining) {
-    return false;
-  }
-  remaining -= requested;
-  return true;
+  return tryConsumeBrowserBudget(requested, remaining);
 }
 
 }  // namespace pj::scene3d

@@ -33,6 +33,8 @@
 #include "pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/point_cloud_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/robot_model_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/scene_entities_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h"
 #include "pj_widgets/ComboBox.h"
 #include "pj_widgets/SvgUtil.h"
@@ -40,9 +42,10 @@
 using namespace Qt::StringLiterals;
 
 using pj::scene3d::readSceneControls;
+using pj::scene3d::readXmlBool;
+using pj::scene3d::readXmlFloat;
 using pj::scene3d::validateCameraState;
 using pj::scene3d::ValidatedCameraState;
-using pj::scene3d::ValidatedSceneControls;
 
 namespace PJ {
 namespace {
@@ -97,6 +100,15 @@ QString pickFixedFrame(const QList<pj::scene3d::FrameRow>& frames) {
   return frames.isEmpty() ? QString{} : QString::fromStdString(frames.front().name);
 }
 
+// The shared backend-neutral controls plus the browser mesh/collision knobs
+// (same extension shape as the native Scene3DDockWidget TU).
+struct ValidatedSceneControls : pj::scene3d::ValidatedSceneControls {
+  std::optional<bool> meshes_visible;
+  std::optional<float> mesh_opacity;
+  std::optional<bool> collisions_visible;
+  std::optional<float> collision_opacity;
+};
+
 bool isKnownFutureScene3dLayer(sdk::BuiltinObjectType type) {
   switch (type) {
     case sdk::BuiltinObjectType::kPointCloud:
@@ -127,7 +139,8 @@ bool isAvailablePointCloudLayer(sdk::BuiltinObjectType type) {
 bool isAvailableScene3dLayer(sdk::BuiltinObjectType type) {
   return isAvailablePointCloudLayer(type) || type == sdk::BuiltinObjectType::kPosesInFrame ||
          type == sdk::BuiltinObjectType::kOccupancyGrid || type == sdk::BuiltinObjectType::kVoxelGrid ||
-         type == sdk::BuiltinObjectType::kImage;
+         type == sdk::BuiltinObjectType::kImage || type == sdk::BuiltinObjectType::kSceneEntities ||
+         type == sdk::BuiltinObjectType::kRobotDescription;
 }
 
 bool firstSampleIsDepthEncoded(PJ::SessionManager& session, ObjectTopicId topic_id) {
@@ -207,6 +220,41 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
         });
         return layer;
       });
+  layerFactory().registerType(
+      sdk::BuiltinObjectType::kSceneEntities,
+      [this](ObjectTopicId topic_id, sdk::BuiltinObjectType /*object_type*/, const QString& display_name)
+          -> std::unique_ptr<ISceneLayer> {
+        prepareTransformBuffer(topic_id);
+        auto layer = std::make_unique<pj::scene3d::WasmSceneEntitiesLayer>(topic_id, display_name, this);
+        connect(layer.get(), &pj::scene3d::WasmSceneEntitiesLayer::sourceFrameChanged, this, [this](const QString&) {
+          QMetaObject::invokeMethod(this, [this]() { reconcileViewLayers(); }, Qt::QueuedConnection);
+        });
+        return layer;
+      });
+  layerFactory().registerType(
+      sdk::BuiltinObjectType::kRobotDescription,
+      [this](ObjectTopicId topic_id, sdk::BuiltinObjectType /*object_type*/, const QString& display_name)
+          -> std::unique_ptr<ISceneLayer> {
+        const bool local = isLocalRobotLayerId(topic_id);
+        if (local) {
+          ensureLocalTransformBuffer();
+        } else {
+          prepareTransformBuffer(topic_id);
+        }
+        auto layer = std::make_unique<pj::scene3d::WasmRobotModelLayer>(topic_id, display_name, this);
+        layer->setEmbeddedAssets(embedded_assets_);
+        layer->setTransformBuffer(tf_buffer_);
+        // A synthetic id has no parser binding. Put the layer in its browser-file
+        // state before attach(); addRobotModelLayerFromContent/FromUrl supplies
+        // the actual source immediately after registration.
+        if (local) {
+          layer->setSourceFileContent({}, {});
+        }
+        connect(layer.get(), &pj::scene3d::WasmRobotModelLayer::sourceFrameChanged, this, [this](const QString&) {
+          QMetaObject::invokeMethod(this, [this]() { reconcileViewLayers(); }, Qt::QueuedConnection);
+        });
+        return layer;
+      });
 
   frame_overlay_combo_ = new ComboBox(this);
   frame_overlay_combo_->setObjectName(u"scene3dFixedFrameCombo"_s);
@@ -238,6 +286,11 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
       view_->resetCamera();
     }
   });
+  connect(this, &SceneDockWidget::layerRemoved, this, [this](ObjectTopicId topic_id) {
+    local_robot_layer_ids_.erase(topic_id.id);
+    scene_topic_datasets_.erase(topic_id.id);
+    resetTransformBindingIfDatasetGone();
+  });
 }
 
 Scene3DDockWidget::~Scene3DDockWidget() {
@@ -262,8 +315,9 @@ void Scene3DDockWidget::setTransformService(pj::scene3d::TransformService* servi
     // The application normally injects this service before a drop. Also make a
     // restored/focused dock robust to late injection by rebuilding the binding
     // from the TF config topic it already consumed.
-    if (tf_buffer_ == nullptr && dataset_id_ != 0) {
+    if ((tf_buffer_ == nullptr || tf_buffer_is_local_) && dataset_id_ != 0) {
       tf_buffer_ = transform_service_->transformBuffer(dataset_id_);
+      tf_buffer_is_local_ = false;
     } else if (tf_buffer_ == nullptr && sessionManager() != nullptr) {
       const uint32_t raw_topic = !config_topics_.empty()  ? *config_topics_.cbegin()
                                  : !layer_topics_.empty() ? *layer_topics_.cbegin()
@@ -276,6 +330,11 @@ void Scene3DDockWidget::setTransformService(pj::scene3d::TransformService* servi
   if (view_ != nullptr) {
     view_->setTransformBuffer(tf_buffer_);
   }
+  for (const SceneLayerInfo& info : layers()) {
+    if (auto* robot = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layerFor(info.topic_id))) {
+      robot->setTransformBuffer(tf_buffer_);
+    }
+  }
 }
 
 bool Scene3DDockWidget::handlesObjectType(sdk::BuiltinObjectType object_type) {
@@ -283,7 +342,14 @@ bool Scene3DDockWidget::handlesObjectType(sdk::BuiltinObjectType object_type) {
 }
 
 bool Scene3DDockWidget::addTopic(ObjectTopicId topic_id, sdk::BuiltinObjectType object_type, const QString& title) {
-  if (!handlesObjectType(object_type) || sessionManager() == nullptr) {
+  if (!handlesObjectType(object_type)) {
+    return false;
+  }
+  const bool local_robot = object_type == sdk::BuiltinObjectType::kRobotDescription && isLocalRobotLayerId(topic_id);
+  if (local_robot) {
+    return SceneDockWidget::addTopic(topic_id, object_type, title);
+  }
+  if (sessionManager() == nullptr) {
     return false;
   }
   if (object_type == sdk::BuiltinObjectType::kFrameTransforms && config_topics_.contains(topic_id.id)) {
@@ -301,6 +367,60 @@ bool Scene3DDockWidget::addTopic(ObjectTopicId topic_id, sdk::BuiltinObjectType 
     return false;
   }
   return SceneDockWidget::addTopic(topic_id, object_type, title);
+}
+
+ObjectTopicId Scene3DDockWidget::addRobotModelLayerFromContent(QString filename, QByteArray bytes) {
+  const ObjectTopicId topic_id = allocateLocalRobotLayerId();
+  if (topic_id.id == 0) {
+    return {};
+  }
+  const QString title = filename.isEmpty() ? tr("Robot model") : filename;
+  if (!addTopic(topic_id, sdk::BuiltinObjectType::kRobotDescription, title)) {
+    local_robot_layer_ids_.erase(topic_id.id);
+    return {};
+  }
+  auto* layer = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layerFor(topic_id));
+  if (layer == nullptr) {
+    removeTopic(topic_id);
+    return {};
+  }
+  layer->setSourceFileContent(std::move(filename), std::move(bytes));
+  return topic_id;
+}
+
+ObjectTopicId Scene3DDockWidget::addRobotModelLayerFromUrl(const QString& url) {
+  const ObjectTopicId topic_id = allocateLocalRobotLayerId();
+  if (topic_id.id == 0) {
+    return {};
+  }
+  const QString file_name = QUrl(url).fileName();
+  const QString title = file_name.isEmpty() ? url : file_name;
+  if (!addTopic(topic_id, sdk::BuiltinObjectType::kRobotDescription, title)) {
+    local_robot_layer_ids_.erase(topic_id.id);
+    return {};
+  }
+  auto* layer = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layerFor(topic_id));
+  if (layer == nullptr) {
+    removeTopic(topic_id);
+    return {};
+  }
+  layer->setSourceUrl(url);
+  return topic_id;
+}
+
+QList<Scene3DDockWidget::RobotDescriptionTopic> Scene3DDockWidget::robotDescriptionTopics() const {
+  QList<RobotDescriptionTopic> result;
+  if (sessionManager() == nullptr) {
+    return result;
+  }
+  ObjectStore& store = sessionManager()->objectStore();
+  for (const ObjectTopicId topic_id : store.listTopics()) {
+    const ObjectTopicDescriptor& descriptor = store.descriptor(topic_id);
+    if (pj::scene3d::builtinObjectTypeFor(descriptor) == sdk::BuiltinObjectType::kRobotDescription) {
+      result.append({topic_id, QString::fromStdString(descriptor.topic_name)});
+    }
+  }
+  return result;
 }
 
 bool Scene3DDockWidget::tryAcceptObjectTopic(
@@ -379,16 +499,27 @@ void Scene3DDockWidget::syncViewLayers(const std::vector<ISceneLayer*>& ordered_
     auto* pose = dynamic_cast<pj::scene3d::WasmPosesInFrameLayer*>(layer);
     auto* grid = dynamic_cast<pj::scene3d::WasmOccupancyGridLayer*>(layer);
     auto* voxel = dynamic_cast<pj::scene3d::WasmVoxelGridLayer*>(layer);
-    if (point == nullptr && pose == nullptr && grid == nullptr && voxel == nullptr) {
+    auto* markers = dynamic_cast<pj::scene3d::WasmSceneEntitiesLayer*>(layer);
+    auto* robot = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layer);
+    if (point == nullptr && pose == nullptr && grid == nullptr && voxel == nullptr && markers == nullptr &&
+        robot == nullptr) {
       continue;
     }
-    const std::string& source_frame = point != nullptr  ? point->sourceFrame()
-                                      : pose != nullptr ? pose->sourceFrame()
-                                      : grid != nullptr ? grid->sourceFrame()
-                                                        : voxel->sourceFrame();
+    if (robot != nullptr) {
+      robot->setEmbeddedAssets(embedded_assets_);
+      robot->setTransformBuffer(tf_buffer_);
+    }
+    const std::string& source_frame = point != nullptr     ? point->sourceFrame()
+                                      : pose != nullptr    ? pose->sourceFrame()
+                                      : grid != nullptr    ? grid->sourceFrame()
+                                      : voxel != nullptr   ? voxel->sourceFrame()
+                                      : markers != nullptr ? markers->sourceFrame()
+                                                           : robot->sourceFrame();
     const ObjectTopicId topic_id = layer->info().topic_id;
-    layer_topics_.insert(topic_id.id);
-    if (sessionManager() != nullptr) {
+    if (!isLocalRobotLayerId(topic_id)) {
+      layer_topics_.insert(topic_id.id);
+    }
+    if (!isLocalRobotLayerId(topic_id) && sessionManager() != nullptr) {
       const DatasetId dataset = sessionManager()->objectStore().descriptor(topic_id).dataset_id;
       scene_topic_datasets_[topic_id.id] = dataset;
       if (dataset_id_ == 0) {
@@ -445,16 +576,23 @@ void Scene3DDockWidget::prepareTransformBuffer(ObjectTopicId topic_id) {
   if (transform_service_ == nullptr) {
     return;
   }
-  if (tf_buffer_ != nullptr) {
+  if (tf_buffer_ != nullptr && !tf_buffer_is_local_) {
     return;
   }
   tf_buffer_ = transform_service_->transformBuffer(dataset_id_);
+  tf_buffer_is_local_ = false;
   if (view_ != nullptr) {
     view_->setTransformBuffer(tf_buffer_);
   }
 }
 
 void Scene3DDockWidget::resetTransformBindingIfDatasetGone() {
+  // A local-only robot intentionally has no dataset id. Its synthetic buffer is
+  // the capability-local frame context, not a stale dataset binding; keep it
+  // stable across layer reconciliation and object-catalog revalidation.
+  if (dataset_id_ == 0) {
+    return;
+  }
   const bool still_present = std::any_of(
       scene_topic_datasets_.cbegin(), scene_topic_datasets_.cend(),
       [this](const auto& item) { return item.second == dataset_id_; });
@@ -466,6 +604,7 @@ void Scene3DDockWidget::resetTransformBindingIfDatasetGone() {
 void Scene3DDockWidget::resetTransformBinding() {
   const bool had_frames = !available_frames_.isEmpty();
   tf_buffer_.reset();
+  tf_buffer_is_local_ = false;
   dataset_id_ = 0;
   transform_frames_.clear();
   available_frames_.clear();
@@ -477,14 +616,66 @@ void Scene3DDockWidget::resetTransformBinding() {
     emit availableFramesChanged({});
   }
   refreshFrameOverlayCombo();
+  const bool has_local_robot = std::any_of(
+      local_robot_layer_ids_.cbegin(), local_robot_layer_ids_.cend(),
+      [this](uint32_t raw) { return layerFor(ObjectTopicId{raw}) != nullptr; });
+  if (has_local_robot) {
+    ensureLocalTransformBuffer();
+  }
+}
+
+void Scene3DDockWidget::ensureLocalTransformBuffer() {
+  if (tf_buffer_ != nullptr) {
+    return;
+  }
+  tf_buffer_ = std::make_shared<pj::scene3d::TransformBuffer>();
+  tf_buffer_is_local_ = true;
+  if (view_ != nullptr) {
+    view_->setTransformBuffer(tf_buffer_);
+  }
+  // resetTransformBinding() can replace an evicted dataset TF buffer while a
+  // local robot remains. Keep the layer and view on the same new buffer so its
+  // fixed-joint bridges are injected into the tree that actually renders it.
+  for (const SceneLayerInfo& info : layers()) {
+    if (isLocalRobotLayerId(info.topic_id)) {
+      if (auto* robot = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layerFor(info.topic_id))) {
+        robot->setTransformBuffer(tf_buffer_);
+      }
+    }
+  }
+}
+
+bool Scene3DDockWidget::isLocalRobotLayerId(ObjectTopicId topic_id) const {
+  return local_robot_layer_ids_.contains(topic_id.id);
+}
+
+ObjectTopicId Scene3DDockWidget::allocateLocalRobotLayerId() {
+  while (next_local_robot_topic_id_ > 0) {
+    // Local ids descend from UINT32_MAX while real ObjectStore ids ascend from
+    // low values; the ranges share one namespace, so every store access must gate
+    // on isLocalRobotLayerId() first (all current call sites do).
+    const ObjectTopicId topic_id{next_local_robot_topic_id_--};
+    if (layerFor(topic_id) == nullptr && local_robot_layer_ids_.insert(topic_id.id).second) {
+      return topic_id;
+    }
+  }
+  return {};
 }
 
 bool Scene3DDockWidget::pruneEvictedObjects() {
-  const bool render_layers_alive = SceneDockWidget::pruneEvictedObjects();
   if (sessionManager() == nullptr) {
-    return render_layers_alive || !config_topics_.empty();
+    return !layers().empty() || !config_topics_.empty();
   }
   ObjectStore& store = sessionManager()->objectStore();
+  std::vector<ObjectTopicId> dead;
+  for (const SceneLayerInfo& info : layers()) {
+    if (!isLocalRobotLayerId(info.topic_id) && store.descriptor(info.topic_id).topic_name.empty()) {
+      dead.push_back(info.topic_id);
+    }
+  }
+  for (const ObjectTopicId topic_id : dead) {
+    removeTopic(topic_id);
+  }
   for (auto iterator = config_topics_.begin(); iterator != config_topics_.end();) {
     if (store.descriptor(ObjectTopicId{*iterator}).topic_name.empty()) {
       scene_topic_datasets_.erase(*iterator);
@@ -494,7 +685,7 @@ bool Scene3DDockWidget::pruneEvictedObjects() {
     }
   }
   resetTransformBindingIfDatasetGone();
-  return render_layers_alive || !config_topics_.empty();
+  return !layers().empty() || !config_topics_.empty();
 }
 
 void Scene3DDockWidget::reconnectLiveSamples(SessionManager* session) {
@@ -507,8 +698,8 @@ void Scene3DDockWidget::reconnectLiveSamples(SessionManager* session) {
   }
   live_samples_connection_ =
       connect(session, &SessionManager::samplesIngested, this, [this](const QVector<TopicId>&, bool live) {
-        if (!live || transform_service_ == nullptr || tf_buffer_ == nullptr || sessionManager() == nullptr ||
-            view_ == nullptr) {
+        if (!live || transform_service_ == nullptr || tf_buffer_ == nullptr || tf_buffer_is_local_ ||
+            dataset_id_ == 0 || sessionManager() == nullptr || view_ == nullptr) {
           return;
         }
         transform_service_->ingestNewTransforms(dataset_id_);
@@ -723,8 +914,66 @@ Scene3DDockWidget::RestoreResult Scene3DDockWidget::restoreConfigTopic(const QDo
   return addTopic(*topic, *object_type, topic_name) ? RestoreResult::kRestored : RestoreResult::kInvalid;
 }
 
+Scene3DDockWidget::RestoreResult Scene3DDockWidget::restoreLocalRobotLayer(const QDomElement& element) {
+  if (element.tagName() != "layer"_L1 || element.attribute(u"local"_s) != "true"_L1) {
+    return RestoreResult::kInvalid;
+  }
+  const auto type = sdk::parseBuiltinObjectType(element.attribute(u"object_type"_s).toStdString());
+  const QDomElement payload = element.firstChildElement();
+  if (type != sdk::BuiltinObjectType::kRobotDescription || payload.isNull() ||
+      !pj::scene3d::WasmRobotModelLayer::validateXml(payload) || !payload.nextSiblingElement().isNull() ||
+      payload.attribute(u"source_type"_s, u"topic"_s) == "topic"_L1) {
+    return RestoreResult::kInvalid;
+  }
+  const ObjectTopicId topic_id = allocateLocalRobotLayerId();
+  if (topic_id.id == 0) {
+    return RestoreResult::kInvalid;
+  }
+  if (!addTopic(topic_id, *type, element.attribute(u"display_name"_s))) {
+    local_robot_layer_ids_.erase(topic_id.id);
+    return RestoreResult::kInvalid;
+  }
+  ISceneLayer* layer = layerFor(topic_id);
+  if (layer == nullptr || !layer->xmlLoadState(payload)) {
+    removeTopic(topic_id);
+    return RestoreResult::kInvalid;
+  }
+  bool order_ok = false;
+  const int saved_order = element.attribute(u"order"_s).toInt(&order_ok);
+  if (order_ok && saved_order >= 0) {
+    std::vector<SceneLayerInfo> ordered_layers = layers();
+    const auto restored = std::find_if(ordered_layers.begin(), ordered_layers.end(), [topic_id](const auto& info) {
+      return info.topic_id == topic_id;
+    });
+    if (restored != ordered_layers.end()) {
+      const SceneLayerInfo restored_info = *restored;
+      ordered_layers.erase(restored);
+      const auto insertion =
+          ordered_layers.begin() + std::min<std::size_t>(static_cast<std::size_t>(saved_order), ordered_layers.size());
+      ordered_layers.insert(insertion, restored_info);
+      std::vector<ObjectTopicId> ordered_ids;
+      ordered_ids.reserve(ordered_layers.size());
+      for (const SceneLayerInfo& info : ordered_layers) {
+        ordered_ids.push_back(info.topic_id);
+      }
+      reorderLayers(ordered_ids);
+    }
+  }
+  if (element.attribute(u"visible"_s, u"true"_s) == "false"_L1) {
+    setLayerVisible(topic_id, false);
+  }
+  return RestoreResult::kRestored;
+}
+
 bool Scene3DDockWidget::restoreOnePending(const QDomElement& element) {
   if (element.tagName() == "layer"_L1) {
+    if (element.attribute(u"local"_s) == "true"_L1) {
+      const RestoreResult result = restoreLocalRobotLayer(element);
+      if (result == RestoreResult::kInvalid) {
+        markWorkspaceRestoreFailed();
+      }
+      return true;
+    }
     const auto type = sdk::parseBuiltinObjectType(element.attribute(u"object_type"_s).toStdString());
     if (type.has_value() && isAvailableScene3dLayer(*type)) {
       const bool qualified = element.hasAttribute(u"dataset_id"_s) || element.hasAttribute(u"dataset_source"_s) ||
@@ -764,6 +1013,19 @@ bool Scene3DDockWidget::restoreOnePending(const QDomElement& element) {
 
 QDomElement Scene3DDockWidget::xmlSaveState(QDomDocument& document) const {
   QDomElement root = SceneDockWidget::xmlSaveState(document);
+  const std::vector<SceneLayerInfo> live_layers = layers();
+  std::size_t live_index = 0;
+  for (QDomElement child = root.firstChildElement(u"layer"_s); !child.isNull() && live_index < live_layers.size();
+       child = child.nextSiblingElement(u"layer"_s), ++live_index) {
+    if (!isLocalRobotLayerId(live_layers[live_index].topic_id)) {
+      continue;
+    }
+    child.setAttribute(u"local"_s, u"true"_s);
+    child.removeAttribute(u"dataset_id"_s);
+    child.removeAttribute(u"dataset_source"_s);
+    child.removeAttribute(u"dataset_path"_s);
+    child.setAttribute(u"topic_name"_s, QString{});
+  }
   if (sessionManager() != nullptr) {
     ObjectStore& store = sessionManager()->objectStore();
     for (const uint32_t raw_topic : config_topics_) {
@@ -805,6 +1067,11 @@ QDomElement Scene3DDockWidget::xmlSaveState(QDomDocument& document) const {
     controls.setAttribute(u"gizmo_size_m"_s, view_->gizmoSize());
     controls.setAttribute(u"gizmo_opacity"_s, view_->gizmoOpacity());
     controls.setAttribute(u"tf_parent_lines"_s, boolean(view_->tfConnectionsVisible()));
+    const auto& shading = view_->meshShadingParams();
+    controls.setAttribute(u"meshes_visible"_s, boolean(shading.meshes_visible));
+    controls.setAttribute(u"mesh_opacity"_s, shading.mesh_opacity);
+    controls.setAttribute(u"collisions_visible"_s, boolean(shading.collisions_visible));
+    controls.setAttribute(u"collision_opacity"_s, shading.collision_opacity);
     root.appendChild(controls);
   }
   return root;
@@ -830,7 +1097,11 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
     }
     if (child.tagName() == "layer"_L1) {
       const auto type = sdk::parseBuiltinObjectType(child.attribute(u"object_type"_s).toStdString());
-      if (!type.has_value() || !isKnownFutureScene3dLayer(*type) || child.attribute(u"topic_name"_s).isEmpty()) {
+      const QString local = child.attribute(u"local"_s, u"false"_s);
+      const bool is_local = local == "true"_L1;
+      if ((local != "true"_L1 && local != "false"_L1) || !type.has_value() || !isKnownFutureScene3dLayer(*type) ||
+          (is_local ? *type != sdk::BuiltinObjectType::kRobotDescription
+                    : child.attribute(u"topic_name"_s).isEmpty())) {
         markWorkspaceRestoreFailed();
         return false;
       }
@@ -882,6 +1153,21 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
           markWorkspaceRestoreFailed();
           return false;
         }
+      } else if (*type == sdk::BuiltinObjectType::kSceneEntities) {
+        const QDomElement payload = child.firstChildElement();
+        if ((!payload.isNull() && !pj::scene3d::WasmSceneEntitiesLayer::validateXml(payload)) ||
+            !payload.nextSiblingElement().isNull()) {
+          markWorkspaceRestoreFailed();
+          return false;
+        }
+      } else if (*type == sdk::BuiltinObjectType::kRobotDescription) {
+        const QDomElement payload = child.firstChildElement();
+        if ((!payload.isNull() && !pj::scene3d::WasmRobotModelLayer::validateXml(payload)) ||
+            !payload.nextSiblingElement().isNull() ||
+            (is_local && (payload.isNull() || payload.attribute(u"source_type"_s, u"topic"_s) == "topic"_L1))) {
+          markWorkspaceRestoreFailed();
+          return false;
+        }
       }
     } else if (child.tagName() == "config_topic"_L1) {
       const auto type = sdk::parseBuiltinObjectType(child.attribute(u"object_type"_s).toStdString());
@@ -915,7 +1201,10 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
   if (!controls.isNull()) {
     scene_controls.emplace();
     ValidatedSceneControls& parsed = *scene_controls;
-    if (!readSceneControls(controls, parsed)) {
+    if (!readSceneControls(controls, parsed) || !readXmlBool(controls, u"meshes_visible"_s, parsed.meshes_visible) ||
+        !readXmlFloat(controls, u"mesh_opacity"_s, 0.0F, 1.0F, parsed.mesh_opacity) ||
+        !readXmlBool(controls, u"collisions_visible"_s, parsed.collisions_visible) ||
+        !readXmlFloat(controls, u"collision_opacity"_s, 0.0F, 1.0F, parsed.collision_opacity)) {
       markWorkspaceRestoreFailed();
       return false;
     }
@@ -933,6 +1222,7 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
   resetWorkspaceRestoreStatus();
   clearPendingRestores();
   clearLayers();
+  local_robot_layer_ids_.clear();
   config_topics_.clear();
   layer_topics_.clear();
   scene_topic_datasets_.clear();
@@ -941,6 +1231,7 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
   const auto reject_and_rollback = [this, &previous_state, &previous_pending]() {
     clearPendingRestores();
     clearLayers();
+    local_robot_layer_ids_.clear();
     config_topics_.clear();
     layer_topics_.clear();
     scene_topic_datasets_.clear();
@@ -960,7 +1251,12 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
   for (QDomElement child = element.firstChildElement(); !child.isNull(); child = child.nextSiblingElement()) {
     if (child.tagName() == "layer"_L1) {
       const auto type = sdk::parseBuiltinObjectType(child.attribute(u"object_type"_s).toStdString());
-      if (type.has_value() && isAvailableScene3dLayer(*type)) {
+      if (child.attribute(u"local"_s) == "true"_L1) {
+        if (restoreLocalRobotLayer(child) != RestoreResult::kRestored) {
+          markWorkspaceRestoreFailed();
+          return reject_and_rollback();
+        }
+      } else if (type.has_value() && isAvailableScene3dLayer(*type)) {
         if (!restoreOnePending(child)) {
           rememberPendingRestore(child, child.attribute(u"topic_name"_s));
         }
@@ -1050,6 +1346,20 @@ bool Scene3DDockWidget::xmlLoadState(const QDomElement& element) {
     if (parsed.tf_parent_lines.has_value()) {
       view_->setTfConnectionsVisible(*parsed.tf_parent_lines);
     }
+    auto shading = view_->meshShadingParams();
+    if (parsed.meshes_visible.has_value()) {
+      shading.meshes_visible = *parsed.meshes_visible;
+    }
+    if (parsed.mesh_opacity.has_value()) {
+      shading.mesh_opacity = *parsed.mesh_opacity;
+    }
+    if (parsed.collisions_visible.has_value()) {
+      shading.collisions_visible = *parsed.collisions_visible;
+    }
+    if (parsed.collision_opacity.has_value()) {
+      shading.collision_opacity = *parsed.collision_opacity;
+    }
+    view_->setMeshShadingParams(shading);
   }
   emit fixedFrameModeChanged(fixed_frame_mode_ == FixedFrameMode::kAutoRoot);
   refreshFrameOverlayCombo();

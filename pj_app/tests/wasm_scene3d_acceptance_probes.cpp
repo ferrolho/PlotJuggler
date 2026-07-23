@@ -24,6 +24,8 @@
 #include "pj_scene3d_widgets/wasm/occupancy_grid_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/point_cloud_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/poses_in_frame_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/robot_model_layer_wasm.h"
+#include "pj_scene3d_widgets/wasm/scene_entities_layer_wasm.h"
 #include "pj_scene3d_widgets/wasm/voxel_grid_layer_wasm.h"
 #include "pj_widgets/LayerListView.h"
 #include "pj_widgets/RealSlider.h"
@@ -174,6 +176,36 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
       int pose_layers = 0;
       int occupancy_layers = 0;
       int voxel_layers = 0;
+      int marker_layers = 0;
+      int marker_decoding = 0;
+      quint64 marker_starts = 0;
+      quint64 marker_completed = 0;
+      quint64 marker_off_main = 0;
+      quint64 marker_cubes = 0;
+      quint64 marker_spheres = 0;
+      quint64 marker_cylinders = 0;
+      quint64 marker_arrows = 0;
+      quint64 marker_axes = 0;
+      quint64 marker_lines = 0;
+      quint64 marker_triangles = 0;
+      quint64 marker_skipped_text = 0;
+      quint64 marker_skipped_models = 0;
+      quint64 marker_skipped_invalid = 0;
+      quint64 ready_models = 0;
+      quint64 live_models = 0;
+      quint64 model_bytes = 0;
+      int robot_layers = 0;
+      quint64 robot_meshes = 0;
+      quint64 robot_draws = 0;
+      quint64 robot_visuals = 0;
+      quint64 robot_collisions = 0;
+      quint64 robot_placeholders = 0;
+      quint64 robot_bridges = 0;
+      int robot_source_type = -1;
+      int robot_display_mode = -1;
+      quint64 robot_revision = 0;
+      QString robot_source;
+      QStringList robot_statuses;
       QStringList warnings;
       QStringList ui_order;
       for (const PJ::SceneLayerInfo& info : dock->layers()) {
@@ -215,6 +247,46 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
           if (!voxels->warningReason().isEmpty()) {
             warnings.push_back(voxels->warningReason());
           }
+        } else if (auto* markers = dynamic_cast<pj::scene3d::WasmSceneEntitiesLayer*>(layer)) {
+          ++marker_layers;
+          marker_decoding += markers->decodeInFlightForTest() ? 1 : 0;
+          marker_starts += markers->decodeStartsForTest();
+          marker_completed += markers->decodeCompletionsForTest();
+          marker_off_main += markers->decodeOffMainCompletionsForTest();
+          const auto& geometry = markers->geometry();
+          marker_cubes += geometry.cubes.size();
+          marker_spheres += geometry.spheres.size();
+          marker_cylinders += geometry.cylinders.size();
+          marker_arrows += geometry.arrows.size();
+          marker_axes += geometry.axes.size();
+          marker_lines += geometry.line_vertices;
+          marker_triangles += geometry.triangle_vertices;
+          marker_skipped_text += geometry.skipped_texts;
+          marker_skipped_models += geometry.skipped_models;
+          marker_skipped_invalid += geometry.skipped_invalid;
+          ready_models += markers->readyModelCountForTest();
+          live_models += markers->liveModelCountForTest();
+          model_bytes += markers->modelRetainedBytes();
+          if (!markers->warningReason().isEmpty()) {
+            warnings.push_back(markers->warningReason());
+          }
+        } else if (auto* robot = dynamic_cast<pj::scene3d::WasmRobotModelLayer*>(layer)) {
+          ++robot_layers;
+          robot_meshes += robot->modelMeshes().size();
+          robot_draws += robot->modelDrawCalls().size();
+          for (const auto& draw : robot->modelDrawCalls()) {
+            robot_visuals += draw.group == pj::scene3d::WasmModelDrawGroup::kVisual ? 1U : 0U;
+            robot_collisions += draw.group == pj::scene3d::WasmModelDrawGroup::kCollision ? 1U : 0U;
+            robot_placeholders += draw.mesh_key == "robot:placeholder" ? 1U : 0U;
+          }
+          robot_bridges += robot->fixedJointBridgeCount();
+          if (robot_source_type < 0) {
+            robot_source_type = static_cast<int>(robot->sourceType());
+            robot_display_mode = static_cast<int>(robot->displayMode());
+            robot_revision = robot->modelRevision();
+            robot_source = robot->sourceValue();
+          }
+          robot_statuses.push_back(robot->statusText());
         }
       }
 
@@ -224,10 +296,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
           submitted_order.push_back(QString::number(topic_id));
         }
       }
+      auto* config_panel = main_window->findChild<PJ::Scene3DConfigPanel*>();
       PJ::LayerListView* layer_list = nullptr;
-      if (auto* panel = main_window->findChild<PJ::Scene3DConfigPanel*>();
-          panel != nullptr && panel->boundDockForTest() == dock) {
-        layer_list = panel->layerListForTest();
+      if (config_panel != nullptr && config_panel->boundDockForTest() == dock) {
+        layer_list = config_panel->layerListForTest();
       }
       QStringList row_centers;
       if (auto* list = layer_list != nullptr ? layer_list->findChild<QListWidget*>() : nullptr) {
@@ -267,6 +339,39 @@ extern "C" EMSCRIPTEN_KEEPALIVE void pj_wasm_test_report_scene3d_foundation() {
           right_toggle_geometry.x(), right_toggle_geometry.y(), right_toggle_geometry.width(),
           right_toggle_geometry.height(), right_panel != nullptr && right_panel->isVisibleTo(main_window) ? 1 : 0,
           encoded_warnings.constData());
+
+      const auto model_maps = view != nullptr ? view->lastModelTextureSlotCountsForTest() : std::array<int, 5>{};
+      auto* source_combo = config_panel != nullptr && config_panel->boundDockForTest() == dock
+                               ? config_panel->findChild<QComboBox*>(u"scene3dModelSource"_s)
+                               : nullptr;
+      qInfo(
+          "PJ_WASM_SCENE3D_MODELS sequence=%llu index=%lld "
+          "markers=%d,%d,%llu,%llu,%llu,%d,%d,%d families=%llu,%llu,%llu,%llu,%llu,%llu,%llu "
+          "skipped=%llu,%llu,%llu models=%llu,%llu,%llu,%d,%d,%d maps=%d,%d,%d,%d,%d "
+          "robots=%d,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%llu source=%s status=%s source_index=%d",
+          static_cast<unsigned long long>(current_sequence), static_cast<long long>(index), marker_layers,
+          marker_decoding, static_cast<unsigned long long>(marker_starts),
+          static_cast<unsigned long long>(marker_completed), static_cast<unsigned long long>(marker_off_main),
+          view != nullptr ? view->lastMarkerLayerCountForTest() : 0,
+          view != nullptr ? view->lastMarkerInstanceCountForTest() : 0,
+          view != nullptr ? view->lastMarkerStreamVertexCountForTest() : 0,
+          static_cast<unsigned long long>(marker_cubes), static_cast<unsigned long long>(marker_spheres),
+          static_cast<unsigned long long>(marker_cylinders), static_cast<unsigned long long>(marker_arrows),
+          static_cast<unsigned long long>(marker_axes), static_cast<unsigned long long>(marker_lines),
+          static_cast<unsigned long long>(marker_triangles), static_cast<unsigned long long>(marker_skipped_text),
+          static_cast<unsigned long long>(marker_skipped_models),
+          static_cast<unsigned long long>(marker_skipped_invalid), static_cast<unsigned long long>(ready_models),
+          static_cast<unsigned long long>(live_models), static_cast<unsigned long long>(model_bytes),
+          view != nullptr ? view->lastModelLayerCountForTest() : 0,
+          view != nullptr ? view->lastModelDrawCountForTest() : 0,
+          view != nullptr ? view->lastModelTriangleCountForTest() : 0, model_maps[0], model_maps[1], model_maps[2],
+          model_maps[3], model_maps[4], robot_layers, static_cast<unsigned long long>(robot_meshes),
+          static_cast<unsigned long long>(robot_draws), static_cast<unsigned long long>(robot_visuals),
+          static_cast<unsigned long long>(robot_collisions), static_cast<unsigned long long>(robot_placeholders),
+          static_cast<unsigned long long>(robot_bridges), robot_source_type, robot_display_mode,
+          static_cast<unsigned long long>(robot_revision), QUrl::toPercentEncoding(robot_source).constData(),
+          QUrl::toPercentEncoding(robot_statuses.join(u'|')).constData(),
+          source_combo != nullptr ? source_combo->currentIndex() : -1);
     }
     return;
   }

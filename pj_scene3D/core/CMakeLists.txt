@@ -7,9 +7,10 @@ find_package(nlohmann_json REQUIRED)
 
 if(EMSCRIPTEN)
   # Expose only the backend-neutral slice used by the product QRhi view and its
-  # canonical point-cloud, pose-array, occupancy, and voxel layers. Compressed
-  # canonical clouds add only the existing transcoder when their explicit
-  # browser dependency option is enabled. The native branch below is unchanged.
+  # canonical point-cloud, pose-array, occupancy, voxel, marker, and robot-model
+  # layers. Compressed canonical clouds add only the existing transcoder when
+  # their explicit browser dependency option is enabled. The native branch
+  # below is unchanged.
   set(_pj_scene3d_core_sources
     src/camera/camera.cpp
     src/camera/camera_math.cpp
@@ -17,7 +18,9 @@ if(EMSCRIPTEN)
     src/occupancy_grid_reconstructor.cpp
     src/pointcloud_convert.cpp
     src/poses_in_frame_render.cpp
+    src/robot_model_bridges.cpp
     src/scene_entities_decode.cpp
+    src/scene_entities_model_state.cpp
     src/tf/tf_buffer.cpp
     src/tf/tf_connections.cpp
     src/version.cpp
@@ -63,6 +66,7 @@ add_library(pj_scene3d_core STATIC
   src/poses_in_frame_render.cpp
   src/robot_model_bridges.cpp
   src/scene_entities_decode.cpp
+  src/scene_entities_model_state.cpp
   src/shadow_camera.cpp
   src/tf/tf_buffer.cpp
   src/tf/tf_connections.cpp
@@ -100,7 +104,10 @@ if(PJ_BUILD_TESTS)
     ../tests/camera_follow_test.cpp
     ../tests/poses_in_frame_render_test.cpp
     ../tests/poses_budget_test.cpp
+    ../tests/model_budget_test.cpp
+    ../tests/scene_entities_budget_test.cpp
     ../tests/scene_entities_decode_test.cpp
+    ../tests/scene_entities_model_state_test.cpp
     ../tests/shadow_camera_test.cpp
     ../tests/tf_buffer_test.cpp
     ../tests/tf_buffer_hierarchy_test.cpp
