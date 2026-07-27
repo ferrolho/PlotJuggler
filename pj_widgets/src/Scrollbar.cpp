@@ -9,14 +9,20 @@
 #include <QEvent>
 #include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
+#include <QHeaderView>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPropertyAnimation>
 #include <QScrollBar>
+#include <QStyle>
+#include <QStyleOptionSlider>
+#include <QTableView>
 #include <QTimer>
+#include <QTreeView>
 #include <QWheelEvent>
 #include <algorithm>
 #include <cmath>
+using namespace Qt::StringLiterals;
 
 #include "pj_widgets/FrameworkTokens.h"
 
@@ -57,6 +63,24 @@ QColor defaultAccent(const QColor& window_color) {
 
 namespace PJ {
 
+namespace {
+
+/// The header whose band the gutter for `orientation` runs beside: the
+/// horizontal (top) header for a vertical gutter, the vertical (left) row
+/// header for a horizontal gutter. Null for non-item-view areas or when the
+/// view has no such header.
+QHeaderView* gutterAdjacentHeader(QAbstractScrollArea* area, Qt::Orientation orientation) {
+  if (auto* tree = qobject_cast<QTreeView*>(area)) {
+    return orientation == Qt::Vertical ? tree->header() : nullptr;
+  }
+  if (auto* table = qobject_cast<QTableView*>(area)) {
+    return orientation == Qt::Vertical ? table->horizontalHeader() : table->verticalHeader();
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 Scrollbar::Scrollbar(Qt::Orientation orientation, QWidget* parent) : QWidget(parent), orientation_(orientation) {
   // Transparent overlay: never intercepts mouse events, paints over the native
   // scroll-bar gutter without a system background or opaque window behind it.
@@ -71,8 +95,9 @@ Scrollbar::Scrollbar(Qt::Orientation orientation, QWidget* parent) : QWidget(par
   accent_ = scrollbar_detail::defaultAccent(QGuiApplication::palette().window().color());
 }
 
-void Scrollbar::attach(QAbstractScrollArea* area) {
+void Scrollbar::attach(QAbstractScrollArea* area, Placement placement) {
   area_ = area;
+  placement_ = placement;
   viewport_ = area->viewport();
   // Stamp the marker EVERY attach path sets, so a host that attaches its own
   // pills directly (e.g. the Timeline) is skipped by the bulk adaptScrollAreas
@@ -82,12 +107,34 @@ void Scrollbar::attach(QAbstractScrollArea* area) {
   // Reparent so this widget lives inside the scroll area's coordinate space.
   setParent(area);
 
-  // Hide the native bar's visual widget; leave the bar object live because it
-  // remains the single source of truth for scroll state.
-  if (orientation_ == Qt::Horizontal) {
-    area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  if (placement_ == Placement::kOverlayViewport) {
+    // Hide the native bar's visual widget; leave the bar object live because it
+    // remains the single source of truth for scroll state.
+    if (orientation_ == Qt::Horizontal) {
+      area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    } else {
+      area->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    }
   } else {
-    area->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // Reserved gutter: the native bar keeps its policy and layout slot (content
+    // never reflows under the pill) and all interaction, but paints nothing —
+    // gutterEventFilter() eats its Paint events and this pill is its visual.
+    // The property lets the app QSS blank the bar's own visuals too and give the
+    // gutter its thin extent; repolish applies the attribute selector to an
+    // already-polished widget. Dropping the opaque-paint hint makes Qt fill the
+    // blanked region with the area's background instead of leaving stale pixels.
+    QScrollBar* native = bar();
+    native->setProperty("pjPillBar", true);
+    native->setAttribute(Qt::WA_OpaquePaintEvent, false);
+    native->style()->unpolish(native);
+    native->style()->polish(native);
+    native->installEventFilter(this);
+
+    // Item views: Qt lays the gutter along the area's full edge, including the
+    // band beside the view's header. recomputeGeometry() insets the native
+    // groove past that band; the intercepted Paint above then paints the band
+    // as the header's continuation (see gutter_header_ in the header).
+    gutter_header_ = gutterAdjacentHeader(area, orientation_);
   }
 
   // Reposition + repaint whenever the native bar moves or its range changes
@@ -318,7 +365,6 @@ bool Scrollbar::eventFilter(QObject* watched, QEvent* event) {
   if (area_ == nullptr) {
     return false;
   }
-  QWidget* viewport = area_->viewport();
 
   // A newly-added descendant anywhere in the observed subtree (a fresh card, or a
   // content widget set on the scroll area) must be observed for hover too, so the
@@ -330,6 +376,11 @@ bool Scrollbar::eventFilter(QObject* watched, QEvent* event) {
     }
     return false;
   }
+
+  if (placement_ == Placement::kReservedGutter) {
+    return gutterEventFilter(watched, event);
+  }
+  QWidget* viewport = area_->viewport();
 
   // Events from a covering child (see installHoverObserver). Hover MouseMoves
   // are mapped into viewport space to drive show/hide without consuming. The
@@ -517,31 +568,9 @@ bool Scrollbar::eventFilter(QObject* watched, QEvent* event) {
       break;
     }
 
-    case QEvent::Wheel: {
-      // Reveal the pill on a scroll, even when the cursor is nowhere near the
-      // strip. Only the axis that actually scrolled reveals: angleDelta carries
-      // the standard wheel/gesture delta, pixelDelta the high-resolution trackpad
-      // variant; y drives the vertical bar, x the horizontal. Shift+vertical
-      // wheel is the common "scroll horizontally" convention, so the horizontal
-      // bar also honors a y-delta when Shift is held. Never consume — the scroll
-      // area must still scroll.
-      auto* we = static_cast<QWheelEvent*>(event);
-      const QPoint angle = we->angleDelta();
-      const QPoint pixels = we->pixelDelta();
-      int axis_delta = 0;
-      if (orientation_ == Qt::Horizontal) {
-        axis_delta = (angle.x() != 0) ? angle.x() : pixels.x();
-        if (axis_delta == 0 && (we->modifiers() & Qt::ShiftModifier)) {
-          axis_delta = (angle.y() != 0) ? angle.y() : pixels.y();
-        }
-      } else {
-        axis_delta = (angle.y() != 0) ? angle.y() : pixels.y();
-      }
-      if (axis_delta != 0) {
-        revealTemporarily();
-      }
+    case QEvent::Wheel:
+      revealOnWheel(static_cast<QWheelEvent*>(event));
       break;
-    }
 
     case QEvent::Leave:
       // Don't hide while a drag is active — the cursor has left the viewport strip
@@ -564,6 +593,175 @@ bool Scrollbar::eventFilter(QObject* watched, QEvent* event) {
   return false;
 }
 
+bool Scrollbar::gutterEventFilter(QObject* watched, QEvent* event) {
+  QWidget* viewport = area_->viewport();
+  if (watched == bar()) {
+    switch (event->type()) {
+      case QEvent::Paint: {
+        // Stand in for the bar's own painting: blank everywhere (the pill is
+        // its visual) EXCEPT the band beside an item view's header, painted as
+        // the header's continuation — Backdrop fill + Separation bottom edge,
+        // from FrameworkTokens because QStyleSheetStyle does not extend the
+        // QHeaderView QSS background into foreign rects (CE_HeaderEmptyArea
+        // falls back to the base-style color there). Painting on the bar keeps
+        // Qt's own stacking/geometry — no sibling-widget z-order to fight.
+        if (applied_header_inset_ > 0) {
+          QScrollBar* native = bar();
+          const theme::Theme band_theme =
+              theme::themeFor(QGuiApplication::palette().window().color().lightness() >= 128);
+          QPainter painter(native);
+          if (orientation_ == Qt::Vertical) {
+            painter.fillRect(
+                QRect(0, 0, native->width(), applied_header_inset_),
+                theme::surface(theme::Surface::Backdrop, band_theme));
+            // Both horizontal hairlines continue across the band: the sections'
+            // border-top and the header's border-bottom — without the top one
+            // the header's upper edge line visibly stops at the gutter.
+            painter.fillRect(QRect(0, 0, native->width(), 1), theme::surface(theme::Surface::Separation, band_theme));
+            painter.fillRect(
+                QRect(0, applied_header_inset_ - 1, native->width(), 1),
+                theme::surface(theme::Surface::Separation, band_theme));
+          } else {
+            const int band_x = native->isRightToLeft() ? native->width() - applied_header_inset_ : 0;
+            painter.fillRect(
+                QRect(band_x, 0, applied_header_inset_, native->height()),
+                theme::surface(theme::Surface::Backdrop, band_theme));
+            const int edge_x = native->isRightToLeft() ? band_x : applied_header_inset_ - 1;
+            painter.fillRect(
+                QRect(edge_x, 0, 1, native->height()), theme::surface(theme::Surface::Separation, band_theme));
+          }
+        }
+        return true;
+      }
+
+      case QEvent::Enter:
+      case QEvent::HoverEnter:
+      case QEvent::HoverMove:
+      case QEvent::MouseMove:
+        // Hovering anywhere on the gutter reveals; the bar is pure chrome, so
+        // no in-strip hit test is needed. The Hover trio matters: the bar has
+        // WA_Hover, and QApplication discards buttonless MouseMoves for a
+        // widget without mouseTracking BEFORE object filters see them — the
+        // synthesized HoverMove is what actually arrives on a plain hover.
+        setShown(true);
+        return false;
+
+      case QEvent::MouseButtonPress:
+        if (static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton) {
+          native_bar_pressed_ = true;
+          setShown(true);
+        }
+        return false;  // never consume: the native bar owns all interaction
+
+      case QEvent::MouseButtonRelease: {
+        auto* me = static_cast<QMouseEvent*>(event);
+        if (me->button() == Qt::LeftButton && native_bar_pressed_) {
+          native_bar_pressed_ = false;
+          // A native drag often releases with the cursor off the gutter; linger
+          // briefly instead of vanishing under the pointer.
+          if (bar()->rect().contains(me->position().toPoint())) {
+            setShown(true);
+          } else {
+            revealTemporarily();
+          }
+        }
+        return false;
+      }
+
+      case QEvent::Leave:
+      case QEvent::HoverLeave:
+        if (!native_bar_pressed_ && !scrollRevealActive()) {
+          setShown(false);
+        }
+        return false;
+
+      case QEvent::Show:
+      case QEvent::Hide:
+      case QEvent::Resize:
+      case QEvent::Move:
+        // AsNeeded bars appear/vanish and get re-laid-out with the area; the
+        // pill must track the bar's rect through all of it.
+        recomputeGeometry();
+        return false;
+
+      default:
+        return false;
+    }
+  }
+
+  // Viewport and covering children: hover + wheel reveal only. Nothing here may
+  // ever be consumed — the gutter holds no content, so there is no press to own.
+  switch (event->type()) {
+    case QEvent::MouseMove: {
+      auto* me = static_cast<QMouseEvent*>(event);
+      QPoint vp_pos = me->position().toPoint();
+      if (watched != viewport) {
+        auto* w = qobject_cast<QWidget*>(watched);
+        if (w == nullptr) {
+          return false;
+        }
+        vp_pos = viewport->mapFromGlobal(w->mapToGlobal(vp_pos));
+      }
+      // Near-edge hover still reveals (discoverability parity with overlay
+      // mode); wandering back into content hides.
+      applyHoverAt(vp_pos);
+      return false;
+    }
+
+    case QEvent::Wheel:
+      revealOnWheel(static_cast<QWheelEvent*>(event));
+      return false;
+
+    case QEvent::Leave: {
+      if (watched != viewport) {
+        return false;
+      }
+      // Moving from the viewport onto the gutter itself fires a viewport Leave
+      // before the bar's Enter; skip the intermediate hide so the fade does not
+      // flicker across that boundary.
+      QScrollBar* native = bar();
+      const bool over_bar = native->isVisible() && native->rect().contains(native->mapFromGlobal(QCursor::pos()));
+      if (!over_bar && !scrollRevealActive()) {
+        setShown(false);
+      }
+      return false;
+    }
+
+    case QEvent::Resize:
+      if (watched == viewport) {
+        recomputeGeometry();
+      }
+      return false;
+
+    default:
+      return false;
+  }
+}
+
+void Scrollbar::revealOnWheel(QWheelEvent* event) {
+  // Reveal the pill on a scroll, even when the cursor is nowhere near the
+  // strip. Only the axis that actually scrolled reveals: angleDelta carries
+  // the standard wheel/gesture delta, pixelDelta the high-resolution trackpad
+  // variant; y drives the vertical bar, x the horizontal. Shift+vertical
+  // wheel is the common "scroll horizontally" convention, so the horizontal
+  // bar also honors a y-delta when Shift is held. Never consume — the scroll
+  // area must still scroll.
+  const QPoint angle = event->angleDelta();
+  const QPoint pixels = event->pixelDelta();
+  int axis_delta = 0;
+  if (orientation_ == Qt::Horizontal) {
+    axis_delta = (angle.x() != 0) ? angle.x() : pixels.x();
+    if (axis_delta == 0 && (event->modifiers() & Qt::ShiftModifier)) {
+      axis_delta = (angle.y() != 0) ? angle.y() : pixels.y();
+    }
+  } else {
+    axis_delta = (angle.y() != 0) ? angle.y() : pixels.y();
+  }
+  if (axis_delta != 0) {
+    revealTemporarily();
+  }
+}
+
 QScrollBar* Scrollbar::bar() const {
   return (orientation_ == Qt::Horizontal) ? area_->horizontalScrollBar() : area_->verticalScrollBar();
 }
@@ -574,6 +772,75 @@ void Scrollbar::recomputeGeometry() {
   if (area_ == nullptr || viewport_.isNull()) {
     return;
   }
+
+  if (placement_ == Placement::kReservedGutter) {
+    QScrollBar* native = bar();
+    if (!native->isVisible()) {
+      // An AsNeeded bar with nothing to scroll reserves no gutter — no pill,
+      // and no header band to complete (the header spans the full width again).
+      handle_pos_ = 0.0;
+      handle_len_ = 0.0;
+      setGeometry(0, 0, 0, 0);
+      update();
+      return;
+    }
+
+    // Item views: inset the native groove past the header band, so neither the
+    // native hit target nor the mirrored pill ever climbs beside the header
+    // (a QSS margin excludes the groove — the standard scroll-bar margin
+    // mechanism). Guard on the applied value — setStyleSheet repolishes, which
+    // must not loop.
+    int header_inset = 0;
+    if (!gutter_header_.isNull() && gutter_header_->isVisibleTo(area_)) {
+      header_inset = (orientation_ == Qt::Vertical) ? gutter_header_->height() : gutter_header_->width();
+    }
+    if (header_inset != applied_header_inset_) {
+      applied_header_inset_ = header_inset;
+      if (orientation_ == Qt::Vertical) {
+        native->setStyleSheet(u"margin-top: %1px;"_s.arg(header_inset));
+      } else {
+        native->setStyleSheet(
+            (native->isRightToLeft() ? u"margin-right: %1px;"_s : u"margin-left: %1px;"_s).arg(header_inset));
+      }
+    }
+
+    // Cover the bar's gutter exactly (the bar lives in the area's private
+    // scroll-bar container, so map through it into area coordinates).
+    const QPoint bar_tl = native->mapTo(area_, QPoint(0, 0));
+    setGeometry(QRect(bar_tl, native->size()));
+
+    // Mirror the style-resolved slider rect so the painted pill and the native
+    // hit target are the same region. QScrollBar::initStyleOption is protected,
+    // so fill the option by hand.
+    QStyleOptionSlider opt;
+    opt.initFrom(native);
+    opt.orientation = native->orientation();
+    opt.minimum = native->minimum();
+    opt.maximum = native->maximum();
+    opt.sliderPosition = native->sliderPosition();
+    opt.sliderValue = native->value();
+    opt.singleStep = native->singleStep();
+    opt.pageStep = native->pageStep();
+    opt.upsideDown = native->invertedAppearance();
+    if (opt.orientation == Qt::Horizontal) {
+      opt.state |= QStyle::State_Horizontal;
+    }
+    const QRect slider =
+        native->style()->subControlRect(QStyle::CC_ScrollBar, &opt, QStyle::SC_ScrollBarSlider, native);
+    if (native->maximum() <= native->minimum() || slider.isEmpty()) {
+      handle_pos_ = 0.0;
+      handle_len_ = 0.0;
+    } else if (orientation_ == Qt::Horizontal) {
+      handle_pos_ = slider.x();
+      handle_len_ = slider.width();
+    } else {
+      handle_pos_ = slider.y();
+      handle_len_ = slider.height();
+    }
+    update();
+    return;
+  }
+
   const QWidget* vp = viewport_;
   const int strip = static_cast<int>(scrollbar_detail::kHoverStripPx);
 
@@ -652,10 +919,13 @@ void attachPillScrollbars(QWidget* root, const std::function<bool(QAbstractScrol
     if (qobject_cast<QAbstractItemView*>(area) != nullptr && (area->window()->windowFlags() & Qt::Popup) == Qt::Popup) {
       continue;
     }
-    // An AlwaysOn axis is a deliberate persistent, draggable native bar (e.g. a
-    // log view) that a hover-only pill would silently replace — leave it be.
-    const bool adapt_h = area->horizontalScrollBarPolicy() != Qt::ScrollBarAlwaysOn;
-    const bool adapt_v = area->verticalScrollBarPolicy() != Qt::ScrollBarAlwaysOn;
+    // Only an AsNeeded axis is adapted. AlwaysOn is a deliberate persistent,
+    // draggable native bar (e.g. a log view) that a hover-only pill would
+    // silently replace; AlwaysOff is a deliberately suppressed axis (the
+    // reflow-based "never scroll this way" pattern) where the reserved gutter
+    // would never appear — leave both be.
+    const bool adapt_h = area->horizontalScrollBarPolicy() == Qt::ScrollBarAsNeeded;
+    const bool adapt_v = area->verticalScrollBarPolicy() == Qt::ScrollBarAsNeeded;
     if (!adapt_h && !adapt_v) {
       continue;
     }
@@ -666,7 +936,7 @@ void attachPillScrollbars(QWidget* root, const std::function<bool(QAbstractScrol
         area->property("pjScrollbarFadeMs").isValid() ? area->property("pjScrollbarFadeMs").toInt() : kDefaultFadeMs;
     const auto attach_pill = [&](Qt::Orientation orientation) {
       auto* pill = new Scrollbar(orientation, area);
-      pill->attach(area);
+      pill->attach(area, Scrollbar::Placement::kReservedGutter);
       pill->setAutoHide(auto_hide);
       pill->setFadeDurationMs(fade_ms);
     };

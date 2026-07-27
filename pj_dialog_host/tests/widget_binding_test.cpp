@@ -791,9 +791,11 @@ TEST(WidgetBindingTabWidget, DocumentModeSurvivesLoadAndApplyRestoresExpanding) 
 
 // --- adaptScrollAreas --------------------------------------------------------
 
-// A QScrollArea under root gets one H + one V PJ::Scrollbar attached, the
-// native bars are forced to AlwaysOff, and a second call produces no duplicates.
-TEST(WidgetScrollAreaAdapter, AttachesHAndVScrollbarsAndHidesNativeBars) {
+// A QScrollArea under root gets one H + one V PJ::Scrollbar attached in
+// reserved-gutter placement — the native bars keep their AsNeeded policy (they
+// still reserve the layout gutter; the pill is their visual) — and a second
+// call produces no duplicates.
+TEST(WidgetScrollAreaAdapter, AttachesHAndVScrollbarsInGutterPlacement) {
   qapp();
 
   QWidget root;
@@ -808,10 +810,15 @@ TEST(WidgetScrollAreaAdapter, AttachesHAndVScrollbarsAndHidesNativeBars) {
 
   const auto scrollbars = root.findChildren<PJ::Scrollbar*>();
   ASSERT_EQ(scrollbars.size(), 2) << "expect one H + one V Scrollbar per area";
+  for (const auto* pill : scrollbars) {
+    EXPECT_EQ(pill->placement(), PJ::Scrollbar::Placement::kReservedGutter)
+        << "adapted areas must use the reserved gutter, never the content-covering overlay";
+  }
 
-  EXPECT_EQ(area->horizontalScrollBarPolicy(), Qt::ScrollBarAlwaysOff)
-      << "attach() must hide the native horizontal bar";
-  EXPECT_EQ(area->verticalScrollBarPolicy(), Qt::ScrollBarAlwaysOff) << "attach() must hide the native vertical bar";
+  EXPECT_EQ(area->horizontalScrollBarPolicy(), Qt::ScrollBarAsNeeded)
+      << "gutter placement must leave the horizontal policy untouched (the bar reserves the gutter)";
+  EXPECT_EQ(area->verticalScrollBarPolicy(), Qt::ScrollBarAsNeeded)
+      << "gutter placement must leave the vertical policy untouched (the bar reserves the gutter)";
 
   // Idempotent: a second call must not add more scrollbars.
   PJ::adaptScrollAreas(&root);
@@ -861,7 +868,32 @@ TEST(WidgetScrollAreaAdapter, RespectsAlwaysOnPolicyPerAxis) {
 
   EXPECT_EQ(root.findChildren<PJ::Scrollbar*>().size(), 1) << "only the horizontal (default) axis is adapted";
   EXPECT_EQ(area->verticalScrollBarPolicy(), Qt::ScrollBarAlwaysOn) << "pinned AlwaysOn vertical bar is left untouched";
-  EXPECT_EQ(area->horizontalScrollBarPolicy(), Qt::ScrollBarAlwaysOff) << "default horizontal axis still gets a pill";
+  EXPECT_EQ(area->horizontalScrollBarPolicy(), Qt::ScrollBarAsNeeded)
+      << "default horizontal axis gets a gutter pill with its policy untouched";
+}
+
+// An axis pinned ScrollBarAlwaysOff is a deliberately suppressed axis (the
+// reflow-based "never scroll this way" pattern, e.g. a widgetResizable page):
+// no gutter would ever appear there, so adaptScrollAreas must skip it entirely
+// while still adapting the other (default) axis.
+TEST(WidgetScrollAreaAdapter, SkipsAlwaysOffAxis) {
+  qapp();
+
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* area = new QScrollArea(&root);
+  auto* inner = new QWidget();
+  inner->setMinimumSize(2000, 2000);
+  area->setWidget(inner);
+  area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);  // suppressed axis
+  layout->addWidget(area);
+
+  PJ::adaptScrollAreas(&root);
+
+  const auto scrollbars = root.findChildren<PJ::Scrollbar*>();
+  ASSERT_EQ(scrollbars.size(), 1) << "only the vertical (default) axis is adapted";
+  EXPECT_EQ(scrollbars.front()->orientation(), Qt::Vertical);
+  EXPECT_EQ(area->horizontalScrollBarPolicy(), Qt::ScrollBarAlwaysOff) << "the suppressed axis stays suppressed";
 }
 
 // setDateTime/setDateTimeRange land on a QDateTimeEdit (range first, so the

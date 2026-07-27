@@ -571,127 +571,72 @@ QToolTip {
 
 /* QScrollBar -------------------------------------------------------------
 
-https://doc.qt.io/qt-5/stylesheet-examples.html#customizing-qscrollbar
+Thin flat bars: transparent track, rounded 6px pill handle, no step buttons.
+Native bars stay visible only where pill adoption skips them (an axis pinned
+AlwaysOn, combo-box popup lists); everywhere else attachPillScrollbars() blanks
+the bar ([pjPillBar]) and the PJ::Scrollbar overlay paints the fading pill in
+the gutter the bar still reserves — so scrollbars never cover content.
 
 --------------------------------------------------------------------------- */
-QScrollBar:horizontal {
-  height: 16px;
-  margin: ${space_tight}px ${space_section}px ${space_tight}px ${space_section}px;
-  border: none;
-  border-radius: ${radius_square}px;
+QScrollBar {
   background-color: ${surface_transparent};
+  border: none;
+}
+
+QScrollBar:horizontal {
+  height: 12px;
 }
 
 QScrollBar:vertical {
-  background-color: ${surface_transparent};
-  width: 16px;
-  margin: ${space_section}px ${space_tight}px ${space_section}px ${space_tight}px;
+  width: 12px;
+}
+
+QScrollBar::handle {
+  background-color: ${scroll_handle};
   border: none;
-  border-radius: ${radius_square}px;
+  border-radius: 3px;
+}
+
+QScrollBar::handle:hover {
+  background-color: ${scroll_handle_hovered};
 }
 
 QScrollBar::handle:horizontal {
-  background-color: ${scroll_handle};
-  border: none;
-  border-radius: ${radius_square}px;
-  min-width: 8px;
-}
-
-QScrollBar::handle:horizontal:hover {
-  background-color: ${scroll_handle_hovered};
-  border: none;
-  border-radius: ${radius_square}px;
-  min-width: 8px;
+  min-width: 28px;
+  margin: 3px 0px;
 }
 
 QScrollBar::handle:vertical {
-  background-color: ${scroll_handle};
+  min-height: 28px;
+  margin: 0px 3px;
+}
+
+/* No step buttons; their track slots collapse so the handle spans the bar. */
+QScrollBar::add-line, QScrollBar::sub-line {
+  width: 0px;
+  height: 0px;
   border: none;
-  min-height: 8px;
-  border-radius: ${radius_square}px;
+  background: none;
 }
 
-QScrollBar::handle:vertical:hover {
-  background-color: ${scroll_handle_hovered};
+QScrollBar::add-page, QScrollBar::sub-page {
+  background: none;
+}
+
+/* A gutter bar adapted by attachPillScrollbars(): keeps its layout slot and
+   native interaction but paints nothing — the pill overlay is its visual.
+   Margins off so the whole gutter width stays a grabbable native handle. */
+QScrollBar[pjPillBar="true"]::handle,
+QScrollBar[pjPillBar="true"]::handle:hover {
+  background-color: ${surface_transparent};
+  margin: 0px;
+}
+
+/* The square where a horizontal and a vertical bar meet: paint nothing, like
+   the rest of the gutter (unstyled it shows through as a light box). */
+QAbstractScrollArea::corner {
+  background: transparent;
   border: none;
-  border-radius: ${radius_square}px;
-  min-height: 8px;
-}
-
-QScrollBar::add-line:horizontal {
-  margin: ${space_none}px ${space_none}px ${space_none}px ${space_none}px;
-  border-image: url(":/resources/svg/keyboard_arrow_right_dark.svg");
-  height: 12px;
-  width: 12px;
-  subcontrol-position: right;
-  subcontrol-origin: margin;
-}
-QScrollBar::add-line:horizontal:hover {
-  border-image: url(":/resources/svg/keyboard_arrow_right_hover.svg");
-}
-QScrollBar::add-line:horizontal:pressed {
-  border-image: url(":/resources/svg/keyboard_arrow_right_pressed.svg");
-}
-
-QScrollBar::add-line:vertical {
-  margin: ${space_snug}px ${space_none}px ${space_snug}px ${space_none}px;
-  border-image: url(":/resources/svg/keyboard_arrow_down_dark.svg");
-  height: 12px;
-  width: 12px;
-  subcontrol-position: bottom;
-  subcontrol-origin: margin;
-}
-QScrollBar::add-line:vertical:hover {
-  border-image: url(":/resources/svg/keyboard_arrow_down_hover.svg");
-}
-QScrollBar::add-line:vertical:pressed {
-  border-image: url(":/resources/svg/keyboard_arrow_down_pressed.svg");
-}
-
-QScrollBar::sub-line:horizontal {
-  margin: ${space_none}px ${space_snug}px ${space_none}px ${space_snug}px;
-  border-image: url(":/resources/svg/keyboard_arrow_left_dark.svg");
-  height: 12px;
-  width: 12px;
-  subcontrol-position: left;
-  subcontrol-origin: margin;
-}
-QScrollBar::sub-line:horizontal:hover {
-  border-image: url(":/resources/svg/keyboard_arrow_left_hover.svg");
-}
-QScrollBar::sub-line:horizontal:pressed {
-  border-image: url(":/resources/svg/keyboard_arrow_left_pressed.svg");
-}
-
-QScrollBar::sub-line:vertical {
-  margin: ${space_snug}px ${space_none}px ${space_snug}px ${space_none}px;
-  border-image: url(":/resources/svg/keyboard_arrow_up_dark.svg");
-  height: 12px;
-  width: 12px;
-  subcontrol-position: top;
-  subcontrol-origin: margin;
-}
-QScrollBar::sub-line:vertical:hover {
-  border-image: url(":/resources/svg/keyboard_arrow_up_hover.svg");
-}
-QScrollBar::sub-line:vertical:pressed {
-  border-image: url(":/resources/svg/keyboard_arrow_up_pressed.svg");
-}
-
-QScrollBar::up-arrow:horizontal, QScrollBar::down-arrow:horizontal {
-  background: none;
-}
-
-QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-  background: none;
-}
-
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-  background: none;
-}
-
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-  background: none;
 }
 
 /* QMenu ----------------------------------------------------------- */

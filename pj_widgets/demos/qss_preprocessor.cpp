@@ -105,12 +105,12 @@ void syncApplicationPalette(const std::map<QString, QString>& tokens) {
     return it == tokens.end() ? QColor() : QColor(it->second);
   };
 
-  const QColor window = color_for(u"main_background"_s);
-  const QColor text = color_for(u"default_text"_s);
-  const QColor base = color_for(u"input_background"_s);
-  const QColor button = color_for(u"widget_background_disabled"_s);
-  const QColor highlight = color_for(u"item_selection_background"_s);
-  const QColor highlighted_text = color_for(u"selection_text"_s);
+  const QColor window = color_for(u"backdrop"_s);
+  const QColor text = color_for(u"text"_s);
+  const QColor base = color_for(u"input"_s);
+  const QColor button = color_for(u"backdrop"_s);
+  const QColor highlight = color_for(u"selection_fill"_s);
+  const QColor highlighted_text = color_for(u"on_selection"_s);
   if (!window.isValid() || !text.isValid() || !base.isValid() || !button.isValid() || !highlight.isValid() ||
       !highlighted_text.isValid()) {
     qWarning() << "Cannot sync demo palette from theme tokens";

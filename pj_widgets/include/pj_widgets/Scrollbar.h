@@ -4,12 +4,14 @@
 #include <QColor>
 #include <QPointer>
 #include <QWidget>
+#include <cstdint>
 #include <functional>
 
 #include "pj_widgets/FrameworkTokens.h"
 
 class QAbstractScrollArea;
 class QGraphicsOpacityEffect;
+class QHeaderView;
 class QPropertyAnimation;
 class QScrollBar;
 class QTimer;
@@ -52,41 +54,70 @@ struct Handle {
 
 namespace PJ {
 
-/// Overlay scroll-pill widget that attaches to a QAbstractScrollArea and
-/// mirrors its native scroll bar as a thin floating pill.
+/// Scroll-pill widget that attaches to a QAbstractScrollArea and mirrors its
+/// native scroll bar as a thin fading pill, in one of two placements:
 ///
-/// After attach():
-///   - The matching native bar policy is forced to ScrollBarAlwaysOff (the bar
-///     remains live as the scroll-state source of truth; only its visual widget
-///     is hidden).
-///   - This widget re-parents itself to the area, covers the edge strip of the
-///     viewport, and repaints whenever the native bar's value or range changes.
+///   - Placement::kOverlayViewport — the native bar policy is forced to
+///     ScrollBarAlwaysOff (the bar remains live as the scroll-state source of
+///     truth; only its visual widget is hidden) and this widget floats over the
+///     edge strip of the viewport. Content reflows under the strip, so the pill
+///     can cover it — acceptable only when the host owns the viewport and keeps
+///     that strip free of interactive content (the Timeline).
+///   - Placement::kReservedGutter — the native bar keeps its authored policy
+///     and its layout slot (content never flows under the pill), but is painted
+///     blank; this widget covers the bar's rect and mirrors its style-resolved
+///     handle. All presses/drags/paging go to the native bar itself — in this
+///     mode the pill never consumes a mouse event, so it cannot steal a content
+///     click. The default for areas adapted by attachPillScrollbars().
+///
+/// Common to both placements:
+///   - This widget re-parents itself to the area and repaints whenever the
+///     native bar's value or range changes.
 ///   - A QGraphicsOpacityEffect fades the pill in/out; the pill is hidden
-///     (opacity 0) by default and revealed when the cursor enters the edge strip
-///     (auto-hide mode). Call setAutoHide(false) to keep the pill always visible.
+///     (opacity 0) by default and revealed when the cursor enters the edge
+///     strip / gutter (auto-hide mode). setAutoHide(false) pins it visible.
 ///   - Scrolling the viewport (mouse wheel or trackpad scroll gesture) also
 ///     briefly reveals the matching-axis pill even when the cursor is nowhere
 ///     near the strip; it fades out kScrollRevealHoldMs after the last scroll
 ///     unless the cursor is then hovering the strip.
 ///
-/// Drag-to-scroll: a left-press anywhere in the edge strip grabs the pill.
-/// Pressing off the handle first centers the handle under the cursor, then
-/// tracks the drag delta. Events during an active drag are consumed (return
-/// true) so the underlying view is not affected. Hover events (no drag) are
-/// still observed-only (return false).
+/// Overlay-mode drag-to-scroll: a left-press on the handle grabs the pill
+/// (with setClickToScroll(true), anywhere in the strip). Events during an
+/// active drag are consumed (return true) so the underlying view is not
+/// affected. Hover events (no drag) are still observed-only (return false).
 class Scrollbar : public QWidget {
   Q_OBJECT
 
  public:
+  /// Where the pill lives relative to the scroll area's layout. See the class
+  /// comment for the behavioral contract of each mode.
+  enum class Placement : std::uint8_t {
+    kOverlayViewport,
+    kReservedGutter,
+  };
+
   explicit Scrollbar(Qt::Orientation orientation, QWidget* parent = nullptr);
 
   /// Attach to a scroll area. Safe to call only once; re-attaching is not
   /// supported. After this call the widget covers the viewport's edge strip
-  /// and fades in on hover (auto-hide on by default).
+  /// (overlay) or the native bar's gutter (reserved-gutter) and fades in on
+  /// hover (auto-hide on by default).
   /// Side-effect: enables mouse tracking on the area's viewport so hover
   /// (button-up) MouseMove events are delivered — without it the pill would
   /// only appear on click and never re-hide on intra-viewport motion.
-  void attach(QAbstractScrollArea* area);
+  /// Reserved-gutter mode leaves the axis policy untouched — attaching to an
+  /// axis pinned ScrollBarAlwaysOff yields a permanently empty pill (the bar
+  /// never shows), so callers should skip such axes (attachPillScrollbars does).
+  void attach(QAbstractScrollArea* area, Placement placement = Placement::kOverlayViewport);
+
+  /// The placement chosen at attach() time. Primarily a test hook.
+  [[nodiscard]] Placement placement() const {
+    return placement_;
+  }
+
+  [[nodiscard]] Qt::Orientation orientation() const {
+    return orientation_;
+  }
 
   /// Override the accent color used for the pill. By default the pill picks a
   /// theme-aware accent via scrollbar_detail::defaultAccent() (info-blue on a
@@ -120,6 +151,15 @@ class Scrollbar : public QWidget {
   /// Return the current fade animation duration in ms. Primarily a test hook.
   int fadeDurationMs() const {
     return fade_ms_;
+  }
+
+  /// The mirrored handle's start offset / length along the scroll axis, in this
+  /// widget's coordinates (px). Primarily test hooks.
+  [[nodiscard]] double handlePosPx() const {
+    return handle_pos_;
+  }
+  [[nodiscard]] double handleLenPx() const {
+    return handle_len_;
   }
 
   /// Enable or disable pill-drag and scroll-on-drag interaction (default: true).
@@ -159,10 +199,21 @@ class Scrollbar : public QWidget {
   void changeEvent(QEvent* event) override;
 
  private:
-  /// Recompute this widget's geometry (edge-strip rect, mapped into the
-  /// parent area's coordinate space) and the handle position/length from the
-  /// live native bar. Calls update().
+  /// Recompute this widget's geometry (the viewport edge strip in overlay mode,
+  /// the native bar's rect in reserved-gutter mode — both mapped into the parent
+  /// area's coordinate space) and the handle position/length from the live
+  /// native bar. Calls update().
   void recomputeGeometry();
+
+  /// The whole eventFilter() body for reserved-gutter mode: blanks the native
+  /// bar's painting, drives hover/scroll reveal, and tracks bar geometry.
+  /// Never consumes a mouse event — the native bar owns all interaction.
+  bool gutterEventFilter(QObject* watched, QEvent* event);
+
+  /// Reveal-on-scroll shared by both placements: reveal this pill iff `event`
+  /// carries a delta on this pill's axis (Shift+vertical wheel counts as
+  /// horizontal, the common convention). Never consumes.
+  void revealOnWheel(QWheelEvent* event);
 
   /// Return the area's native scroll bar matching orientation_.
   /// Undefined behavior if area_ is null.
@@ -208,6 +259,7 @@ class Scrollbar : public QWidget {
   void installHoverObserver(QWidget* widget);
 
   Qt::Orientation orientation_;
+  Placement placement_ = Placement::kOverlayViewport;
   QAbstractScrollArea* area_ = nullptr;
   // Cached viewport, held as a QPointer so it auto-nulls if the viewport is
   // destroyed before this overlay. Guards recomputeGeometry() (wired to the live
@@ -247,23 +299,45 @@ class Scrollbar : public QWidget {
   // never starts/continues a drag and never consumes mouse events. Set by
   // setInteractive(); cleared drags immediately on disable.
   bool interactive_ = true;
+  // Reserved-gutter mode: a left press is currently held on the native bar (a
+  // native handle drag / track page). Keeps the pill revealed while the drag's
+  // cursor wanders off the gutter, mirroring what dragging_ does for overlay.
+  bool native_bar_pressed_ = false;
+
+  // Reserved-gutter mode, item views only. The native gutter spans the area's
+  // full edge — including the band beside the view's header, where a blank
+  // strip would read as a hole in the header. Fix in two parts: from
+  // recomputeGeometry(), a per-bar QSS margin insets the native groove (and so
+  // the mirrored pill and native hit-testing) past the header; and while
+  // standing in for the bar's eaten Paint, gutterEventFilter() paints that band
+  // as the header's continuation (FrameworkTokens Backdrop + Separation — the
+  // QSS header background is not reachable for a foreign rect) so the header
+  // reads continuous to the edge.
+  QPointer<QHeaderView> gutter_header_;
+  // Last header extent (px) applied as the bar's QSS margin; -1 = never set.
+  // Guards the setStyleSheet churn (it triggers a repolish) to actual changes.
+  int applied_header_inset_ = -1;
   // Whether accent_ was explicitly set via setAccentColor(). When false the
   // color is re-read from the application palette on each changeEvent so the
   // pill follows theme changes automatically.
   bool accent_overridden_ = false;
 };
 
-/// Attach canonical overlay pill scrollbars (PJ::Scrollbar) to every
-/// QAbstractScrollArea under `root`, in place of their native bars — the one
-/// call that gives an app window/dialog the same scroll pills the Timeline and
-/// plugin dialogs already use. Idempotent: each adapted area is tagged with a
-/// "pjScrollbarAttached" dynamic property, so re-calling after new views appear
-/// only pills the newcomers.
+/// Attach canonical pill scrollbars (PJ::Scrollbar, reserved-gutter placement)
+/// to every QAbstractScrollArea under `root` — the one call that gives an app
+/// window/dialog the same scroll pills plugin dialogs already use. The native
+/// bar keeps reserving its layout gutter (so the pill never covers content) but
+/// is painted blank; the pill overlay is its fading visual. Idempotent: each
+/// adapted area is tagged with a "pjScrollbarAttached" dynamic property, so
+/// re-calling after new views appear only pills the newcomers.
 ///
 /// Per area it honours the shared conventions:
 ///   - skips a combo-box's internal view and any transient popup item view;
-///   - skips an axis pinned to Qt::ScrollBarAlwaysOn (that axis keeps its
-///     draggable native bar); ScrollBarAsNeeded/AlwaysOff get a pill;
+///   - adapts only a ScrollBarAsNeeded axis. AlwaysOn is a deliberate
+///     persistent native bar (kept, thin-styled by the app QSS); AlwaysOff is a
+///     deliberately suppressed axis (the reflow-based "never scroll this axis"
+///     pattern) where a reserved gutter would never appear — both are left
+///     untouched;
 ///   - reads optional per-area "pjScrollbarAutoHide" (bool) / "pjScrollbarFadeMs"
 ///     (int) dynamic properties to override the overlay defaults.
 ///

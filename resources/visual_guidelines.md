@@ -254,7 +254,7 @@ automatically based on the active theme.
 | `_dark` | `fill="#E0E0E0"` | Dark theme. |
 | `_disabled_light` | `fill="#3D3D3D"` + `opacity="0.4"` | Disabled in light. |
 | `_disabled_dark` | `fill="#E0E0E0"` + `opacity="0.4"` | Disabled in dark. |
-| `_hover` | `fill="#1177FF"` | QSS `:hover` (scrollbar arrows etc.). |
+| `_hover` | `fill="#1177FF"` | QSS `:hover` (combo-box arrows etc.). |
 | `_pressed` | `fill="#CC00CC"` | QSS `:pressed`. |
 
 ### 3.3 Hand-crafted assets

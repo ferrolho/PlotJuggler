@@ -5,13 +5,19 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QHeaderView>
+#include <QImage>
 #include <QMouseEvent>
+#include <QPainter>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QTableWidget>
 #include <QTest>
 #include <QWheelEvent>
 
 #include "pj_widgets/FrameworkTokens.h"
+using namespace Qt::StringLiterals;
 
 using PJ::scrollbar_detail::computeHandle;
 using PJ::scrollbar_detail::defaultAccent;
@@ -409,6 +415,279 @@ TEST(ScrollbarWidget, VerticalStripYieldsBottomRightCornerToHorizontal) {
 
   EXPECT_TRUE(h.isShown()) << "the bottom-right corner reveals the horizontal pill";
   EXPECT_FALSE(v.isShown()) << "the vertical pill yields the bottom-right corner";
+}
+
+// ---------------------------------------------------------------------------
+// Reserved-gutter placement — attachPillScrollbars' mode: the native bar keeps
+// its policy and layout slot (content never sits under the pill) and owns all
+// interaction; the pill is a paint-only mirror.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A 200x200 scroll area over 2000x2000 content with a trailing-edge button —
+// the "trash button at the right edge of a row" shape. The button hugs the
+// viewport's right edge (placed AFTER attach, since gutter mode narrows the
+// viewport) with its center inside the hover strip and, with the scroll at
+// minimum, within the pill handle's span.
+// `pill` is declared after `area` on purpose: attach() reparents the pill into
+// the area, so the pill member must be destroyed first (reverse declaration
+// order) or the area's child cleanup would delete it a second time.
+struct EdgeButtonArea {
+  QScrollArea area;
+  PJ::Scrollbar pill;
+  QPushButton* button = nullptr;
+  int clicks = 0;
+
+  explicit EdgeButtonArea(PJ::Scrollbar::Placement placement) : pill(Qt::Vertical) {
+    auto* content = new QWidget;
+    content->setFixedSize(2000, 2000);
+    area.setWidget(content);
+    area.resize(200, 200);
+    area.show();
+    pill.attach(&area, placement);
+    QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+    const int vp_w = area.viewport()->width();
+    button = new QPushButton(content);
+    button->setGeometry(vp_w - 14, 0, 14, 20);
+    button->show();
+    QObject::connect(button, &QPushButton::clicked, button, [this] { ++clicks; });
+    QCoreApplication::processEvents();  // deliver ChildAdded to the hover observer
+
+    // Hover the button so the pill is revealed first — the overlay consume path
+    // only triggers on a shown pill, matching a user who can see it.
+    const QPoint center = button->rect().center();
+    QMouseEvent move(
+        QEvent::MouseMove, QPointF(center), button->mapToGlobal(center), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(button, &move);
+  }
+};
+
+}  // namespace
+
+TEST(ScrollbarGutter, KeepsPolicyAndReservesGutter) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  EXPECT_EQ(area.verticalScrollBarPolicy(), Qt::ScrollBarAsNeeded) << "gutter mode must not touch the axis policy";
+  QScrollBar* native = area.verticalScrollBar();
+  EXPECT_TRUE(native->isVisible()) << "the native bar keeps reserving its gutter";
+  EXPECT_LE(area.viewport()->width() + native->width(), area.width())
+      << "viewport and gutter must partition the width — content never under the pill";
+}
+
+TEST(ScrollbarGutter, EdgeContentClickReachesChild) {
+  EdgeButtonArea fixture(PJ::Scrollbar::Placement::kReservedGutter);
+
+  QTest::mouseClick(fixture.button, Qt::LeftButton);
+
+  EXPECT_EQ(fixture.clicks, 1) << "gutter mode must never consume a content click";
+}
+
+TEST(ScrollbarGutter, OverlayPlacementStealsSameClickOnHandle) {
+  // The contrast pin: in overlay placement the same edge button sits under the
+  // revealed pill handle, whose press-grab wins. This is the documented
+  // trade-off that reserves overlay placement for viewport-owning hosts (the
+  // Timeline) — content views get the gutter.
+  EdgeButtonArea fixture(PJ::Scrollbar::Placement::kOverlayViewport);
+  ASSERT_TRUE(fixture.pill.isShown()) << "precondition: the hover revealed the pill";
+
+  QTest::mouseClick(fixture.button, Qt::LeftButton);
+
+  EXPECT_EQ(fixture.clicks, 0);
+}
+
+TEST(ScrollbarGutter, NativeBarStillPagesOnTrackPress) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  QScrollBar* native = area.verticalScrollBar();
+  native->setValue(native->minimum());
+
+  // Press the (blank) track well below the handle: the native bar pages down —
+  // proof the bar still owns interaction; the pill only observes.
+  const QPoint below_handle(native->width() / 2, native->height() - 5);
+  QTest::mouseClick(native, Qt::LeftButton, Qt::NoModifier, below_handle);
+
+  EXPECT_GT(native->value(), native->minimum()) << "a track press must still page-scroll via the native bar";
+}
+
+TEST(ScrollbarGutter, PillCoversBarAndMirrorsHandle) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  QScrollBar* native = area.verticalScrollBar();
+  native->setValue(native->maximum());
+  QCoreApplication::processEvents();
+
+  EXPECT_EQ(pill.geometry(), QRect(native->mapTo(&area, QPoint(0, 0)), native->size()))
+      << "the pill must cover exactly the native bar's gutter";
+  EXPECT_GT(pill.handleLenPx(), 0.0);
+  EXPECT_GT(pill.handlePosPx(), 0.0) << "at max scroll the mirrored handle sits away from the origin";
+  EXPECT_LE(pill.handlePosPx() + pill.handleLenPx(), static_cast<double>(native->height()) + 0.5)
+      << "the mirrored handle stays inside the bar";
+}
+
+TEST(ScrollbarGutter, NoGutterOrRevealWhenNothingToScroll) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(100, 100);  // fits: nothing to scroll
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  EXPECT_FALSE(area.verticalScrollBar()->isVisible()) << "AsNeeded reserves no gutter when content fits";
+  EXPECT_DOUBLE_EQ(pill.handleLenPx(), 0.0);
+
+  const QPointF mid(50, 50);
+  QWheelEvent wheel(
+      mid, area.viewport()->mapToGlobal(mid), QPoint(0, 0), QPoint(0, -120), Qt::NoButton, Qt::NoModifier,
+      Qt::NoScrollPhase, /*inverted=*/false);
+  QCoreApplication::sendEvent(area.viewport(), &wheel);
+  EXPECT_FALSE(pill.isShown()) << "no reveal when there is nothing to scroll";
+}
+
+TEST(ScrollbarGutter, HoverOnGutterRevealsAndLeaveHides) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+  ASSERT_FALSE(pill.isShown());
+
+  // A plain hover: Qt discards buttonless MouseMoves for a non-tracking widget
+  // before object filters run, so what the pill's filter actually receives is
+  // the HoverMove synthesized via the bar's WA_Hover — send the move through
+  // sendEvent and rely on that synthesis, exactly like a real cursor.
+  QScrollBar* native = area.verticalScrollBar();
+  const QPoint on_bar(native->width() / 2, native->height() / 2);
+  QMouseEvent move(
+      QEvent::MouseMove, QPointF(on_bar), native->mapToGlobal(on_bar), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+  QCoreApplication::sendEvent(native, &move);
+  EXPECT_TRUE(pill.isShown()) << "hovering the gutter must reveal the pill";
+
+  QEvent leave(QEvent::Leave);
+  QCoreApplication::sendEvent(native, &leave);
+  EXPECT_FALSE(pill.isShown()) << "leaving the gutter must hide the pill";
+}
+
+TEST(ScrollbarGutter, HeaderBandPaintedAndTrackInsetBelowHeader) {
+  // Item views: the gutter spans the full edge, so its top segment runs beside
+  // the horizontal header. The groove must be inset below the header (so the
+  // handle never climbs into the band) and the blanked bar must paint that band
+  // as the header's continuation — otherwise it reads as a hole in the header.
+  QTableWidget table(60, 2);
+  table.setHorizontalHeaderLabels({u"Name"_s, u"Value"_s});
+  table.resize(250, 200);
+  table.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&table, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  QScrollBar* native = table.verticalScrollBar();
+  ASSERT_TRUE(native->isVisible());
+  const int header_h = table.horizontalHeader()->height();
+  ASSERT_GT(header_h, 0);
+
+  native->setValue(native->minimum());
+  QCoreApplication::processEvents();
+  EXPECT_GE(pill.handlePosPx(), static_cast<double>(header_h))
+      << "at scroll-top the mirrored handle must start below the header band";
+
+  // Render the bar without the window-background pre-fill: only what the Paint
+  // interception paints lands on the sentinel canvas — the header band must be
+  // the framework Backdrop, everything below it must stay blank (sentinel).
+  QImage canvas(native->size(), QImage::Format_ARGB32);
+  const QColor sentinel(255, 0, 0);
+  canvas.fill(sentinel);
+  QPainter canvas_painter(&canvas);
+  native->render(&canvas_painter, QPoint(), QRegion(), QWidget::DrawChildren);
+  canvas_painter.end();
+  const PJ::theme::Theme band_theme =
+      PJ::theme::themeFor(QGuiApplication::palette().window().color().lightness() >= 128);
+  EXPECT_EQ(
+      canvas.pixelColor(native->width() / 2, header_h / 2),
+      PJ::theme::surface(PJ::theme::Surface::Backdrop, band_theme))
+      << "the band beside the header must paint the framework Backdrop";
+  EXPECT_EQ(canvas.pixelColor(native->width() / 2, header_h + 20), sentinel)
+      << "below the band the blanked bar must paint nothing";
+}
+
+TEST(ScrollbarGutter, NoHeaderInsetForPlainScrollArea) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+
+  QScrollBar* native = area.verticalScrollBar();
+  native->setValue(native->minimum());
+  QCoreApplication::processEvents();
+  EXPECT_LE(pill.handlePosPx(), 1.0) << "no header — the groove must start at the gutter top";
+
+  QImage canvas(native->size(), QImage::Format_ARGB32);
+  const QColor sentinel(255, 0, 0);
+  canvas.fill(sentinel);
+  QPainter canvas_painter(&canvas);
+  native->render(&canvas_painter, QPoint(), QRegion(), QWidget::DrawChildren);
+  canvas_painter.end();
+  EXPECT_EQ(canvas.pixelColor(native->width() / 2, 5), sentinel)
+      << "no header — the blanked bar must paint nothing at all";
+}
+
+TEST(ScrollbarGutter, WheelOverViewportRevealsPill) {
+  QScrollArea area;
+  area.setWidget(new QWidget);
+  area.widget()->setFixedSize(2000, 2000);
+  area.resize(200, 200);
+  area.show();
+
+  PJ::Scrollbar pill(Qt::Vertical);
+  pill.attach(&area, PJ::Scrollbar::Placement::kReservedGutter);
+  QTest::qWait(50);  // let the AsNeeded bar appear and the layout settle
+  ASSERT_FALSE(pill.isShown());
+
+  const QPointF mid(100, 100);
+  QWheelEvent wheel(
+      mid, area.viewport()->mapToGlobal(mid), QPoint(0, 0), QPoint(0, -120), Qt::NoButton, Qt::NoModifier,
+      Qt::NoScrollPhase, /*inverted=*/false);
+  QCoreApplication::sendEvent(area.viewport(), &wheel);
+
+  EXPECT_TRUE(pill.isShown()) << "a wheel scroll must reveal the gutter pill";
 }
 
 TEST(ScrollbarWidget, AttachHidesNativeAndTracksRange) {
