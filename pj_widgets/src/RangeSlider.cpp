@@ -394,6 +394,12 @@ void RangeSlider::setLowerValue(int a_lower_value) {
   if (a_lower_value < minimum_) {
     a_lower_value = minimum_;
   }
+  // Post-clamp no-ops must not emit: the dialog host forwards every emission
+  // as a full plugin event round trip, so a drag held past the track end (or a
+  // same-value echo re-apply) would flood it with no-op events.
+  if (a_lower_value == lower_value_) {
+    return;
+  }
   lower_value_ = a_lower_value;
   emit lowerValueChanged(lower_value_);
   update();
@@ -405,6 +411,9 @@ void RangeSlider::setUpperValue(int a_upper_value) {
   }
   if (a_upper_value < minimum_) {
     a_upper_value = minimum_;
+  }
+  if (a_upper_value == upper_value_) {
+    return;  // same no-op rule as setLowerValue
   }
   upper_value_ = a_upper_value;
   emit upperValueChanged(upper_value_);

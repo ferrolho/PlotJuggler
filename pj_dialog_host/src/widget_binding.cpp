@@ -1581,11 +1581,15 @@ static void applyToWidget(
   // --- RangeSlider (two-handle range slider) ---
   if (auto* rs = qobject_cast<RangeSlider*>(w)) {
     // Bounds first — setMinimum/setMaximum reset the handle values, so values
-    // (sent in the same tick) must be applied afterwards.
-    if (auto v = view.rangeSliderMin(name)) {
+    // (sent in the same tick) must be applied afterwards. Unchanged bounds are
+    // skipped: the whole rangeSlider entry rides every diff (values, bounds,
+    // span, markers share one key), so during a drag the same bounds arrive on
+    // every tick — and a diff that carries no values (e.g. only markers moved)
+    // must not slam the handles to the extremes.
+    if (auto v = view.rangeSliderMin(name); v && *v != rs->getMinimun()) {
       rs->setMinimum(*v);
     }
-    if (auto v = view.rangeSliderMax(name)) {
+    if (auto v = view.rangeSliderMax(name); v && *v != rs->getMaximun()) {
       rs->setMaximum(*v);
     }
     if (auto v = view.rangeSliderLower(name)) {

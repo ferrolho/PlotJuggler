@@ -52,6 +52,7 @@ class MockPanelPlugin : public PJ::DialogPluginTyped {
     return kUiContent;
   }
   std::string widget_data() override {
+    ++g_state.widget_data_calls;
     PJ::WidgetData wd;
     wd.setText("textBox", g_state.text);
     wd.setLabel("labelHello", g_state.label);

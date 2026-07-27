@@ -132,6 +132,80 @@ TEST(WidgetBindingRangeSlider, AppliesBoundsValuesAndTimeSpan) {
   EXPECT_TRUE(slider->floatingLabelsVisible());
 }
 
+// A programmatic apply must never re-enter the plugin event path: the
+// RangeSlider setters emit value-changed signals (setMinimum/setMaximum even
+// reset both handles), and connectWidgetSignals forwards every emission as a
+// rangeChanged event. Under the echo-back model that cascaded a full
+// widget_data round trip per emission — the slider-drag slowness bug.
+TEST(WidgetBindingRangeSlider, ApplyDoesNotFireEventCallback) {
+  qapp();
+  recorder()->clear();
+  QWidget root;
+  auto* slider = new PJ::RangeSlider(Qt::Horizontal, PJ::RangeSlider::kDoubleHandles, &root);
+  slider->setObjectName("rangeSlider");
+  PJ::connectWidgetSignals(
+      &root, [](const std::string& name, const std::string& json) { recorder()->push_back({name, json}); });
+
+  PJ::WidgetData wd;
+  wd.setRangeSliderBounds("rangeSlider", 0, 1000);
+  wd.setRangeSliderValues("rangeSlider", 200, 800);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(wd.toJson()));
+
+  EXPECT_EQ(slider->getLowerValue(), 200);
+  EXPECT_EQ(slider->getUpperValue(), 800);
+  EXPECT_TRUE(recorder()->empty()) << "programmatic apply re-entered the event callback " << recorder()->size()
+                                   << " time(s)";
+}
+
+// Re-applying an entry whose bounds already match must not reset the handle
+// values: the whole rangeSlider entry rides every diff (values, bounds, span,
+// markers share one key), so during a drag the bounds arrive unchanged on
+// every tick — running setMinimum/setMaximum anyway would slam both handles to
+// the extremes before the values are restored.
+TEST(WidgetBindingRangeSlider, UnchangedBoundsReapplyKeepsHandleValues) {
+  qapp();
+  QWidget root;
+  auto* slider = new PJ::RangeSlider(Qt::Horizontal, PJ::RangeSlider::kDoubleHandles, &root);
+  slider->setObjectName("rangeSlider");
+
+  PJ::WidgetData initial;
+  initial.setRangeSliderBounds("rangeSlider", 0, 1000);
+  initial.setRangeSliderValues("rangeSlider", 200, 800);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(initial.toJson()));
+  ASSERT_EQ(slider->getLowerValue(), 200);
+  ASSERT_EQ(slider->getUpperValue(), 800);
+
+  PJ::WidgetData same_bounds;  // bounds only, unchanged — e.g. a diff where only markers moved
+  same_bounds.setRangeSliderBounds("rangeSlider", 0, 1000);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(same_bounds.toJson()));
+
+  EXPECT_EQ(slider->getLowerValue(), 200);
+  EXPECT_EQ(slider->getUpperValue(), 800);
+}
+
+// Pin the documented contract for REAL bounds changes: setting new bounds
+// resets the handle values (setRangeSliderValues in the same tick restores
+// them) — the unchanged-bounds skip above must not swallow this.
+TEST(WidgetBindingRangeSlider, ChangedBoundsStillResetHandleValues) {
+  qapp();
+  QWidget root;
+  auto* slider = new PJ::RangeSlider(Qt::Horizontal, PJ::RangeSlider::kDoubleHandles, &root);
+  slider->setObjectName("rangeSlider");
+
+  PJ::WidgetData initial;
+  initial.setRangeSliderBounds("rangeSlider", 0, 1000);
+  initial.setRangeSliderValues("rangeSlider", 200, 800);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(initial.toJson()));
+
+  PJ::WidgetData new_bounds;  // bounds only, CHANGED: values reset to the new range
+  new_bounds.setRangeSliderBounds("rangeSlider", 0, 500);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(new_bounds.toJson()));
+
+  EXPECT_EQ(slider->getMaximun(), 500);
+  EXPECT_EQ(slider->getLowerValue(), 0);
+  EXPECT_EQ(slider->getUpperValue(), 500);
+}
+
 // The plugin owns the rule and pushes {valid, tooltip}; the host renders the
 // tooltip plus a red border when invalid, and clears it when valid.
 TEST(WidgetBindingFieldValidity, RendersTooltipAndBackground) {

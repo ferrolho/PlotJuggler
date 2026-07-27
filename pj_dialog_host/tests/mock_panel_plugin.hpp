@@ -23,6 +23,10 @@ struct MockPanelState {
   std::string sub_dialog_ui;
 
   std::vector<std::string> events_seen;
+
+  // Number of widget_data() polls the host has made — lets tests pin how many
+  // full document builds a given interaction costs.
+  int widget_data_calls = 0;
 };
 
 MockPanelState& mockPanelState();

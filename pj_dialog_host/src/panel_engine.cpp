@@ -47,6 +47,10 @@ struct PanelEngine::Impl {
   QTimer* tick_timer = nullptr;
   nlohmann::json prev_data = nlohmann::json::object();
   std::string prev_raw;
+  // Parsed view of prev_raw, assigned together with it: per-event consumers
+  // (the file-picker check) read THIS instead of paying a fresh widget_data()
+  // build + parse per forwarded event — at drag rates that build is the cost.
+  WidgetDataView prev_view{std::string_view{}};
   std::function<void(std::string)> close_cb;
   std::function<void()> request_owner_close;  // bound to PanelEngine::close in openPanel
   Stats stats;
@@ -191,7 +195,11 @@ struct PanelEngine::Impl {
     if (new_data.is_discarded()) {
       return std::nullopt;
     }
-    WidgetDataView view(raw);
+    prev_view = WidgetDataView(raw);
+    // Alias, not a copy. A nested applyAndDiff (modal sub-dialog exec below)
+    // reassigns prev_view, so `view` must not be read after that exec returns —
+    // today every use precedes it.
+    const WidgetDataView& view = prev_view;
     auto close_reason = view.requestClose();
     auto sub_dialog_ui = view.subDialogUi();
     auto sub_panel_ui = view.subPanelUi();
@@ -367,8 +375,8 @@ QWidget* PanelEngine::openPanel() {
       initial_data.erase("__request_close");
       initial_data.erase("__request_sub_dialog");
       initial_data.erase("__request_accept");
-      WidgetDataView view(initial_raw);
-      impl_->applyPanelData(loaded, view);
+      impl_->prev_view = WidgetDataView(initial_raw);
+      impl_->applyPanelData(loaded, impl_->prev_view);
       impl_->prev_data = std::move(initial_data);
       impl_->prev_raw = initial_raw;
     }
@@ -407,8 +415,11 @@ QWidget* PanelEngine::openPanel() {
     // marked with the matching action opens the native chooser and feeds the
     // chosen path back as a fileSelected / folderSelected event. DialogEngine
     // does this too; toolbox dialogs are hosted here in PanelEngine, so without
-    // this their Import/Export buttons would be inert.
-    PJ::WidgetDataView picker_view(impl_->handle.widget_data());
+    // this their Import/Export buttons would be inert. Reads the cached view:
+    // a handled event just refreshed it via applyAndDiff, and re-polling
+    // widget_data() here doubled the cost of every high-frequency event (a
+    // slider drag) for metadata that changes at most once per tick.
+    const PJ::WidgetDataView& picker_view = impl_->prev_view;
     if (picker_view.isFilePicker(name)) {
       const QString path = PJ::FileDialog::getOpenFileName(
           impl_->root, QString::fromStdString(picker_view.filePickerTitle(name).value_or("Select File")), QString(),

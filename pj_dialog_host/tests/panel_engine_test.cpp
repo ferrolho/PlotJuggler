@@ -289,6 +289,28 @@ TEST_F(PanelEngineTest, WidgetEventReachesPlugin) {
   delete panel;
 }
 
+TEST_F(PanelEngineTest, WidgetEventCostsOneWidgetDataBuild) {
+  // A forwarded widget event needs exactly ONE widget_data() poll (the
+  // applyAndDiff after sendEvent). The per-event file-picker check must reuse
+  // that already-fetched document — a second full build + parse per event
+  // doubled the cost of every slider-drag tick.
+  PJ::PanelEngineConfig config;
+  config.tick_interval_ms = 100000;  // keep the tick timer out of the count
+  PJ::PanelEngine engine(makeMockHandle(), config);
+  QWidget* panel = engine.openPanel();
+  ASSERT_NE(panel, nullptr);
+
+  auto* text = panel->findChild<QLineEdit*>("textBox");
+  ASSERT_NE(text, nullptr);
+
+  const int baseline = mockPanelState().widget_data_calls;
+  text->setText("one event");  // textChanged is synchronous
+  EXPECT_EQ(mockPanelState().text, "one event");
+  EXPECT_EQ(mockPanelState().widget_data_calls, baseline + 1);
+
+  delete panel;
+}
+
 TEST_F(PanelEngineTest, ConfiguredWidgetEventRestartsTickDeadline) {
   PJ::PanelEngineConfig config;
   config.tick_interval_ms = 1000;
