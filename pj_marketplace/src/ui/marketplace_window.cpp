@@ -124,9 +124,9 @@ void MarketplaceWindow::setupUi() {
   // directly from the resource bundle.
   const bool dark_theme = QSettings().value(QStringLiteral("StyleSheet::theme"), QStringLiteral("light")).toString() !=
                           QStringLiteral("light");
-  ui_->refresh_btn_->setIcon(QIcon(
-      dark_theme ? QStringLiteral(":/resources/svg/reload_dark.svg")
-                 : QStringLiteral(":/resources/svg/reload_light.svg")));
+  ui_->settings_btn_->setIcon(QIcon(
+      dark_theme ? QStringLiteral(":/resources/svg/settings_cog_dark.svg")
+                 : QStringLiteral(":/resources/svg/settings_cog_light.svg")));
   // The canonical Search provides the (self-retinting) magnifying glass and a
   // themed clear "x"; it sits on the toolbar surface, so use the standalone tone.
   ui_->search_edit_->setVariant(Search::Variant::kStandalone);
@@ -144,7 +144,7 @@ void MarketplaceWindow::setupUi() {
   connect(
       ui_->category_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
       &MarketplaceWindow::onCategoryChanged);
-  connect(ui_->refresh_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onRefreshClicked);
+  connect(ui_->settings_btn_, &QPushButton::clicked, this, &MarketplaceWindow::pluginPreferencesRequested);
   connect(ui_->update_all_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onUpdateAllClicked);
   connect(ui_->diagnostics_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onDiagnosticsClicked);
 
@@ -809,18 +809,6 @@ void MarketplaceWindow::onSearchChanged(const QString& /*text*/) {
 void MarketplaceWindow::onCategoryChanged(int /*index*/) {
   clearStickyStatus();
   applyFilters();
-}
-
-void MarketplaceWindow::onRefreshClicked() {
-  clearStickyStatus();
-  setInfoStatus("Refreshing...");
-  const auto before = ext_mgr_->installedExtensions();
-  ext_mgr_->refreshInstalledFromDisk();
-  if (!installedStatesEqual(ext_mgr_->installedExtensions(), before)) {
-    installations_changed_ = true;
-  }
-  populateCards();
-  registry_mgr_->fetchRegistry(registry_url_);
 }
 
 void MarketplaceWindow::showEvent(QShowEvent* event) {

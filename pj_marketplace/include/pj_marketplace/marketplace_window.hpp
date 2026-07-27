@@ -42,6 +42,12 @@ class MarketplaceWindow : public Dialog {
     return installations_changed_;
   }
 
+ signals:
+  // Emitted when the user clicks the settings (gear) button. The host (MainWindow)
+  // responds by opening Preferences ▸ Plugins; the marketplace itself has no
+  // dependency on the preferences UI.
+  void pluginPreferencesRequested();
+
  protected:
   // Handles card hover styling and delegated button events.
   bool eventFilter(QObject* obj, QEvent* event) override;
@@ -55,9 +61,6 @@ class MarketplaceWindow : public Dialog {
 
   // Updates the category filter.
   void onCategoryChanged(int index);
-
-  // Refetches registry data and refreshes installed state.
-  void onRefreshClicked();
 
   // Queues updates for every installed extension with a newer registry version.
   void onUpdateAllClicked();

@@ -452,6 +452,13 @@ PreferencesDialog::~PreferencesDialog() {
   delete ui_;
 }
 
+void PreferencesDialog::showPage(int index) {
+  for (std::size_t i = 0; i < nav_rows_.size(); ++i) {
+    nav_rows_[i]->setSelected(static_cast<int>(i) == index);
+  }
+  ui_->pagesStack->setCurrentIndex(index);
+}
+
 void PreferencesDialog::onRegistryUrlEditingFinished() {
   const QString url_text = ui_->lineEditRegistryUrl->text().trimmed();
   if (url_text == last_checked_registry_url_) {

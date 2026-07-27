@@ -2507,9 +2507,22 @@ void MainWindow::onOpenMarketplace() {
   // Master–detail marketplace needs room for both panes (list + detail) and the
   // detail's button row; open wide enough that nothing is clipped at first show.
   dlg.resize(1100, 640);
+  // The marketplace's settings (gear) button asks the host to open Preferences ▸
+  // Plugins. Close the marketplace first, then open Preferences on that page.
+  bool open_plugin_prefs = false;
+  connect(&dlg, &MarketplaceWindow::pluginPreferencesRequested, &dlg, [&dlg, &open_plugin_prefs]() {
+    open_plugin_prefs = true;
+    dlg.accept();
+  });
   dlg.exec();
   if (dlg.installationsChanged()) {
     catalog.reload();
+  }
+  if (open_plugin_prefs) {
+    PreferencesDialog prefs(*theme_, this);
+    prefs.setChromeMetrics(chrome_metrics_);
+    prefs.showPage(PreferencesDialog::kPluginsPage);
+    prefs.exec();
   }
 #endif
 }
