@@ -5,6 +5,7 @@
 
 #include <QMetaObject>
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -47,12 +48,33 @@ ToolboxRuntimeHost::~ToolboxRuntimeHost() {
   // Mirror the release path: take the contexts out under the lock, run plugin
   // parser destructors and engine flushes outside it.
   std::unordered_map<uint32_t, std::unique_ptr<DataSourceRuntimeHost>> contexts;
+  std::unordered_map<uint32_t, std::shared_ptr<IngestProgress>> progress;
   {
     std::lock_guard lock(parser_ingest_mu_);
     contexts.swap(parser_ingests_);
+    progress.swap(ingest_progress_);
+  }
+  // Close any import the plugin never finished: the shell's started/finished
+  // callbacks must stay paired or its progress UI wedges on a mid-import panel
+  // close. Direct call — teardown runs on the construction thread (the same
+  // contract every marshalled callback already assumes), and a queued metacall
+  // would be purged with marshaller_ before delivery.
+  for (auto& [id, state] : progress) {
+    if (state->active.exchange(false) && callbacks_.on_ingest_finished) {
+      callbacks_.on_ingest_finished(static_cast<DatasetId>(id));
+    }
   }
   for (auto& [id, host] : contexts) {
     host->flushAll();
+  }
+}
+
+void ToolboxRuntimeHost::requestStopActiveIngests() {
+  std::lock_guard lock(parser_ingest_mu_);
+  for (auto& [id, host] : parser_ingests_) {
+    // Flag-only overload: safe from this (GUI) thread against a worker that
+    // may be inside fail()/last_error_ right now.
+    host->requestStop();
   }
 }
 
@@ -100,13 +122,22 @@ void ToolboxRuntimeHost::onNotifyDataChanged(void* ctx) noexcept {
         [self]() {
           try {
             self->write_host_.flushPending();
-            // Drain the datasets that received parser-ingest contexts since
-            // the previous notify; drained here (GUI thread) so the set and
-            // the callback observing it stay ordered.
+            // Report the bulk-import datasets: created/released contexts are
+            // drained per notify, while a MID-IMPORT context (active progress
+            // sequence) re-reports on EVERY notify so the shell's playback
+            // focus follows the growing import instead of collapsing back to
+            // the union between ticks. Composed here (GUI thread) so the set
+            // and the callback observing it stay ordered.
             std::vector<DatasetId> ingested;
             {
               std::lock_guard lock(self->parser_ingest_mu_);
               ingested.swap(self->pending_ingest_datasets_);
+              for (const auto& [id, progress] : self->ingest_progress_) {
+                const auto ds_id = static_cast<DatasetId>(id);
+                if (progress->active.load() && std::find(ingested.begin(), ingested.end(), ds_id) == ingested.end()) {
+                  ingested.push_back(ds_id);
+                }
+              }
             }
             if (self->callbacks_.on_data_changed) {
               self->callbacks_.on_data_changed(std::move(ingested));
@@ -160,6 +191,74 @@ bool ToolboxRuntimeHost::onCreateParserIngest(
           /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/nullptr,
           /*library_keepalive=*/std::shared_ptr<void>{});
       it = self->parser_ingests_.emplace(data_source_id, std::move(host)).first;
+
+      // Progress hooks: the plugin's progress_start/update/finish calls on the
+      // fat pointer drive the shell's progressive-import surface. They run on
+      // the plugin's ingest thread — flushes are engine-lock-safe there, and
+      // UI-facing callbacks marshal through marshaller_ like every other
+      // callback. `raw` is the context that invokes the hook, so it outlives
+      // every invocation; `self` outlives the plugin per the teardown contract.
+      DataSourceRuntimeHost* raw = it->second.get();
+      auto progress = std::make_shared<IngestProgress>();
+      self->ingest_progress_[data_source_id] = progress;
+      const auto hook_ds = static_cast<DatasetId>(data_source_id);
+      raw->on_progress_start = [self, hook_ds, progress](std::string_view label, uint64_t total, bool /*cancellable*/) {
+        try {
+          progress->total.store(total);
+          progress->active.store(true);
+          QMetaObject::invokeMethod(
+              &self->marshaller_,
+              [self, hook_ds, label = std::string(label), total]() {
+                if (self->callbacks_.on_ingest_started) {
+                  self->callbacks_.on_ingest_started(hook_ds, label, total);
+                }
+              },
+              Qt::AutoConnection);
+        } catch (...) {}
+      };
+      raw->on_progress_update = [self, hook_ds, progress, raw](uint64_t current) -> bool {
+        try {
+          const auto now = std::chrono::steady_clock::now();
+          if (now - progress->last_flush < std::chrono::milliseconds(self->flush_throttle_ms_)) {
+            return true;
+          }
+          progress->last_flush = now;
+          // Seal both write surfaces so the marshalled on_ingest_progress can
+          // treat "this tick" as "these rows are reader-visible": the context's
+          // own parser-binding writers AND the toolbox write host the plugin
+          // may be appending through (the cloud connector's Arrow/object path).
+          raw->flushPending();
+          self->write_host_.flushPending();
+          QMetaObject::invokeMethod(
+              &self->marshaller_,
+              [self, hook_ds, current, total = progress->total.load()]() {
+                if (self->callbacks_.on_ingest_progress) {
+                  self->callbacks_.on_ingest_progress(hook_ds, current, total);
+                }
+              },
+              Qt::AutoConnection);
+        } catch (...) {}
+        return true;  // host-side stop travels via stop_requested_, checked before this hook
+      };
+      raw->on_progress_finish = [self, hook_ds, progress]() {
+        try {
+          // Gate on an ACTIVE sequence: the SDK's finite-import pattern calls
+          // progressFinish() as a safe no-op even when no sequence started, and
+          // an unpaired finished callback would disturb the shell's pairing
+          // bookkeeping for some other import.
+          if (!progress->active.exchange(false)) {
+            return;
+          }
+          QMetaObject::invokeMethod(
+              &self->marshaller_,
+              [self, hook_ds]() {
+                if (self->callbacks_.on_ingest_finished) {
+                  self->callbacks_.on_ingest_finished(hook_ds);
+                }
+              },
+              Qt::AutoConnection);
+        } catch (...) {}
+      };
     }
     // Remember the dataset for the next notify_data_changed: an ingest context
     // marks a bulk import the host will want to focus playback on.
@@ -184,6 +283,7 @@ bool ToolboxRuntimeHost::onReleaseParserIngest(void* ctx, uint32_t data_source_i
   }
   try {
     std::unique_ptr<DataSourceRuntimeHost> victim;
+    std::shared_ptr<IngestProgress> progress;
     {
       std::lock_guard lock(self->parser_ingest_mu_);
       auto it = self->parser_ingests_.find(data_source_id);
@@ -192,11 +292,43 @@ bool ToolboxRuntimeHost::onReleaseParserIngest(void* ctx, uint32_t data_source_i
       }
       victim = std::move(it->second);
       self->parser_ingests_.erase(it);
+      if (auto pit = self->ingest_progress_.find(data_source_id); pit != self->ingest_progress_.end()) {
+        progress = std::move(pit->second);
+        self->ingest_progress_.erase(pit);
+      }
     }
     // Seal rows BEFORE destruction so the next notify_data_changed/catalog
     // rebuild sees everything the parsers wrote.
     victim->flushAll();
     victim.reset();
+    {
+      // A released context marks a COMPLETED bulk import: report it on the
+      // next notify so the shell runs its terminal focus/reconcile pass over
+      // the finished dataset (the create-time report was drained long ago on
+      // a progressive import). Published only AFTER the terminal flush above —
+      // release and notify are both [thread-safe], so a concurrent notifier
+      // must not drain this marker while the parser writers are half-flushed.
+      std::lock_guard lock(self->parser_ingest_mu_);
+      const auto ds_id = static_cast<DatasetId>(data_source_id);
+      auto& pending = self->pending_ingest_datasets_;
+      if (std::find(pending.begin(), pending.end(), ds_id) == pending.end()) {
+        pending.push_back(ds_id);
+      }
+    }
+    // Releasing without progress_finish must still pair the shell's
+    // started/finished callbacks, or its progress UI never hides. Marshalled:
+    // release is a [thread-safe] slot.
+    if (progress != nullptr && progress->active.exchange(false)) {
+      const auto ds_id = static_cast<DatasetId>(data_source_id);
+      QMetaObject::invokeMethod(
+          &self->marshaller_,
+          [self, ds_id]() {
+            if (self->callbacks_.on_ingest_finished) {
+              self->callbacks_.on_ingest_finished(ds_id);
+            }
+          },
+          Qt::AutoConnection);
+    }
     return true;
   } catch (const std::exception& e) {
     return parserIngestFail(out_error, e.what());

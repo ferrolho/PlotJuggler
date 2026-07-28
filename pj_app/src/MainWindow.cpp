@@ -285,6 +285,16 @@ constexpr int kResizeMargin = 6;
 // coalescer's job is to additionally cap faster drivers (scrubbing at mouse-move
 // rate, programmatic seeks) that bypass the playback tick.
 constexpr int kTrackerBroadcastIntervalMs = 33;
+// Anti-flash delay before the title-bar ingest strip appears — quick loads that
+// finish inside this window never flash it. WASM shortens this for deterministic
+// cancellation fixtures (PJ_WASM_ENABLE_INGRESS_PROBE below).
+constexpr int kIngestStripShowDelayMs = 500;
+constexpr int kIngestStripShowDelayWasmMs = 50;
+// Linger after the last load/import drains before the strip hides.
+constexpr int kIngestStripHideLingerMs = 1000;
+// Progress-bar resolution: byte counts exceed QProgressBar's int range, so the
+// bar tracks progress as this-many permille of total rather than raw counts.
+constexpr int kIngestProgressResolution = 1000;
 // Per-section cap for the recent popup — at most this many Layouts AND this
 // many Files are retained (the two lists are independent).
 constexpr int kMaxRecentEntries = 8;
@@ -1646,10 +1656,30 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   ingest_show_timer_ = new QTimer(this);
   ingest_show_timer_->setSingleShot(true);
   connect(ingest_show_timer_, &QTimer::timeout, this, [this]() { ingest_progress_->setActive(true); });
+  ingest_hide_timer_ = new QTimer(this);
+  ingest_hide_timer_->setSingleShot(true);
+  ingest_hide_timer_->setInterval(kIngestStripHideLingerMs);
+  connect(ingest_hide_timer_, &QTimer::timeout, this, [this]() {
+    // Only hide once nothing is still producing into the strip: a file load may
+    // have started, or a toolbox import may have re-adopted it, since the linger
+    // began.
+    if (toolbox_active_imports_.isEmpty() && !file_loader_->isBusy()) {
+      ingest_progress_->setActive(false);
+    }
+  });
   connect(ingest_progress_, &IngestProgressWidget::actionRequested, this, [this](IngestProgressWidget::Action) {
     // Stop pressed → ask what to do with the in-progress load. The worker keeps
     // loading (and the bar keeps updating) while this modal dialog is up.
     if (!file_loader_->isBusy()) {
+      // No file load to stop. If toolbox bulk imports are running, route the
+      // stop to every live importing host (a closed panel's entry fails the
+      // owner lock and is skipped): flag-only cooperative cancel, no
+      // keep/discard dialog — toolbox imports keep what already landed (the
+      // ABI has no host-side rollback), so there is no second choice to offer.
+      if (!toolbox_active_imports_.isEmpty()) {
+        stopAllToolboxImports();
+        return;  // strip hides when on_ingest_finished drains the import set
+      }
       // The load already finished (e.g. clicked during the post-completion
       // linger): there is nothing to stop, so just dismiss the strip.
       ingest_progress_->setActive(false);
@@ -1719,9 +1749,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
 #ifdef PJ_WASM_ENABLE_INGRESS_PROBE
         // Keep browser cancellation fixtures small and deterministic. Production
         // retains the anti-flash delay below.
-        ingest_show_timer_->start(50);
+        ingest_show_timer_->start(kIngestStripShowDelayWasmMs);
 #else
-        ingest_show_timer_->start(500);
+        ingest_show_timer_->start(kIngestStripShowDelayMs);
 #endif
       });
   connect(file_loader_.get(), &FileLoader::ingestProgress, this, [this](int current, int maximum) {
@@ -1729,8 +1759,14 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     ingest_progress_->setValue(current);
   });
   connect(file_loader_.get(), &FileLoader::queueDrained, this, [this]() {
+    // A toolbox bulk import that started while this file load owned the strip
+    // takes it over now instead of the strip hiding on a still-running import.
+    if (!toolbox_active_imports_.isEmpty()) {
+      adoptToolboxIngestStrip();
+      return;
+    }
     ingest_show_timer_->stop();
-    QTimer::singleShot(1000, this, [this]() { ingest_progress_->setActive(false); });
+    ingest_hide_timer_->start();
   });
 
 #ifndef PJ_TARGET_WASM
@@ -2018,6 +2054,15 @@ MainWindow::~MainWindow() {
   // session, tab strip, and engines are all still alive — a deferred
   // teardown would run after member destruction and touch a dead engine.
   closeAllPinnedToolboxTabs();
+  // The chart-area takeover panel holds the same kind of session, but its
+  // PanelEngine is a QObject child of this window — the base-class child sweep
+  // would destroy it only AFTER the members (incl. session_) are gone, so its
+  // teardown flush would write into a dead engine. Delete it synchronously
+  // now; the panel widget itself dies with ui_ below, releasing the banner
+  // closures' remaining PanelSession refs while the engine is still alive.
+  delete current_panel_engine_;
+  current_panel_engine_ = nullptr;
+  current_panel_ = nullptr;
   // Break the widget-owned pointers to services before session_ destroys
   // the engine — guarantees no late signal dereferences a dead pointer.
   ui_->timelineWidget->setPlaybackEngine(nullptr);
@@ -3925,6 +3970,11 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   if (file_loader_ != nullptr) {
     file_loader_->joinForShutdown();
   }
+  // Courtesy stop for in-flight toolbox bulk imports: the panel teardown in
+  // ~MainWindow joins their workers synchronously, so signalling the stop here
+  // lets the download wind down during the remaining shutdown instead of the
+  // join blocking on a full fetch.
+  stopAllToolboxImports();
 #ifdef PJ_TARGET_WASM
   // Closing the last Qt window in a browser hides the canvas, but Emscripten may
   // keep the live runtime instead of unwinding main() immediately. Do not rely
@@ -4174,6 +4224,24 @@ void MainWindow::onRebuildExtensionsMenu() {
     QAction* placeholder = menu->addAction(tr("(no extensions installed)"));
     placeholder->setEnabled(false);
   }
+}
+
+void MainWindow::stopAllToolboxImports() {
+  QSet<PJ::ToolboxRuntimeHost*> stopped;
+  for (const auto& ref : std::as_const(toolbox_active_imports_)) {
+    if (ref.host != nullptr && !stopped.contains(ref.host) && ref.owner.lock() != nullptr) {
+      stopped.insert(ref.host);
+      ref.host->requestStopActiveIngests();
+    }
+  }
+}
+
+void MainWindow::adoptToolboxIngestStrip() {
+  toolbox_strip_adopted_ = true;
+  ingest_progress_->setTitle(toolbox_ingest_label_);
+  ingest_progress_->setCounterText({});
+  ingest_progress_->setRange(0, 0);  // busy until the first determinate tick
+  ingest_show_timer_->start(kIngestStripShowDelayMs);
 }
 
 void MainWindow::onRebuildToolboxMenu() {
@@ -7924,7 +7992,14 @@ void MainWindow::launchToolbox(
 #ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       for (const DatasetId id : ingested_datasets) {
-        transform_service_->invalidateDataset(id);
+        // A still-growing import folds incrementally (cursor-based) — the
+        // invalidate + full re-ingest would re-decode the whole accumulated TF
+        // history on every per-topic notify (quadratic over the import). The
+        // terminal release-time report runs after on_ingest_finished removed
+        // the dataset from the active set, so the full pass still happens once.
+        if (!toolbox_active_imports_.contains(id)) {
+          transform_service_->invalidateDataset(id);
+        }
         transform_service_->ingestFrameTransformsForDataset(id);
       }
     }
@@ -7973,6 +8048,67 @@ void MainWindow::launchToolbox(
       diag = DiagnosticLevel::kWarning;
     }
     diagnostic_history_->record(diag, source, u"toolbox"_s, QString::fromStdString(message));
+  };
+
+  // Progressive bulk-import surface (all GUI-thread, marshalled by the host).
+  // Weak capture: these callbacks are owned by the host inside the very
+  // PanelSession they reference, so a strong capture would leak the session;
+  // an expired owner (panel closed mid-import) simply drops the tick.
+  const std::weak_ptr<void> session_weak = session;
+  callbacks.on_ingest_started = [this, session_weak](DatasetId dataset, std::string label, uint64_t) {
+    const auto owner = session_weak.lock();
+    if (owner == nullptr) {
+      return;
+    }
+    // Record the import even when FileLoader owns the strip: the entry keeps
+    // started/finished paired, and label/owner/host let the import re-adopt
+    // the strip after the file queue drains.
+    toolbox_active_imports_.insert(
+        dataset, ToolboxIngestRef{owner, std::static_pointer_cast<PanelSession>(owner)->host.get()});
+    toolbox_ingest_label_ = QString::fromStdString(label);
+    if (file_loader_->isBusy()) {
+      return;  // FileLoader wins the strip; the import still runs, just undisplayed
+    }
+    adoptToolboxIngestStrip();
+  };
+  callbacks.on_ingest_progress = [this](DatasetId dataset, uint64_t current, uint64_t total) {
+    // Toolbox analog of FileLoader::publishIngestProgress — the host flushed
+    // pending rows before this fired, so publish them to plots/playback (the
+    // catalog tree grows via samplesIngested -> rebuildIfChanged) and fold new
+    // FrameTransforms incrementally. The full catalog rebuild + playback focus
+    // stay on notify_data_changed.
+    const auto ids = session_->sessionManager().dataEngine().listTopics(dataset);
+    session_->sessionManager().notifyIngest(QVector<TopicId>(ids.begin(), ids.end()), /*live=*/false);
+#ifdef PJ_WITH_SCENE3D
+    if (transform_service_ != nullptr) {
+      transform_service_->ingestFrameTransformsForDataset(dataset);
+    }
+#endif
+    if (file_loader_->isBusy() || toolbox_active_imports_.isEmpty()) {
+      return;
+    }
+    if (!toolbox_strip_adopted_) {
+      adoptToolboxIngestStrip();  // the file load that owned the strip has drained
+    }
+    // Counts may be bytes far beyond int range — track progress as permille of
+    // total rather than raw counts. total 0 keeps the busy/indeterminate bar.
+    if (total == 0) {
+      ingest_progress_->setRange(0, 0);
+    } else {
+      ingest_progress_->setRange(0, kIngestProgressResolution);
+      ingest_progress_->setValue(static_cast<int>(std::min(current, total) * kIngestProgressResolution / total));
+    }
+  };
+  callbacks.on_ingest_finished = [this](DatasetId dataset) {
+    toolbox_active_imports_.remove(dataset);
+    if (!toolbox_active_imports_.isEmpty()) {
+      return;
+    }
+    toolbox_strip_adopted_ = false;
+    if (!file_loader_->isBusy()) {
+      ingest_show_timer_->stop();
+      ingest_hide_timer_->start();
+    }
   };
 
   // Parser-ingest deps: the plugin catalog for ensureParserBinding lookups and

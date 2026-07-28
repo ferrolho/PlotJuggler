@@ -401,7 +401,14 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
     return false;
   }
   playback_engine_->setRange(DisplayRange{*t_min, *t_max});
-  playback_engine_->setCurrentTime(*t_min);
+  // Snap the cursor only on the first focus or when it fell outside the new
+  // range. A progressive import re-focuses on every notify as it grows — the
+  // range must follow, but yanking a cursor the user scrubbed/played back to
+  // the import's start on each tick would fight them.
+  const DisplaySeconds cursor = playback_engine_->currentTime();
+  if (!playback_seeded_ || cursor < *t_min || cursor > *t_max) {
+    playback_engine_->setCurrentTime(*t_min);
+  }
   playback_seeded_ = true;
   return true;
 }

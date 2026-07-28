@@ -306,6 +306,267 @@ TEST_F(ToolboxRuntimeHostTest, NotifyDataChangedReportsAndDrainsIngestedDatasets
   EXPECT_TRUE(reported[2].empty());
 }
 
+// The progress slots on the parser-ingest fat pointer drive the shell's
+// progressive-import surface: progress_start/finish bracket the import, and
+// each unthrottled progress_update seals pending toolbox writes BEFORE
+// on_ingest_progress fires, so the handler observes reader-visible rows.
+TEST_F(ToolboxRuntimeHostTest, ProgressHooksFlushWritesAndDriveIngestCallbacks) {
+  QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+  PJ::test::HermeticCatalog catalog_box(plugin_file.absolutePath());
+  PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+  deps.catalog = &catalog_box.service;
+
+  struct StartedEvent {
+    PJ::DatasetId dataset;
+    std::string label;
+    uint64_t total;
+  };
+  struct ProgressEvent {
+    PJ::DatasetId dataset;
+    uint64_t current;
+    uint64_t total;
+    uint64_t visible_rows;
+  };
+  std::vector<StartedEvent> started;
+  std::vector<ProgressEvent> progressed;
+  std::vector<PJ::DatasetId> finished;
+  uint32_t source_id = 0;  // assigned after createDataSource; read at callback time
+
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&started](PJ::DatasetId dataset, std::string label, uint64_t total) {
+    started.push_back({dataset, std::move(label), total});
+  };
+  callbacks.on_ingest_progress = [&, this](PJ::DatasetId dataset, uint64_t current, uint64_t total) {
+    progressed.push_back({dataset, current, total, totalRowCount(source_id)});
+  };
+  callbacks.on_ingest_finished = [&finished](PJ::DatasetId dataset) { finished.push_back(dataset); };
+  host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+      engine_, object_store_, settings_, std::move(callbacks), std::move(deps));
+  host_->setFlushThrottleMs(0);
+  auto services = registered();
+  auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+  ASSERT_TRUE(toolbox_or.has_value());
+  auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value());
+
+  const auto source = *(*toolbox_or).createDataSource("cloud download");
+  source_id = source.id;
+  const auto topic = *(*toolbox_or).ensureTopic(source, "imu");
+  ASSERT_TRUE((*toolbox_or).ensureField(topic, "ax", PJ::PrimitiveType::kFloat64).has_value());
+
+  PJ_data_source_runtime_host_t ingest_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(
+      (*runtime_or).raw().vtable->create_parser_ingest((*runtime_or).raw().ctx, source.id, &ingest_raw, &error));
+  const PJ::DataSourceRuntimeHostView progress(ingest_raw);
+
+  ASSERT_TRUE(progress.progressStart("mosaico download", 10, /*cancellable=*/true).has_value());
+  ASSERT_EQ(started.size(), 1u);
+  EXPECT_EQ(started[0].dataset, static_cast<PJ::DatasetId>(source.id));
+  EXPECT_EQ(started[0].label, "mosaico download");
+  EXPECT_EQ(started[0].total, 10u);
+
+  // Buffered toolbox write: invisible until the progress tick flushes it.
+  const std::vector<PJ::sdk::NamedFieldValue> row = {{.name = "ax", .value = 1.5}};
+  ASSERT_TRUE((*toolbox_or).appendRecord(topic, 1, row).has_value());
+  EXPECT_EQ(totalRowCount(source.id), 0u);
+
+  EXPECT_TRUE(progress.progressUpdate(3));
+  ASSERT_EQ(progressed.size(), 1u);
+  EXPECT_EQ(progressed[0].dataset, static_cast<PJ::DatasetId>(source.id));
+  EXPECT_EQ(progressed[0].current, 3u);
+  EXPECT_EQ(progressed[0].total, 10u);
+  EXPECT_EQ(progressed[0].visible_rows, 1u);  // the flush preceded the callback
+
+  progress.progressFinish();
+  ASSERT_EQ(finished.size(), 1u);
+  EXPECT_EQ(finished[0], static_cast<PJ::DatasetId>(source.id));
+
+  ASSERT_TRUE((*runtime_or).releaseParserIngest(source.id).has_value());
+  host_.reset();  // context references test-body locals (catalog)
+}
+
+// A mid-import dataset (between progress_start and progress_finish) re-reports
+// on EVERY notify — the shell's playback focus must follow the growing import —
+// and a released context re-reports once so the terminal notify runs the
+// shell's focus/reconcile pass over the finished dataset.
+TEST_F(ToolboxRuntimeHostTest, NotifyReportsMidImportDatasetOnEveryNotify) {
+  QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+  PJ::test::HermeticCatalog catalog_box(plugin_file.absolutePath());
+  PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+  deps.catalog = &catalog_box.service;
+
+  std::vector<std::vector<PJ::DatasetId>> reported;
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_data_changed = [&reported](std::vector<PJ::DatasetId> ingested) {
+    reported.push_back(std::move(ingested));
+  };
+  host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+      engine_, object_store_, settings_, std::move(callbacks), std::move(deps));
+  auto services = registered();
+  auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+  ASSERT_TRUE(toolbox_or.has_value());
+  auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value());
+
+  const auto source = *(*toolbox_or).createDataSource("cloud download");
+  const auto ds_id = static_cast<PJ::DatasetId>(source.id);
+  PJ_data_source_runtime_host_t ingest_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(
+      (*runtime_or).raw().vtable->create_parser_ingest((*runtime_or).raw().ctx, source.id, &ingest_raw, &error));
+  const PJ::DataSourceRuntimeHostView progress(ingest_raw);
+
+  ASSERT_TRUE(progress.progressStart("import", 0, true).has_value());
+  (*runtime_or).notifyDataChanged();
+  (*runtime_or).notifyDataChanged();
+  ASSERT_EQ(reported.size(), 2u);
+  EXPECT_EQ(reported[0], std::vector<PJ::DatasetId>{ds_id});  // create-time pending + active, deduped
+  EXPECT_EQ(reported[1], std::vector<PJ::DatasetId>{ds_id});  // still mid-import
+
+  progress.progressFinish();
+  (*runtime_or).notifyDataChanged();
+  ASSERT_EQ(reported.size(), 3u);
+  EXPECT_TRUE(reported[2].empty());  // import ended, context idle
+
+  ASSERT_TRUE((*runtime_or).releaseParserIngest(source.id).has_value());
+  (*runtime_or).notifyDataChanged();
+  (*runtime_or).notifyDataChanged();
+  ASSERT_EQ(reported.size(), 5u);
+  EXPECT_EQ(reported[3], std::vector<PJ::DatasetId>{ds_id});  // release re-reports once
+  EXPECT_TRUE(reported[4].empty());
+}
+
+// The shell's "stop this import" routes through requestStopActiveIngests: a
+// flag-only cooperative stop every live context observes via is_stop_requested
+// and progress_update returning false.
+TEST_F(ToolboxRuntimeHostTest, RequestStopActiveIngestsSignalsCooperativeStop) {
+  QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+  PJ::test::HermeticCatalog catalog_box(plugin_file.absolutePath());
+  PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+  deps.catalog = &catalog_box.service;
+  host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+      engine_, object_store_, settings_, PJ::ToolboxRuntimeHost::Callbacks{}, std::move(deps));
+  auto services = registered();
+  auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+  ASSERT_TRUE(toolbox_or.has_value());
+  auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value());
+
+  const auto source = *(*toolbox_or).createDataSource("cloud download");
+  PJ_data_source_runtime_host_t ingest_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(
+      (*runtime_or).raw().vtable->create_parser_ingest((*runtime_or).raw().ctx, source.id, &ingest_raw, &error));
+  const PJ::DataSourceRuntimeHostView progress(ingest_raw);
+
+  EXPECT_FALSE(progress.isStopRequested());
+  host_->requestStopActiveIngests();
+  EXPECT_TRUE(progress.isStopRequested());
+  EXPECT_FALSE(progress.progressUpdate(1));  // cooperative-cancel signal
+
+  ASSERT_TRUE((*runtime_or).releaseParserIngest(source.id).has_value());
+  host_.reset();
+}
+
+// progressFinish without a started sequence is the SDK finite-import pattern's
+// safe no-op — it must not emit an unpaired on_ingest_finished (which would
+// disturb the shell's started/finished bookkeeping for other imports). And the
+// [stream-thread] progress hooks must marshal their callbacks to the
+// constructing thread, exactly like report_message/notify_data_changed.
+TEST_F(ToolboxRuntimeHostTest, ProgressCallbacksArePairedAndMarshalled) {
+  QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+  PJ::test::HermeticCatalog catalog_box(plugin_file.absolutePath());
+  PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+  deps.catalog = &catalog_box.service;
+
+  std::atomic<int> started_calls{0};
+  std::atomic<int> finished_calls{0};
+  std::thread::id callback_thread;
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) {
+    callback_thread = std::this_thread::get_id();
+    ++started_calls;
+  };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+      engine_, object_store_, settings_, std::move(callbacks), std::move(deps));
+  auto services = registered();
+  auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+  ASSERT_TRUE(toolbox_or.has_value());
+  auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value());
+
+  const auto source = *(*toolbox_or).createDataSource("cloud download");
+  PJ_data_source_runtime_host_t ingest_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(
+      (*runtime_or).raw().vtable->create_parser_ingest((*runtime_or).raw().ctx, source.id, &ingest_raw, &error));
+  const PJ::DataSourceRuntimeHostView progress(ingest_raw);
+
+  // Finish with no active sequence: swallowed, no unpaired callback.
+  progress.progressFinish();
+  QCoreApplication::processEvents();
+  EXPECT_EQ(finished_calls.load(), 0);
+
+  // Cross-thread start: queued, delivered on the constructing thread only.
+  const auto host_thread = std::this_thread::get_id();
+  // (Plain call: gtest ASSERTs are not usable off the test thread; the
+  // started-count checks below prove the call succeeded.)
+  std::thread worker([&]() { (void)progress.progressStart("import", 0, true); });
+  worker.join();
+  EXPECT_EQ(started_calls.load(), 0);
+  QCoreApplication::processEvents();
+  EXPECT_EQ(started_calls.load(), 1);
+  EXPECT_EQ(callback_thread, host_thread);
+
+  progress.progressFinish();
+  QCoreApplication::processEvents();
+  EXPECT_EQ(finished_calls.load(), 1);  // paired now that a sequence ran
+
+  ASSERT_TRUE((*runtime_or).releaseParserIngest(source.id).has_value());
+  QCoreApplication::processEvents();
+  EXPECT_EQ(finished_calls.load(), 1);  // release after a clean finish adds nothing
+  host_.reset();
+}
+
+// Rapid progress_update calls inside the throttle window must not stack
+// flush+callback ticks — only the first (epoch-aged) tick fires.
+TEST_F(ToolboxRuntimeHostTest, ProgressUpdateThrottleSuppressesRapidTicks) {
+  QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+  PJ::test::HermeticCatalog catalog_box(plugin_file.absolutePath());
+  PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+  deps.catalog = &catalog_box.service;
+
+  int progress_calls = 0;
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_progress = [&progress_calls](PJ::DatasetId, uint64_t, uint64_t) { ++progress_calls; };
+  host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+      engine_, object_store_, settings_, std::move(callbacks), std::move(deps));
+  host_->setFlushThrottleMs(60000);
+  auto services = registered();
+  auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+  ASSERT_TRUE(toolbox_or.has_value());
+  auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value());
+
+  const auto source = *(*toolbox_or).createDataSource("cloud download");
+  PJ_data_source_runtime_host_t ingest_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(
+      (*runtime_or).raw().vtable->create_parser_ingest((*runtime_or).raw().ctx, source.id, &ingest_raw, &error));
+  const PJ::DataSourceRuntimeHostView progress(ingest_raw);
+
+  ASSERT_TRUE(progress.progressStart("import", 100, true).has_value());
+  EXPECT_TRUE(progress.progressUpdate(1));  // epoch-aged last_flush: fires
+  EXPECT_TRUE(progress.progressUpdate(2));  // inside the window: suppressed
+  EXPECT_TRUE(progress.progressUpdate(3));
+  EXPECT_EQ(progress_calls, 1);
+
+  ASSERT_TRUE((*runtime_or).releaseParserIngest(source.id).has_value());
+  host_.reset();
+}
+
 TEST_F(ToolboxRuntimeHostTest, ParserIngestWithoutDepsFailsCleanly) {
   host_ =
       std::make_unique<PJ::ToolboxRuntimeHost>(engine_, object_store_, settings_, PJ::ToolboxRuntimeHost::Callbacks{});

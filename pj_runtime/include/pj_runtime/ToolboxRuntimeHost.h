@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QObject>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -44,15 +46,33 @@ class ToolboxRuntimeHost {
   struct Callbacks {
     // Fired after notify_data_changed flushes buffered writes — the host
     // rebuilds its catalog / reseeds playback here. `ingested_datasets` lists
-    // the toolbox-created datasets that received a parser-ingest context
-    // (create_parser_ingest) since the PREVIOUS notify — i.e. a bulk import
-    // shaped like a file load (the cloud connector's fetch). Empty for plain
-    // write-API toolboxes. Hosts use it to FOCUS playback on the imported
-    // data: a 10s cloud snippet must present a 10s timeline, not be unioned
-    // into whatever range the session already had.
+    // the toolbox-created datasets that mark a bulk import shaped like a file
+    // load (the cloud connector's fetch): datasets whose parser-ingest context
+    // was created or released since the PREVIOUS notify, plus those whose
+    // context is MID-IMPORT (between progress_start and progress_finish) at
+    // every notify while the import runs. Empty for plain write-API toolboxes.
+    // Hosts use it to FOCUS playback on the imported data: a 10s cloud snippet
+    // must present a 10s timeline, not be unioned into whatever range the
+    // session already had — and a progressive import keeps that focus as it
+    // grows instead of collapsing back to the union on each notify. Ordering
+    // caveat: "no longer mid-import at the terminal notify" assumes the plugin
+    // posts that notify AFTER progress_finish from the same thread (the
+    // documented single-ingest-worker pattern); a notify raced in from a third
+    // thread may still observe the import as active for one round.
     std::function<void(std::vector<DatasetId> ingested_datasets)> on_data_changed;
     // Fired for each plugin diagnostic — routed to the app's notification UI.
     std::function<void(PJ_toolbox_message_level_t, std::string)> on_message;
+    // Progress surface of a delegated bulk import — fired when the toolbox
+    // calls progress_start / progress_update / progress_finish on the runtime
+    // host returned by create_parser_ingest. `total` is 0 for an indeterminate
+    // import. on_ingest_progress fires only on the ticks that also flushed
+    // pending writes (throttled, ~50 ms), so each invocation means "new rows
+    // just became reader-visible" — a handler can publish incrementally
+    // (plots/playback/TF) without any gating of its own. The heavyweight
+    // catalog rebuild stays on on_data_changed.
+    std::function<void(DatasetId dataset, std::string label, uint64_t total)> on_ingest_started;
+    std::function<void(DatasetId dataset, uint64_t current, uint64_t total)> on_ingest_progress;
+    std::function<void(DatasetId dataset)> on_ingest_finished;
   };
 
   // Optional dependencies enabling the parser-ingest tail slots. With a null
@@ -87,6 +107,20 @@ class ToolboxRuntimeHost {
   // into the builder used to bind the toolbox plugin.
   void registerServices(ServiceRegistryBuilder& registry);
 
+  // Flag-only cooperative stop for every live parser-ingest context — the
+  // shell's "stop this import" affordance. Thread-safe. The plugin observes it
+  // through is_stop_requested / progress_update returning false and ends the
+  // import with its own keep-partial semantics: the toolbox ABI has no
+  // host-side rollback, so there is no keep/discard choice on this path.
+  void requestStopActiveIngests();
+
+  // Minimum wall-clock between the flush+on_ingest_progress ticks driven by a
+  // plugin's progress_update calls (test seam; production default 50 ms).
+  // Plain int read by the ingest thread: call only BEFORE any ingest begins.
+  void setFlushThrottleMs(int ms) {
+    flush_throttle_ms_ = ms;
+  }
+
  private:
   static void onReportMessage(void* ctx, PJ_toolbox_message_level_t level, PJ_string_view_t message) noexcept;
   static void onNotifyDataChanged(void* ctx) noexcept;
@@ -113,6 +147,21 @@ class ToolboxRuntimeHost {
   // loads use — catalog lookup, classifySchema, ObjectStore registration,
   // render-parser registrar — on a toolbox-created dataset.
   std::unordered_map<uint32_t, std::unique_ptr<DataSourceRuntimeHost>> parser_ingests_;
+  // Progress bookkeeping shared with the hooks installed on a context's
+  // DataSourceRuntimeHost. `active` spans progress_start→progress_finish and
+  // opts the dataset into every notify's ingested report while the import
+  // runs; `total` backs on_ingest_progress; `last_flush` is touched only on
+  // the plugin's ingest thread (single progress caller per context, per the
+  // data-source protocol). Map guarded by parser_ingest_mu_; entries live as
+  // long as their context.
+  struct IngestProgress {
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> total{0};
+    std::chrono::steady_clock::time_point last_flush;
+  };
+  std::unordered_map<uint32_t, std::shared_ptr<IngestProgress>> ingest_progress_;
+  // See setFlushThrottleMs.
+  int flush_throttle_ms_ = 50;
   // Datasets that received a parser-ingest context since the last
   // notify_data_changed — drained (on the GUI thread) into the
   // on_data_changed callback so the host can focus playback on them.

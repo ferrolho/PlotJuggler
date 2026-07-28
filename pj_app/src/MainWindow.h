@@ -77,6 +77,7 @@ class SceneDockWidget;
 class StreamingSourceManager;
 class IngestProgressWidget;
 class MessageBox;
+class ToolboxRuntimeHost;
 class SourceTimelineController;
 class TopicDemandController;
 class SvgButton;
@@ -339,6 +340,17 @@ class MainWindow : public QMainWindow {
   // its toolbox via launchToolbox(). Built lazily on aboutToShow so it
   // tracks whatever the catalog currently has loaded.
   void onRebuildToolboxMenu();
+
+  // Point the title-bar progress strip at the current toolbox bulk import
+  // (title from toolbox_ingest_label_, busy bar, delayed show). Callers gate on
+  // FileLoader being idle — the strip has one owner at a time and file loads win.
+  void adoptToolboxIngestStrip();
+
+  // Flag-only cooperative cancel of every live toolbox bulk import: dedups by
+  // host, skips entries whose owning panel has closed (dead weak owner), and
+  // never dereferences a host until that owner check passes. Keep-partial — the
+  // toolbox ABI has no host-side rollback.
+  void stopAllToolboxImports();
 
   // Launches a toolbox by id: builds a ToolboxRuntimeHost, binds the
   // toolbox, hosts its dialog in a PanelEngine, and presents it in the
@@ -1033,9 +1045,31 @@ class MainWindow : public QMainWindow {
   // flash it; hidden a moment after the load queue drains.
   IngestProgressWidget* ingest_progress_ = nullptr;
   QTimer* ingest_show_timer_ = nullptr;
+  // Restartable single-shot linger before the strip hides after the last load /
+  // toolbox import drains; restarted (not re-minted) from each drain site so
+  // overlapping finishes coalesce into one hide.
+  QTimer* ingest_hide_timer_ = nullptr;
   // Owned by QObject parentage while open; guards against stacking multiple
   // stop confirmations from repeated title-bar clicks.
   QPointer<MessageBox> ingest_stop_dialog_;
+  // Toolbox bulk-import progress (the second producer of ingest_progress_,
+  // arbitration: FileLoader wins a collision). One entry per import dataset,
+  // present between on_ingest_started and on_ingest_finished (host teardown /
+  // release fire finished for anything the plugin left open, so pairing
+  // holds). `owner` weak-guards the PanelSession whose ToolboxRuntimeHost runs
+  // the import — a closed panel can never be stop-routed into freed memory;
+  // `host` is dereferenced only after the owner check succeeds. Membership also
+  // tells the on_data_changed TF bridge the dataset is still growing
+  // (incremental fold, no invalidate). `adopted` says the strip currently
+  // shows a toolbox import; one that started while a file load owned the strip
+  // re-adopts it (via `label`, last-started wins) once the file queue drains.
+  struct ToolboxIngestRef {
+    std::weak_ptr<void> owner;
+    PJ::ToolboxRuntimeHost* host = nullptr;
+  };
+  QHash<PJ::DatasetId, ToolboxIngestRef> toolbox_active_imports_;
+  QString toolbox_ingest_label_;
+  bool toolbox_strip_adopted_ = false;
   // Help ▸ Installed Extensions — informational, rebuilt on aboutToShow.
   QMenu* installed_extensions_menu_ = nullptr;
   // Local-panel header bands (grey "Curve Width" / "Curve Style" labels).
