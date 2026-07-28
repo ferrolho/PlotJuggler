@@ -10,6 +10,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
+#include <algorithm>
 
 #include "pj_widgets/FrameworkTokens.h"
 
@@ -149,11 +150,15 @@ QRect ToggleSwitch::trackRect() const {
   if (text_.isEmpty()) {
     return rect();
   }
-  // Fixed-width pill near the edge opposite the label; full height. A Left-side
-  // label anchors the pill to the right, kept kRightInset off the edge.
+  // Fixed-width pill near the edge opposite the label. A Left-side label anchors
+  // it to the right, kept kRightInset off the edge. The pill never grows past the
+  // height it asks for and centres in whatever box it is given, so a layout that
+  // stretches the widget (a header band sizes its controls to the band height)
+  // gets a taller hit area rather than a fat oval.
   const int track_w = kDefaultWidth;
+  const int track_h = std::min(height(), sizeHint().height());
   const int x = (label_side_ == LabelSide::Left) ? width() - track_w - kRightInset : 0;
-  return {x, 0, track_w, height()};
+  return {x, (height() - track_h) / 2, track_w, track_h};
 }
 
 QRect ToggleSwitch::labelRect() const {

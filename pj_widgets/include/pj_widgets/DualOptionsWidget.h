@@ -11,17 +11,23 @@ class QVariantAnimation;
 
 namespace PJ {
 
-// Horizontal "segmented control" — a joined row of pill segments that
-// replaces an exclusive group of QRadioButtons in config panels. Clicking a
-// segment selects it; the selected segment renders as a raised neutral chip
-// while the others show the input background. Despite the (historical) name
-// it supports any number of segments >= 2; the two-option constructors remain
-// as the common-case convenience.
+// A "segmented control" — a joined strip of pill segments that replaces an
+// exclusive group of QRadioButtons in config panels. Clicking a segment selects
+// it; the selected segment renders as a raised neutral chip that slides to the
+// new position while the others show the input background. Despite the
+// (historical) name it supports any number of segments >= 2; the two-option
+// constructors remain as the common-case convenience.
+//
+// Orientation is configurable (default Horizontal): a Horizontal strip lays the
+// segments left-to-right and the chip slides sideways; a Vertical strip stacks
+// them top-to-bottom and the chip slides up/down. The host radio-group adapter
+// picks the orientation from the source radios' layout axis.
 //
 // Usage:
 //   auto* w = new DualOptionsWidget("Frame", "Arrow");
 //   auto* m = new DualOptionsWidget(QStringList{"Contains", "Wildcard", "RegExp"});
-//   w->setSelectedIndex(0);                           // 0 = leftmost
+//   w->setSelectedIndex(0);                           // 0 = first (left/top)
+//   w->setOrientation(Qt::Vertical);                  // stack + slide up/down
 //   connect(w, &DualOptionsWidget::selectionChanged, [](int i){ ... });
 //
 // Colors come from the QSS via Qt stylesheet qproperties:
@@ -35,6 +41,7 @@ namespace PJ {
 class DualOptionsWidget : public QWidget {
   Q_OBJECT
   Q_PROPERTY(int selectedIndex READ selectedIndex WRITE setSelectedIndex NOTIFY selectionChanged)
+  Q_PROPERTY(Qt::Orientation orientation READ orientation WRITE setOrientation)
   Q_PROPERTY(QColor accentColor READ accentColor WRITE setAccentColor)
   Q_PROPERTY(QColor borderColor READ borderColor WRITE setBorderColor)
   Q_PROPERTY(QColor baseFillColor READ baseFillColor WRITE setBaseFillColor)
@@ -66,6 +73,13 @@ class DualOptionsWidget : public QWidget {
   [[nodiscard]] bool isSecondSelected() const {
     return selected_ == 1;
   }
+
+  [[nodiscard]] Qt::Orientation orientation() const {
+    return orientation_;
+  }
+  // Horizontal (default) lays segments left-to-right; Vertical stacks them
+  // top-to-bottom and slides the chip up/down. Swaps the size policy + geometry.
+  void setOrientation(Qt::Orientation orientation);
 
   [[nodiscard]] QColor accentColor() const {
     return accent_color_;
@@ -115,6 +129,7 @@ class DualOptionsWidget : public QWidget {
   void animateSelectedIndex(int index);
 
   QStringList options_{"Option A", "Option B"};
+  Qt::Orientation orientation_ = Qt::Horizontal;
   int selected_ = 0;
   qreal visual_selection_ = 0.0;
   QVariantAnimation* selection_animation_ = nullptr;

@@ -97,10 +97,17 @@ class RangeSlider : public QWidget {
   int validLength() const;
 
   // Y of the track's top (horizontal orientation). With floating labels the
-  // per-handle labels occupy a row ABOVE the track, so the (fixed-height) track
-  // sits just below that row; without them the track is vertically centered. The
-  // track height itself stays kScTrackHeight — same as the playback scrubber.
+  // per-handle labels occupy a row ABOVE the track, so the track sits just below
+  // that row; without them the track is vertically centered.
   int trackTop() const;
+
+  // Height of the groove + handles (horizontal orientation). Defaults to
+  // kScTrackHeight but GROWS to fill the widget when it is given more vertical
+  // room than its minimum needs (e.g. stretched to match a taller neighbour), so
+  // the visible slider area — not just its bounding box — gets taller. At the
+  // natural minimum height this equals kScTrackHeight, so short sliders are
+  // unchanged.
+  int trackHeight() const;
 
   int minimum_ = 0;
   int maximum_ = 100;

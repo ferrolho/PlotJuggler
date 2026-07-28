@@ -1084,6 +1084,113 @@ std::vector<std::string> columnTexts(const QTableWidget* tw, int col) {
   return out;
 }
 
+TEST(WidgetBindingTableDelete, DeletableTableInstallsDelegateAndEmitsPluginRow) {
+  qapp();
+  recorder()->clear();
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* tw = new QTableWidget(&root);
+  tw->setObjectName("tbl");
+  layout->addWidget(tw);
+
+  PJ::WidgetData wd;
+  wd.setTableHeaders("tbl", {"Topic"});
+  wd.setTableRows("tbl", std::vector<std::vector<std::string>>{{"first"}, {"second"}});
+  wd.setListItemsDeletable("tbl", true);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(wd.toJson()));
+  EXPECT_TRUE(tw->property("pj_deletable").toBool());
+
+  auto* default_delegate = tw->itemDelegate();
+  PJ::connectWidgetSignals(
+      &root, [](const std::string& name, const std::string& json) { recorder()->push_back({name, json}); });
+  ASSERT_NE(tw->itemDelegate(), default_delegate) << "deletable tables need the row-delete delegate";
+
+  // Put plugin row 1 at visual row 0. The delegate must emit the delivered
+  // plugin index carried by kPluginRowRole, not the visual row after sorting.
+  tw->sortItems(0, Qt::DescendingOrder);
+  ASSERT_EQ(tw->item(0, 0)->text(), u"second"_s);
+
+  root.resize(500, 300);
+  root.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&root));
+  const QRect cell = tw->visualItemRect(tw->item(0, 0));
+  ASSERT_FALSE(cell.isEmpty());
+  const QPoint trash_pos(cell.right() - 14, cell.center().y());
+  ASSERT_TRUE(tw->viewport()->rect().contains(trash_pos));
+  QTest::mouseClick(tw->viewport(), Qt::LeftButton, Qt::NoModifier, trash_pos);
+
+  const std::string expected = PJ::WidgetEventBuilder::itemDeleteRequested(1);
+  bool saw_delete = false;
+  for (const auto& ev : *recorder()) {
+    if (ev.name == "tbl" && ev.json == expected) {
+      saw_delete = true;
+    }
+  }
+  EXPECT_TRUE(saw_delete) << "trash click must emit itemDeleteRequested(plugin row)";
+}
+
+// A .ui that hides the horizontal header still needs its columns to span the
+// viewport: the row-delete trash sits at the cell's right edge, so a column
+// frozen at Qt's default section width parks the icon in the middle of the row,
+// on top of the text.
+TEST(WidgetBindingTableDelete, HiddenHeaderStillSpansTheViewport) {
+  qapp();
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* tw = new QTableWidget(&root);
+  tw->setObjectName("tbl");
+  tw->horizontalHeader()->hide();
+  layout->addWidget(tw);
+
+  PJ::WidgetData wd;
+  wd.setTableHeaders("tbl", {"Topic"});
+  wd.setTableRows("tbl", std::vector<std::vector<std::string>>{{"test/cos/value"}});
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(wd.toJson()));
+
+  root.resize(500, 300);
+  root.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&root));
+
+  EXPECT_EQ(tw->columnWidth(0), tw->viewport()->width())
+      << "the single column of a headerless table must fill the viewport";
+
+  // Widening the panel must widen the column with it. A hidden QHeaderView never
+  // receives the resize event its own stretch logic reacts to, so this is the
+  // case that leaves rows stranded at a fraction of the table width.
+  root.resize(1100, 300);
+  QTest::qWait(50);
+  EXPECT_EQ(tw->columnWidth(0), tw->viewport()->width()) << "the column must follow the table as it widens";
+
+  root.resize(400, 300);
+  QTest::qWait(50);
+  EXPECT_EQ(tw->columnWidth(0), tw->viewport()->width()) << "the column must follow the table as it narrows";
+}
+
+// Every column of a headerless table shares the width — not just the last one,
+// which would leave the leading columns stranded at Qt's default section size.
+TEST(WidgetBindingTableDelete, HiddenHeaderSpreadsEveryColumnAcrossTheViewport) {
+  qapp();
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* tw = new QTableWidget(&root);
+  tw->setObjectName("tbl");
+  tw->horizontalHeader()->hide();
+  layout->addWidget(tw);
+
+  PJ::WidgetData wd;
+  wd.setTableHeaders("tbl", {"Topic", "Type"});
+  wd.setTableRows("tbl", std::vector<std::vector<std::string>>{{"test/cos/value", "double"}});
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(wd.toJson()));
+
+  root.resize(900, 300);
+  root.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&root));
+
+  EXPECT_EQ(tw->columnWidth(0) + tw->columnWidth(1), tw->viewport()->width())
+      << "the columns together must span the viewport";
+  EXPECT_GT(tw->columnWidth(0), 200) << "a leading column must not stay at the default section width";
+}
+
 // The reported repro: keyed cells must order by VALUE, not by rendered text —
 // a text sort of "720","7","65" yields 65,7,720 ascending, which is the bug.
 TEST(WidgetBindingTableSort, NumericKeysSortNumericallyBothDirections) {

@@ -276,6 +276,9 @@ static void insertDualOptionsWidget(QWidget* parent, const QList<QRadioButton*>&
   if (placement.box_layout != nullptr) {
     QBoxLayout* box = placement.box_layout;
     const bool horizontal = box->direction() == QBoxLayout::LeftToRight || box->direction() == QBoxLayout::RightToLeft;
+    // The segmented control adopts the source radios' layout axis: a vertical
+    // radio column becomes a vertical strip whose chip slides up/down.
+    dual->setOrientation(horizontal ? Qt::Horizontal : Qt::Vertical);
     const int insert_at = placement.begin_index;
     // The push-to-right-edge rearrangement below is only valid for the classic
     // `[... group (expanding spacer)]` tail rows. If any real widget follows the

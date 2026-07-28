@@ -132,6 +132,50 @@ TEST(DualOptionsWidgetTest, KeyboardStepsThroughThreeOptions) {
   EXPECT_EQ(widget.selectedIndex(), 0) << "Space wraps around after the last segment";
 }
 
+TEST(DualOptionsWidgetTest, DefaultsToHorizontalOrientation) {
+  PJ::DualOptionsWidget widget(u"Frame"_s, u"Arrow"_s);
+  EXPECT_EQ(widget.orientation(), Qt::Horizontal);
+}
+
+TEST(DualOptionsWidgetTest, VerticalOrientationSwapsSizeHintAxes) {
+  PJ::DualOptionsWidget horizontal(QStringList{u"Contains"_s, u"Wildcard"_s, u"RegExp"_s});
+  PJ::DualOptionsWidget vertical(QStringList{u"Contains"_s, u"Wildcard"_s, u"RegExp"_s});
+  vertical.setOrientation(Qt::Vertical);
+
+  // Vertical stacks the 3 segments: taller than the single-row horizontal strip,
+  // and only one segment wide instead of three.
+  EXPECT_GT(vertical.sizeHint().height(), horizontal.sizeHint().height());
+  EXPECT_LT(vertical.sizeHint().width(), horizontal.sizeHint().width());
+}
+
+TEST(DualOptionsWidgetTest, VerticalMouseClickSelectsBySegmentRow) {
+  PJ::DualOptionsWidget widget(QStringList{u"Contains"_s, u"Wildcard"_s, u"RegExp"_s});
+  widget.setOrientation(Qt::Vertical);
+  widget.resize(widget.sizeHint());
+  widget.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&widget));
+
+  QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, QPoint(widget.width() / 2, widget.height() - 2));
+  EXPECT_EQ(widget.selectedIndex(), 2) << "click near the bottom selects the last segment";
+
+  QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, QPoint(widget.width() / 2, 2));
+  EXPECT_EQ(widget.selectedIndex(), 0) << "click near the top selects the first segment";
+}
+
+TEST(DualOptionsWidgetTest, VerticalKeyboardUsesUpDown) {
+  PJ::DualOptionsWidget widget(u"Frame"_s, u"Arrow"_s);
+  widget.setOrientation(Qt::Vertical);
+  widget.resize(widget.sizeHint());
+  widget.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&widget));
+  widget.setFocus();
+
+  QTest::keyClick(&widget, Qt::Key_Down);
+  EXPECT_EQ(widget.selectedIndex(), 1);
+  QTest::keyClick(&widget, Qt::Key_Up);
+  EXPECT_EQ(widget.selectedIndex(), 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

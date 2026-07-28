@@ -91,7 +91,7 @@ void RangeSlider::paintEvent(QPaintEvent* a_event) {
   // Groove geometry: a full-height rectangular track (timeSlider shape).
   QRectF background_rect;
   if (orientation_ == Qt::Horizontal) {
-    background_rect = QRectF(kScLeftRightMargin, trackTop(), width() - kScLeftRightMargin * 2, kScTrackHeight);
+    background_rect = QRectF(kScLeftRightMargin, trackTop(), width() - kScLeftRightMargin * 2, trackHeight());
   } else {
     background_rect =
         QRectF((width() - kScTrackHeight) / 2.0, kScLeftRightMargin, kScTrackHeight, height() - kScLeftRightMargin * 2);
@@ -208,7 +208,7 @@ QRectF RangeSlider::handleRect(int a_value) const {
   // Thin grip spanning the full track height (timeSlider handle: 6px wide,
   // groove-tall), centered across the short axis.
   if (orientation_ == Qt::Horizontal) {
-    return QRect(a_value, trackTop(), kScHandleWidth, kScTrackHeight);
+    return QRect(a_value, trackTop(), kScHandleWidth, trackHeight());
   } else {
     return QRect((width() - kScTrackHeight) / 2, a_value, kScTrackHeight, kScHandleWidth);
   }
@@ -461,11 +461,20 @@ int RangeSlider::validLength() const {
 
 int RangeSlider::trackTop() const {
   if (orientation_ != Qt::Horizontal || !floating_labels_) {
-    return static_cast<int>((height() - kScTrackHeight) / 2);  // centered (no label row)
+    return static_cast<int>((height() - trackHeight()) / 2);  // centered (no label row)
   }
-  // One label row above the track (matches minimumSizeHint). No reserve below.
+  // One label row above the track; the track fills the remaining height below.
   const QFontMetrics fm(font());
   return fm.height() + 6 + 4;
+}
+
+int RangeSlider::trackHeight() const {
+  if (orientation_ != Qt::Horizontal || !floating_labels_) {
+    return kScTrackHeight;
+  }
+  const QFontMetrics fm(font());
+  const int label_row = fm.height() + 6 + 4;
+  return std::max(kScTrackHeight, height() - label_row);
 }
 
 void RangeSlider::setRange(int a_minimum, int a_maximum) {
@@ -640,6 +649,14 @@ void RangeSlider::drawFloatingLabels(QPainter& painter) {
   painter.setFont(label_font);
   QFontMetrics fm(label_font);
 
+  // A disabled slider dims its floating labels so the dark HUD pills / accent
+  // duration chip read as inactive alongside the disabled track and handles,
+  // instead of staying full-strength (which looks like a live control).
+  painter.save();
+  if (!isEnabled()) {
+    painter.setOpacity(0.4);
+  }
+
   const int label_height = fm.height() + 6;
   const int handle_top = trackTop();
   const int label_y = handle_top - label_height - 2;
@@ -685,7 +702,7 @@ void RangeSlider::drawFloatingLabels(QPainter& painter) {
         const int chip_h = fm.height() + 4;
         const double track_top = trackTop();
         QRect rect(
-            static_cast<int>(cx - text_width / 2.0), static_cast<int>(track_top + (kScTrackHeight - chip_h) / 2.0),
+            static_cast<int>(cx - text_width / 2.0), static_cast<int>(track_top + (trackHeight() - chip_h) / 2.0),
             text_width, chip_h);
         // Bordered duration chip, using the same selection outline as the range.
         const auto fw_theme = frameworkTheme();
@@ -701,6 +718,7 @@ void RangeSlider::drawFloatingLabels(QPainter& painter) {
       }
     }
   }
+  painter.restore();
 }
 
 }  // namespace PJ

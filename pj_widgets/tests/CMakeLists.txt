@@ -556,6 +556,24 @@ if(DEFINED PJ_WARNING_FLAGS)
 endif()
 add_test(NAME SearchTest COMMAND search_test)
 
+add_executable(section_header_band_test
+    section_header_band_test.cpp
+    ${CMAKE_SOURCE_DIR}/resources/resources.qrc
+)
+set_target_properties(section_header_band_test PROPERTIES
+    AUTORCC ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(section_header_band_test PRIVATE
+    pj_widgets
+    GTest::gtest
+    Qt6::Test
+)
+if(DEFINED PJ_WARNING_FLAGS)
+    target_compile_options(section_header_band_test PRIVATE ${PJ_WARNING_FLAGS})
+endif()
+add_test(NAME SectionHeaderBandTest COMMAND section_header_band_test)
+
 add_executable(header_divider_highlight_test
     header_divider_highlight_test.cpp
     ${CMAKE_SOURCE_DIR}/resources/resources.qrc

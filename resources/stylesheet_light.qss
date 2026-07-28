@@ -1618,16 +1618,29 @@ QWidget#leftMainWindowFrame
   background-color: ${backdrop};
 }
 
+/* The exporter's prefix field lives inside the Settings header band, so it wears
+   the band's input tone — the same pair the canonical Search uses for its
+   kBanner variant, not the standalone `input` surface. */
+/* Same rest/hover/focus treatment as the canonical Search: a 1px border is
+   always present (transparent at rest) so the two states only recolour it and
+   the text never shifts. Focus wins over hover (later rule, equal specificity).
+   The id selector outranks the global QLineEdit:hover/:focus rules, which would
+   otherwise paint this field with the standalone-input border. */
 QLineEdit#lineEditPrefix{
-  background-color: transparent;
-  border: none;
-  border-radius: ${radius_square}px;
-  border-bottom: none;
-  padding: ${space_none}px;
+  background-color: ${banner_input};
+  color: ${on_banner_input_default};
+  border: 1px solid transparent;
+  border-radius: ${radius_input}px;
+  padding-left: ${space_snug}px;
+  padding-right: ${space_snug}px;
+}
+
+QLineEdit#lineEditPrefix:hover{
+  border: 1px solid ${accent_checked_hovered};
 }
 
 QLineEdit#lineEditPrefix:focus{
-  border-bottom: none;
+  border: 1px solid ${accent_checked};
 }
 
 QWidget#plottingArea{
@@ -1895,6 +1908,27 @@ PJ--DualOptionsWidget {
 PJ--ScrubberBase, PJ--CheckButton, PJ--DualOptionsWidget, PJ--ColorPickerWidget {
     min-height: ${size_input_outer_height}px;
     max-height: ${size_input_outer_height}px;
+}
+/* A vertical DualOptionsWidget stacks its segments, so the single-row cap above
+   would crush them. Lift it and let the widget's own stacked height hint win. */
+PJ--DualOptionsWidget[pjOrientation="vertical"] {
+    min-height: 0;
+    max-height: 16777215;
+}
+
+/* A control docked inside a SectionHeaderBand is sized to the band height so it
+   reads as part of the strip. The caps above (and the native input caps) are
+   applied by QStyleSheetStyle over the layout, so they have to be lifted here or
+   the band's fixed height could never take effect. */
+PJ--ScrubberBase[pjBandDocked="true"],
+PJ--CheckButton[pjBandDocked="true"],
+PJ--DualOptionsWidget[pjBandDocked="true"],
+PJ--ColorPickerWidget[pjBandDocked="true"],
+QLineEdit[pjBandDocked="true"],
+QAbstractSpinBox[pjBandDocked="true"],
+QComboBox[pjBandDocked="true"] {
+    min-height: 0;
+    max-height: 16777215;
 }
 
 /* Scene-control icon buttons (eye / add / trash / grid-style / copy-paste) sit in

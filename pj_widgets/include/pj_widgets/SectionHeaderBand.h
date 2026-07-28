@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QList>
+#include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
 
 #include "pj_widgets/ChromeMetrics.h"
 
+class QChildEvent;
 class QComboBox;
 class QHBoxLayout;
 class QLabel;
@@ -166,6 +168,26 @@ class SectionHeaderBand : public QWidget {
   // chromeMetricsChanged signal here so the band scales with the icon size.
   void onChromeMetricsChanged(const ChromeMetrics& metrics);
 
+  // Dock an arbitrary widget on the trailing (right) side of the band, after the
+  // title's stretch. This is what lets the band act as a container: a widget
+  // nested inside the band in a .ui file is reparented onto it by the loader and
+  // auto-docked here (see childEvent), in declaration order, so plugin panels can
+  // group e.g. a checkbox + radios into the header strip.
+  //
+  // Docked widgets are sized to the full band height, the same rule the band's
+  // own buttons follow, so they read as part of the strip instead of floating in
+  // it. They also carry a `pjBandDocked` dynamic property, which the app
+  // stylesheet keys on to lift the single-input-row height cap it pins on the
+  // self-painted PJ controls — QStyleSheetStyle enforces that cap over the
+  // layout, so without the property those controls could not grow.
+  void addTrailingWidget(QWidget* widget);
+
+ protected:
+  // Auto-docks externally-reparented children (the .ui-nested case above). The
+  // band's OWN sub-widgets are created under the creating_internal_ guard and
+  // self-insert, so they are not re-docked here.
+  void childEvent(QChildEvent* event) override;
+
  private:
   // Remove the title's trailing stretch once an expanding control (filter or
   // expanding combo) takes over the middle of the band. Idempotent.
@@ -184,8 +206,23 @@ class SectionHeaderBand : public QWidget {
   // trailing order [.. toggle][buttons..][docked combo] whatever the .ui
   // property order was.
   [[nodiscard]] int trailingInsertIndex(bool before_buttons) const;
-  // Size one metric-tracked band button (bandHeight box, icon_size icon).
+  // Apply the canonical title-band insets + spacing to the band's layout.
+  void applyBandLayoutMetrics();
+  // Height left for chrome once the band's vertical insets are taken
+  // (icon_size + icon_padding). Every control the band sizes uses this, so
+  // nothing butts against the band's edges.
+  [[nodiscard]] int contentHeight() const;
+  // Size one metric-tracked band button (contentHeight box, icon_size icon).
   void applyButtonMetrics(QPushButton* button) const;
+  // Pin one docked widget to the band height. A fixed height (rather than a
+  // stretching size policy) is what survives a later setSizePolicy from whoever
+  // adapts the widget — the dialog host swaps a docked QCheckBox for a
+  // ToggleSwitch and re-declares its policy after the dock.
+  void applyDockedWidgetMetrics(QWidget* widget) const;
+
+  // >0 while the band constructs its OWN sub-widgets (title/filter/combo/buttons/
+  // toggle), so childEvent can tell those apart from .ui-nested external children.
+  int creating_internal_ = 0;
 
   QHBoxLayout* layout_ = nullptr;
   QLabel* label_ = nullptr;
@@ -210,6 +247,10 @@ class SectionHeaderBand : public QWidget {
   QString trailing_toggle_name_;
   QString trailing_toggle_text_;
   QString trailing_toggle_tooltip_;
+  // Externally docked widgets, kept so a later metrics change re-pins their
+  // height. Guarded pointers: the host deletes and re-creates docked controls
+  // when it adapts them (QCheckBox -> ToggleSwitch).
+  QList<QPointer<QWidget>> docked_widgets_;
 };
 
 }  // namespace PJ

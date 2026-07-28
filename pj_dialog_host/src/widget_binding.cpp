@@ -505,11 +505,11 @@ QPixmap rowTrashPixmap(const QColor& ink, int extent, qreal dpr) {
   return pix;
 }
 
-// Paints a trailing trash icon on every row of a QListWidget and turns a click
-// on that icon into an itemDeleteRequested(row) event. Only active when the list
-// carries a true "pj_deletable" dynamic property (set from WidgetData), so the
-// same delegate is harmless on non-deletable lists. Clicks off the icon fall
-// through untouched, so selection and double-click-to-load still work.
+// Paints a trailing trash icon on every delegated list/table item and turns a
+// click on that icon into an itemDeleteRequested(row) event. Only active when
+// the item view carries a true "pj_deletable" dynamic property (set from
+// WidgetData), so the same delegate is harmless on non-deletable views. Clicks
+// off the icon fall through untouched, so selection and double-click still work.
 class ListRowDeleteDelegate : public QStyledItemDelegate {
  public:
   static constexpr int kIconExtent = 16;
@@ -558,8 +558,8 @@ class ListRowDeleteDelegate : public QStyledItemDelegate {
 
  private:
   [[nodiscard]] bool deletable() const {
-    const auto* list = qobject_cast<const QWidget*>(parent());
-    return list != nullptr && list->property("pj_deletable").toBool();
+    const auto* view = qobject_cast<const QWidget*>(parent());
+    return view != nullptr && view->property("pj_deletable").toBool();
   }
   [[nodiscard]] static QRect iconRect(const QRect& row) {
     return {
@@ -795,6 +795,18 @@ static void installTreeLikeHeader(QTableWidget* tw) {
     return;
   }
   tw->setProperty("pjTreeLikeHeader", true);
+
+  // A .ui can hide the horizontal header (a list-like table has no column labels
+  // worth showing). Nothing can be dragged or highlighted then, and the policy
+  // would in fact freeze the columns at Qt's default section width: it rebalances
+  // off the header's own resize event, which a hidden header never receives — so
+  // rows end up a fraction of the table wide, with the row-delete trash parked
+  // mid-row on top of the text. Qt's Stretch mode is driven by the view instead
+  // and keeps every section spanning the viewport, at any column count.
+  if (header->isHidden()) {
+    header->setSectionResizeMode(QHeaderView::Stretch);
+    return;
+  }
 
   auto* policy = PJ::HeaderResizePolicy::install(header, kNameColumn, 20);
   PJ::HeaderDividerHighlight::install(header);
@@ -1268,6 +1280,15 @@ static void applyToWidget(
 
   // --- QTableWidget ---
   if (auto* tw = qobject_cast<QTableWidget*>(w)) {
+    // Per-row delete affordance (setListItemsDeletable), shared with QListWidget.
+    // The property drives the ListRowDeleteDelegate installed in
+    // connectWidgetSignals; relayout when it changes so the delegate's sizeHint
+    // is re-queried for existing rows.
+    const bool deletable = view.listDeletable(name).value_or(false);
+    if (tw->property("pj_deletable").toBool() != deletable) {
+      tw->setProperty("pj_deletable", deletable);
+      tw->doItemsLayout();
+    }
     // The dialog protocol carries no cell-edit event (only selection, double-click
     // and radio), so an edited cell can never be read back by the plugin — an
     // editable cell silently discards the edit on accept. Force read-only on every
@@ -2068,6 +2089,10 @@ void connectWidgetSignals(QWidget* root, WidgetEventCallback callback) {
       QObject::connect(tw, &QTableWidget::cellDoubleClicked, tw, [callback, name, tw](int row, int /*col*/) {
         callback(name, WidgetEventBuilder::itemDoubleClicked(viewRowToPluginRow(tw, row)));
       });
+      // Per-row trash button, matching QListWidget. The delegate is inert unless
+      // setListItemsDeletable enabled the pj_deletable property on this table.
+      tw->setItemDelegate(new ListRowDeleteDelegate(
+          tw, [callback, name](int row) { callback(name, WidgetEventBuilder::itemDeleteRequested(row)); }));
       // Header click -> headerClicked(section), letting a plugin own its column
       // sorting (it re-orders its row model and re-emits, so index-based selection
       // and visibility stay consistent). A plugin that doesn't override

@@ -11,6 +11,7 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
+#include <QStyle>
 #include <QVariantAnimation>
 #include <algorithm>
 
@@ -83,6 +84,35 @@ void DualOptionsWidget::setSelectedIndex(int index) {
   emit selectionChanged(selected_);
 }
 
+void DualOptionsWidget::setOrientation(Qt::Orientation orientation) {
+  if (orientation_ == orientation) {
+    return;
+  }
+  orientation_ = orientation;
+  // Horizontal: fill-width row, fixed height. Vertical: fixed width, fill-height
+  // column. Maximum on the growing axis keeps the strip snug to its content.
+  setSizePolicy(
+      orientation_ == Qt::Horizontal ? QSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed)
+                                     : QSizePolicy(QSizePolicy::Fixed, QSizePolicy::Maximum));
+  // Hard-pin the stacked height so a constrained parent (e.g. an aligned
+  // sub-layout, which only honours minimumSize — not minimumSizeHint) cannot
+  // squash the vertical pills below their text. Horizontal keeps its natural
+  // single-row height.
+  setMinimumHeight(orientation_ == Qt::Vertical ? sizeHint().height() : 0);
+  // The app QSS pins PJ--DualOptionsWidget to a single input-row height
+  // (min/max-height), which QStyleSheetStyle enforces OVER the C++ size hints —
+  // correct for a horizontal strip, fatal for a stacked one. This property lets
+  // the stylesheet lift that cap for the vertical case so the height above wins;
+  // re-polish so the selector re-evaluates immediately.
+  setProperty("pjOrientation", orientation_ == Qt::Vertical ? "vertical" : "horizontal");
+  if (QStyle* s = style(); s != nullptr) {
+    s->unpolish(this);
+    s->polish(this);
+  }
+  updateGeometry();
+  update();
+}
+
 void DualOptionsWidget::setAccentColor(const QColor& color) {
   if (accent_color_ == color) {
     return;
@@ -130,7 +160,16 @@ QSize DualOptionsWidget::sizeHint() const {
     max_w = std::max(max_w, fm.horizontalAdvance(option));
   }
   const int segment_w = max_w + 2 * theme::space(kHPadding);
-  return {optionCount() * segment_w, theme::metric(theme::Metric::InputOuterHeight)};
+  const int segment_h = theme::metric(theme::Metric::InputOuterHeight);
+  if (orientation_ == Qt::Horizontal) {
+    return {optionCount() * segment_w, segment_h};
+  }
+  // Vertical: one segment wide (all segments share the widest label), N tall.
+  // A stacked column gives each pill its own row; snug breathing room keeps the
+  // stack compact enough to pair with a single input-row-scale neighbour (the
+  // comfortable horizontal inset would fatten each row well past the row grid).
+  const int vertical_segment_h = std::max(segment_h, fm.height() + 2 * theme::space(theme::Space::Snug));
+  return {segment_w, optionCount() * vertical_segment_h};
 }
 
 QSize DualOptionsWidget::minimumSizeHint() const {
@@ -163,7 +202,15 @@ void DualOptionsWidget::paintEvent(QPaintEvent* /*event*/) {
 
   const QRectF box =
       QRectF(rect()).adjusted(border_width / 2.0, border_width / 2.0, -border_width / 2.0, -border_width / 2.0);
-  const qreal segment_w = box.width() / optionCount();
+  // Segment geometry runs along the strip's axis; a fractional position (the
+  // animated visual_selection_ for the chip, the integer index for a label) maps
+  // to a rect the full cross-axis thickness.
+  const bool horizontal = orientation_ == Qt::Horizontal;
+  const qreal segment_extent = (horizontal ? box.width() : box.height()) / optionCount();
+  const auto segment_box = [&](qreal pos) -> QRectF {
+    return horizontal ? QRectF(box.left() + segment_extent * pos, box.top(), segment_extent, box.height())
+                      : QRectF(box.left(), box.top() + segment_extent * pos, box.width(), segment_extent);
+  };
 
   const QColor bg =
       isEnabled() ? base_fill_color_ : theme::interaction(theme::Variant::Neutral, theme::State::Disabled, fw_theme);
@@ -178,8 +225,7 @@ void DualOptionsWidget::paintEvent(QPaintEvent* /*event*/) {
   painter.setPen(QPen(base_border, border_width));
   painter.drawRoundedRect(box, corner_radius, corner_radius);
 
-  const qreal selected_left = box.left() + segment_w * visual_selection_;
-  const QRectF selected_box(selected_left, box.top(), segment_w, box.height());
+  const QRectF selected_box = segment_box(visual_selection_);
   painter.setBrush(sel_fill);
   painter.setPen(QPen(selected_border, border_width));
   painter.drawRoundedRect(selected_box, corner_radius, corner_radius);
@@ -188,14 +234,15 @@ void DualOptionsWidget::paintEvent(QPaintEvent* /*event*/) {
       isEnabled() ? text_color_ : theme::onSurface(theme::Surface::Backdrop, theme::Emphasis::Disabled, fw_theme);
   painter.setPen(label_color);
   for (int i = 0; i < optionCount(); ++i) {
-    painter.drawText(
-        QRectF(box.left() + segment_w * i, box.top(), segment_w, box.height()), Qt::AlignCenter, options_[i]);
+    painter.drawText(segment_box(static_cast<qreal>(i)), Qt::AlignCenter, options_[i]);
   }
 }
 
 void DualOptionsWidget::mousePressEvent(QMouseEvent* event) {
   if (event->button() == Qt::LeftButton) {
-    const int index = static_cast<int>(event->pos().x() * optionCount() / std::max(1, width()));
+    const int pos = orientation_ == Qt::Horizontal ? event->pos().x() : event->pos().y();
+    const int extent = std::max(1, orientation_ == Qt::Horizontal ? width() : height());
+    const int index = static_cast<int>(pos * optionCount() / extent);
     setSelectedIndex(std::clamp(index, 0, optionCount() - 1));
     event->accept();
     return;
@@ -205,11 +252,15 @@ void DualOptionsWidget::mousePressEvent(QMouseEvent* event) {
 
 void DualOptionsWidget::keyPressEvent(QKeyEvent* event) {
   switch (event->key()) {
+    // Arrow keys navigate along the strip's axis; both pairs are accepted so the
+    // control feels natural whether it is laid out horizontally or vertically.
     case Qt::Key_Left:
+    case Qt::Key_Up:
       setSelectedIndex(selected_ - 1);
       event->accept();
       break;
     case Qt::Key_Right:
+    case Qt::Key_Down:
       setSelectedIndex(selected_ + 1);
       event->accept();
       break;
