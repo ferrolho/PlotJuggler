@@ -3,10 +3,12 @@
  <class>Dialog</class>
  <widget class="QDialog" name="Dialog">
   <layout class="QVBoxLayout" name="rootLayout">
-   <property name="leftMargin"><number>0</number></property>
-   <property name="topMargin"><number>0</number></property>
-   <property name="rightMargin"><number>0</number></property>
-   <property name="bottomMargin"><number>0</number></property>
+   <!-- Reserves the 1px border the theme paints on PJ::Dialog: Qt does not inset a
+        QDialog's layout for its stylesheet border, so children would cover it. -->
+   <property name="leftMargin"><number>1</number></property>
+   <property name="topMargin"><number>1</number></property>
+   <property name="rightMargin"><number>1</number></property>
+   <property name="bottomMargin"><number>1</number></property>
    <property name="spacing"><number>0</number></property>
    <item>
     <widget class="QWidget" name="dialogTitleBar" native="true">

@@ -438,6 +438,14 @@ QDialog {
     background: ${backdrop};
 }
 
+/* Frameless, no drop shadow, and the same backdrop as the app behind it — this
+   hairline is the dialog's only edge. Deliberately not `QDialog`: a plugin's .ui
+   root is itself a QDialog that QUiLoader embeds as a child widget, and a generic
+   rule would box that content again inside this chrome. */
+PJ--Dialog {
+    border: 1px solid ${separation};
+}
+
 QLabel {
     color: ${text};
     background: transparent;
