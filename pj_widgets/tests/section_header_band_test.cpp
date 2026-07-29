@@ -101,6 +101,25 @@ TEST(SectionHeaderBandTest, DockedChildrenAreSizedToTheInputRowHeight) {
   EXPECT_EQ(layout->itemAt(index)->alignment(), Qt::Alignment(Qt::AlignVCenter));
 }
 
+TEST(SectionHeaderBandTest, DockedChildrenCanFillTheBandContentHeight) {
+  SectionHeaderBand band(QStringLiteral("Settings"));
+  auto* already_docked = new QCheckBox(QStringLiteral("One file per group"), &band);
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+
+  band.setFillDockedWidgets(true);
+  auto* docked_with_fill = new QCheckBox(QStringLiteral("Include metadata"), &band);
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+
+  const PJ::ChromeMetrics metrics{};
+  const int content_height = metrics.bandHeight() - (2 * metrics.layout_padding);
+  EXPECT_TRUE(band.fillDockedWidgets());
+  for (auto* checkbox : {already_docked, docked_with_fill}) {
+    EXPECT_EQ(checkbox->height(), content_height);
+    EXPECT_EQ(checkbox->minimumHeight(), content_height);
+    EXPECT_EQ(checkbox->maximumHeight(), content_height);
+  }
+}
+
 // A metrics broadcast rescales the band, so docked children have to follow it the
 // same way the band's own buttons do.
 TEST(SectionHeaderBandTest, DockedChildrenFollowAChromeMetricsChange) {

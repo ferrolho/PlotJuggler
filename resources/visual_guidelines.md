@@ -158,6 +158,7 @@ the chrome look uniform.
   Vertical centering inside the row is done by Qt's automatic
   alignment when the button is `Fixed,Fixed`-policy and matches the
   row's inner content height.
+- Set `flush="true"` on a `QTabWidget` to remove its global inset; QSS zeros the widget/pane margins and padding and the tab-bar offset.
 - Inter-row spacing (between rows in a stacked widget like
   `pageStream`): **`chrome_spacing` (4 px)** vertical.
 

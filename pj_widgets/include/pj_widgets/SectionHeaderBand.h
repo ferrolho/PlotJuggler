@@ -46,6 +46,7 @@ class Search;
 class SectionHeaderBand : public QWidget {
   Q_OBJECT
   Q_PROPERTY(QString text READ text WRITE setText)
+  Q_PROPERTY(bool fillDockedWidgets READ fillDockedWidgets WRITE setFillDockedWidgets)
   Q_PROPERTY(QString titleObjectName READ titleObjectName WRITE setTitleObjectName)
   Q_PROPERTY(QString filterPlaceholder READ filterPlaceholder WRITE setFilterPlaceholder)
   Q_PROPERTY(QString filterFieldName READ filterFieldName WRITE setFilterFieldName)
@@ -64,6 +65,13 @@ class SectionHeaderBand : public QWidget {
 
   void setText(const QString& title);
   [[nodiscard]] QString text() const;
+
+  // Ordinary docked inputs keep the app-wide input-row height. Enable this for
+  // bands whose docked controls should fill the band's full content box.
+  void setFillDockedWidgets(bool fill);
+  [[nodiscard]] bool fillDockedWidgets() const {
+    return fill_docked_widgets_;
+  }
 
   // objectName stamped on the inner title QLabel so a dialog host can retitle
   // the band by name (setLabel), mirroring Search::fieldObjectName. Defaults to
@@ -174,12 +182,12 @@ class SectionHeaderBand : public QWidget {
   // auto-docked here (see childEvent), in declaration order, so plugin panels can
   // group e.g. a checkbox + radios into the header strip.
   //
-  // Docked widgets are sized to the full band height, the same rule the band's
-  // own buttons follow, so they read as part of the strip instead of floating in
-  // it. They also carry a `pjBandDocked` dynamic property, which the app
-  // stylesheet keys on to lift the single-input-row height cap it pins on the
-  // self-painted PJ controls — QStyleSheetStyle enforces that cap over the
-  // layout, so without the property those controls could not grow.
+  // Docked widgets use the app-wide input-row height by default, or the band's
+  // full content box when fillDockedWidgets is enabled. They also carry a
+  // `pjBandDocked` dynamic property, which the app stylesheet keys on to lift
+  // the single-input-row height cap it pins on the self-painted PJ controls —
+  // QStyleSheetStyle enforces that cap over the layout, so without the property
+  // those controls could not grow.
   void addTrailingWidget(QWidget* widget);
 
  protected:
@@ -247,6 +255,7 @@ class SectionHeaderBand : public QWidget {
   QString trailing_toggle_name_;
   QString trailing_toggle_text_;
   QString trailing_toggle_tooltip_;
+  bool fill_docked_widgets_ = false;
   // Externally docked widgets, kept so a later metrics change re-pins their
   // height. Guarded pointers: the host deletes and re-creates docked controls
   // when it adapts them (QCheckBox -> ToggleSwitch).

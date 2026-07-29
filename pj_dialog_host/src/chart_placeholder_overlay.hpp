@@ -43,6 +43,13 @@ class ChartPlaceholderOverlay : public QLabel {
     }
   }
 
+  void setMessage(const QString& text) {
+    setText(text);
+    // Text can change the banner geometry while the host stays fixed.
+    last_host_size_ = QSize();
+    recenter();
+  }
+
   // Center over the host frame, sized to the text (capped to the frame width).
   void recenter() {
     QWidget* host = parentWidget();

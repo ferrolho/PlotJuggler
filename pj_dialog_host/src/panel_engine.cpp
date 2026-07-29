@@ -11,8 +11,10 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
+#include <QGuiApplication>
 #include <QLineEdit>
 #include <QPointer>
+#include <QScreen>
 #include <QString>
 #include <QTimer>
 #include <QUiLoader>
@@ -146,6 +148,11 @@ struct PanelEngine::Impl {
     auto* dlg = new PJ::Dialog(root);
     dlg->setDialogTitle(loaded->windowTitle());
     dlg->contentLayout()->addWidget(loaded);
+    // Embedding drops the root's authored window geometry unless the chrome
+    // adopts it explicitly; keep the requested size usable on the active screen.
+    const QSize want = loaded->size().expandedTo(loaded->sizeHint());
+    const QSize avail = (dlg->screen() ? dlg->screen() : QGuiApplication::primaryScreen())->availableSize();
+    dlg->resize(want.boundedTo(avail));
     forwardEmbeddedDialogClose(loaded, dlg);
     dlg->setWindowModality(Qt::ApplicationModal);
     applyPanelData(loaded, full_view);
@@ -268,6 +275,16 @@ struct PanelEngine::Impl {
         auto* sub_dialog = new PJ::Dialog(root);
         sub_dialog->setDialogTitle(sub_loaded->windowTitle());
         sub_dialog->contentLayout()->addWidget(sub_loaded);
+        // Size the dialog to the loaded root's preferred size (its .ui geometry /
+        // sizeHint), clamped to the screen — PJ::Dialog otherwise opens at its own
+        // minimal chrome size and ignores the plugin's requested dimensions.
+        {
+          const QSize want = sub_loaded->size().expandedTo(sub_loaded->sizeHint());
+          const QSize avail =
+              (sub_dialog->screen() != nullptr ? sub_dialog->screen() : QGuiApplication::primaryScreen())
+                  ->availableSize();
+          sub_dialog->resize(want.boundedTo(avail));
+        }
         forwardEmbeddedDialogClose(sub_loaded, sub_dialog);
         // Wire the standard QDialogButtonBox (objectName "buttonBox") to
         // QDialog::accept/reject. Without this the OK/Cancel buttons are

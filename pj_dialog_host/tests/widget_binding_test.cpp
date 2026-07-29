@@ -23,6 +23,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTimeEdit>
+#include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -32,6 +33,8 @@
 #include <QScrollArea>
 #include <QSpacerItem>
 #include <QSpinBox>
+#include <QStyleOptionViewItem>
+#include <QStyledItemDelegate>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -208,7 +211,7 @@ TEST(WidgetBindingRangeSlider, ChangedBoundsStillResetHandleValues) {
 
 // The plugin owns the rule and pushes {valid, tooltip}; the host renders the
 // tooltip plus a red border when invalid, and clears it when valid.
-TEST(WidgetBindingFieldValidity, RendersTooltipAndBackground) {
+TEST(WidgetBindingFieldValidity, RendersTooltipAndBorder) {
   qapp();
   QWidget root;
   auto* edit = new QLineEdit(&root);
@@ -218,8 +221,9 @@ TEST(WidgetBindingFieldValidity, RendersTooltipAndBackground) {
   bad.setFieldValid("apiKey", false, "invalid key");
   PJ::applyWidgetData(&root, PJ::WidgetDataView(bad.toJson()));
   EXPECT_EQ(edit->toolTip().toStdString(), "invalid key");
-  // PJ3 parity: invalid fields get a light-red background, not a border.
-  EXPECT_TRUE(edit->styleSheet().contains("background-color")) << "invalid field should show a background cue";
+  // The invalid cue is a Highlight border, keeping the nominal background (never red).
+  EXPECT_TRUE(edit->styleSheet().contains("border:")) << "invalid field should show a border cue";
+  EXPECT_FALSE(edit->styleSheet().contains("background-color")) << "invalid field must not repaint its background";
 
   PJ::WidgetData good;
   good.setFieldValid("apiKey", true);
@@ -1127,6 +1131,123 @@ TEST(WidgetBindingTableDelete, DeletableTableInstallsDelegateAndEmitsPluginRow) 
     }
   }
   EXPECT_TRUE(saw_delete) << "trash click must emit itemDeleteRequested(plugin row)";
+}
+
+TEST(WidgetBindingTableDelete, ThreeColumnTableUsesDeleteAffordanceOnlyInLastColumn) {
+  qapp();
+  recorder()->clear();
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* tw = new QTableWidget(&root);
+  tw->setObjectName("tbl");
+  layout->addWidget(tw);
+
+  PJ::WidgetData wd;
+  wd.setTableHeaders("tbl", {"Source", "Type", "Primary"});
+  wd.setTableRows("tbl", std::vector<std::vector<std::string>>{{"", "", ""}, {"", "", ""}});
+  wd.setListItemsDeletable("tbl", true);
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(wd.toJson()));
+  PJ::connectWidgetSignals(
+      &root, [](const std::string& name, const std::string& json) { recorder()->push_back({name, json}); });
+
+  root.resize(720, 320);
+  root.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&root));
+
+  auto* delegate = tw->itemDelegate();
+  ASSERT_NE(delegate, nullptr);
+  QStyleOptionViewItem option;
+  option.rect = QRect(0, 0, 120, 40);
+  option.state = QStyle::State_Enabled;
+  option.palette = tw->palette();
+  option.font = tw->font();
+  option.fontMetrics = QFontMetrics(option.font);
+  option.widget = tw;
+
+  QStyledItemDelegate baseline_delegate(tw);
+  for (int row = 0; row < tw->rowCount(); ++row) {
+    int affordance_count = 0;
+    for (int column = 0; column < tw->columnCount(); ++column) {
+      const QModelIndex index = tw->model()->index(row, column);
+      const QSize baseline_hint = baseline_delegate.sizeHint(option, index);
+      const QSize deletable_hint = delegate->sizeHint(option, index);
+      const bool has_trash = deletable_hint.width() > baseline_hint.width();
+      EXPECT_EQ(has_trash, column == tw->columnCount() - 1) << "row " << row << ", column " << column;
+      affordance_count += has_trash ? 1 : 0;
+    }
+    EXPECT_EQ(affordance_count, 1) << "each row should paint exactly one trash affordance";
+  }
+
+  const auto delete_event_count = []() {
+    int count = 0;
+    for (const auto& ev : *recorder()) {
+      if (ev.name != "tbl") {
+        continue;
+      }
+      const auto json = nlohmann::json::parse(ev.json, nullptr, false);
+      if (!json.is_discarded() && json.contains("item_delete_index")) {
+        ++count;
+      }
+    }
+    return count;
+  };
+
+  constexpr int kTargetRow = 1;
+  for (int column = 0; column < tw->columnCount() - 1; ++column) {
+    const QRect cell = tw->visualItemRect(tw->item(kTargetRow, column));
+    ASSERT_FALSE(cell.isEmpty());
+    recorder()->clear();
+    QTest::mouseClick(tw->viewport(), Qt::LeftButton, Qt::NoModifier, QPoint(cell.right() - 14, cell.center().y()));
+    EXPECT_EQ(delete_event_count(), 0) << "a trailing click in column " << column << " must not request deletion";
+  }
+
+  const QRect last_cell = tw->visualItemRect(tw->item(kTargetRow, tw->columnCount() - 1));
+  ASSERT_FALSE(last_cell.isEmpty());
+  recorder()->clear();
+  QTest::mouseClick(
+      tw->viewport(), Qt::LeftButton, Qt::NoModifier, QPoint(last_cell.right() - 14, last_cell.center().y()));
+  ASSERT_EQ(delete_event_count(), 1);
+  EXPECT_EQ(recorder()->back().name, "tbl");
+  EXPECT_EQ(recorder()->back().json, PJ::WidgetEventBuilder::itemDeleteRequested(kTargetRow));
+}
+
+TEST(WidgetBindingChartPlaceholder, EmptyTextHidesAndChangedTextRemeasuresSerieslessFrame) {
+  qapp();
+  QWidget root;
+  auto* layout = new QVBoxLayout(&root);
+  auto* frame = new QFrame(&root);
+  frame->setObjectName("preview");
+  frame->setFixedSize(800, 200);
+  layout->addWidget(frame);
+
+  root.resize(900, 300);
+  root.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&root));
+
+  PJ::WidgetData short_message;
+  short_message.setChartPlaceholder("preview", "boom");
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(short_message.toJson()));
+
+  auto* overlay = frame->findChild<QLabel*>(u"chartPlaceholderOverlay"_s, Qt::FindDirectChildrenOnly);
+  ASSERT_NE(overlay, nullptr);
+  EXPECT_EQ(overlay->text(), u"boom"_s);
+  EXPECT_TRUE(overlay->isVisibleTo(frame));
+  const int short_width = overlay->width();
+  ASSERT_GT(short_width, 0);
+
+  PJ::WidgetData empty_message;
+  empty_message.setChartPlaceholder("preview", "");
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(empty_message.toJson()));
+  EXPECT_TRUE(overlay->isHidden()) << "an empty chart placeholder is the command to hide the HUD";
+
+  const QString long_text = u"This subsequent placeholder message is substantially longer than boom"_s;
+  PJ::WidgetData long_message;
+  long_message.setChartPlaceholder("preview", long_text.toStdString());
+  PJ::applyWidgetData(&root, PJ::WidgetDataView(long_message.toJson()));
+
+  EXPECT_EQ(overlay->text(), long_text);
+  EXPECT_TRUE(overlay->isVisibleTo(frame));
+  EXPECT_GT(overlay->width(), short_width) << "a text change at fixed host size must invalidate the cached measurement";
 }
 
 // A .ui that hides the horizontal header still needs its columns to span the

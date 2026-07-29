@@ -505,9 +505,9 @@ QPixmap rowTrashPixmap(const QColor& ink, int extent, qreal dpr) {
   return pix;
 }
 
-// Paints a trailing trash icon on every delegated list/table item and turns a
-// click on that icon into an itemDeleteRequested(row) event. Only active when
-// the item view carries a true "pj_deletable" dynamic property (set from
+// Paints a trailing trash icon on the last column of each delegated row and
+// turns a click on that icon into an itemDeleteRequested(row) event. Only active
+// when the item view carries a true "pj_deletable" dynamic property (set from
 // WidgetData), so the same delegate is harmless on non-deletable views. Clicks
 // off the icon fall through untouched, so selection and double-click still work.
 class ListRowDeleteDelegate : public QStyledItemDelegate {
@@ -521,7 +521,7 @@ class ListRowDeleteDelegate : public QStyledItemDelegate {
 
   void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
     QStyledItemDelegate::paint(painter, option, index);
-    if (!deletable()) {
+    if (!deletable() || !isLastColumn(index)) {
       return;
     }
     const qreal dpr = painter->device() != nullptr ? painter->device()->devicePixelRatioF() : 1.0;
@@ -530,7 +530,7 @@ class ListRowDeleteDelegate : public QStyledItemDelegate {
 
   QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override {
     QSize s = QStyledItemDelegate::sizeHint(option, index);
-    if (deletable()) {
+    if (deletable() && isLastColumn(index)) {
       s.setWidth(s.width() + kIconExtent + (2 * kIconMargin));
       // Match the Save button's height: text + the same 6px vertical padding a
       // QPushButton uses, so a row reads as the same size as the button below.
@@ -541,7 +541,7 @@ class ListRowDeleteDelegate : public QStyledItemDelegate {
 
   bool editorEvent(
       QEvent* event, QAbstractItemModel* model, const QStyleOptionViewItem& option, const QModelIndex& index) override {
-    if (deletable() && event->type() == QEvent::MouseButtonRelease) {
+    if (deletable() && isLastColumn(index) && event->type() == QEvent::MouseButtonRelease) {
       const auto* me = static_cast<QMouseEvent*>(event);
       if (me->button() == Qt::LeftButton && iconRect(option.rect).contains(me->pos())) {
         // Report the delivered-order (plugin) index, not the view row: on a
@@ -560,6 +560,9 @@ class ListRowDeleteDelegate : public QStyledItemDelegate {
   [[nodiscard]] bool deletable() const {
     const auto* view = qobject_cast<const QWidget*>(parent());
     return view != nullptr && view->property("pj_deletable").toBool();
+  }
+  [[nodiscard]] static bool isLastColumn(const QModelIndex& index) {
+    return index.model() != nullptr && index.column() == index.model()->columnCount() - 1;
   }
   [[nodiscard]] static QRect iconRect(const QRect& row) {
     return {
@@ -789,9 +792,34 @@ class WasmHeaderHeightClamp : public QObject {
 };
 #endif
 
-static void installTreeLikeHeader(QTableWidget* tw) {
+static void installTreeLikeHeader(QTableWidget* tw, int stretch_col = -1) {
   auto* header = tw->horizontalHeader();
-  if (header->count() == 0 || tw->property("pjTreeLikeHeader").toBool()) {
+  if (header->count() == 0) {
+    return;
+  }
+
+  // A nominated content column (typically the series name, just after a leading
+  // radio marker) is sized EVERY call — setSectionResizeMode is idempotent, so
+  // the stretch still lands if the first delivery hadn't yet carried the radio
+  // column key (and so it is NOT gated by the one-time guard below). The VIEW
+  // drives these built-in modes on its own resize, so the content column fills
+  // whether or not the header is shown; the narrow marker columns hug content.
+  if (stretch_col >= 0 && stretch_col < header->count()) {
+    for (int i = 0; i < header->count(); ++i) {
+      header->setSectionResizeMode(i, i == stretch_col ? QHeaderView::Stretch : QHeaderView::ResizeToContents);
+    }
+    tw->setProperty("pjContentStretch", true);
+    return;
+  }
+
+  // Once a content-column stretch is established, a later delivery that lacks the
+  // radio-column key (a stable value drops out of the diff) must NOT fall through
+  // and overwrite it with the uniform/list-like sizing below.
+  if (tw->property("pjContentStretch").toBool()) {
+    return;
+  }
+  // The one-time policy install below must run once, not per delivery.
+  if (tw->property("pjTreeLikeHeader").toBool()) {
     return;
   }
   tw->setProperty("pjTreeLikeHeader", true);
@@ -1021,7 +1049,9 @@ static void applyToWidget(
   // renders a soft cue (the tooltip plus an error background on the field
   // itself when invalid) without needing a per-field indicator widget. The cue
   // is scoped by objectName so child widgets are unaffected; cleared when valid.
-  // PJ3 parity: invalid input fields use an error background, not a border.
+  // The invalid cue is a Highlight (magenta) outline, not a fill: the field keeps
+  // its nominal background and only its border recolours, so an empty/invalid
+  // input reads as "needs attention" without the jarring red wash.
   if (auto ok = view.fieldValid(name)) {
     if (auto tip = view.fieldValidTooltip(name)) {
       w->setToolTip(QString::fromStdString(*tip));
@@ -1032,10 +1062,10 @@ static void applyToWidget(
     } else {
       const auto fw_theme = theme::appTheme();
       w->setStyleSheet(
-          sel + QStringLiteral(" { background-color: %1; color: %2; }")
+          sel + QStringLiteral(" { border: 1px solid %1; }")
                     .arg(
-                        theme::statusErrorSurface(fw_theme).name(QColor::HexArgb),
-                        theme::onStatusErrorSurface(fw_theme).name(QColor::HexArgb)));
+                        theme::interaction(theme::Variant::Highlight, theme::State::Nominal, fw_theme)
+                            .name(QColor::HexArgb)));
     }
   }
 
@@ -1296,26 +1326,28 @@ static void applyToWidget(
     // idempotent, so setting it on each delivery is free. A future editable table
     // would need a new protocol event anyway, and would opt out here then.
     tw->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    // The radio column is read up front: recordPluginKeyColumn needs to know
+    // which column carries radio widgets (no item text) to pick the key column,
+    // and the header sizing stretches the content column just after it.
+    const std::optional<int> radio_col = view.tableRadioColumn(name);
     if (auto v = view.tableHeaders(name)) {
       QStringList hdr;
       for (const auto& h : *v) {
         hdr << QString::fromStdString(h);
       }
       // Re-setting labels reconfigures the header (not free), so only do it when
-      // they actually changed. The sizing setup below is separate: it must also
-      // run for dialogs whose .ui predefines matching headers (e.g. MCAP), where
-      // this branch is skipped — hence InstallTreeLikeHeader lives outside it.
+      // they actually changed.
       if (!tableMatchesHeaders(tw, hdr)) {
         tw->setColumnCount(static_cast<int>(hdr.size()));
         tw->setHorizontalHeaderLabels(hdr);
       }
-      // First column fills the width, the rest hug content. Idempotent + guarded,
-      // so calling it on every delivery is cheap (port/fix of #90).
-      installTreeLikeHeader(tw);
     }
-    // The radio column is read up front: recordPluginKeyColumn needs to know
-    // which column carries radio widgets (no item text) to pick the key column.
-    const std::optional<int> radio_col = view.tableRadioColumn(name);
+    // Header sizing runs on EVERY delivery, not only when the header SET changes:
+    // a leading radio marker means the next column is the series name that should
+    // absorb the width, and that stretch must (re)apply once the radio column is
+    // known even if the headers themselves were stable. Idempotent; the one-time
+    // HeaderResizePolicy install inside stays guarded.
+    installTreeLikeHeader(tw, radio_col.has_value() ? *radio_col + 1 : -1);
     bool rows_replaced = false;
     if (auto v = view.tableRows(name)) {
       applyTableRows(tw, *v, view.tableColumnValues(name));
@@ -1869,15 +1901,13 @@ static void applyToWidget(
       // frame; shown/hidden per current data.
       if (chart_placeholder) {
         const bool has_data = series_data && !series_data->empty();
+        const std::string& placeholder_text = *chart_placeholder;
         auto* overlay = frame->findChild<ChartPlaceholderOverlay*>(QString(), Qt::FindDirectChildrenOnly);
         if (overlay == nullptr) {
           overlay = new ChartPlaceholderOverlay(frame);
         }
-        overlay->setText(QString::fromStdString(*chart_placeholder));
-        overlay->setVisible(!has_data);
-        if (!has_data) {
-          overlay->recenter();
-        }
+        overlay->setMessage(QString::fromStdString(placeholder_text));
+        overlay->setVisible(!has_data && !placeholder_text.empty());
       } else if (series_data) {
         // Series delivered WITHOUT re-sending chart_placeholder: recompute the
         // existing overlay so it auto-hides over fresh data (and reappears if

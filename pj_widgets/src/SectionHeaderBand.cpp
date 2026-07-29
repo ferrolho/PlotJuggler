@@ -387,6 +387,15 @@ QString SectionHeaderBand::titleObjectName() const {
   return label_->objectName();
 }
 
+void SectionHeaderBand::setFillDockedWidgets(bool fill) {
+  fill_docked_widgets_ = fill;
+  for (const auto& docked : docked_widgets_) {
+    if (!docked.isNull()) {
+      applyDockedWidgetMetrics(docked);
+    }
+  }
+}
+
 void SectionHeaderBand::applyDockedWidgetMetrics(QWidget* widget) const {
   // Several PJ controls are pinned to one input-row height by the app QSS, and
   // QStyleSheetStyle applies that over any C++ size. The property selects the rule
@@ -402,9 +411,11 @@ void SectionHeaderBand::applyDockedWidgetMetrics(QWidget* widget) const {
   // A fixed height, not a stretching size policy: it is what survives the later
   // setSizePolicy calls of whoever adapts the widget (the dialog host swaps a
   // docked QCheckBox for a ToggleSwitch and re-declares its policy afterwards).
-  // Clamped to the app-wide input-row height so a docked control matches its
-  // siblings outside the band instead of fattening to the band's icon height.
-  widget->setFixedHeight(std::min(contentHeight(), theme::metric(theme::Metric::InputOuterHeight)));
+  // Ordinary docked inputs stay aligned with their siblings outside the band;
+  // full-height control rows can opt into using the band's whole content box.
+  const int h = fill_docked_widgets_ ? contentHeight()
+                                     : std::min(contentHeight(), theme::metric(theme::Metric::InputOuterHeight));
+  widget->setFixedHeight(h);
 }
 
 void SectionHeaderBand::addTrailingWidget(QWidget* widget) {
@@ -413,8 +424,8 @@ void SectionHeaderBand::addTrailingWidget(QWidget* widget) {
   }
   docked_widgets_.append(QPointer<QWidget>(widget));
   // Append after the title's stretch so the title stays left and docked widgets
-  // fill the right, in the order they were added. Centered vertically: docked
-  // controls are pinned to the input-row height, shorter than the band.
+  // fill the right, in the order they were added. Centering keeps fixed-height
+  // controls aligned whether they use the input-row height or fill the content.
   layout_->addWidget(widget, 0, Qt::AlignVCenter);
   // Sizing waits for the next event-loop turn. The auto-dock path runs from
   // childEvent, which QWidget's own constructor triggers — the child is still a

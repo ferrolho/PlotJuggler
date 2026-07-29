@@ -97,6 +97,7 @@
     <file alias="delete_forever.svg">svg/delete_forever.svg</file>
     <file alias="diag_error.svg">svg/diag_error.svg</file>
     <file alias="diag_info.svg">svg/diag_info.svg</file>
+    <file alias="help.svg">svg/help.svg</file>
     <file alias="diag_warning.svg">svg/diag_warning.svg</file>
     <file alias="draft.svg">svg/draft.svg</file>
     <file alias="drag_handle_horizontal.svg">svg/drag_handle_horizontal.svg</file>

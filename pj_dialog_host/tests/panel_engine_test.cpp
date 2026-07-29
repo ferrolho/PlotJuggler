@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <pj_plotting/PlotWidget.h>
 #include <pj_runtime/AppSession.h>
+#include <pj_widgets/Dialog.h>
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -13,6 +14,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QScreen>
 #include <QSettings>
 #include <QTimer>
 #include <QWidget>
@@ -20,6 +22,9 @@
 #include <pj_plugins/host/dialog_handle.hpp>
 #include <pj_plugins/host_qt/chart_preview_widget.hpp>
 #include <pj_plugins/host_qt/panel_engine.hpp>
+#include <pj_plugins/sdk/dialog_plugin_typed.hpp>
+#include <pj_plugins/sdk/widget_data.hpp>
+#include <string_view>
 
 #include "mock_panel_plugin.hpp"
 using namespace Qt::StringLiterals;
@@ -59,6 +64,93 @@ void pumpEventLoop(int ms) {
 
 PJ::DialogHandle makeMockHandle() {
   return PJ::DialogHandle(PJ_get_dialog_vtable());
+}
+
+constexpr int kPreferredSubPanelWidth = 1200;
+constexpr int kPreferredSubPanelHeight = 900;
+
+constexpr char kSizedSubPanelUi[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SizedSubPanel</class>
+ <widget class="QWidget" name="sizedSubPanel">
+  <property name="geometry">
+   <rect><x>0</x><y>0</y><width>1200</width><height>900</height></rect>
+  </property>
+  <property name="minimumSize">
+   <size><width>500</width><height>400</height></size>
+  </property>
+  <property name="windowTitle"><string>Sized sub-panel</string></property>
+  <layout class="QVBoxLayout">
+   <item>
+    <widget class="QLabel" name="preferredSizeContent">
+     <property name="minimumSize">
+      <size><width>640</width><height>440</height></size>
+     </property>
+     <property name="text"><string>Large content</string></property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+)";
+
+class SizedSubPanelPlugin final : public PJ::DialogPluginTyped {
+ public:
+  std::string manifest() const override {
+    return R"({"id":"sized-sub-panel","name":"Sized Sub-panel","version":"0.0.1"})";
+  }
+
+  std::string ui_content() const override {
+    return R"(<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SizedSubPanelHost</class>
+ <widget class="QWidget" name="sizedSubPanelHost">
+  <layout class="QVBoxLayout">
+   <item>
+    <widget class="QPushButton" name="openSubPanel">
+     <property name="text"><string>Open</string></property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+)";
+  }
+
+  std::string widget_data() override {
+    PJ::WidgetData data;
+    if (open_sub_panel_) {
+      data.requestSubPanel(kSizedSubPanelUi);
+      open_sub_panel_ = false;
+    }
+    return data.toJson();
+  }
+
+  bool onClicked(std::string_view widget_name) override {
+    if (widget_name != "openSubPanel") {
+      return false;
+    }
+    open_sub_panel_ = true;
+    return true;
+  }
+
+ private:
+  bool open_sub_panel_ = false;
+};
+
+PJ::DialogHandle makeSizedSubPanelHandle() {
+  const auto* vtable = PJ::DialogPluginBase::vtableWithCreate([]() noexcept -> void* {
+    try {
+      return static_cast<PJ::DialogPluginBase*>(new SizedSubPanelPlugin());
+    } catch (...) {
+      return nullptr;
+    }
+  });
+  return PJ::DialogHandle(vtable);
 }
 
 }  // namespace
@@ -285,6 +377,33 @@ TEST_F(PanelEngineTest, WidgetEventReachesPlugin) {
 
   EXPECT_EQ(mockPanelState().text, "typed by test");
   EXPECT_GT(engine.stats().event_count, 0);
+
+  delete panel;
+}
+
+TEST_F(PanelEngineTest, SubPanelUsesLoadedRootPreferredSize) {
+  PJ::PanelEngine engine(makeSizedSubPanelHandle());
+  QWidget* panel = engine.openPanel();
+  ASSERT_NE(panel, nullptr);
+
+  auto* open_button = panel->findChild<QPushButton*>("openSubPanel");
+  ASSERT_NE(open_button, nullptr);
+  open_button->click();
+
+  auto* dialog = panel->findChild<PJ::Dialog*>();
+  ASSERT_NE(dialog, nullptr);
+  auto* loaded_root = dialog->findChild<QWidget*>("sizedSubPanel");
+  ASSERT_NE(loaded_root, nullptr);
+  EXPECT_GE(loaded_root->minimumWidth(), 500);
+  EXPECT_GE(loaded_root->minimumHeight(), 400);
+  EXPECT_GE(loaded_root->sizeHint().width(), 640);
+  EXPECT_GE(loaded_root->sizeHint().height(), 440);
+
+  ASSERT_NE(dialog->screen(), nullptr);
+  const QSize available = dialog->screen()->availableSize();
+  const QSize expected = QSize(kPreferredSubPanelWidth, kPreferredSubPanelHeight).boundedTo(available);
+  EXPECT_GE(dialog->width(), expected.width());
+  EXPECT_GE(dialog->height(), expected.height());
 
   delete panel;
 }

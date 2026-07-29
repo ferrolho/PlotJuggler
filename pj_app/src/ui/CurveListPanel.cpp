@@ -348,7 +348,12 @@ CurveListPanel::CurveListPanel(QWidget* parent) : QWidget(parent), ui_(new Ui::C
   custom_menu->addAction(delete_custom_action);
   connect(delete_custom_button_, &QPushButton::clicked, this, [this, custom_menu]() {
     custom_menu->hide();
-    const auto names = custom_view_->selectedCurveNames();
+    // Recursive so selecting a GROUP row (a slashed name like "test/sin/valueasda"
+    // nests under "test") deletes every custom curve beneath it. A group row itself
+    // carries no catalog key, so the non-recursive selection would emit only the
+    // group label, which the delete handler can't resolve — the delete silently
+    // no-ops. This mirrors the custom-series drag provider.
+    const auto names = custom_view_->selectedCurveNamesRecursive();
     for (const auto& name : names) {
       emit deleteCustomSeriesRequested(name);
     }

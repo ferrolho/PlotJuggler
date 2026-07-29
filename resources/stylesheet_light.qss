@@ -503,6 +503,19 @@ QTabWidget::tab-bar {
     left: 0;
 }
 
+/* Opt-in edge-to-edge tabs for layouts that own their surrounding spacing. */
+QTabWidget[flush="true"] {
+    margin: ${space_none}px;
+    padding: ${space_none}px;
+}
+QTabWidget[flush="true"]::pane {
+    margin: ${space_none}px;
+    padding: ${space_none}px;
+}
+QTabWidget[flush="true"]::tab-bar {
+    left: ${space_none}px;
+}
+
 QTabBar::tab {
     border-top-left-radius: 0px;
     border-top-right-radius: 0px;
@@ -551,6 +564,17 @@ QTabWidget[framed="true"] QTabBar::tab:selected {
 QTabWidget[framed="true"] QTabBar::tab:!selected {
     background: transparent;
     border-bottom: 1px solid ${separation};
+}
+
+/* Chart-tab look for panels that are BOTH flush and framed (e.g. the Transform
+   Editor): keep the slight per-tab border but drop the body/pane border, and
+   mark the active tab with the checked accent — matching #plotTabFrame. Scoped by
+   the two-attribute selector so single-`framed` plugin dialogs are untouched. */
+QTabWidget[flush="true"][framed="true"]::pane {
+    border: none;
+}
+QTabWidget[flush="true"][framed="true"] QTabBar::tab:selected {
+    background: ${accent_checked};
 }
 
 QTextBrowser {
@@ -1411,6 +1435,12 @@ QTableView {
    selection-color: ${on_data_backdrop_default};
    selection-background-color: transparent;
    show-decoration-selected: 1;
+}
+
+/* Opt out of the table border for flush, header-banded tables (plugin panels
+   that lead with a SectionHeaderBand and want the rows butting the band). */
+QTableView[flush="true"] {
+   border: none;
 }
 
 QTreeView,

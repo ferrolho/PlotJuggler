@@ -6,6 +6,7 @@
 #include <qwt_plot_curve.h>
 #include <qwt_text.h>
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
 #include <QButtonGroup>
@@ -7675,13 +7676,44 @@ MainWindow::WrappedToolboxPanel MainWindow::wrapToolboxPanel(
   auto* close_button = new QToolButton(banner);
   close_button->setObjectName(QStringLiteral("buttonClose"));
 
+  row->addWidget(migrate_button);
+
+  // A tagged plugin action stays in the content tree for its existing routing
+  // while the host gives it a domain-neutral place in takeover chrome.
+  std::vector<QPointer<SvgButton>> chrome_action_proxies;
+  for (auto* src : content->findChildren<QAbstractButton*>()) {
+    if (src == nullptr || !src->property("pjToolboxChromeAction").toBool()) {
+      continue;
+    }
+    QString icon_path = src->property("chromeActionIcon").toString();
+    if (icon_path.isEmpty()) {
+      icon_path = u":/resources/svg/help.svg"_s;
+    }
+    auto* proxy = new SvgButton(icon_path, SvgButton::Size::kDefault, banner);
+    proxy->setToolTip(src->toolTip());
+    proxy->setCursor(Qt::PointingHandCursor);
+    chrome_action_proxies.emplace_back(proxy);
+    row->insertWidget(row->indexOf(migrate_button), proxy);
+    connect(proxy, &QAbstractButton::clicked, this, [src = QPointer<QAbstractButton>(src)]() {
+      if (!src.isNull()) {
+        src->click();
+      }
+    });
+    src->hide();
+  }
+
   // Banner + buttons ride the canonical band height so a docked toolbox
   // reads at the same height as every section band and every chrome button,
   // and rescales with the icon size. Seed from the current metrics, then keep
   // in step via the chromeMetricsChanged broadcast.
-  const auto size_banner = [banner, migrate_button, close_button](const ChromeMetrics& metrics) {
+  const auto size_banner = [banner, migrate_button, close_button, chrome_action_proxies](const ChromeMetrics& metrics) {
     banner->setFixedHeight(metrics.bandHeight());
     migrate_button->setExtent(metrics.bandHeight(), metrics.icon_size);
+    for (const auto& proxy : chrome_action_proxies) {
+      if (!proxy.isNull()) {
+        proxy->setExtent(metrics.bandHeight(), metrics.icon_size);
+      }
+    }
     close_button->setFixedSize(metrics.bandHeight(), metrics.bandHeight());
     close_button->setIconSize(QSize(metrics.icon_size, metrics.icon_size));
   };
@@ -7691,15 +7723,19 @@ MainWindow::WrappedToolboxPanel MainWindow::wrapToolboxPanel(
   // Pinning strips the takeover-only banner buttons — the tab frame provides
   // name + close. Owned here because only this function knows which banner
   // widgets are takeover chrome.
-  const auto enter_pinned_chrome = [migrate_button, close_button]() {
+  const auto enter_pinned_chrome = [migrate_button, close_button, chrome_action_proxies]() {
     migrate_button->hide();
+    for (const auto& proxy : chrome_action_proxies) {
+      if (!proxy.isNull()) {
+        proxy->hide();
+      }
+    }
     close_button->hide();
   };
   connect(migrate_button, &QToolButton::clicked, this, [enter_pinned_chrome, on_migrate]() {
     enter_pinned_chrome();
     on_migrate();
   });
-  row->addWidget(migrate_button);
 
   close_button->setAutoRaise(true);
   close_button->setFocusPolicy(Qt::NoFocus);
