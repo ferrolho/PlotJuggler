@@ -713,19 +713,10 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         //   2D-ish (kImage/kDepthImage/kImageAnnotations/kSceneEntities/kVideoFrame) → scene2d
         QString resolved_kind = kind;
         if (resolved_kind.isEmpty() && seed != nullptr) {
-          // Classify the dropped object into a scene kind.
-          //  - Image-family types (incl. depth-encoded kImage) open the 2D viewer
-          //    on a placeholder drop. A depth image is also hostable in 3D, but
-          //    depth→3D is an explicit action (drop onto an existing 3D dock, or
-          //    "Open in 3D view"); routing 2D-first also means a *color* image is
-          //    never auto-routed to a 3D dock that would then reject it.
-          //  - kSceneEntities is both 2D and 3D; is3d wins (markers are primarily
-          //    3D), but a 2D dock still accepts markers dropped onto it.
-          //  - Neither → "".
-          resolved_kind = isImageFamilyObjectType(seed->object_type) ? u"scene2d"_s
-                          : is3dSceneObjectType(seed->object_type)   ? u"scene3d"_s
-                          : is2dSceneObjectType(seed->object_type)   ? u"scene2d"_s
-                                                                     : QString();
+          // Classify the dropped object into a scene kind — the single routing
+          // decision shared with the curve list's drag veto (see
+          // scene_object_classification.h for the 2D-first rationale).
+          resolved_kind = sceneKindForObjectType(seed->object_type);
         }
         if (seed == nullptr) {
           // Restore / click-create path: build the empty dock and seed its
@@ -750,18 +741,15 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         }
 
         // Drop path: build, then populate the first topic and apply view
-        // side-effects. An unknown kind here is a real failure — tell the user.
+        // side-effects. Failures here surface as transient toasts (non-blocking,
+        // WASM-safe): the empty-kind branch is defensive-only (the curve list
+        // refuses drags of undisplayable types), but the per-dock refusals below
+        // are reachable — the drag veto is type-level and cannot see runtime
+        // parser availability.
         IDataWidget* widget = makeSceneDock(resolved_kind, dock_parent);
         if (widget == nullptr) {
-#ifdef PJ_TARGET_WASM
-          showBrowserLayoutWarning(
-              this, tr("Cannot display topic"),
-              tr("This object topic cannot be displayed (object_type=%1).").arg(static_cast<int>(seed->object_type)));
-#else
-          MessageBox::warning(
-              this, tr("Cannot display topic"),
-              tr("This object topic cannot be displayed (object_type=%1).").arg(static_cast<int>(seed->object_type)));
-#endif
+          showToast(tr("This object topic cannot be displayed (type %1).")
+                        .arg(QString::fromUtf8(sdk::name(seed->object_type))));
           return nullptr;
         }
         QWidget* qwidget = widget->widget();
@@ -769,23 +757,11 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
         if (auto* scene3d = qobject_cast<Scene3DDockWidget*>(qwidget)) {
           if (!scene3d->addTopic(seed->topic_id, seed->object_type, seed->title)) {
             scene3d->deleteLater();
-#ifdef PJ_TARGET_WASM
-            showBrowserLayoutWarning(
-                this, tr("Cannot display topic"),
-                tr("This object topic cannot be displayed in a 3D view (object_type=%1). "
-                   "The 3D view requires a registered parser that emits one of its supported "
-                   "canonical objects (PointCloud, CompressedPointCloud, OccupancyGrid, "
-                   "SceneEntities, or FrameTransforms).")
-                    .arg(static_cast<int>(seed->object_type)));
-#else
-            MessageBox::warning(
-                this, tr("Cannot display topic"),
-                tr("This object topic cannot be displayed in a 3D view (object_type=%1). "
-                   "The 3D view requires a registered parser that emits one of its supported "
-                   "canonical objects (PointCloud, CompressedPointCloud, OccupancyGrid, "
-                   "SceneEntities, or FrameTransforms).")
-                    .arg(static_cast<int>(seed->object_type)));
-#endif
+            showToast(tr("This object topic cannot be displayed in a 3D view (type %1). "
+                         "The 3D view requires a registered parser that emits one of its supported "
+                         "canonical objects (PointCloud, CompressedPointCloud, OccupancyGrid, "
+                         "SceneEntities, or FrameTransforms).")
+                          .arg(QString::fromUtf8(sdk::name(seed->object_type))));
             return nullptr;
           }
           // A 3D-only stream must seed playback here too (see header doc).
@@ -800,21 +776,10 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
             if (auto* media2d = qobject_cast<Scene2DDockWidget*>(qwidget)) {
           if (!media2d->setImageTopic(seed->topic_id, seed->object_type, seed->title)) {
             media2d->deleteLater();
-#ifdef PJ_TARGET_WASM
-            showBrowserLayoutWarning(
-                this, tr("Cannot display topic"),
-                tr("This object topic cannot be displayed in a 2D view (object_type=%1). "
-                   "Typically this means the source did not register a parser for the topic, "
-                   "or the type is not yet supported by the built-in viewer.")
-                    .arg(static_cast<int>(seed->object_type)));
-#else
-            MessageBox::warning(
-                this, tr("Cannot display topic"),
-                tr("This object topic cannot be displayed in a 2D view (object_type=%1). "
-                   "Typically this means the source did not register a parser for the topic, "
-                   "or the type is not yet supported by the built-in viewer.")
-                    .arg(static_cast<int>(seed->object_type)));
-#endif
+            showToast(tr("This object topic cannot be displayed in a 2D view (type %1). "
+                         "Typically this means the source did not register a parser for the topic, "
+                         "or the type is not yet supported by the built-in viewer.")
+                          .arg(QString::fromUtf8(sdk::name(seed->object_type))));
             return nullptr;
           }
           seedStreamingPlaybackFromDrop();
@@ -864,6 +829,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   });
 
   connect(ui_->curveListPanel, &CurveListPanel::trashRequested, this, &MainWindow::onCatalogTrashRequested);
+  connect(ui_->curveListPanel, &CurveListPanel::toastRequested, this, [this](const QString& message) {
+    showToast(message);
+  });
   connect(ui_->curveListPanel, &CurveListPanel::removeDatasetsRequested, this, &MainWindow::onRemoveDatasetsRequested);
   connect(ui_->curveListPanel, &CurveListPanel::mergeDatasetsRequested, this, &MainWindow::onMergeDatasetsRequested);
   // The "+" in Custom Series opens the Transform Editor — now provided by the

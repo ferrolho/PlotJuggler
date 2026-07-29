@@ -20,6 +20,7 @@ namespace {
 
 class TestCurveTreeView : public PJ::CurveTreeView {
  public:
+  using PJ::CurveTreeView::mouseMoveEvent;
   using PJ::CurveTreeView::mousePressEvent;
   using PJ::CurveTreeView::mouseReleaseEvent;
 };
@@ -61,6 +62,43 @@ QTreeWidgetItem* findChild(QTreeWidgetItem* parent, const QString& name) {
     }
   }
   return nullptr;
+}
+
+// Left-button gesture events dispatched straight to the protected handlers;
+// `pos` is in viewport coordinates (visualItemRect space).
+void sendMousePress(TestCurveTreeView& view, const QPoint& pos) {
+  const QPointF local(pos);
+  const QPointF global(view.viewport()->mapToGlobal(pos));
+  QMouseEvent event(QEvent::MouseButtonPress, local, local, global, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+  view.mousePressEvent(&event);
+}
+
+void sendMouseMove(TestCurveTreeView& view, const QPoint& pos) {
+  const QPointF local(pos);
+  const QPointF global(view.viewport()->mapToGlobal(pos));
+  QMouseEvent event(QEvent::MouseMove, local, local, global, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+  view.mouseMoveEvent(&event);
+}
+
+void sendMouseRelease(TestCurveTreeView& view, const QPoint& pos) {
+  const QPointF local(pos);
+  const QPointF global(view.viewport()->mapToGlobal(pos));
+  QMouseEvent event(QEvent::MouseButtonRelease, local, local, global, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+  view.mouseReleaseEvent(&event);
+}
+
+// The not-draggable object-topic row (an undisplayable type, host policy) shared
+// by the not-draggable drag tests.
+PJ::CurveTreeView::CurvePath calibCurvePath() {
+  return PJ::CurveTreeView::CurvePath{
+      .key = u"object:calib"_s,
+      .dataset = u"drive.mcap"_s,
+      .topic = u"/camera/camera_info"_s,
+      .field = {},
+      .selectable = false,
+      .draggable = false,
+      .tooltip = u"Camera calibration topic"_s,
+  };
 }
 
 }  // namespace
@@ -237,19 +275,13 @@ TEST(CurveTreeViewTest, PressingSelectedItemDoesNotCollapseMultiSelection) {
   top_leaf->setSelected(true);
 
   const QPoint press_pos = view.visualItemRect(first_leaf).center();
-  const QPointF local_pos(press_pos);
-  const QPointF global_pos(view.viewport()->mapToGlobal(press_pos));
-  QMouseEvent press_event(
-      QEvent::MouseButtonPress, local_pos, local_pos, global_pos, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-  view.mousePressEvent(&press_event);
+  sendMousePress(view, press_pos);
 
   EXPECT_TRUE(first_leaf->isSelected());
   EXPECT_TRUE(second_leaf->isSelected());
   EXPECT_TRUE(top_leaf->isSelected());
 
-  QMouseEvent release_event(
-      QEvent::MouseButtonRelease, local_pos, local_pos, global_pos, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-  view.mouseReleaseEvent(&release_event);
+  sendMouseRelease(view, press_pos);
 
   EXPECT_TRUE(first_leaf->isSelected());
   EXPECT_TRUE(second_leaf->isSelected());
@@ -449,6 +481,91 @@ TEST(CurveTreeViewTest, DragPayloadCarriesEverySelectedObjectTopic) {
   EXPECT_EQ(catalog_keys.size(), 2);
   EXPECT_TRUE(catalog_keys.contains("object:a"_L1));
   EXPECT_TRUE(catalog_keys.contains("object:b"_L1));
+}
+
+// An object topic whose type no view can display (draggable=false, e.g. a
+// CameraInfo topic) stays selectable but never starts a drag, shows the
+// caller-supplied "why" tooltip, and is skipped by the drag payload even when
+// it sits inside a dragged multi-selection.
+TEST(CurveTreeViewTest, UndisplayableObjectTopicIsNotDraggableAndExcludedFromDragPayload) {
+  PJ::CurveTreeView view;
+  view.addCatalogItem(
+      PJ::CurveTreeView::CurvePath{
+          .key = u"object:cloud"_s,
+          .dataset = u"drive.mcap"_s,
+          .topic = u"/lidar/points"_s,
+          .field = {},
+          .selectable = false,
+          .is_3d_object_topic = true,
+      });
+  view.addCatalogItem(calibCurvePath());
+
+  QTreeWidgetItem* dataset = view.topLevelItem(0);
+  ASSERT_NE(dataset, nullptr);
+  QTreeWidgetItem* calib = findChild(findChild(dataset, u"camera"_s), u"camera_info"_s);
+  QTreeWidgetItem* cloud = findChild(findChild(dataset, u"lidar"_s), u"points"_s);
+  ASSERT_NE(calib, nullptr);
+  ASSERT_NE(cloud, nullptr);
+
+  EXPECT_TRUE(calib->flags().testFlag(Qt::ItemIsSelectable));
+  EXPECT_FALSE(calib->flags().testFlag(Qt::ItemIsDragEnabled));
+  EXPECT_EQ(calib->toolTip(0), u"Camera calibration topic"_s);
+  EXPECT_TRUE(cloud->flags().testFlag(Qt::ItemIsDragEnabled));
+  EXPECT_TRUE(cloud->toolTip(0).isEmpty());
+
+  // Alone, the undisplayable topic produces no drag payload at all — but the
+  // COMPLETE selection collector still sees it: deletion and selection-count
+  // logic must not mistake "only not-draggable rows selected" for "nothing selected"
+  // (which the trash path widens to "everything").
+  calib->setSelected(true);
+  EXPECT_EQ(toStdStrings(view.selectedCatalogKeysRecursive()), (std::vector<std::string>{"object:calib"}));
+  std::unique_ptr<QMimeData> solo(view.createDragMimeData(Qt::LeftButton));
+  EXPECT_EQ(solo, nullptr);
+
+  // In a mixed selection, only the displayable topic's key ships; the not-draggable
+  // key is reported through the skipped-keys out-param. The complete collector
+  // keeps returning both.
+  cloud->setSelected(true);
+  QStringList skipped_keys;
+  std::unique_ptr<QMimeData> mixed(view.createDragMimeData(Qt::LeftButton, &skipped_keys));
+  ASSERT_NE(mixed, nullptr);
+  const QStringList catalog_keys_mixed = PJ::CurveTreeView::decodeCatalogKeys(mixed.get());
+  const std::vector<QString> mixed_keys(catalog_keys_mixed.begin(), catalog_keys_mixed.end());
+  EXPECT_EQ(toStdStrings(mixed_keys), (std::vector<std::string>{"object:cloud"}));
+  EXPECT_EQ(skipped_keys, QStringList{u"object:calib"_s});
+  EXPECT_EQ(
+      toStdStrings(view.selectedCatalogKeysRecursive()), (std::vector<std::string>{"object:calib", "object:cloud"}));
+}
+
+// A pull past the drag threshold on a not-draggable object row starts no drag,
+// so the view must say why: dragAttemptedOnNotDraggableRow fires once per press gesture,
+// carrying the row's tooltip for the host to surface (PJ4 shows a toast).
+TEST(CurveTreeViewTest, PullOnNotDraggableObjectTopicEmitsNoticeOnce) {
+  TestCurveTreeView view;
+  view.resize(320, 240);
+  view.addCatalogItem(calibCurvePath());
+  view.expandAll();
+  view.show();
+  QApplication::processEvents();
+
+  QStringList attempt_reasons;
+  QObject::connect(
+      &view, &PJ::CurveTreeView::dragAttemptedOnNotDraggableRow,
+      [&attempt_reasons](const QString& reason) { attempt_reasons.append(reason); });
+
+  QTreeWidgetItem* calib = findChild(findChild(view.topLevelItem(0), u"camera"_s), u"camera_info"_s);
+  ASSERT_NE(calib, nullptr);
+  const QPoint press_pos = view.visualItemRect(calib).center();
+  sendMousePress(view, press_pos);
+
+  // Below the threshold the gesture still reads as a click: no notice.
+  sendMouseMove(view, press_pos + QPoint(QApplication::startDragDistance() / 2, 0));
+  EXPECT_TRUE(attempt_reasons.isEmpty());
+
+  // Past the threshold: exactly one notice, even if the pull continues.
+  sendMouseMove(view, press_pos + QPoint(QApplication::startDragDistance() + 10, 0));
+  sendMouseMove(view, press_pos + QPoint(QApplication::startDragDistance() + 30, 0));
+  EXPECT_EQ(attempt_reasons, QStringList{u"Camera calibration topic"_s});
 }
 
 // The "Value" column keeps decimal points vertically aligned in a monospace

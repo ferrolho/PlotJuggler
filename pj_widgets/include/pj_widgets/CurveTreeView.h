@@ -12,6 +12,7 @@
 #include <QTreeWidget>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace PJ {
@@ -32,10 +33,13 @@ class CurveTreeView : public QTreeWidget {
     QString topic;
     QString field;
     bool selectable = true;
-    // A value-only leaf: shown with its Value cell but NOT draggable and excluded
-    // from the drag payload (string fields today — they can't be plotted). Only
-    // consulted for selectable curve leaves; object topics ignore it.
+    // false = the row never starts a drag and is excluded from any drag payload.
+    // Curve leaves: a value-only leaf (string fields today — they can't be
+    // plotted) keeps its Value cell but is drag-inert. Object topics: a type no
+    // view can display (the caller's policy) — pair with `tooltip` to say why.
     bool draggable = true;
+    // Optional name-cell tooltip. Empty = none.
+    QString tooltip = {};
     bool is_image_topic = false;
     bool is_3d_object_topic = false;
     // An advertised-but-unsubscribed placeholder (a streaming source's topic with
@@ -152,8 +156,16 @@ class CurveTreeView : public QTreeWidget {
   std::vector<QString> selectedCurveNamesRecursive() const;
   // Returns catalog item keys for selected nodes, including object-topic
   // branch nodes. Scalar-only curve selection remains available through
-  // selectedCurveNamesRecursive().
+  // selectedCurveNamesRecursive(). COMPLETE: not-draggable object rows are
+  // included — deletion and selection-size logic must see the whole selection
+  // (an empty result means "nothing selected", which some callers widen to
+  // "everything"). Drag payloads use selectedCatalogKeysForDrag() instead.
   std::vector<QString> selectedCatalogKeysRecursive() const;
+  // Drag-payload variant of selectedCatalogKeysRecursive(): not-draggable object
+  // rows (CurvePath::draggable=false) are excluded; when `skipped_keys` is
+  // given, their keys are appended to it so the caller can tell the user what
+  // was left out.
+  std::vector<QString> selectedCatalogKeysForDrag(QStringList* skipped_keys = nullptr) const;
 
   // Builds the MIME payload for a drag of the current selection: the
   // "curveslist/add_curve" / "curveslist/new_XY_axis" curve-name format and
@@ -164,7 +176,9 @@ class CurveTreeView : public QTreeWidget {
   // cannot be driven from a unit test. WASM reuses this payload with a
   // non-blocking in-app dispatcher (see the wasmDrag* helpers below), which is
   // covered by the browser (Playwright) suite rather than these native tests.
-  [[nodiscard]] QMimeData* createDragMimeData(Qt::MouseButton button) const;
+  // `skipped_keys` (optional) collects the not-draggable object rows the payload
+  // excluded — see selectedCatalogKeysForDrag.
+  [[nodiscard]] QMimeData* createDragMimeData(Qt::MouseButton button, QStringList* skipped_keys = nullptr) const;
 
   void setValuesColumnHidden(bool hidden);
   bool valuesColumnHidden() const {
@@ -194,6 +208,18 @@ class CurveTreeView : public QTreeWidget {
   // subscription so one real sample lands and the placeholder promotes to
   // per-field rows. Carries the row's catalog key.
   void placeholderPeekRequested(const QString& catalog_key);
+  // Emitted at most once per press gesture when the user pulls past the drag
+  // threshold on a not-draggable object-topic row (CurvePath::draggable=false) —
+  // the drag never starts, and without this notice the gesture would fail
+  // silently. `reason` is the row's tooltip (may be empty; the host supplies a
+  // fallback wording).
+  void dragAttemptedOnNotDraggableRow(const QString& reason);
+  // Emitted when a drag that DID start had to exclude not-draggable object rows
+  // from its multi-selection payload, so the host can tell the user why fewer
+  // topics arrive than were selected. Fires when the drag gesture ENDS (after
+  // the QDrag loop returns; on WASM when the drop is delivered) — a toast
+  // raised mid-drag could sit over the drop target and steal its hit test.
+  void dragPayloadKeysSkipped(const QStringList& catalog_keys);
 
  protected:
 #ifdef PJ_TARGET_WASM
@@ -248,6 +274,12 @@ class CurveTreeView : public QTreeWidget {
   void updateEmptyMessageChild(QTreeWidgetItem* dataset_node, bool subtree_hidden);
   void setDescendantsExpanded(QTreeWidgetItem* item, bool expanded);
   std::vector<QString> selectedCurveNamesForDrag() const;
+  // Shared walk behind selectedCatalogKeysRecursive (complete) and
+  // selectedCatalogKeysForDrag (not-draggable rows excluded and reported).
+  std::vector<QString> collectSelectedCatalogKeys(bool exclude_not_draggable, QStringList* skipped_keys) const;
+  // The one drag-start threshold, measured from drag_start_pos_ — used by both
+  // the real drag arming and the not-draggable notice so they can never disagree.
+  [[nodiscard]] bool pastDragThreshold(const QPoint& pos) const;
 #ifdef PJ_TARGET_WASM
   // QDrag::exec() needs Qt WASM's Asyncify build because it enters a nested
   // event loop. The production browser build deliberately avoids Asyncify, so
@@ -255,7 +287,7 @@ class CurveTreeView : public QTreeWidget {
   // DnD events to the widget under the pointer instead. Drop sites therefore
   // share their exact MIME validation and mutation paths with desktop. These
   // helpers are exercised by the browser (Playwright) suite, not native tests.
-  void beginWasmDrag(QMimeData* mime_data, QMouseEvent* event);
+  void beginWasmDrag(QMimeData* mime_data, QMouseEvent* event, QStringList skipped_keys);
   void updateWasmDrag(const QPoint& global_pos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
   void finishWasmDrag(QMouseEvent* event);
   void cancelWasmDrag();
@@ -268,10 +300,19 @@ class CurveTreeView : public QTreeWidget {
   std::vector<QString> drag_curve_names_;
   QStringList drag_catalog_keys_;
   bool suppress_next_release_ = false;
+  // One-shot dragAttemptedOnNotDraggableRow state, armed (with the row's tooltip as the
+  // reason) by a left press on a not-draggable object row and consumed by the
+  // first past-threshold move of that gesture. Shares drag_start_pos_ with the
+  // real drag arming — the two are mutually exclusive per press.
+  std::optional<QString> not_draggable_reason_;
 #ifdef PJ_TARGET_WASM
   std::unique_ptr<QMimeData> wasm_drag_mime_;
   QPointer<QWidget> wasm_drag_target_;
   Qt::MouseButton wasm_drag_button_ = Qt::NoButton;
+  // Not-draggable keys excluded from the in-flight WASM drag's payload; emitted as
+  // dragPayloadKeysSkipped when the drop is delivered (finishWasmDrag) and
+  // dropped silently on cancel/abort.
+  QStringList wasm_drag_skipped_keys_;
   // Reentrancy guard for the synchronous drop dispatch: sendEvent into the drop
   // target runs the drop site's handler inline (e.g. adding a curve rebuilds
   // this very tree via clearCurves), which can loop back into finishWasmDrag /

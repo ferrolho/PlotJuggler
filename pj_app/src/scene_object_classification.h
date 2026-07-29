@@ -2,13 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 #pragma once
 
+#include <QString>
+
 #include "pj_base/builtin/builtin_object.hpp"
-#ifdef PJ_WITH_SCENE2D
-#include "pj_scene2d_widgets/Scene2DDockWidget.h"
-#endif
-#ifdef PJ_WITH_SCENE3D
-#include "pj_scene3d_widgets/Scene3DDockWidget.h"
-#endif
 
 namespace PJ {
 
@@ -17,23 +13,8 @@ namespace PJ {
 // support); these aliases exist so shell code reads as policy. kSceneEntities is
 // handled by both families; the factory ladder gives 3D precedence (3D is tried
 // first, 2D falls back for types the 3D family does not claim).
-[[nodiscard]] inline bool is3dSceneObjectType(sdk::BuiltinObjectType type) {
-#ifdef PJ_WITH_SCENE3D
-  return Scene3DDockWidget::handlesObjectType(type);
-#else
-  (void)type;
-  return false;
-#endif
-}
-
-[[nodiscard]] inline bool is2dSceneObjectType(sdk::BuiltinObjectType type) {
-#ifdef PJ_WITH_SCENE2D
-  return Scene2DDockWidget::handlesObjectType(type);
-#else
-  (void)type;
-  return false;
-#endif
-}
+[[nodiscard]] bool is3dSceneObjectType(sdk::BuiltinObjectType type);
+[[nodiscard]] bool is2dSceneObjectType(sdk::BuiltinObjectType type);
 
 // The image-family object types — those a 2D media viewer renders: stills
 // (kImage, raw or compressed), depth images (kImage with a depth encoding, or
@@ -46,9 +27,20 @@ namespace PJ {
 // predicate cannot tell depth from color, placeholder-drop routing treats the
 // whole family as 2D-first; depth→3D is an explicit action (drop onto an
 // existing 3D dock, or "Open in 3D view").
-[[nodiscard]] inline bool isImageFamilyObjectType(sdk::BuiltinObjectType type) {
-  return type == sdk::BuiltinObjectType::kImage || type == sdk::BuiltinObjectType::kVideoFrame ||
-         type == sdk::BuiltinObjectType::kDepthImage || type == sdk::BuiltinObjectType::kImageAnnotations;
-}
+[[nodiscard]] bool isImageFamilyObjectType(sdk::BuiltinObjectType type);
+
+// The drop-routing decision, in one place: the object-dock kind ("scene2d" /
+// "scene3d") a catalog drop of `type` resolves to, or empty when no compiled
+// family accepts it. Image-family types route 2D-first and never fall back to
+// 3D (a color image must not land in a 3D dock that would reject it; depth→3D
+// stays an explicit action); kSceneEntities is claimed by both families and 3D
+// wins. MainWindow's object-dock factory consumes this directly.
+[[nodiscard]] QString sceneKindForObjectType(sdk::BuiltinObjectType type);
+
+// True when a drop of `type` resolves to a dock that accepts it — so the curve
+// list never offers a drag that could only end in the "cannot display"
+// fallback. Types outside every claim (kCameraInfo, kOccupancyGridUpdate, ...)
+// are consumed indirectly or have no viewer yet.
+[[nodiscard]] bool isDroppableObjectType(sdk::BuiltinObjectType type);
 
 }  // namespace PJ

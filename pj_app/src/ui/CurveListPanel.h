@@ -109,6 +109,10 @@ class CurveListPanel : public QWidget {
   // The user chose "Replace" on a single file-backed dataset: pick a different
   // file and transactionally replace this dataset's data with it.
   void replaceDatasetRequested(DatasetId dataset_id);
+  // Asks the shell to show a transient toast. Carries the panel's not-draggable
+  // feedback: why a pull on an undisplayable topic started no drag, or which
+  // topics a multi-selection drag left out.
+  void toastRequested(const QString& message);
 
  public slots:
   void onStylesheetChanged(QString theme);
@@ -166,6 +170,10 @@ class CurveListPanel : public QWidget {
   // asks the controller for a bounded field preview, and arms the tree's
   // one-shot auto-expand at the topic's path. No-op without a controller.
   void onPlaceholderPeekRequested(const QString& catalog_key);
+  // Handles CurveTreeView::dragPayloadKeysSkipped: resolves the skipped keys to
+  // topic names via the catalog and emits a toastRequested explaining that they
+  // were left out of the drag.
+  void onDragPayloadKeysSkipped(const QStringList& catalog_keys);
   void applyIcons(QString theme);
   std::vector<QString> selectedCurveNamesForDrag() const;
 

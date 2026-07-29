@@ -73,6 +73,10 @@ constexpr int kForcedRole = Qt::UserRole + 10;
 // CurveTreeView::updateEmptyMessageChild) so the filter skips it and it is never
 // mistaken for a real data row.
 constexpr int kEmptyMessageRole = Qt::UserRole + 11;
+// Marks an object-topic row the caller marked not-draggable
+// (CurvePath::draggable=false) — see applyObjectTopicSelectability. Read by the
+// drag-payload collector and the not-draggable-notice arming in mousePressEvent.
+constexpr int kNotDraggableRole = Qt::UserRole + 12;
 
 QStringList splitPath(const QString& name) {
   return name.split('/', Qt::SkipEmptyParts);
@@ -191,6 +195,12 @@ bool isValueOnlyItem(const QTreeWidgetItem* item) {
   return item != nullptr && item->data(kNameColumn, kValueOnlyRole).toBool();
 }
 
+// An object-topic row the caller marked CurvePath::draggable=false: it
+// must neither start a drag nor ride inside a drag payload.
+bool isNotDraggableItem(const QTreeWidgetItem* item) {
+  return item != nullptr && item->data(kNameColumn, kNotDraggableRole).toBool();
+}
+
 // Flags for a curve leaf. A draggable leaf is a normal drag source; a value-only
 // leaf (string field) stays selectable/highlightable but is never dragged and is
 // tagged so the selection collectors leave it out of the drag payload.
@@ -201,6 +211,17 @@ void applyLeafSelectability(QTreeWidgetItem* item, bool draggable) {
   }
   item->setData(kNameColumn, kValueOnlyRole, true);
   item->setFlags((item->flags() | Qt::ItemIsSelectable) & ~Qt::ItemIsDragEnabled);
+}
+
+// Flags for an object-topic terminal. A non-draggable one (a type no view can
+// display) stays selectable — context menu, force-streaming — but never starts
+// a drag and is tagged kNotDraggableRole so the drag-payload collectors and the
+// not-draggable-notice arming recognize it. Unlike leaves, it is NOT tagged
+// kValueOnlyRole (that role means "string field with a Value cell").
+void applyObjectTopicSelectability(QTreeWidgetItem* item, bool draggable) {
+  const Qt::ItemFlags base = item->flags() | Qt::ItemIsSelectable;
+  item->setFlags(draggable ? (base | Qt::ItemIsDragEnabled) : (base & ~Qt::ItemIsDragEnabled));
+  item->setData(kNameColumn, kNotDraggableRole, !draggable);
 }
 
 QString catalogKeyForItem(const QTreeWidgetItem* item) {
@@ -512,7 +533,7 @@ void CurveTreeView::addCatalogItem(const CurvePath& path, SortMode sort_mode) {
       item = ensureGroupSegments(segments);
       item->setData(kNameColumn, kObjectTopicRole, path.key);
       item->setData(kNameColumn, kCatalogItemRole, path.key);
-      item->setFlags(item->flags() | Qt::ItemIsDragEnabled | Qt::ItemIsSelectable);
+      applyObjectTopicSelectability(item, path.draggable);
       setTopicIconDecoration(item, path.is_image_topic, path.is_3d_object_topic, currentTheme());
     }
   } else if (path.selectable) {
@@ -533,8 +554,13 @@ void CurveTreeView::addCatalogItem(const CurvePath& path, SortMode sort_mode) {
     item = ensureGroup(tree_path);
     item->setData(kNameColumn, kObjectTopicRole, path.key);
     item->setData(kNameColumn, kCatalogItemRole, path.key);
-    item->setFlags(item->flags() | Qt::ItemIsDragEnabled | Qt::ItemIsSelectable);
+    applyObjectTopicSelectability(item, path.draggable);
     setTopicIconDecoration(item, path.is_image_topic, path.is_3d_object_topic, currentTheme());
+  }
+  // Guarded: an unconditional write would add a setData/dataChanged per row on
+  // every rebuild; the second clause clears a stale tooltip on a reused row.
+  if (!path.tooltip.isEmpty() || !item->toolTip(kNameColumn).isEmpty()) {
+    item->setToolTip(kNameColumn, path.tooltip);
   }
   item->setData(kNameColumn, kSearchRole, tree_path);
   item->setData(kNameColumn, kPlaceholderRole, path.is_placeholder);
@@ -952,11 +978,32 @@ std::vector<QString> CurveTreeView::selectedCurveNamesRecursive() const {
 }
 
 std::vector<QString> CurveTreeView::selectedCatalogKeysRecursive() const {
+  return collectSelectedCatalogKeys(/*exclude_not_draggable=*/false, nullptr);
+}
+
+std::vector<QString> CurveTreeView::selectedCatalogKeysForDrag(QStringList* skipped_keys) const {
+  return collectSelectedCatalogKeys(/*exclude_not_draggable=*/true, skipped_keys);
+}
+
+// The complete walk keeps not-draggable object rows — deletion and selection-size
+// logic must see the whole selection (an empty result reads as "nothing
+// selected", which some callers widen to "everything"). Only the drag-payload
+// variant excludes them (a not-draggable row riding into a drop would hit the very
+// dead end its exclusion exists to prevent), reporting each via `skipped_keys` so
+// the host can say why fewer topics arrived.
+std::vector<QString> CurveTreeView::collectSelectedCatalogKeys(
+    bool exclude_not_draggable, QStringList* skipped_keys) const {
   std::vector<QString> keys;
   std::function<void(QTreeWidgetItem*)> collect = [&](QTreeWidgetItem* item) {
     const QString key = catalogKeyForItem(item);
-    if (!key.isEmpty() && !isValueOnlyItem(item)) {
-      keys.push_back(key);
+    if (!key.isEmpty()) {
+      if (exclude_not_draggable && isNotDraggableItem(item)) {
+        if (skipped_keys != nullptr && !skipped_keys->contains(key)) {
+          skipped_keys->append(key);
+        }
+      } else if (!isValueOnlyItem(item)) {
+        keys.push_back(key);
+      }
     }
     if (isObjectTopicItem(item)) {
       return;
@@ -1103,6 +1150,10 @@ bool CurveTreeView::event(QEvent* event) {
 }
 #endif
 
+bool CurveTreeView::pastDragThreshold(const QPoint& pos) const {
+  return (pos - drag_start_pos_).manhattanLength() >= QApplication::startDragDistance();
+}
+
 void CurveTreeView::mousePressEvent(QMouseEvent* event) {
 #ifdef PJ_TARGET_WASM
   if (in_wasm_drop_) {
@@ -1118,6 +1169,7 @@ void CurveTreeView::mousePressEvent(QMouseEvent* event) {
   drag_catalog_keys_.clear();
   suppress_next_release_ = false;
   drag_button_ = Qt::NoButton;
+  not_draggable_reason_.reset();
   if (event->button() == Qt::LeftButton || event->button() == Qt::RightButton) {
     QTreeWidgetItem* item = itemAt(event->pos());
     // Only draggable rows (curve leaves / object topics) initiate a drag or the
@@ -1148,6 +1200,13 @@ void CurveTreeView::mousePressEvent(QMouseEvent* event) {
           return;
         }
       }
+    } else if (event->button() == Qt::LeftButton && isNotDraggableItem(item)) {
+      // Pulling on a not-draggable row must not fail silently: arm a one-shot
+      // notice that fires if this press turns into a drag gesture
+      // (mouseMoveEvent). drag_start_pos_ is free here — such a row never
+      // arms a real drag.
+      drag_start_pos_ = event->pos();
+      not_draggable_reason_ = item->toolTip(kNameColumn);
     }
   }
   QTreeWidget::mousePressEvent(event);
@@ -1175,6 +1234,18 @@ void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
 #endif
+  if (not_draggable_reason_.has_value()) {
+    if (!event->buttons().testFlag(Qt::LeftButton)) {
+      not_draggable_reason_.reset();
+    } else if (pastDragThreshold(event->pos())) {
+      // Same threshold as a real drag start, so the notice fires exactly when
+      // the pull stops reading as a click. Selection handling continues below —
+      // the notice explains the missing drag, it does not swallow the gesture.
+      const QString reason = *not_draggable_reason_;
+      not_draggable_reason_.reset();
+      emit dragAttemptedOnNotDraggableRow(reason);
+    }
+  }
   if (drag_button_ == Qt::NoButton) {
     QTreeWidget::mouseMoveEvent(event);
     return;
@@ -1186,7 +1257,7 @@ void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
     QTreeWidget::mouseMoveEvent(event);
     return;
   }
-  if ((event->pos() - drag_start_pos_).manhattanLength() < QApplication::startDragDistance()) {
+  if (!pastDragThreshold(event->pos())) {
     if (drag_curve_names_.empty() && drag_catalog_keys_.empty()) {
       QTreeWidget::mouseMoveEvent(event);
     } else {
@@ -1195,7 +1266,8 @@ void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
 
-  QMimeData* mime_data = createDragMimeData(drag_button_);
+  QStringList skipped_keys;
+  QMimeData* mime_data = createDragMimeData(drag_button_, &skipped_keys);
   drag_button_ = Qt::NoButton;
   drag_curve_names_.clear();
   drag_catalog_keys_.clear();
@@ -1204,16 +1276,21 @@ void CurveTreeView::mouseMoveEvent(QMouseEvent* event) {
   }
 
 #ifdef PJ_TARGET_WASM
-  beginWasmDrag(mime_data, event);
+  beginWasmDrag(mime_data, event, std::move(skipped_keys));
 #else
   auto* drag = new QDrag(this);
   drag->setMimeData(mime_data);
   drag->exec(Qt::CopyAction | Qt::MoveAction);
+  // Only after the drag ends: the host answers this with a toast, and a toast
+  // raised mid-drag would sit over drop targets in its corner of the window.
+  if (!skipped_keys.isEmpty()) {
+    emit dragPayloadKeysSkipped(skipped_keys);
+  }
 #endif
 }
 
 #ifdef PJ_TARGET_WASM
-void CurveTreeView::beginWasmDrag(QMimeData* mime_data, QMouseEvent* event) {
+void CurveTreeView::beginWasmDrag(QMimeData* mime_data, QMouseEvent* event, QStringList skipped_keys) {
   // A drop handler running on our stack (in_wasm_drop_) may synthesize a press
   // that reaches here; do not start a fresh drag inside the in-flight one.
   if (in_wasm_drop_) {
@@ -1221,6 +1298,7 @@ void CurveTreeView::beginWasmDrag(QMimeData* mime_data, QMouseEvent* event) {
     return;
   }
   wasm_drag_mime_.reset(mime_data);
+  wasm_drag_skipped_keys_ = std::move(skipped_keys);
   wasm_drag_button_ = event->buttons().testFlag(Qt::RightButton) ? Qt::RightButton : Qt::LeftButton;
   updateWasmDrag(event->globalPosition().toPoint(), event->buttons(), event->modifiers());
   event->accept();
@@ -1314,6 +1392,14 @@ void CurveTreeView::finishWasmDrag(QMouseEvent* event) {
   wasm_drag_mime_.reset();
   wasm_drag_button_ = Qt::NoButton;
   event->accept();
+
+  // The drop is delivered; the skipped-keys toast can no longer sit between
+  // the pointer and the drop target's hit test.
+  if (!wasm_drag_skipped_keys_.isEmpty()) {
+    const QStringList skipped_keys = wasm_drag_skipped_keys_;
+    wasm_drag_skipped_keys_.clear();
+    emit dragPayloadKeysSkipped(skipped_keys);
+  }
 }
 
 void CurveTreeView::cancelWasmDrag() {
@@ -1324,6 +1410,7 @@ void CurveTreeView::cancelWasmDrag() {
   wasm_drag_target_.clear();
   wasm_drag_mime_.reset();
   wasm_drag_button_ = Qt::NoButton;
+  wasm_drag_skipped_keys_.clear();
 }
 
 void CurveTreeView::balanceWasmSourcePress(Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
@@ -1347,7 +1434,7 @@ void CurveTreeView::abortWasmDrag(Qt::KeyboardModifiers modifiers) {
 }
 #endif
 
-QMimeData* CurveTreeView::createDragMimeData(Qt::MouseButton button) const {
+QMimeData* CurveTreeView::createDragMimeData(Qt::MouseButton button, QStringList* skipped_keys) const {
   const std::vector<QString> names = selectedCurveNamesForDrag();
 
   // The catalog payload must carry EVERY selected item, not just the row under
@@ -1356,7 +1443,7 @@ QMimeData* CurveTreeView::createDragMimeData(Qt::MouseButton button) const {
   // from `names`, which also folds in a cross-view selection supplied by a drag
   // selection provider.
   QStringList catalog_keys;
-  for (const QString& key : selectedCatalogKeysRecursive()) {
+  for (const QString& key : selectedCatalogKeysForDrag(skipped_keys)) {
     catalog_keys.push_back(key);
   }
   for (const QString& name : names) {

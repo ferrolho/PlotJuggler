@@ -115,6 +115,23 @@ bool isTopicUnsubscribed(
   return it != active_sets.constEnd() && !it->contains(topic_name);
 }
 
+// Why an object topic of `type` cannot be dragged into a view — shown as the
+// row's tooltip so a drag that never starts doesn't read as a bug.
+QString undisplayableObjectTooltip(sdk::BuiltinObjectType type) {
+  switch (type) {
+    case sdk::BuiltinObjectType::kCameraInfo:
+      return QObject::tr(
+          "Camera calibration topic, used automatically by 2D and 3D views. "
+          "It cannot be displayed on its own.");
+    case sdk::BuiltinObjectType::kOccupancyGridUpdate:
+      return QObject::tr(
+          "Incremental map update, applied automatically to its occupancy grid. "
+          "It cannot be displayed on its own.");
+    default:
+      return QObject::tr("No view can display this topic type.");
+  }
+}
+
 CurveTreeView::CurvePath treePathFromCatalogItem(
     const CatalogItem& item, const QHash<DatasetId, QSet<QString>>& active_sets) {
   const auto* scalar = asScalarField(item);
@@ -129,6 +146,10 @@ CurveTreeView::CurvePath treePathFromCatalogItem(
   const auto object_type = object_topic != nullptr ? object_topic->object_type
                            : placeholder_is_object ? advertised->classification
                                                    : sdk::BuiltinObjectType::kNone;
+  // An object topic no dock family claims (kCameraInfo, ...) must not start a
+  // drag — the drop could only end in a "cannot display" dead end.
+  const bool object_undisplayable =
+      (object_topic != nullptr || placeholder_is_object) && !isDroppableObjectType(object_type);
   return CurveTreeView::CurvePath{
       .key = item.key,
       .dataset = item.dataset_name,
@@ -137,7 +158,8 @@ CurveTreeView::CurvePath treePathFromCatalogItem(
       .selectable = scalar != nullptr || (advertised != nullptr && !placeholder_is_object),
       // String fields drag onto the State Transitions strip (plots keep
       // refusing them via the curveDescriptor gate, so a plot drop is a no-op).
-      .draggable = true,
+      .draggable = !object_undisplayable,
+      .tooltip = object_undisplayable ? undisplayableObjectTooltip(object_type) : QString{},
       .is_image_topic = isImageFamilyObjectType(object_type),
       .is_3d_object_topic = is3dSceneObjectType(object_type),
       .is_placeholder = advertised != nullptr,
@@ -365,6 +387,14 @@ CurveListPanel::CurveListPanel(QWidget* parent) : QWidget(parent), ui_(new Ui::C
   // auto-expand. The handler no-ops until setTopicDemandController wires it.
   connect(tree_view_, &CurveTreeView::placeholderPeekRequested, this, &CurveListPanel::onPlaceholderPeekRequested);
 
+  // Not-draggable drag feedback → shell toasts. A pull on an undisplayable topic reuses
+  // the row's tooltip as the toast text (one wording for both channels); a row
+  // without one falls back to the generic undisplayable wording.
+  connect(tree_view_, &CurveTreeView::dragAttemptedOnNotDraggableRow, this, [this](const QString& reason) {
+    emit toastRequested(reason.isEmpty() ? undisplayableObjectTooltip(sdk::BuiltinObjectType::kNone) : reason);
+  });
+  connect(tree_view_, &CurveTreeView::dragPayloadKeysSkipped, this, &CurveListPanel::onDragPayloadKeysSkipped);
+
   // 10 Hz throttle for the value column (see refreshValues). The timeout is the
   // trailing edge: if a tracker update arrived during the window, fill once more
   // and re-arm so a continuous playback stream settles into a steady 10 Hz.
@@ -439,6 +469,28 @@ void CurveListPanel::onPlaceholderPeekRequested(const QString& catalog_key) {
   // The unsubscribed flag is irrelevant for path derivation — pass empty sets.
   const CurveTreeView::CurvePath path = treePathFromCatalogItem(*item, {});
   tree_view_->requestExpansionWhenPromoted(CurveTreeView::treePathFromCurvePath(path));
+}
+
+void CurveListPanel::onDragPayloadKeysSkipped(const QStringList& catalog_keys) {
+  if (catalog_keys.isEmpty()) {
+    return;
+  }
+  if (catalog_keys.size() > 1) {
+    emit toastRequested(tr("%1 topics were left out of the drag: no view can display them.").arg(catalog_keys.size()));
+    return;
+  }
+  // Single skipped topic: name it. The catalog resolves the key to its topic
+  // name; a key that vanished mid-drag (dataset removal) falls back to the raw
+  // key rather than dropping the notice. ToastNotification renders rich text,
+  // so the name must be escaped or an HTML-looking channel name would render
+  // as markup.
+  QString topic_name = catalog_keys.front();
+  if (catalog_ != nullptr) {
+    if (const auto item = catalog_->itemDescriptor(topic_name); item.has_value()) {
+      topic_name = item->topic_name;
+    }
+  }
+  emit toastRequested(tr("\"%1\" was left out of the drag: no view can display it.").arg(topic_name.toHtmlEscaped()));
 }
 
 void CurveListPanel::onActiveTopicsChanged(DatasetId /*dataset_id*/, const std::vector<QString>& /*active_topics*/) {

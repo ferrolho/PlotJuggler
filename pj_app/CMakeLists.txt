@@ -44,6 +44,8 @@ add_library(pj_app_shell OBJECT
     src/MainWindow.cpp
     src/MainWindow.h
     src/MainWindow.ui
+    src/scene_object_classification.cpp
+    src/scene_object_classification.h
     src/WidgetTuner.cpp
     src/WidgetTuner.h
     src/KeySequence.cpp
@@ -301,6 +303,11 @@ if(PJ_BUILD_TESTS)
     endfunction()
 
     add_pj_app_gui_test(slider_states_test SliderStates tests/slider_states_test.cpp)
+
+    # Curve-list drag policy: an object topic no view can display (CameraInfo,
+    # ...) must be drag-inert with a "why" tooltip; displayable ones keep
+    # dragging.
+    add_pj_app_gui_test(curve_list_panel_test CurveListPanelTest tests/curve_list_panel_test.cpp)
 
     # Source-bound layout seam: one replayable file that fans out into several
     # datasets must persist/restore each independent timeline track.
