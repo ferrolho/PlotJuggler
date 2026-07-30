@@ -118,6 +118,10 @@ void PluginRuntimeCatalog::setHostVersion(std::string host_version) {
   host_version_ = std::move(host_version);
 }
 
+void PluginRuntimeCatalog::setDisabledIds(std::unordered_set<std::string> disabled_ids) {
+  disabled_ids_ = std::move(disabled_ids);
+}
+
 std::vector<PluginDescriptor> PluginRuntimeCatalog::collectDeduplicatedPlugins() const {
   // Winner selection when the same plugin id appears in more than one folder:
   //
@@ -236,6 +240,18 @@ std::vector<PluginDescriptor> PluginRuntimeCatalog::collectDeduplicatedPlugins()
       }
     }
   }
+
+  // Drop user-disabled extensions: installed on disk but deliberately not loaded.
+  if (!disabled_ids_.empty()) {
+    std::erase_if(winners, [this](const PluginDescriptor& descriptor) {
+      if (disabled_ids_.count(descriptor.id) == 0) {
+        return false;
+      }
+      report(DiagnosticLevel::kInfo, descriptor.id, descriptor.dso_path.string() + ": disabled by user — not loaded");
+      return true;
+    });
+  }
+
   return winners;
 }
 

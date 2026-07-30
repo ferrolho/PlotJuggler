@@ -13,7 +13,9 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #ifndef PJ_TARGET_WASM
@@ -230,6 +232,17 @@ ExtensionCatalogService::ExtensionCatalogService(
 #endif
   const auto scan_dir_count = scan_dirs.size();
   plugin_catalog_->setPluginDirs(std::move(scan_dirs));
+
+#ifndef PJ_TARGET_WASM
+  // Honor the user's disabled list (installed but not loaded): the marketplace
+  // persists it to QSettings; the catalog skips loading those ids. Applied here
+  // at startup, so a disable/enable in the UI takes effect on the next launch.
+  std::unordered_set<std::string> disabled_ids;
+  for (const QString& id : ExtensionManager::disabledExtensionIds()) {
+    disabled_ids.insert(id.toStdString());
+  }
+  plugin_catalog_->setDisabledIds(std::move(disabled_ids));
+#endif
 
   qCInfo(lcCatalog) << "Scanning" << static_cast<int>(scan_dir_count) << "plugin folder(s); install dir"
                     << extensions_dir_;

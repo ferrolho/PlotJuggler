@@ -3,36 +3,49 @@
 
 #include "pj_marketplace/marketplace_window.hpp"
 
-#include <QComboBox>
+#include <QColor>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QEvent>
 #include <QFont>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QIcon>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStyle>
+#include <QStyleOptionViewItem>
+#include <QStyledItemDelegate>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QTextBrowser>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
 #include <algorithm>
+#include <utility>
 
 #include "pj_marketplace/download_manager.hpp"
 #include "pj_marketplace/extension_manager.hpp"
 #include "pj_marketplace/platform_utils.hpp"
 #include "pj_marketplace/registry_manager.hpp"
 #include "pj_marketplace/version_compare.hpp"
+#include "pj_widgets/CheckButton.h"
 #include "pj_widgets/ChromeMetrics.h"
 #include "pj_widgets/ElidingLabel.h"
+#include "pj_widgets/FileDialog.h"
 #include "pj_widgets/FrameworkTokens.h"
+#include "pj_widgets/MessageBox.h"
 #include "pj_widgets/Scrollbar.h"
 #include "pj_widgets/Search.h"
+#include "pj_widgets/ToggleSwitch.h"
 #include "ui_extension_detail_dialog.h"
 #include "ui_marketplace_window.h"
 using namespace Qt::StringLiterals;
@@ -40,6 +53,59 @@ using namespace Qt::StringLiterals;
 namespace PJ {
 
 namespace {
+
+// Column order of the plugin table (see setupUi / rebuildTable).
+enum Column {
+  kColName = 0,
+  kColInstalledVersion,    // the installed version, or "—" when not installed
+  kColMarketplaceVersion,  // the registry version; highlighted when it's an update
+  kColDescription,
+  kColCount,
+};
+
+// Row-height floor: a comfortable minimum so rows read as clearly separated
+// even when their text is short.
+constexpr int kMinRowHeight = 44;
+
+// Per-item bool: true when the row is an available update (set in rebuildTable,
+// read by UpdateRowDelegate to paint the highlight).
+constexpr int kUpdateRole = Qt::UserRole + 1;
+
+// Paints updatable rows in the framework's Emphasis "update" tone. A delegate is
+// required because the app-wide QSS rule `QTableView::item { background-color: … }`
+// unconditionally overrides any per-item setBackground(), so the highlight has to
+// be drawn here (the delegate owns the cell's paint) rather than via item brushes.
+class UpdateRowDelegate : public QStyledItemDelegate {
+ public:
+  UpdateRowDelegate(QColor bg, QColor fg, QObject* parent)
+      : QStyledItemDelegate(parent), bg_(std::move(bg)), fg_(std::move(fg)) {}
+
+  void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+    const bool updatable = index.data(kUpdateRole).toBool();
+    const bool selected = (option.state & QStyle::State_Selected) != 0;
+    if (!updatable || selected) {
+      QStyledItemDelegate::paint(painter, option, index);  // normal cells: let the QSS style paint
+      return;
+    }
+    // Updatable, unselected: fill the Emphasis background and draw the text
+    // ourselves (calling the base would let the QSS repaint the cell backdrop
+    // over our fill).
+    painter->save();
+    painter->fillRect(option.rect, bg_);
+    painter->setPen(fg_);
+    const QRect text_rect = option.rect.adjusted(6, 0, -6, 0);
+    // Respect the item's own alignment (e.g. the centered version columns);
+    // fall back to left-aligned when the item sets none.
+    const QVariant item_align = index.data(Qt::TextAlignmentRole);
+    const int align = item_align.isValid() ? item_align.toInt() : (Qt::AlignLeft | Qt::AlignVCenter);
+    painter->drawText(text_rect, align | Qt::TextWordWrap, index.data().toString());
+    painter->restore();
+  }
+
+ private:
+  QColor bg_;
+  QColor fg_;
+};
 
 bool installedStatesEqual(const QMap<QString, InstalledExtension>& lhs, const QMap<QString, InstalledExtension>& rhs) {
   if (lhs.size() != rhs.size()) {
@@ -115,6 +181,7 @@ void MarketplaceWindow::setupUi() {
   auto* body = new QWidget;
   ui_->setupUi(body);
   contentLayout()->addWidget(body);
+  content_widget_ = body;  // exposed via contentWidget() for embedding
 
   ui_->update_all_btn_->setFixedWidth(90);
   ui_->update_all_btn_->setEnabled(false);
@@ -134,41 +201,86 @@ void MarketplaceWindow::setupUi() {
   // Scroll-area background comes from the central stylesheet
   // (#scroll_area_ rule binds it to ${dark_background}).
 
-  ui_->category_combo_->addItem("All categories", "");
-  ui_->category_combo_->addItem("Data Loader", "data_loader");
-  ui_->category_combo_->addItem("Data Streamer", "data_stream");
-  ui_->category_combo_->addItem("Message Parser", "message_parser");
-  ui_->category_combo_->addItem("Toolbox", "toolbox");
-
   connect(ui_->search_edit_, &Search::textChanged, this, &MarketplaceWindow::onSearchChanged);
-  connect(
-      ui_->category_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-      &MarketplaceWindow::onCategoryChanged);
+  for (CheckButton* toggle :
+       {ui_->filter_installed_, ui_->filter_data_loader_, ui_->filter_data_streamer_, ui_->filter_parser_,
+        ui_->filter_toolbox_}) {
+    connect(toggle, &CheckButton::toggled, this, &MarketplaceWindow::onFilterToggled);
+  }
   connect(ui_->settings_btn_, &QPushButton::clicked, this, &MarketplaceWindow::pluginPreferencesRequested);
+  connect(ui_->install_local_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onInstallLocalClicked);
   connect(ui_->update_all_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onUpdateAllClicked);
   connect(ui_->diagnostics_btn_, &QPushButton::clicked, this, &MarketplaceWindow::onDiagnosticsClicked);
 
-  // Master–detail split: the plugin list (left) is narrower than the detail
-  // panel (right), but wide enough that a card's action button fits fully; the
-  // right keeps enough room that its button row (ending in "Visit Website") is
-  // never clipped by the window edge. Only this middle band is split, and the
-  // user can drag the boundary (childrenCollapsible is off in the .ui so
-  // neither pane can be dragged away to zero width).
-  ui_->scroll_area_->setMinimumWidth(410);
-  ui_->detail_scroll_->setMinimumWidth(520);
-  ui_->content_split_->setStretchFactor(0, 2);
-  ui_->content_split_->setStretchFactor(1, 3);
+  // Plugin table: fixed columns (Name/Installed/Marketplace versions) sized to
+  // their content, Description stretches to take the rest. Rows are read-only and
+  // whole-row selectable; the Marketplace-version cell is highlighted when it is
+  // a newer version than the installed one. All actions — install/update/
+  // uninstall and enable/disable — live in the details footer, not in the cells.
+  auto* table = ui_->plugin_table_;
+  table->setColumnCount(kColCount);
+  table->setHorizontalHeaderLabels({tr("Name"), tr("Installed"), tr("Marketplace"), tr("Description")});
+  table->verticalHeader()->setVisible(false);
+  table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  table->setSelectionMode(QAbstractItemView::SingleSelection);
+  // Grid + alternating rows give clear visual separation between plugins; a
+  // minimum row height keeps short-text rows from looking cramped.
+  table->setShowGrid(true);
+  table->setWordWrap(true);
+  table->setAlternatingRowColors(true);
+  table->setSortingEnabled(false);
+  table->verticalHeader()->setMinimumSectionSize(kMinRowHeight);
+  auto* header = table->horizontalHeader();
+  header->setSectionResizeMode(kColName, QHeaderView::ResizeToContents);
+  header->setSectionResizeMode(kColInstalledVersion, QHeaderView::ResizeToContents);
+  header->setSectionResizeMode(kColMarketplaceVersion, QHeaderView::ResizeToContents);
+  header->setSectionResizeMode(kColDescription, QHeaderView::Stretch);
 
-  // Hard floor on the window size so it can never be shrunk to where the two
-  // panes overlap or buttons get hidden: left(360) + right(520) minimum pane
-  // widths + the split spacing, dialog margins and chrome. Below this Qt simply
-  // refuses to shrink further, keeping everything visible.
-  setMinimumSize(1080, 580);
+  // Delegate that lights up updatable rows in the "update" tone (the per-item
+  // setBackground path is defeated by the app-wide QTableView::item QSS). The
+  // update tone is the palette's Destructive pink (${destructive_nominal}), the
+  // same pink the "Abort" button uses; painted at reduced alpha as a very subtle
+  // tint over the cell surface (there is no pastel-pink token — only the opacity
+  // drops, the base stays the palette token). Standard body ink reads cleanly.
+  {
+    const auto fw = theme::appTheme();
+    QColor subtle_pink = theme::destructive(theme::Destructive::Nominal, fw);
+    subtle_pink.setAlphaF(0.22);
+    table->setItemDelegate(new UpdateRowDelegate(subtle_pink, theme::text(fw), table));
+  }
 
-  // Open a touch larger than the floor so both panes and every button (card
-  // action on the left, action/uninstall/website on the right) are comfortably
-  // visible without the user having to resize.
-  resize(1100, 640);
+  // Selecting a row updates the bottom "Details" footer with that plugin.
+  connect(table, &QTableWidget::itemSelectionChanged, this, [this]() {
+    const QModelIndexList rows = ui_->plugin_table_->selectionModel()->selectedRows();
+    if (rows.isEmpty()) {
+      return;
+    }
+    QTableWidgetItem* name = ui_->plugin_table_->item(rows.first().row(), kColName);
+    footer_ext_id_ = (name != nullptr) ? name->data(Qt::UserRole).toString() : QString{};
+    updateDetailFooter();
+  });
+
+  // Footer enable/disable toggle (the standard palette ToggleSwitch — Accent
+  // "on" track). Hidden for non-installed plugins; acts on the plugin currently
+  // shown in the footer; the change persists and takes effect on next restart.
+  ui_->detail_enable_toggle_->setVisible(false);
+  connect(ui_->detail_enable_toggle_, &ToggleSwitch::toggled, this, [this](bool checked) {
+    if (footer_ext_id_.isEmpty()) {
+      return;
+    }
+    ext_mgr_->setEnabled(footer_ext_id_, checked);
+    installations_changed_ = true;
+    setStatus(
+        (checked ? tr("Extension %1 will be enabled after restart") : tr("Extension %1 will be disabled after restart"))
+            .arg(footer_ext_id_));
+    rebuildTable();  // keep the table's Enabled column in sync
+  });
+
+  // Floor + initial size: wide enough for the four fixed columns plus a roomy
+  // Description, without the two-pane minimum the old master-detail view needed.
+  setMinimumSize(900, 520);
+  resize(1080, 600);
 
   // Canonical overlay pill scrollbars for the extension list / detail scroll
   // areas just built (their ranges update live as the registry loads).
@@ -178,6 +290,26 @@ void MarketplaceWindow::setupUi() {
 // ─── Signal wiring ───────────────────────────────────────────────────────────
 
 void MarketplaceWindow::setupSignals() {
+  // A local archive whose id is already installed needs a decision, and the
+  // manager cannot take it: this is UI policy. Replacement is staged, so the
+  // wording promises "after restart" rather than an immediate swap.
+  ext_mgr_->setReplaceConfirmation(
+      [this](const QString& id, const QString& installed_version, const QString& archive_version) {
+        const QString text = (installed_version == archive_version)
+                                 ? tr("\"%1\" is already installed at version %2, the same version the archive "
+                                      "carries.\n\nReplace it? The replacement is applied the next time PlotJuggler "
+                                      "starts.")
+                                       .arg(id, installed_version)
+                                 : tr("\"%1\" is already installed at version %2. The archive carries version "
+                                      "%3.\n\nReplace it? The replacement is applied the next time PlotJuggler "
+                                      "starts.")
+                                       .arg(id, installed_version, archive_version);
+        const int choice = MessageBox::question(
+            this, tr("Replace installed extension?"), text,
+            {{tr("Replace"), MessageBox::kPrimaryRole}, {tr("Cancel"), MessageBox::kCancelRole}});
+        return choice == 0;
+      });
+
   // RegistryManager
   connect(registry_mgr_, &RegistryManager::fetchStarted, this, [this]() { setInfoStatus("Loading registry..."); });
 
@@ -189,7 +321,8 @@ void MarketplaceWindow::setupSignals() {
     // A successful refresh is a strong "things are working" signal; let it
     // override any old sticky error so progress messages aren't suppressed.
     clearStickyStatus();
-    extensions_ = registry_mgr_->compatibleExtensions(PlatformUtils::currentPlatform());
+    registry_extensions_ = registry_mgr_->compatibleExtensions(PlatformUtils::currentPlatform());
+    rebuildExtensionList();
     applyFilters();
     setInfoStatus("Ready — " + QString::number(extensions_.size()) + " extensions loaded");
   });
@@ -202,9 +335,10 @@ void MarketplaceWindow::setupSignals() {
       active_install_id_.clear();
     }
     installations_changed_ = true;
+    local_install_in_flight_ = false;
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
-    populateCards();
+    refreshAfterInstalledChange();
     setStatus(QString("Extension %1 staged — will be active after restart").arg(id));
     processInstallQueue();
   });
@@ -212,14 +346,14 @@ void MarketplaceWindow::setupSignals() {
   connect(ext_mgr_, &ExtensionManager::uninstallPendingRestart, this, [this](const QString& id) {
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
-    populateCards();
+    refreshAfterInstalledChange();
     setStatus(QString("Extension %1 staged — will be uninstalled after restart").arg(id));
   });
 
   connect(ext_mgr_, &ExtensionManager::downgradePendingRestart, this, [this](const QString& id) {
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
-    populateCards();
+    refreshAfterInstalledChange();
     setStatus(QString("Extension %1 will revert to its bundled version after restart").arg(id));
   });
 
@@ -234,7 +368,7 @@ void MarketplaceWindow::setupSignals() {
     ui_->progress_bar_->setRange(0, 100);
     ui_->progress_bar_->setVisible(true);
     showInstallProgress();
-    populateCards();  // repaint so the active card shows the "Installing" badge
+    rebuildTable();  // repaint so the active card shows the "Installing" badge
   });
 
   connect(ext_mgr_, &ExtensionManager::installProgress, this, [this](const QString& /*id*/, int percent) {
@@ -273,15 +407,11 @@ void MarketplaceWindow::setupSignals() {
     if (success) {
       installations_changed_ = true;
     }
-    populateCards();
+    refreshAfterInstalledChange();
+    const bool was_sideload = std::exchange(local_install_in_flight_, false);
     if (success) {
       status_error_sticky_ = false;
-      for (const auto& ext : extensions_) {
-        if (ext.id == id) {
-          setStatus("Installed " + ext.name + " v" + ext.version);
-          break;
-        }
-      }
+      setStatus(installedStatusText(id, was_sideload));
     }
     // On failure the status was already set by installError — do not overwrite it.
     processInstallQueue();
@@ -298,13 +428,17 @@ void MarketplaceWindow::setupSignals() {
     if (success) {
       status_error_sticky_ = false;
       installations_changed_ = true;
-      populateCards();
+      // Read the name BEFORE the repaint: uninstalling a local-only extension
+      // drops its row from extensions_, leaving nothing to look the name up in.
+      QString name = id;
       for (const auto& ext : extensions_) {
         if (ext.id == id) {
-          setStatus("Uninstalled " + ext.name);
+          name = ext.name;
           break;
         }
       }
+      refreshAfterInstalledChange();
+      setStatus("Uninstalled " + name);
     }
     // On failure the status was already set by uninstallError — do not overwrite it.
   });
@@ -326,147 +460,86 @@ void MarketplaceWindow::setupSignals() {
       });
 }
 
-// ─── Cards Population ─────────────────────────────────────────────────────────
+// ─── Table Population ─────────────────────────────────────────
 
-void MarketplaceWindow::populateCards(bool preserve_scroll) {
-  // The rebuild below destroys every card, so the scroll offset is captured now
-  // and reapplied after the new cards are laid out. Restoring synchronously would
-  // clamp against a stale (empty) range, so it is deferred to the next event-loop
-  // turn once the scroll area has recomputed its range from the rebuilt content.
-  const int saved_scroll = ui_->scroll_area_->verticalScrollBar()->value();
+void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
+  auto* table = ui_->plugin_table_;
+  const int saved_scroll = table->verticalScrollBar()->value();
 
-  while (ui_->cards_layout_->count() > 1) {
-    delete ui_->cards_layout_->takeAt(0)->widget();
-  }
-
-  // Keep a valid selection so the detail panel is never empty: if the current
-  // selection is filtered out (or unset), fall back to the first visible card.
-  const bool selection_visible =
-      std::any_of(filtered_.begin(), filtered_.end(), [&](const Extension& e) { return e.id == selected_ext_id_; });
-  if (!selection_visible) {
-    selected_ext_id_ = filtered_.isEmpty() ? QString{} : filtered_.first().id;
-  }
+  // Silence selection changes while tearing down + repopulating (setRowCount(0)
+  // clears the selection); the deliberate selectRow() at the end fires exactly
+  // one itemSelectionChanged that refreshes the footer.
+  table->blockSignals(true);
+  table->setRowCount(0);
 
   const auto installed = ext_mgr_->installedExtensions();
   for (const Extension& ext : filtered_) {
-    const QString ext_id = ext.id;
+    const int row = table->rowCount();
+    table->insertRow(row);
 
-    auto* card = new QFrame(ui_->cards_container);
-    card->setFrameShape(QFrame::NoFrame);
-    card->setProperty("ext_id", ext_id);
-    // Highlight the selected card (styled via QFrame#extCard[selected="true"]).
-    card->setProperty("selected", ext_id == selected_ext_id_);
-    card->setToolTip(ext.description);
-    card->setCursor(Qt::PointingHandCursor);
-    card->setObjectName("extCard");
-    card->installEventFilter(this);
-    // Card surface (theme-relative ${marketplace_card_bg}) and hover
-    // are wired in resources/stylesheet_*.qss.
-
-    auto* card_layout = new QVBoxLayout(card);
-    card_layout->setContentsMargins(
-        theme::space(theme::Space::Comfortable), theme::space(theme::Space::Comfortable),
-        theme::space(theme::Space::Comfortable), theme::space(theme::Space::Comfortable));
-    card_layout->setSpacing(theme::space(theme::Space::Snug));
-
-    auto* top_row = new QHBoxLayout();
-
-    auto* name_lbl = new QLabel(ext.name, card);
-    QFont f = name_lbl->font();
-    f.setBold(true);
-    name_lbl->setFont(f);
-
+    const bool is_installed = installed.contains(ext.id);
     const bool has_update = ext_mgr_->hasUpdate(ext);
-    const bool has_newer_local = ext_mgr_->hasNewerInstalledVersion(ext);
 
-    QString version_text = ext.version;
-    if (installed.contains(ext.id)) {
-      version_text = installed[ext.id].version;
-      if (has_update) {
-        version_text += " \u2192 " + ext.version;
-      } else if (has_newer_local) {
-        version_text += " \u2191 " + ext.version;
+    // Name, with the full description as tooltip.
+    auto* name_item = new QTableWidgetItem(ext.name);
+    name_item->setToolTip(ext.description);
+    name_item->setData(Qt::UserRole, ext.id);
+    table->setItem(row, kColName, name_item);
+
+    // Installed version (an em dash when not installed), centered.
+    auto* installed_item = new QTableWidgetItem(is_installed ? installed[ext.id].version : u"\u2014"_s);
+    installed_item->setTextAlignment(Qt::AlignCenter);
+    table->setItem(row, kColInstalledVersion, installed_item);
+
+    // Marketplace (registry) version \u2014 the version an update would move to. Only
+    // THIS cell is flagged for the update highlight (UpdateRowDelegate paints it),
+    // so an available update shows as a pink Marketplace-version cell, not a
+    // whole-row tint.
+    auto* market_item = new QTableWidgetItem(ext.version);
+    market_item->setTextAlignment(Qt::AlignCenter);
+    market_item->setData(kUpdateRole, has_update);
+    if (has_update) {
+      market_item->setToolTip(tr("Update available: v%1").arg(ext.version));
+    }
+    table->setItem(row, kColMarketplaceVersion, market_item);
+
+    // Description: full text, wraps within the stretched column.
+    auto* desc_item = new QTableWidgetItem(ext.description);
+    desc_item->setToolTip(ext.description);
+    table->setItem(row, kColDescription, desc_item);
+  }
+
+  table->resizeRowsToContents();
+  // resizeRowsToContents sizes to text; lift any row below the readability floor.
+  for (int row = 0; row < table->rowCount(); ++row) {
+    if (table->rowHeight(row) < kMinRowHeight) {
+      table->setRowHeight(row, kMinRowHeight);
+    }
+  }
+
+  table->blockSignals(false);
+
+  // Restore the selection by ext id (preserved across rebuilds) so the details
+  // footer stays on the same plugin through install/update repaints; fall back
+  // to the first row. selectRow() fires itemSelectionChanged → updateDetailFooter().
+  if (table->rowCount() > 0) {
+    int target = 0;
+    for (int row = 0; row < table->rowCount(); ++row) {
+      if (table->item(row, kColName)->data(Qt::UserRole).toString() == footer_ext_id_) {
+        target = row;
+        break;
       }
     }
-    auto* version_lbl = new QLabel(version_text, card);
-    // Text colour comes from the QFrame#extCard QLabel rule.
-
-    auto* btn_box = new QHBoxLayout();
-    btn_box->setSpacing(theme::space(theme::Space::Comfortable));
-
-    // An install is in flight or queued for this extension (the active one, an
-    // explicit click awaiting its turn, or an Update All entry). Show a disabled
-    // "Installing" badge on all of them until the operation completes.
-    const bool queued_for_update =
-        std::any_of(update_queue_.begin(), update_queue_.end(), [&](const Extension& e) { return e.id == ext.id; });
-    const bool installing = ext.id == active_install_id_ || pending_clicks_.contains(ext.id) || queued_for_update;
-
-    // Per-state action button / status badge. Object name selects the
-    // matching #extButton* / #extBadge* rule in resources/stylesheet_*.qss.
-    if (installing) {
-      auto* badge = new QPushButton("Installing", card);
-      badge->setObjectName("extBadgeInstalling");
-      badge->setFixedWidth(90);
-      badge->setEnabled(false);
-      btn_box->addWidget(badge);
-    } else if (ext_mgr_->hasPendingInstall(ext.id) || ext_mgr_->hasPendingUninstall(ext.id)) {
-      auto* badge = new QPushButton("Needs Restart", card);
-      badge->setObjectName("extBadgeNeedsRestart");
-      badge->setFixedWidth(90);
-      badge->setEnabled(false);
-      btn_box->addWidget(badge);
-    } else if (has_update) {
-      auto* btn = new QPushButton("Update \u2B06", card);
-      btn->setObjectName("extButtonUpdate");
-      btn->setFixedWidth(90);
-      connect(btn, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
-      btn_box->addWidget(btn);
-    } else if (has_newer_local) {
-      auto* badge = new QPushButton("Local newer", card);
-      badge->setObjectName("extBadgeLocalNewer");
-      badge->setFixedWidth(90);
-      badge->setEnabled(false);
-      btn_box->addWidget(badge);
-    } else if (installed.contains(ext.id)) {
-      auto* badge = new QPushButton("Installed", card);
-      badge->setObjectName("extBadgeInstalled");
-      badge->setFixedWidth(90);
-      badge->setEnabled(false);
-      btn_box->addWidget(badge);
-    } else {
-      auto* btn = new QPushButton("Install", card);
-      btn->setObjectName("extButtonInstall");
-      btn->setFixedWidth(90);
-      connect(btn, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
-      btn_box->addWidget(btn);
-    }
-
-    top_row->addWidget(name_lbl);
-    top_row->addStretch();
-    top_row->addWidget(version_lbl);
-    card_layout->addLayout(top_row);
-
-    auto* bottom_row = new QHBoxLayout();
-    // Two-line summary: wraps, then elides with "…" once the text exceeds two
-    // lines (the full text lives in the tooltip and the detail panel).
-    auto* desc_lbl = new ElidingLabel(card);
-    desc_lbl->setObjectName("extCardDescription");
-    desc_lbl->setMaxLineCount(2);
-    desc_lbl->setFullText(ext.description);
-    bottom_row->addWidget(desc_lbl, /*stretch=*/1);
-    bottom_row->addLayout(btn_box);
-    // Keep the button pinned to the top of a now-possibly-multiline row.
-    bottom_row->setAlignment(btn_box, Qt::AlignTop);
-    card_layout->addLayout(bottom_row);
-
-    ui_->cards_layout_->insertWidget(ui_->cards_layout_->count() - 1, card);
+    table->selectRow(target);
+  } else {
+    footer_ext_id_.clear();
+    updateDetailFooter();
   }
 
   // Enable "Update All" if ANY loaded extension has an update — not just the
-  // filtered subset shown as cards — so the button's reach matches its action.
-  // A staged update keeps its old installed version until restart, so
-  // hasUpdate() stays true; exclude already-pending extensions so the button
-  // doesn't stay enabled to re-stage what is already queued for restart.
+  // filtered subset shown — so the button's reach matches its action. A staged
+  // update keeps its old installed version until restart (hasUpdate stays true),
+  // so exclude already-pending extensions to avoid re-staging what is queued.
   bool any_updatable = false;
   for (const Extension& ext : extensions_) {
     if (ext_mgr_->hasUpdate(ext) && !ext_mgr_->hasPendingInstall(ext.id) && !ext_mgr_->hasPendingUninstall(ext.id)) {
@@ -476,99 +549,97 @@ void MarketplaceWindow::populateCards(bool preserve_scroll) {
   }
   ui_->update_all_btn_->setEnabled(any_updatable && update_queue_.isEmpty());
 
-  // Refresh the right-hand detail panel for the (possibly updated) selection.
-  showDetail(selected_ext_id_);
-
   if (preserve_scroll) {
     QTimer::singleShot(
-        0, this, [this, saved_scroll]() { ui_->scroll_area_->verticalScrollBar()->setValue(saved_scroll); });
+        0, this, [this, saved_scroll]() { ui_->plugin_table_->verticalScrollBar()->setValue(saved_scroll); });
   }
 }
 
-// ─── Event Filter (select a card on click) ───────────────────────────────────
+// ─── Details footer ───────────────────────────────────────────
 
-bool MarketplaceWindow::eventFilter(QObject* obj, QEvent* event) {
-  // Select the clicked card so the right-hand detail panel shows it. The base
-  // PJ::Dialog installs this object as an app-wide event filter (for resize-edge
-  // cursors), so this override sees every widget's events; find the owning card
-  // by walking up from the clicked widget to the first ancestor carrying an
-  // "ext_id" (so a click anywhere on the card — label, empty area — selects it).
-  // Never consume the event: the action button inside the card must still fire.
-  if (event->type() == QEvent::MouseButtonPress) {
-    for (QObject* o = obj; o != nullptr; o = o->parent()) {
-      const QString ext_id = o->property("ext_id").toString();
-      if (!ext_id.isEmpty()) {
-        if (ext_id != selected_ext_id_) {
-          selected_ext_id_ = ext_id;
-          updateCardSelection();
-          showDetail(ext_id);
-        }
-        break;
-      }
+void MarketplaceWindow::updateDetailFooter() {
+  // Tear down the previous action row (widgets + the leading stretch).
+  QLayoutItem* old_item = nullptr;
+  while ((old_item = ui_->detail_buttons_layout->takeAt(0)) != nullptr) {
+    if (old_item->widget() != nullptr) {
+      old_item->widget()->deleteLater();
     }
-  }
-  return Dialog::eventFilter(obj, event);
-}
-
-void MarketplaceWindow::updateCardSelection() {
-  for (int i = 0; i < ui_->cards_layout_->count(); ++i) {
-    QWidget* w = ui_->cards_layout_->itemAt(i)->widget();
-    if (w == nullptr) {
-      continue;  // the trailing vertical stretch has no widget
-    }
-    const QString ext_id = w->property("ext_id").toString();
-    if (ext_id.isEmpty()) {
-      continue;
-    }
-    const bool sel = ext_id == selected_ext_id_;
-    if (w->property("selected").toBool() != sel) {
-      w->setProperty("selected", sel);
-      w->style()->unpolish(w);
-      w->style()->polish(w);
-    }
-  }
-}
-
-void MarketplaceWindow::showDetail(const QString& ext_id) {
-  // Tear down the previous panel content (widgets + layout).
-  if (QLayout* old = ui_->detail_container_->layout()) {
-    QLayoutItem* item = nullptr;
-    while ((item = old->takeAt(0)) != nullptr) {
-      delete item->widget();
-      delete item;
-    }
-    delete old;
+    delete old_item;
   }
 
   const Extension* ext = nullptr;
   for (const Extension& e : extensions_) {
-    if (e.id == ext_id) {
+    if (e.id == footer_ext_id_) {
       ext = &e;
       break;
     }
   }
-
-  auto* outer = new QVBoxLayout(ui_->detail_container_);
-  outer->setContentsMargins(0, 0, 0, 0);
-
   if (ext == nullptr) {
-    outer->addStretch();  // no selection (empty list) — leave the panel blank
+    ui_->detail_text_->clear();
+    ui_->detail_title_->clear();
+    ui_->detail_enable_toggle_->setVisible(false);
     return;
   }
 
-  // Build the SAME form the modal detail dialog used, so the layout and button
-  // disposition are identical — just embedded in the right panel. The Ui struct
-  // is local: it only creates the widgets (owned by `body`) and gives us named
-  // handles to configure them here.
-  auto* body = new QWidget(ui_->detail_container_);
-  Ui::ExtensionDetailDialog form;
-  form.setupUi(body);
-  outer->addWidget(body);
-  // No "Close" button: this is an embedded panel, not a modal subdialog.
-  form.close_btn->hide();
-
   const auto installed = ext_mgr_->installedExtensions();
-  const QString installed_version = installed.contains(ext_id) ? installed[ext_id].version : QString{};
+  const QString installed_version = installed.contains(ext->id) ? installed[ext->id].version : QString{};
+  const auto esc = [](const QString& s) { return s.toHtmlEscaped(); };
+
+  // Title (plugin name) — a real header-row label so the enable toggle can sit
+  // at its height. The green toggle is shown only for installed plugins.
+  ui_->detail_title_->setText(ext->name);
+  {
+    const bool title_installed = installed.contains(ext->id);
+    ui_->detail_enable_toggle_->setVisible(title_installed);
+    QSignalBlocker block(ui_->detail_enable_toggle_);
+    ui_->detail_enable_toggle_->setChecked(title_installed && ext_mgr_->isEnabled(ext->id), /*animate=*/false);
+  }
+
+  QString html;
+
+  // Metadata line (publisher/author • category • license • requires PJ •
+  // installed).
+  QStringList meta;
+  if (!ext->publisher.isEmpty()) {
+    meta << esc(ext->publisher);
+  } else if (!ext->author.isEmpty()) {
+    meta << esc(ext->author);
+  }
+  if (!ext->category.isEmpty()) {
+    meta << esc(ext->category);
+  }
+  if (!ext->license.isEmpty()) {
+    meta << esc(ext->license);
+  }
+  if (!ext->min_plotjuggler_version.isEmpty()) {
+    meta << u"requires PJ %1+"_s.arg(esc(ext->min_plotjuggler_version));
+  }
+  if (!installed_version.isEmpty()) {
+    meta << u"installed: v%1"_s.arg(esc(installed_version));
+  }
+  if (!meta.isEmpty()) {
+    html += u"<p style='margin:0 0 6px 0;'>%1</p>"_s.arg(meta.join(u"  •  "_s));
+  }
+
+  // Description.
+  if (!ext->description.isEmpty()) {
+    html += u"<p style='margin:0 0 6px 0;'>%1</p>"_s.arg(esc(ext->description));
+  }
+
+  // Changelog: version → text (QMap iterates ascending by version key).
+  if (!ext->changelog.isEmpty()) {
+    html += u"<p style='margin:0 0 2px 0;'><b>Changelog</b></p><ul style='margin:0 0 0 -20px;'>"_s;
+    for (auto it = ext->changelog.cbegin(); it != ext->changelog.cend(); ++it) {
+      html += u"<li><b>%1</b> — %2</li>"_s.arg(esc(it.key()), esc(it.value()));
+    }
+    html += u"</ul>"_s;
+  }
+
+  ui_->detail_text_->setHtml(html);
+
+  // ── Action row (same order as the old detail panel): primary action ·
+  //    Uninstall/Downgrade · stretch · Visit Website. ──
+  const QString ext_id = ext->id;
   const bool is_installed = installed.contains(ext_id);
   const bool has_update = ext_mgr_->hasUpdate(*ext);
   const bool has_newer_local = ext_mgr_->hasNewerInstalledVersion(*ext);
@@ -576,135 +647,172 @@ void MarketplaceWindow::showDetail(const QString& ext_id) {
   const bool in_update_queue =
       std::any_of(update_queue_.begin(), update_queue_.end(), [&](const Extension& e) { return e.id == ext_id; });
   const bool installing = ext_id == active_install_id_ || pending_clicks_.contains(ext_id) || in_update_queue;
-  // Core (bundled) extensions ship with the app and can't be uninstalled — the
-  // panel shows the Uninstall action locked (mirrors the modal detail dialog).
   const bool is_bundled = ext_mgr_->isBundled(ext_id);
 
-  // Title.
-  form.title_lbl->setText(ext->name + "  v" + ext->version);
-  // Force the size via stylesheet: a QSS font-size rule from the app theme wins
-  // over QFont::setPointSize(), so setFont() alone left the title unchanged.
-  form.title_lbl->setStyleSheet("font-size: 20px; font-weight: 700;");
+  // Leading stretch pushes the whole cluster to the right edge.
+  ui_->detail_buttons_layout->addStretch();
 
-  // Metadata row.
-  QStringList meta;
-  if (!ext->publisher.isEmpty()) {
-    meta << ext->publisher;
-  }
-  if (!ext->category.isEmpty()) {
-    meta << ext->category;
-  }
-  if (!ext->license.isEmpty()) {
-    meta << ext->license;
-  }
-  if (!ext->min_plotjuggler_version.isEmpty()) {
-    meta << "requires PJ " + ext->min_plotjuggler_version + "+";
-  }
-  if (is_installed) {
-    meta << "installed: v" + installed_version;
-  }
-  form.meta_lbl->setText(meta.join("  •  "));
-
-  // Tag chips.
-  for (int i = 0; i < ext->tags.size(); ++i) {
-    auto* chip = new QLabel(ext->tags[i], form.tags_container);
-    chip->setObjectName("extTagChip");
-    form.tags_layout->insertWidget(i, chip);
-  }
-
-  // Full description, wrapped.
-  form.desc_lbl->setText(ext->description);
-  form.desc_lbl->setWordWrap(true);
-
-  // GitHub / website link.
-  form.github_btn->setEnabled(!ext->website.isEmpty());
-  const QString website = ext->website;
-  connect(form.github_btn, &QPushButton::clicked, this, [website]() {
-    if (!website.isEmpty()) {
-      QDesktopServices::openUrl(QUrl(website));
-    }
-  });
-
-  // Exactly ONE action button, chosen by state (never all of them). action_btn
-  // and uninstall_btn default hidden in the .ui, so untouched states stay off.
+  // Primary action / status: colour-coded per state via the #extButton*/#extBadge*
+  // QSS rules. Uninstall/Downgrade/Visit Website below stay standard buttons.
+  // Every footer button carries mpFooterButton so the stylesheet gives them one
+  // shared geometry: a min-width floor plus the snug vertical padding that sets
+  // their height. Pinned in QSS rather than via setFixedWidth because these are
+  // QSS-styled buttons, and QStyleSheetStyle governs their geometry — a
+  // widget-level fixed width is ignored. min-width is a floor, not a clamp, so a
+  // long label (Downgrade names the version) still grows to its natural width
+  // while keeping the same height as its neighbours.
+  const auto mark_footer_button = [](QPushButton* button) { button->setProperty("mpFooterButton", true); };
+  auto* action = new QPushButton;
+  mark_footer_button(action);
   if (installing) {
-    form.action_btn->setText("Installing");
-    form.action_btn->setObjectName("extBadgeInstalling");
-    form.action_btn->setEnabled(false);
-    form.action_btn->setVisible(true);
+    action->setText(tr("Installing"));
+    action->setObjectName("extBadgeInstalling");
+    action->setEnabled(false);
   } else if (needs_restart) {
-    form.action_btn->setText("Needs Restart");
-    form.action_btn->setObjectName("extBadgeNeedsRestart");
-    form.action_btn->setEnabled(false);
-    form.action_btn->setVisible(true);
+    action->setText(tr("Needs Restart"));
+    action->setObjectName("extBadgeNeedsRestart");
+    action->setEnabled(false);
+  } else if (has_update) {
+    action->setText(tr("Update"));
+    action->setObjectName("extButtonUpdate");
+    connect(action, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
+  } else if (has_newer_local) {
+    action->setText(tr("Local newer"));
+    action->setObjectName("extBadgeLocalNewer");
+    action->setEnabled(false);
+  } else if (is_installed) {
+    action->setText(tr("Installed"));
+    action->setObjectName("extBadgeInstalled");
+    action->setEnabled(false);
   } else {
-    if (!is_installed || has_update) {
-      form.action_btn->setText(has_update ? "Update ⬆" : "Install");
-      form.action_btn->setObjectName(has_update ? "extButtonUpdate" : "extButtonInstall");
-      form.action_btn->setVisible(true);
-      connect(form.action_btn, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
-    } else if (has_newer_local) {
-      form.action_btn->setText("Local newer");
-      form.action_btn->setObjectName("extBadgeLocalNewer");
-      form.action_btn->setEnabled(false);
-      form.action_btn->setVisible(true);
+    action->setText(tr("Install"));
+    action->setObjectName("extButtonInstall");
+    connect(action, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
+  }
+  ui_->detail_buttons_layout->addWidget(action);
+
+  // Uninstall / Downgrade-to-bundled (installed, not mid-operation), with the
+  // same bundled logic the old detail dialog used. Standard button style too.
+  if (is_installed && !installing && !needs_restart) {
+    const QString bundled_version = ext_mgr_->bundledVersion(ext_id);
+    const int installed_vs_bundled =
+        is_bundled ? compareSemver(installed_version.toStdString(), bundled_version.toStdString()) : 0;
+    if (is_bundled && installed_vs_bundled <= 0) {
+      // Core plugin at its bundled version: shown but locked.
+      auto* uninstall = new QPushButton(tr("Uninstall"));
+      mark_footer_button(uninstall);
+      uninstall->setEnabled(false);
+      uninstall->setToolTip(tr("This extension ships with the application and cannot be uninstalled"));
+      ui_->detail_buttons_layout->addWidget(uninstall);
+    } else if (is_bundled) {
+      // Core plugin updated above bundled: offer revert-to-bundled.
+      auto* downgrade = new QPushButton(tr("Downgrade to bundled v%1").arg(bundled_version));
+      mark_footer_button(downgrade);
+      downgrade->setToolTip(tr("Reverts to the bundled version v%1 on the next launch").arg(bundled_version));
+      connect(downgrade, &QPushButton::clicked, this, [this, ext_id]() {
+        clearStickyStatus();
+        ext_mgr_->downgradeToBundled(ext_id);
+      });
+      ui_->detail_buttons_layout->addWidget(downgrade);
     } else {
-      form.action_btn->setText("Installed");
-      form.action_btn->setObjectName("extBadgeInstalled");
-      form.action_btn->setEnabled(false);
-      form.action_btn->setVisible(true);
-    }
-    // Uninstall, shown for an installed extension (between the action and Close),
-    // exactly as the old subdialog did.
-    if (is_installed) {
-      form.uninstall_btn->setVisible(true);
-      // Empty when not core; otherwise the version the app ships, used to lock
-      // uninstall (installed == bundled) or offer downgrade-to-bundled.
-      const QString bundled_version = ext_mgr_->bundledVersion(ext_id);
-      // For a core plugin, compare the installed version to the one it ships
-      // with — via the same comparator the seed and the uninstall guard use.
-      const int installed_vs_bundled =
-          is_bundled ? compareSemver(installed_version.toStdString(), bundled_version.toStdString()) : 0;
-      if (is_bundled && installed_vs_bundled <= 0) {
-        // Core extension at its bundled version: it ships with the app and can't be
-        // removed. Shown but locked, so the user sees it exists yet cannot remove it.
-        form.uninstall_btn->setEnabled(false);
-        form.uninstall_btn->setToolTip(tr("This extension ships with the application and cannot be uninstalled"));
-      } else if (is_bundled) {
-        // Core extension updated ABOVE its bundled version: offer to revert to the
-        // shipped version instead of a plain uninstall. The bundled build ships with
-        // the app, so it is always a compatible downgrade. Functionally this
-        // uninstalls the updated copy; the seed restores the bundled version on the
-        // next launch. Red style via the #extButtonDowngrade rule.
-        form.uninstall_btn->setText(tr("Downgrade to bundled v%1").arg(bundled_version));
-        form.uninstall_btn->setObjectName("extButtonDowngrade");
-        form.uninstall_btn->setToolTip(
-            tr("Reverts to the bundled version v%1 on the next launch").arg(bundled_version));
-        connect(form.uninstall_btn, &QPushButton::clicked, this, [this, ext_id]() {
-          clearStickyStatus();
-          ext_mgr_->downgradeToBundled(ext_id);
-        });
-      } else {
-        connect(
-            form.uninstall_btn, &QPushButton::clicked, this, [this, ext_id]() { onUninstallButtonClicked(ext_id); });
-      }
+      auto* uninstall = new QPushButton(tr("Uninstall"));
+      mark_footer_button(uninstall);
+      connect(uninstall, &QPushButton::clicked, this, [this, ext_id]() { onUninstallButtonClicked(ext_id); });
+      ui_->detail_buttons_layout->addWidget(uninstall);
     }
   }
 
-  // Same fixed width as the left-hand card buttons so the action reads identically
-  // on both sides.
-  form.action_btn->setFixedWidth(90);
+  // Visit Website / repository (right edge).
+  const QString url = !ext->website.isEmpty() ? ext->website : ext->repository;
+  if (!url.isEmpty()) {
+    auto* web = new QPushButton(tr("Visit Website"));
+    mark_footer_button(web);
+    connect(web, &QPushButton::clicked, this, [url]() { QDesktopServices::openUrl(QUrl(url)); });
+    ui_->detail_buttons_layout->addWidget(web);
+  }
 }
 
 // ─── Filtering ────────────────────────────────────────────────────────────────
 
+bool MarketplaceWindow::rebuildExtensionList() {
+  QStringList previous_ids;
+  previous_ids.reserve(extensions_.size());
+  for (const Extension& ext : extensions_) {
+    previous_ids << ext.id;
+  }
+
+  extensions_ = registry_extensions_;
+
+  // An installed id the registry does not list has no row to reuse, so build one
+  // from what the plugin declares about itself. The registry-sourced fields
+  // (author, license, website, changelog, platforms…) stay empty; every consumer
+  // guards them with isEmpty(), and the footer's primary action is disabled for an
+  // installed extension anyway, so no install path can be driven off this row.
+  const auto installed = ext_mgr_->installedExtensions();
+  for (auto it = installed.cbegin(); it != installed.cend(); ++it) {
+    if (std::any_of(registry_extensions_.cbegin(), registry_extensions_.cend(), [&](const Extension& ext) {
+          return ext.id == it.key();
+        })) {
+      continue;
+    }
+    const InstalledExtension& record = it.value();
+    Extension local;
+    local.id = record.id;
+    local.name = record.name;
+    local.description = record.description;
+    local.category = record.category;
+    local.version = record.version;
+    extensions_.append(local);
+  }
+
+  QStringList current_ids;
+  current_ids.reserve(extensions_.size());
+  for (const Extension& ext : extensions_) {
+    current_ids << ext.id;
+  }
+  return current_ids != previous_ids;
+}
+
+void MarketplaceWindow::refreshAfterInstalledChange() {
+  if (rebuildExtensionList()) {
+    applyFilters();
+  } else {
+    rebuildTable();
+  }
+}
+
 void MarketplaceWindow::applyFilters() {
   const QString search = ui_->search_edit_->text().toLower();
-  const QString category = ui_->category_combo_->currentData().toString();
+
+  // Category values are the strings the published registry actually ships in each
+  // extension's "category" field, NOT the button labels and NOT the vocabulary in
+  // the marketplace spec doc (§5.2 lists data_streamer/parser/bundle; the live
+  // registry uses data_stream/message_parser and ships no bundles). A value that
+  // does not appear in the registry silently matches nothing, so these must be
+  // checked against real registry data rather than the spec.
+  QStringList active_categories;
+  if (ui_->filter_data_loader_->isChecked()) {
+    active_categories << u"data_loader"_s;
+  }
+  if (ui_->filter_data_streamer_->isChecked()) {
+    active_categories << u"data_stream"_s;
+  }
+  if (ui_->filter_parser_->isChecked()) {
+    active_categories << u"message_parser"_s;
+  }
+  if (ui_->filter_toolbox_->isChecked()) {
+    active_categories << u"toolbox"_s;
+  }
+  const bool installed_only = ui_->filter_installed_->isChecked();
 
   filtered_.clear();
   for (const auto& ext : extensions_) {
-    if (!category.isEmpty() && ext.category != category) {
+    // Categories are a single facet: any number may be active and they widen the
+    // result (OR). "Installed" is a separate facet and narrows it (AND).
+    if (!active_categories.isEmpty() && !active_categories.contains(ext.category)) {
+      continue;
+    }
+    if (installed_only && !ext_mgr_->isInstalled(ext.id)) {
       continue;
     }
     if (!search.isEmpty()) {
@@ -724,7 +832,7 @@ void MarketplaceWindow::applyFilters() {
     filtered_.append(ext);
   }
 
-  populateCards(/*preserve_scroll=*/false);
+  rebuildTable(/*preserve_scroll=*/false);
   setInfoStatus(QString::number(filtered_.size()) + " of " + QString::number(extensions_.size()) + " extensions shown");
 }
 
@@ -806,28 +914,76 @@ void MarketplaceWindow::onSearchChanged(const QString& /*text*/) {
   clearStickyStatus();
   applyFilters();
 }
-void MarketplaceWindow::onCategoryChanged(int /*index*/) {
+void MarketplaceWindow::onFilterToggled() {
   clearStickyStatus();
   applyFilters();
 }
 
-void MarketplaceWindow::showEvent(QShowEvent* event) {
-  if (ext_mgr_ != nullptr) {
-    if (initial_snapshot_provided_) {
-      initial_snapshot_provided_ = false;
-      populateCards();
-    } else {
-      const auto before = ext_mgr_->installedExtensions();
-      ext_mgr_->refreshInstalledFromDisk();
-      if (!installedStatesEqual(ext_mgr_->installedExtensions(), before)) {
-        installations_changed_ = true;
-        populateCards();
-      }
-    }
-    updateDiagnosticsButton();
-    showLatestDiagnostic();
+void MarketplaceWindow::onInstallLocalClicked() {
+  const QString path =
+      FileDialog::getOpenFileName(this, tr("Install plugin from local ZIP"), QString(), tr("Plugin package (*.zip)"));
+  if (path.isEmpty()) {
+    return;  // cancelled
   }
+  clearStickyStatus();
+  local_install_in_flight_ = true;
+  ext_mgr_->installFromLocalZip(path);
+}
+
+QString MarketplaceWindow::installedStatusText(const QString& id, bool from_file) const {
+  // A sideloaded id is by definition absent from the registry list, so its name and
+  // version have to come from the installed snapshot instead.
+  //
+  // No restart is promised here: this runs on installFinished, which a sideload
+  // only reaches on the fresh-install branch — the one that writes straight to the
+  // extensions dir and is picked up by the host's catalog reload, exactly like a
+  // fresh registry install. Replacing an installed id is staged instead and
+  // reports through installPendingRestart, which owns the restart wording.
+  if (from_file) {
+    const auto installed = ext_mgr_->installedExtensions();
+    const QString version = installed.contains(id) ? installed[id].version : QString();
+    return version.isEmpty() ? QString("Installed %1 from file").arg(id)
+                             : QString("Installed %1 v%2 from file").arg(id, version);
+  }
+  for (const auto& ext : extensions_) {
+    if (ext.id == id) {
+      return "Installed " + ext.name + " v" + ext.version;
+    }
+  }
+  return "Installed " + id;
+}
+
+void MarketplaceWindow::showEvent(QShowEvent* event) {
+  activateEmbedded();
   Dialog::showEvent(event);
+}
+
+void MarketplaceWindow::activateEmbedded() {
+  if (ext_mgr_ == nullptr) {
+    return;
+  }
+  bool state_changed = false;
+  if (initial_snapshot_provided_) {
+    initial_snapshot_provided_ = false;
+    state_changed = true;
+  } else {
+    const auto before = ext_mgr_->installedExtensions();
+    ext_mgr_->refreshInstalledFromDisk();
+    if (!installedStatesEqual(ext_mgr_->installedExtensions(), before)) {
+      installations_changed_ = true;
+      state_changed = true;
+    }
+  }
+  // Composing is unconditional even though repainting is not: this is the only
+  // entry point guaranteed to run, so a session whose registry never loads would
+  // otherwise never build the local-only rows and would show an empty list.
+  if (rebuildExtensionList()) {
+    applyFilters();
+  } else if (state_changed) {
+    rebuildTable();
+  }
+  updateDiagnosticsButton();
+  showLatestDiagnostic();
 }
 
 void MarketplaceWindow::onActionButtonClicked(const QString& ext_id) {
@@ -844,7 +1000,7 @@ void MarketplaceWindow::onActionButtonClicked(const QString& ext_id) {
     }
     pending_clicks_.append(ext_id);
     showInstallProgress();  // keep the active install visible; reflect the new queue depth
-    populateCards();        // repaint so the queued card shows the "Installing" badge
+    rebuildTable();         // repaint so the queued card shows the "Installing" badge
     return;
   }
 
@@ -891,7 +1047,7 @@ void MarketplaceWindow::onUpdateAllClicked() {
   }
   ui_->update_all_btn_->setEnabled(false);
   setStatus("Updating " + QString::number(update_queue_.size()) + " extensions...");
-  populateCards();  // repaint so all queued cards show the "Installing" badge
+  rebuildTable();  // repaint so all queued cards show the "Installing" badge
   processInstallQueue();
 }
 

@@ -2240,47 +2240,83 @@ QLabel#extCardDescription {
     font-size: 11px;
 }
 
-/* Action button / status badge family. All share padding + bold
-   text; only the background / hover differ per state. */
-QPushButton#extButtonInstall,
-QPushButton#extButtonUpdate,
+/* VS Code-style details footer: a greyish panel below the plugin table,
+   separated by a top hairline, showing the selected plugin's description +
+   changelog + metadata. */
+QFrame#marketplaceDetailFooter {
+    background: ${backdrop};
+    border: 1px solid ${separation};
+    border-radius: ${radius_input}px;
+}
+QFrame#marketplaceDetailFooter QTextBrowser {
+    background: transparent;
+    color: ${text};
+    border: none;
+}
+
+/* Status badges: labels, not emphasis, so normal weight. */
 QPushButton#extBadgeInstalled,
 QPushButton#extBadgeNeedsRestart,
 QPushButton#extBadgeInstalling,
+QPushButton#extBadgeUpdate,
 QPushButton#extBadgeLocalNewer {
-    border: none;
-    padding: ${space_snug}px ${space_none}px;
-    font-weight: 600;
+    font-weight: normal;
 }
 
-/* Downgrade-to-bundled: a core plugin updated above its bundled version. Red, to
-   read as a "revert/remove" action distinct from Install/Update. Sits on the
-   detail dialog's uninstall_btn, so it keeps that button's rounded shape. */
+/* Downgrade-to-bundled: a core plugin updated above its bundled version. Uses
+   the framework's Destructive tokens to read as a "revert/remove" action
+   distinct from Install/Update. Sits on the detail dialog's uninstall_btn, so it
+   keeps that button's rounded shape. */
 QPushButton#extButtonDowngrade {
     border: none;
     border-radius: ${radius_input}px;
     padding: ${space_snug}px ${space_comfortable}px;
     font-weight: 600;
-    background: ${status_error};
-    color: ${on_status_error};
+    background: ${destructive_nominal};
+    color: ${on_destructive_nominal};
 }
-QPushButton#extButtonDowngrade:hover { background: ${status_error}; color: ${on_status_error}; }
+QPushButton#extButtonDowngrade:hover { background: ${destructive_hovered}; color: ${on_destructive_hovered}; }
 
-/* Action buttons (not the status badges) get a minimum width so they read as
-   buttons rather than hugging their label. */
-QPushButton#extButtonInstall,
-QPushButton#extButtonUpdate {
-    min-width: 96px;
+/* Footer action buttons (Update/Install/Installed/Uninstall/Visit Website) share
+   one uniform geometry so they all read as the same size. Pinned here (not via
+   setFixedWidth) because these buttons are QSS-styled and QStyleSheetStyle
+   governs their geometry. The min-width is the content box; identical padding on
+   every button makes the TOTAL widths equal (min-width ≥ the widest label,
+   "Visit Website", so none overflow and all render at the same width). Downgrade
+   is exempt — its label is far longer — so it does not carry the property. */
+QPushButton[mpFooterButton="true"] {
+    min-width: 110px;
+    padding: ${space_snug}px ${space_comfortable}px;
+    border: none;
+    border-radius: ${radius_input}px;
 }
 
-QPushButton#extButtonInstall            { background: ${status_info}; color: ${on_status_info}; }
-QPushButton#extButtonInstall:hover      { background: ${status_info_hovered}; color: ${on_status_info}; }
-QPushButton#extButtonUpdate             { background: ${status_warning}; color: ${on_status_warning}; }
-QPushButton#extButtonUpdate:hover       { background: ${status_warning_hovered}; color: ${on_status_warning}; }
-QPushButton#extBadgeInstalled:disabled  { background: ${status_success}; color: ${on_status_success}; }
-QPushButton#extBadgeNeedsRestart:disabled { background: ${status_warning}; color: ${on_status_warning}; }
-QPushButton#extBadgeLocalNewer:disabled { background: ${status_neutral}; color: ${on_status_neutral}; }
-QPushButton#extBadgeInstalling:disabled { background: ${status_neutral}; color: ${on_status_neutral}; }
+/* Semantic → framework family mapping (ui_framework.md §Interactions):
+   Install = Accent (action), Update/NeedsRestart = Emphasis (soft attention),
+   Installed = Accent (positive confirmation), LocalNewer/Installing = Neutral
+   (quiet). Badges are :disabled to be non-clickable, but keep the nominal fill
+   (not the greyed disabled step) so they still read as coloured status chips. */
+QPushButton#extButtonInstall            { background: ${accent_nominal}; color: ${on_accent_nominal}; }
+QPushButton#extButtonInstall:hover      { background: ${accent_hovered}; color: ${on_accent_hovered}; }
+/* Update: a single soft-pink tone — the SAME fill as the updatable plugin rows
+   (destructive_nominal #CC00CC at 0.22 alpha), with normal body ink. One colour;
+   hover/pressed only deepen its alpha for click feedback (like the Install
+   button's state shift). Keep in sync with UpdateRowDelegate's alpha. */
+QPushButton#extButtonUpdate             { background: rgba(204, 0, 204, 0.22); color: ${text}; }
+QPushButton#extButtonUpdate:hover       { background: rgba(204, 0, 204, 0.34); color: ${text}; }
+QPushButton#extButtonUpdate:pressed     { background: rgba(204, 0, 204, 0.48); color: ${text}; }
+QPushButton#extBadgeInstalled:disabled  { background: ${accent_nominal}; color: ${on_accent_nominal}; }
+QPushButton#extBadgeNeedsRestart:disabled { background: ${emphasis_nominal}; color: ${on_emphasis_nominal}; }
+QPushButton#extBadgeLocalNewer:disabled { background: ${neutral_nominal}; color: ${on_neutral_nominal}; }
+QPushButton#extBadgeInstalling:disabled { background: ${neutral_nominal}; color: ${on_neutral_nominal}; }
+
+/* Update-All button: the same single soft-pink tone as the Update button and the
+   updatable rows, shown exactly when enabled (i.e. when at least one extension
+   has an update pending); hover/pressed deepen the alpha for click feedback.
+   Disabled (nothing to update) falls back to the default look. */
+QPushButton#update_all_btn_:enabled         { background: rgba(204, 0, 204, 0.22); color: ${text}; }
+QPushButton#update_all_btn_:enabled:hover   { background: rgba(204, 0, 204, 0.34); color: ${text}; }
+QPushButton#update_all_btn_:enabled:pressed { background: rgba(204, 0, 204, 0.48); color: ${text}; }
 
 /* Tag chip in the extension-detail dialog. Uses the same card surface
    tone so chips feel like inset elements of the card. */

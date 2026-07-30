@@ -48,7 +48,7 @@ The marketplace window shows a list of all extensions with their status:
 | Column | Content |
 |--------|---------|
 | **Name** | Extension name |
-| **Version** | Installed version when available, otherwise registry version; registry version is shown for comparison when they differ |
+| **Version** | Installed version when available, otherwise registry version. The registry version is appended (`1.0.0 → 1.1.0`) only when an update is available; a locally-newer build shows just its own version, and the `Installed` column says `Local newer` |
 | **Status** | `[install]`, `[installed]`, `[update]`, or `[local newer]` |
 
 **To see extension details:** Double-click on any extension to open a detail dialog with full information (description, author, changelog).
@@ -63,14 +63,20 @@ If PlotJuggler already has the plugin loaded at startup, the marketplace is seed
 - Example: `ros` finds "ROS 2 Streaming", "ROS Bag Loader"
 - Example: `csv` finds "CSV Loader", "CSV Exporter"
 
-**Category filter dropdown:**
-- All categories
-- Data Loader
-- Data Streamer
-- Message Parser
-- Toolbox
+**Filter row:** A row of toggle buttons under the toolbar. Any number of them can
+be active at the same time.
 
-**Quick filters:** *(planned — not yet implemented)*
+- **Installed** — only extensions that are already installed
+- **Data Source** — extensions that load data from files
+- **Data Streamer** — extensions that stream data continuously
+- **Parsers** — extensions that decode byte blobs into fields
+- **Toolboxes** — extensions that add a tool with its own GUI
+
+The four category toggles combine as "any of these": with none active every
+category is listed, and activating several lists the extensions belonging to any
+one of them. **Installed** is independent — it narrows whichever categories are
+active rather than replacing them, so "Installed + Parsers" lists the installed
+parsers. The search box narrows the result further.
 
 ### 2.4 Installing an Extension
 

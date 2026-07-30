@@ -42,6 +42,18 @@ class MarketplaceWindow : public Dialog {
     return installations_changed_;
   }
 
+  // The marketplace content widget (the whole UI body). Lets a host embed the
+  // marketplace as a central-area panel/tab instead of a modal window: reparent
+  // this into the host container and keep the MarketplaceWindow alive as the
+  // controller (it owns the UI and receives all the child-widget signals).
+  QWidget* contentWidget() const {
+    return content_widget_;
+  }
+
+  // Refreshes installed state and repaints — the embedded equivalent of what
+  // showEvent() does for the modal path. Call after embedding contentWidget().
+  void activateEmbedded();
+
  signals:
   // Emitted when the user clicks the settings (gear) button. The host (MainWindow)
   // responds by opening Preferences ▸ Plugins; the marketplace itself has no
@@ -49,18 +61,19 @@ class MarketplaceWindow : public Dialog {
   void pluginPreferencesRequested();
 
  protected:
-  // Handles card hover styling and delegated button events.
-  bool eventFilter(QObject* obj, QEvent* event) override;
-
-  // Refreshes installed state before cards are painted.
+  // Refreshes installed state before the table is repainted.
   void showEvent(QShowEvent* event) override;
 
  private slots:
   // Updates the search filter.
   void onSearchChanged(const QString& text);
 
-  // Updates the category filter.
-  void onCategoryChanged(int index);
+  // Re-applies the filter row after any one of its toggles flips. Shared by all
+  // of them: the toggles are read as a set, so which one changed is irrelevant.
+  void onFilterToggled();
+
+  // Picks a local ZIP and sideloads it via ExtensionManager::installFromLocalZip.
+  void onInstallLocalClicked();
 
   // Queues updates for every installed extension with a newer registry version.
   void onUpdateAllClicked();
@@ -87,12 +100,25 @@ class MarketplaceWindow : public Dialog {
   // Connects registry, extension-manager, and widget signals.
   void setupSignals();
 
-  // Rebuilds every extension card from filtered_. preserve_scroll keeps the
-  // vertical scroll offset across the teardown/rebuild (true for install/update/
-  // uninstall repaints, so the list doesn't jump to the top mid-session); pass
-  // false when the card set changes meaning — filter/search/registry reload —
-  // where returning to the top is the expected behaviour.
-  void populateCards(bool preserve_scroll = true);
+  // Rebuilds every table row from filtered_. preserve_scroll keeps the vertical
+  // scroll offset across the rebuild (true for install/update/uninstall repaints,
+  // so the list doesn't jump to the top mid-session); pass false when the row set
+  // changes meaning — filter/search/registry reload — where returning to the top
+  // is the expected behaviour.
+  void rebuildTable(bool preserve_scroll = true);
+
+  // Recomposes extensions_ as registry_extensions_ plus one synthesized row per
+  // installed extension the registry does not list, so a sideloaded plugin is
+  // still visible and manageable. Recomputed rather than appended to, so a
+  // repeated install can never duplicate a row. Returns whether the resulting id
+  // set differs from the previous one.
+  bool rebuildExtensionList();
+
+  // Repaints after the installed set may have changed. Re-filters only when a row
+  // actually appeared or disappeared (a local-only extension installed or
+  // removed) — otherwise the cheaper repaint keeps the scroll position, since the
+  // same rows still mean the same thing.
+  void refreshAfterInstalledChange();
 
   // Applies search and category filters to the registry list.
   void applyFilters();
@@ -109,13 +135,9 @@ class MarketplaceWindow : public Dialog {
   // Shows or hides the diagnostics button based on diagnostic history.
   void updateDiagnosticsButton();
 
-  // Rebuilds the right-hand detail panel for the given registry extension (the
-  // currently selected card). Replaces the former modal detail dialog.
-  void showDetail(const QString& ext_id);
-
-  // Applies the "selected" highlight to the card matching selected_ext_id_ and
-  // clears it from the others.
-  void updateCardSelection();
+  // Rebuilds the bottom "Details" footer (description + changelog + metadata)
+  // for the currently selected table row. No selection / empty list clears it.
+  void updateDetailFooter();
 
   // Processes one pending bulk-update item at a time.
   void processInstallQueue();
@@ -132,6 +154,12 @@ class MarketplaceWindow : public Dialog {
   // or an empty string when nothing is waiting.
   QString queueSuffix() const;
 
+  // Success message for a finished install. `from_file` selects the sideload
+  // phrasing, which reads the version from the installed snapshot rather than the
+  // registry list. Neither phrasing mentions a restart: this is the immediate
+  // install path. Staged outcomes report through installPendingRestart instead.
+  QString installedStatusText(const QString& id, bool from_file) const;
+
   // Shows an informational (non-error) status, UNLESS an install/update is in
   // flight — then the status line belongs to that operation, so re-assert its
   // progress instead of clobbering it with unrelated text (filter count,
@@ -139,12 +167,16 @@ class MarketplaceWindow : public Dialog {
   void setInfoStatus(const QString& msg);
 
   Ui::MarketplaceWindow* ui_ = nullptr;
+  QWidget* content_widget_ = nullptr;  ///< the UI body; exposed for embedding
   DownloadManager* download_mgr_ = nullptr;
   RegistryManager* registry_mgr_ = nullptr;
   ExtensionManager* ext_mgr_ = nullptr;
   QUrl registry_url_;
 
-  QList<Extension> extensions_;  // populated from RegistryManager::fetchFinished
+  // Registry rows exactly as fetched, kept apart from extensions_ so the local-only
+  // rows can be recomposed on top of them without ever accumulating duplicates.
+  QList<Extension> registry_extensions_;
+  QList<Extension> extensions_;  // registry_extensions_ + synthesized local-only rows
   QList<Extension> filtered_;
   QList<Extension> update_queue_;
   // Individual Install/Update button clicks that arrive while another install
@@ -156,9 +188,13 @@ class MarketplaceWindow : public Dialog {
   // idle — the UI-side guard uses this to decide whether to enqueue a click
   // instead of dispatching it straight to ExtensionManager::install().
   QString active_install_id_;
-  // Registry id of the card currently selected (shown in the detail panel). One
-  // is always selected while the list is non-empty, so the panel is never empty.
-  QString selected_ext_id_;
+  // Registry id of the row whose details the footer shows; preserved across
+  // table rebuilds so an install/update repaint keeps the same row selected.
+  QString footer_ext_id_;
+  // True while a local-ZIP sideload is in flight, so the outcome handlers can
+  // phrase their message from the installed snapshot instead of the registry list,
+  // which a sideloaded id is by definition absent from.
+  bool local_install_in_flight_ = false;
   bool installations_changed_ = false;
   bool status_error_sticky_ = false;
   bool initial_snapshot_provided_ = false;

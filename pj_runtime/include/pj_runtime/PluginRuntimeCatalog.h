@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "pj_base/diagnostic_sink.hpp"
@@ -135,6 +136,11 @@ class PluginRuntimeCatalog {
   // concurrently with a scan.
   void setHostVersion(std::string host_version);
 
+  // Ids of extensions the user disabled (installed but not loaded): a matching
+  // winner is skipped at load time with an info diagnostic. Read on the scan
+  // thread like setHostVersion, so set it before the first scanDirectory()/reload().
+  void setDisabledIds(std::unordered_set<std::string> disabled_ids);
+
   // Rebuilds the DSO-backed plugin set from the scan folders. Statically
   // registered plugins (registerStatic*) are permanent and survive rescans.
   void scanDirectory();
@@ -253,7 +259,8 @@ class PluginRuntimeCatalog {
   std::vector<PluginDirEntry> plugin_dirs_;
   DiagnosticSink sink_;
   std::string diagnostic_source_;
-  std::string host_version_;  ///< host version for compatibility ties; "" disables the check
+  std::string host_version_;                      ///< host version for compatibility ties; "" disables the check
+  std::unordered_set<std::string> disabled_ids_;  ///< winners with these ids are not loaded
   std::vector<RuntimeDataSourcePlugin> data_sources_;
   std::vector<RuntimeMessageParserPlugin> message_parsers_;
   std::vector<RuntimeToolboxPlugin> toolbox_plugins_;

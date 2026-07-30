@@ -2516,28 +2516,59 @@ void MainWindow::wasmProbeSupersedeBrowserReplayPicker() {
 void MainWindow::onOpenMarketplace() {
 #ifndef PJ_TARGET_WASM
   auto& catalog = session_->extensionCatalog();
-  MarketplaceWindow dlg(&catalog.extensionManager(), effectiveRegistryUrl(), this);
-  dlg.setChromeMetrics(chrome_metrics_);
-  // Master–detail marketplace needs room for both panes (list + detail) and the
-  // detail's button row; open wide enough that nothing is clipped at first show.
-  dlg.resize(1100, 640);
-  // The marketplace's settings (gear) button asks the host to open Preferences ▸
-  // Plugins. Close the marketplace first, then open Preferences on that page.
-  bool open_plugin_prefs = false;
-  connect(&dlg, &MarketplaceWindow::pluginPreferencesRequested, &dlg, [&dlg, &open_plugin_prefs]() {
-    open_plugin_prefs = true;
-    dlg.accept();
+  // Embed the marketplace in the central area (like a toolbox), not a modal
+  // window. The MarketplaceWindow is a hidden controller: it owns the UI and
+  // receives its child-widget signals; its content widget is lifted into a
+  // banner-wrapped takeover panel that can be closed or migrated to a persistent
+  // central tab.
+  auto* mkt = new MarketplaceWindow(&catalog.extensionManager(), effectiveRegistryUrl(), this);
+  mkt->setChromeMetrics(chrome_metrics_);
+  QWidget* content = mkt->contentWidget();
+
+  // Gear → Preferences ▸ Plugins (deferred so the click's own teardown doesn't
+  // run inside the panel's event handling).
+  connect(mkt, &MarketplaceWindow::pluginPreferencesRequested, this, [this]() {
+    QTimer::singleShot(0, this, [this]() {
+      PreferencesDialog prefs(*theme_, this);
+      prefs.setChromeMetrics(chrome_metrics_);
+      prefs.showPage(PreferencesDialog::kPluginsPage);
+      prefs.exec();
+    });
   });
-  dlg.exec();
-  if (dlg.installationsChanged()) {
-    catalog.reload();
+
+  // Reload the plugin catalog if anything was installed/uninstalled while open.
+  const auto reload_if_changed = [this, mkt]() {
+    if (mkt->installationsChanged()) {
+      session_->extensionCatalog().reload();
+    }
+  };
+
+  const WrappedToolboxPanel wrapped = wrapToolboxPanel(
+      content, tr("Marketplace"),
+      /*on_close=*/
+      [this, mkt, reload_if_changed]() {
+        reload_if_changed();
+        restoreCentralArea();
+        mkt->deleteLater();
+      },
+      /*on_migrate=*/
+      [this, mkt, reload_if_changed]() {
+        QWidget* released = releaseCentralPanel();
+        if (released == nullptr) {
+          return;
+        }
+        ui_->tabbedPlotWidget->addWidgetTab(tr("Marketplace"), released, [mkt, reload_if_changed]() {
+          reload_if_changed();
+          mkt->deleteLater();
+        });
+      });
+
+  if (!presentPanel(wrapped.container)) {
+    wrapped.container->deleteLater();
+    mkt->deleteLater();
+    return;
   }
-  if (open_plugin_prefs) {
-    PreferencesDialog prefs(*theme_, this);
-    prefs.setChromeMetrics(chrome_metrics_);
-    prefs.showPage(PreferencesDialog::kPluginsPage);
-    prefs.exec();
-  }
+  mkt->activateEmbedded();
 #endif
 }
 

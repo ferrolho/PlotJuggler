@@ -28,7 +28,7 @@ PlotJuggler has grown significantly, evolving from an internal tool to a de fact
 | ------------------ | -------------------- | ------------------------------------------------------------- |
 | **Discovery**      | Extension listing    | Display all available extensions in VSCode-style cards        |
 |                    | Search               | Search by name, description, tags, and publisher              |
-|                    | Category filtering   | Data Loader, Data Streamer, Parser, Toolbox                   |
+|                    | Filtering            | Any combination of Installed, Data Source, Streamer, Parsers, Toolboxes |
 |                    | Extension detail     | Panel with complete information, changelog, and dependencies  |
 |                    | Startup snapshot     | Host app may seed the marketplace with already-loaded plugin ids/versions before first render |
 | **Installation**   | Secure download      | ZIP artifact download with SHA256 verification                |
@@ -121,7 +121,7 @@ elsewhere in the host application:
 | F-01 | Fetch and parse registry JSON from configurable URL | Given a valid URL, the system loads and parses extension metadata |
 | F-02 | List extensions in sidebar with cards | User sees all available extensions with name, description, version |
 | F-03 | Search by name, description, tags | Typing "ros" shows all ROS-related extensions |
-| F-04 | Filter by category | User can filter by Data Loader, Streamer, Parser, Toolbox |
+| F-04 | Filter by any combination of facets | User can activate several category toggles at once (union) and intersect them with Installed |
 | F-05 | Show selected extension detail | Clicking an extension shows full information panel |
 | F-06 | Download ZIP with SHA256 verification | Download fails if checksum doesn't match |
 | F-07 | Extract ZIP to extensions directory | ZIP contents are extracted to correct location |

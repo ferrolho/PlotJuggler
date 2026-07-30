@@ -8,6 +8,8 @@
 #include <QMetaObject>
 #include <QObject>
 #include <QString>
+#include <functional>
+#include <utility>
 
 #include "pj_base/diagnostic_sink.hpp"
 #include "pj_marketplace/download_manager.hpp"
@@ -43,6 +45,51 @@ class ExtensionManager : public QObject {
 
   // Starts an async install for the current platform.
   void install(const Extension& ext);
+
+  // Asked by installFromLocalZip when the archive carries an id that is already
+  // installed: return true to replace it, false to abort. Called synchronously on
+  // the calling (GUI) thread, so an implementation may run a modal dialog.
+  //
+  // The manager cannot ask this itself — the decision is UI policy and this module
+  // links no widgets — so the host injects it, the same way
+  // StreamingSourceManager takes its chrome-metrics provider and FileLoader its
+  // file picker. Left unset, a conflict is refused, which is what a test or the
+  // standalone harness wants.
+  using ReplaceConfirmation =
+      std::function<bool(const QString& id, const QString& installed_version, const QString& archive_version)>;
+  void setReplaceConfirmation(ReplaceConfirmation confirm) {
+    replace_confirmation_ = std::move(confirm);
+  }
+
+  // Sideloads a plugin from a local ZIP that the registry does not list.
+  //
+  // Unlike install(), there is no registry entry to validate against: the id and
+  // version come FROM the archive's embedded plugin manifest, which is the only
+  // source of truth here. Consequently there is also no checksum to verify — a
+  // local file has no provenance, and the integrity gate is the manifest scan
+  // (the DSO must load and describe itself coherently), not a digest.
+  //
+  // The archive must hold exactly one top-level directory containing the plugin.
+  // On success the directory lands in extensionsDir() keyed by the discovered id —
+  // the same root every other install writes to, so a sideload follows a
+  // `--plugin-dir` override exactly like a registry install does. The plugin becomes
+  // live at the next application start; installing never loads it into the running
+  // session.
+  //
+  // If that id is ALREADY installed, setReplaceConfirmation() decides. A confirmed
+  // replacement is staged rather than written over the existing directory, because
+  // a DSO the running session loaded cannot be swapped underneath it (Windows locks
+  // the file) and dlopen keys its cache by path name, so a same-path replacement is
+  // never re-read. applyPendingInstalls() promotes the stage on the next launch,
+  // backing up the displaced version first, and installPendingRestart() is emitted
+  // instead of installFinished(). The version comparison that update() applies is
+  // deliberately skipped: a local archive is an explicit act on a specific file,
+  // and rebuilding without bumping the version is the normal case.
+  //
+  // Reports through the same installStarted / installFinished / installError
+  // signals as install(), except that installStarted is emitted only once the id
+  // is known (after the manifest is read), since that signal is keyed by id.
+  void installFromLocalZip(const QString& zip_path);
 
   // Removes an installed extension or schedules Windows cleanup after restart.
   void uninstall(const QString& extension_id);
@@ -87,6 +134,24 @@ class ExtensionManager : public QObject {
   // between the disabled Uninstall (installed == bundled) and the "downgrade to
   // bundled" action (installed > bundled), and to show the version transition.
   QString bundledVersion(const QString& id) const;
+
+  // ── Enable/disable (installed but not loaded) ──────────────────────────────
+  // A disabled extension stays on disk but the host skips loading it. The state
+  // persists globally in QSettings so both the marketplace and the runtime
+  // catalog read the same list, and it applies on the next launch (a loaded DSO
+  // cannot be unloaded live).
+
+  // True when `id` is NOT in the disabled list (independent of installed state).
+  bool isEnabled(const QString& id) const;
+
+  // Adds/removes `id` from the persisted disabled list. Does not touch the
+  // already-loaded plugin — the change takes effect on the next launch.
+  void setEnabled(const QString& id, bool enabled);
+
+  // The persisted set of disabled extension ids, read straight from QSettings.
+  // Static so the runtime catalog can honor it without an ExtensionManager
+  // instance (the single source of truth for the QSettings key).
+  static QStringList disabledExtensionIds();
 
   // Rebuilds installed state by scanning extension directories for plugin DSOs.
   void refreshInstalledFromDisk();
@@ -208,6 +273,9 @@ class ExtensionManager : public QObject {
   // (e.g. a bundled plugin in "data-load-foo" for id "foo") is replaced instead
   // of left behind as a duplicate that refreshInstalledFromDisk would then
   // resolve non-deterministically by directory name.
+  // Moves aside any directory in extensions_dir_ other than keep_dir whose embedded
+  // manifest carries `id`, so the promoted "<id>" directory is that extension's sole
+  // install of it.
   void replaceConflictingInstallDirs(const QString& id, const QString& keep_dir);
 
   // Emits uninstallError + uninstallFinished(false) and records a diagnostic.
@@ -215,6 +283,7 @@ class ExtensionManager : public QObject {
 
   DownloadManager* downloader_ = nullptr;
   QString extensions_dir_;
+  ReplaceConfirmation replace_confirmation_;
   QString pending_dir_;
   DiagnosticSink sink_;
 

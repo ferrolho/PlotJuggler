@@ -1440,6 +1440,410 @@ TEST_F(ExtensionManagerTest, RefreshWipesStaleTransactionDirsAfterInstall) {
   EXPECT_TRUE(mgr_->isInstalled("mock-data-source")) << "live install must remain registered";
 }
 
+// ---------------------------------------------------------------------------
+// [10] installFromLocalZip: sideload of a plugin the registry does not list
+// ---------------------------------------------------------------------------
+
+// Writes `zip` to a file inside `dir` and returns its path.
+QString writeZipFile(const QTemporaryDir& dir, const QByteArray& zip, const QString& name = "pkg.zip") {
+  const QString path = QDir(dir.path()).absoluteFilePath(name);
+  QFile f(path);
+  if (!f.open(QIODevice::WriteOnly)) {
+    return {};
+  }
+  f.write(zip);
+  f.close();
+  return path;
+}
+
+// The happy path, and with it the load-bearing assumption of the whole feature:
+// fetch() serves a file:// URL, so a local archive reuses the same
+// download/verify/extract pipeline as a registry artifact.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRegistersDiscoveredExtension) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+
+  QSignalSpy spy_started(mgr_, &ExtensionManager::installStarted);
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  for (const auto& e : spy_error) {
+    qWarning("installFromLocalZip error: %s", qPrintable(e.at(1).toString()));
+  }
+  ASSERT_EQ(spy_error.count(), 0);
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_EQ(spy_finished.first().at(0).toString(), "mock-data-source");
+  EXPECT_TRUE(spy_finished.first().at(1).toBool());
+
+  // installStarted is emitted only once the id has been read from the manifest.
+  ASSERT_EQ(spy_started.count(), 1);
+  EXPECT_EQ(spy_started.first().at(0).toString(), "mock-data-source");
+
+  // Id and version come from the embedded manifest, not from any caller-supplied
+  // declaration, and the directory is keyed by the discovered id.
+  EXPECT_TRUE(mgr_->isInstalled("mock-data-source"));
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+  EXPECT_TRUE(QDir(QDir(ext_dir_.path()).absoluteFilePath("mock-data-source")).exists());
+}
+
+// The archive's top-level directory name is irrelevant: the managed layout keys
+// directories by the id the manifest declares.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipKeysDirectoryByEmbeddedId) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  // Directory named "some-folder", manifest inside declares "mock-data-source".
+  const QString zip = writeZipFile(src, pluginZipWithDso("some-folder", "mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_TRUE(spy_finished.first().at(1).toBool());
+  EXPECT_TRUE(QDir(QDir(ext_dir_.path()).absoluteFilePath("mock-data-source")).exists());
+  EXPECT_FALSE(QDir(QDir(ext_dir_.path()).absoluteFilePath("some-folder")).exists());
+}
+
+// Provisional policy: replacing an installed extension needs the staged
+// apply-at-restart path, so a re-sideload is refused rather than swapping a DSO
+// the running session may hold open.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsAlreadyInstalled) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+
+  QSignalSpy first_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy first_pending(mgr_, &ExtensionManager::installPendingRestart);
+  mgr_->installFromLocalZip(zip);
+  ASSERT_TRUE(waitForInstallOutcome(first_finished, first_pending));
+  ASSERT_TRUE(mgr_->isInstalled("mock-data-source"));
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("already installed"));
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_FALSE(spy_finished.first().at(1).toBool());
+  // The installed copy is left exactly as it was.
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+}
+
+// A ZIP with no loadable plugin is refused, and nothing is left behind.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsArchiveWithoutPlugin) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, buildZip({{"some-folder/readme.txt", QByteArray("not a plugin")}}));
+  ASSERT_FALSE(zip.isEmpty());
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_error.count(), 1);
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_FALSE(spy_finished.first().at(1).toBool());
+  EXPECT_TRUE(mgr_->installedExtensions().isEmpty());
+  EXPECT_FALSE(QDir(QDir(ext_dir_.path()).absoluteFilePath("some-folder")).exists());
+}
+
+// More than one top-level entry is ambiguous: which directory is the plugin?
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsMultipleTopLevelEntries) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString suffix = QString::fromStdString(PlatformUtils::pluginExtension());
+  const QString zip = writeZipFile(
+      src, buildZip({
+               {"first/plugin" + suffix, readAll(pluginPathForId("mock-data-source"))},
+               {"second/plugin" + suffix, readAll(pluginPathForId("mock-file-source"))},
+           }));
+  ASSERT_FALSE(zip.isEmpty());
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("exactly one top-level directory"));
+  EXPECT_TRUE(mgr_->installedExtensions().isEmpty());
+}
+
+// With a confirmation that says yes, a second install stages instead of failing:
+// the live directory is untouched until the next launch promotes the stage.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipStagesConfirmedReplacement) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  // Seeded straight onto disk: installFromLocalZip refreshes installed state
+  // itself, so a directory is a sufficient precondition and this avoids paying for
+  // an extract/dlopen round-trip just to reach the case under test.
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
+
+  // A different version, so the promoted result is distinguishable.
+  const QString second = writeZipFile(src, dummyPluginZip("mock-data-source", "2.0.0"), "v2.zip");
+  ASSERT_FALSE(second.isEmpty());
+
+  QString asked_id;
+  QString asked_installed;
+  QString asked_archive;
+  mgr_->setReplaceConfirmation(
+      [&](const QString& id, const QString& installed_version, const QString& archive_version) {
+        asked_id = id;
+        asked_installed = installed_version;
+        asked_archive = archive_version;
+        return true;
+      });
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(second);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  EXPECT_EQ(spy_error.count(), 0);
+  // Staged, not finished: promotion happens on the next launch.
+  ASSERT_EQ(spy_pending.count(), 1);
+  EXPECT_EQ(spy_pending.first().at(0).toString(), "mock-data-source");
+  EXPECT_EQ(spy_finished.count(), 0);
+
+  // The confirmation was asked with both versions, so the UI can name them.
+  EXPECT_EQ(asked_id, "mock-data-source");
+  EXPECT_EQ(asked_installed, "1.0.0");
+  EXPECT_EQ(asked_archive, "2.0.0");
+
+  // The live install still reads as the old version until promotion.
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+  EXPECT_TRUE(mgr_->hasPendingInstall("mock-data-source"));
+}
+
+// A declined confirmation leaves everything exactly as it was.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipHonoursDeclinedReplacement) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
+
+  bool asked = false;
+  mgr_->setReplaceConfirmation([&](const QString&, const QString&, const QString&) {
+    asked = true;
+    return false;
+  });
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  EXPECT_TRUE(asked);
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("cancelled"));
+  EXPECT_EQ(spy_pending.count(), 0);
+  EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source"));
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+}
+
+// The staged replacement is promoted on the next launch, into the same extensions
+// dir every other install uses, and the displaced copy is kept in the backup dir.
+TEST_F(ExtensionManagerTest, StagedLocalReplacementIsPromotedOnNextLaunch) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+
+  const QString v2 = writeZipFile(src, dummyPluginZip("mock-data-source", "2.0.0"), "v2.zip");
+  ASSERT_FALSE(v2.isEmpty());
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source", "1.0.0"));
+
+  mgr_->setReplaceConfirmation([](const QString&, const QString&, const QString&) { return true; });
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  mgr_->installFromLocalZip(v2);
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_pending.count(), 1);
+  EXPECT_TRUE(mgr_->hasPendingInstall("mock-data-source"));
+  // Untouched until promotion: the running session may still have this DSO loaded.
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+
+  // Next launch.
+  mgr_->applyPendingInstalls();
+
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "2.0.0")
+      << "the staged replacement must be promoted into the extensions dir";
+  EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source")) << "the stage must be consumed by promotion";
+}
+
+// A path that is not a readable file fails before any transaction directory is
+// created, and reports against the file name since no id exists yet.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsUnreadablePath) {
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(QDir(ext_dir_.path()).absoluteFilePath("does-not-exist.zip"));
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("Cannot read"));
+  EXPECT_TRUE(mgr_->installedExtensions().isEmpty());
+}
+
+// ---------------------------------------------------------------------------
+// [10] Enable / disable (installed but not loaded)
+// ---------------------------------------------------------------------------
+// A disabled extension stays on disk but the host must skip loading it. The
+// three surfaces that need to agree — the in-memory record on installed_[id],
+// the static disabledExtensionIds() the runtime catalog reads, and isEnabled()
+// — are exercised here so any one of them drifting alone would surface.
+
+// A fixture that starts every test from a clean QSettings key. The manager reads
+// the "Marketplace/disabledExtensions" list via QSettings() default scope, so a
+// residual list from a previous test (or the developer's machine) would leak in
+// and produce non-deterministic assertions.
+class ExtensionManagerEnableDisableTest : public ExtensionManagerTest {
+ protected:
+  void SetUp() override {
+    ExtensionManagerTest::SetUp();
+    QSettings().remove(kDisabledExtensionsKey);
+  }
+  void TearDown() override {
+    QSettings().remove(kDisabledExtensionsKey);
+    ExtensionManagerTest::TearDown();
+  }
+
+  // The manager owns this string as a private constant. Duplicated here so a
+  // rename on that side breaks the test at compile time (via the sync check
+  // further down) instead of silently starting to leak state.
+  static constexpr const char* kDisabledExtensionsKey = "Marketplace/disabledExtensions";
+};
+
+// A newly-arrived extension defaults to enabled: setEnabled() has never been
+// called and the QSettings list is empty.
+TEST_F(ExtensionManagerEnableDisableTest, IsEnabledDefaultsToTrueForUnknownIds) {
+  EXPECT_TRUE(mgr_->isEnabled("never-heard-of-it"));
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().isEmpty());
+}
+
+// Disabling an id appends it to the persisted list AND updates the in-memory
+// installed_[id].enabled record so the UI reads the new state without a
+// refreshInstalledFromDisk() round trip. The runtime catalog, which reads via
+// the static disabledExtensionIds(), sees the same list.
+TEST_F(ExtensionManagerEnableDisableTest, SetEnabledFalsePersistsAndUpdatesInMemoryRecord) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+  ASSERT_TRUE(mgr_->installedExtensions()["mock-data-source"].enabled);
+
+  mgr_->setEnabled("mock-data-source", false);
+
+  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+  EXPECT_FALSE(mgr_->installedExtensions()["mock-data-source"].enabled)
+      << "in-memory record must reflect the change without a rescan";
+  EXPECT_EQ(ExtensionManager::disabledExtensionIds(), QStringList{"mock-data-source"})
+      << "the static reader (used by PluginRuntimeCatalog::setDisabledIds) must see the same list";
+}
+
+// Enabling an already-enabled id (and disabling an already-disabled one) is a
+// no-op: the persisted list is unchanged. Guards against a bug where setEnabled
+// silently duplicated the id in the list, which would then double-count on
+// unset (an already-disabled id would need TWO enables to actually enable).
+TEST_F(ExtensionManagerEnableDisableTest, SetEnabledIsIdempotent) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  mgr_->setEnabled("mock-data-source", false);
+  mgr_->setEnabled("mock-data-source", false);  // idempotent
+  EXPECT_EQ(ExtensionManager::disabledExtensionIds(), QStringList{"mock-data-source"});
+
+  mgr_->setEnabled("mock-data-source", true);
+  mgr_->setEnabled("mock-data-source", true);  // idempotent
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().isEmpty());
+  EXPECT_TRUE(mgr_->isEnabled("mock-data-source"));
+}
+
+// Re-enabling removes the id and reflects it in the in-memory record too, so a
+// disable-then-enable sequence lands back where it started on both surfaces.
+TEST_F(ExtensionManagerEnableDisableTest, SetEnabledTrueRemovesIdFromDisabledList) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  mgr_->setEnabled("mock-data-source", false);
+  ASSERT_FALSE(mgr_->isEnabled("mock-data-source"));
+
+  mgr_->setEnabled("mock-data-source", true);
+  EXPECT_TRUE(mgr_->isEnabled("mock-data-source"));
+  EXPECT_TRUE(mgr_->installedExtensions()["mock-data-source"].enabled);
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().isEmpty());
+}
+
+// refreshInstalledFromDisk() must reflect the persisted disable state onto
+// every installed_[id].enabled record it rebuilds. Without this, a rescan
+// (bulk install, uninstall of an unrelated plugin, promotion of a staged
+// install) would silently reset the enabled flag to true for every plugin,
+// hiding the runtime effect of the toggle even though QSettings still holds
+// the disabled list.
+TEST_F(ExtensionManagerEnableDisableTest, RefreshFromDiskReflectsPersistedDisableState) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  mgr_->setEnabled("mock-data-source", false);
+  mgr_->refreshInstalledFromDisk();  // rebuild the installed_ map from scratch
+
+  EXPECT_FALSE(mgr_->installedExtensions()["mock-data-source"].enabled)
+      << "refresh must not clobber the persisted disabled state";
+  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+}
+
+// Disabling a plugin that is NOT installed still persists — an install that
+// arrives later must land in the disabled state. This is the sideload path:
+// the user might disable a plugin they know about before its ZIP even
+// arrives, and the choice has to survive the intervening install.
+TEST_F(ExtensionManagerEnableDisableTest, DisabledStateAppliesToLaterInstallOfSameId) {
+  mgr_->setEnabled("mock-data-source", false);
+  ASSERT_FALSE(mgr_->isEnabled("mock-data-source"));
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  EXPECT_FALSE(mgr_->installedExtensions()["mock-data-source"].enabled)
+      << "install must honour a pre-existing disabled state";
+  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+}
+
 }  // namespace
 }  // namespace PJ
 
@@ -1449,6 +1853,12 @@ TEST_F(ExtensionManagerTest, RefreshWipesStaleTransactionDirsAfterInstall) {
 
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
+  // ExtensionManager::disabledExtensionIds() reads via QSettings() with the
+  // process-wide default scope. Pin unique org/app names so a residual
+  // Marketplace/disabledExtensions entry from another PJ4 binary on the same
+  // developer machine cannot leak into these tests.
+  QCoreApplication::setOrganizationName("pj4-test-extension-manager");
+  QCoreApplication::setApplicationName("extension_manager_test");
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

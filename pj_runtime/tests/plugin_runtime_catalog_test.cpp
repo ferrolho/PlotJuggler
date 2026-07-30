@@ -669,6 +669,59 @@ TEST_F(PluginCatalogTest, RegisterStaticPluginsContinuesPastFailedEntryAndKeepsS
   EXPECT_EQ(catalog.messageParsers()[0].id, "good-parser");
 }
 
+// ─── setDisabledIds (installed-but-not-loaded winners are dropped before load) ──
+
+TEST_F(PluginCatalogTest, RuntimeCatalogDropsDisabledIdsFromWinners) {
+  // A winner whose id sits in disabled_ids_ must not appear in the loaded set —
+  // this is what turns the marketplace's "disable installed plugin" toggle into a
+  // real runtime effect on the next launch. The diagnostic tells the user WHY
+  // they don't see the plugin.
+  std::filesystem::copy_file(PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, dir_ / pluginFileName("ds"));
+
+  std::vector<Diagnostic> diagnostics;
+  PluginRuntimeCatalog catalog({}, [&](const Diagnostic& d) { diagnostics.push_back(d); });
+  catalog.setPluginDir(dir_);
+  catalog.setDisabledIds({"mock-data-source"});
+  catalog.scanDirectory();
+
+  EXPECT_TRUE(catalog.dataSources().empty()) << "the disabled id must not be loaded";
+  EXPECT_TRUE(std::ranges::any_of(diagnostics, [](const Diagnostic& d) {
+    return d.level == DiagnosticLevel::kInfo && d.message.find("disabled by user") != std::string::npos;
+  })) << "an info diagnostic must explain the skip";
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogKeepsIdsAbsentFromDisabledSet) {
+  // The filtering must be scoped: an unrelated id (or an empty disabled set)
+  // leaves every winner in place. Otherwise a copy/paste bug in setDisabledIds
+  // could quietly kill the loaded plugin set on every launch.
+  std::filesystem::copy_file(PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, dir_ / pluginFileName("ds"));
+
+  PluginRuntimeCatalog catalog;
+  catalog.setPluginDir(dir_);
+  catalog.setDisabledIds({"unrelated-id"});
+  catalog.scanDirectory();
+
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+  EXPECT_EQ(catalog.dataSources()[0].id, "mock-data-source");
+}
+
+TEST_F(PluginCatalogTest, RuntimeCatalogReloadHonoursNewlyDisabledId) {
+  // The disabled set is consulted on every scan, not baked in at construction:
+  // toggling a plugin off after startup, then calling reload(), must remove it
+  // from the loaded set. reload() reports the change (returns true), which is
+  // the signal the host uses to re-notify the app runtime.
+  std::filesystem::copy_file(PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, dir_ / pluginFileName("ds"));
+
+  PluginRuntimeCatalog catalog;
+  catalog.setPluginDir(dir_);
+  catalog.scanDirectory();
+  ASSERT_EQ(catalog.dataSources().size(), 1U);
+
+  catalog.setDisabledIds({"mock-data-source"});
+  EXPECT_TRUE(catalog.reload()) << "reload must report a change when a winner drops out";
+  EXPECT_TRUE(catalog.dataSources().empty());
+}
+
 // ─── compareSemver (pj_marketplace/version_compare.hpp — the shared version
 //     ordering used by the catalog dedup, the seed, and the marketplace) ──────────
 

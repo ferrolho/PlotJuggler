@@ -22,9 +22,9 @@
       </widget>
      </item>
      <item>
-      <widget class="PJ::ComboBox" name="category_combo_">
-       <property name="minimumWidth"><number>140</number></property>
-       <!-- Items populated in C++ to support QVariant userData -->
+      <widget class="QPushButton" name="install_local_btn_">
+       <property name="text"><string>Install local...</string></property>
+       <property name="toolTip"><string>Install a plugin from a local ZIP. The archive is not from the registry, so its origin cannot be verified — only that it holds a loadable plugin. Replacing an already-installed extension takes effect on the next restart.</string></property>
       </widget>
      </item>
      <item>
@@ -45,51 +45,126 @@
     </layout>
    </item>
 
-   <!-- Plugin list (left) + detail panel (right). Only this middle band is split;
-        the toolbar and status bar stay full width. A QSplitter (not a plain
-        QHBoxLayout) so the user can drag the boundary between the two panes. -->
+   <!-- Faceted filter row. Any number of toggles can be active at once: the four
+        category toggles OR among themselves (none checked means "any category"),
+        and "Installed" intersects that result. Right-aligned behind a spacer so the
+        row reads as a trailing control strip under the toolbar. Button labels are
+        the user-facing names only; the registry "category" values they map to live
+        in applyFilters() and deliberately differ from these labels. -->
    <item>
-    <widget class="QSplitter" name="content_split_">
-     <!-- Unlike the QHBoxLayout it replaces, a bare QSplitter widget defaults
-          to a Preferred/Preferred size policy and does not inherit its
-          children's Expanding vertical policy, so it stops claiming leftover
-          vertical space from main_layout without this override. -->
+    <layout class="QHBoxLayout" name="filter_layout">
+     <property name="spacing"><number>6</number></property>
+     <item>
+      <widget class="QLabel" name="filter_label">
+       <property name="text"><string>Show:</string></property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="filter_stretch">
+       <property name="orientation"><enum>Qt::Horizontal</enum></property>
+       <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_installed_">
+       <property name="text"><string>Installed</string></property>
+       <property name="toolTip"><string>Show only extensions that are already installed</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_data_loader_">
+       <property name="text"><string>Data Source</string></property>
+       <property name="toolTip"><string>Extensions that load data from files</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_data_streamer_">
+       <property name="text"><string>Data Streamer</string></property>
+       <property name="toolTip"><string>Extensions that stream data continuously</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_parser_">
+       <property name="text"><string>Parsers</string></property>
+       <property name="toolTip"><string>Extensions that decode byte blobs into fields</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_toolbox_">
+       <property name="text"><string>Toolboxes</string></property>
+       <property name="toolTip"><string>Extensions that add a tool with its own GUI</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
+   <!-- Plugin table: Name / Enabled / Version / Installed (state button) /
+        Description. Columns + resize modes are configured in setupUi(); the
+        Description column stretches to take the leftover width. -->
+   <item>
+    <widget class="QTableWidget" name="plugin_table_">
      <property name="sizePolicy">
       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
        <horstretch>0</horstretch><verstretch>0</verstretch>
       </sizepolicy>
      </property>
-     <property name="orientation"><enum>Qt::Horizontal</enum></property>
-     <property name="childrenCollapsible"><bool>false</bool></property>
-    <widget class="QScrollArea" name="scroll_area_">
-     <property name="widgetResizable"><bool>true</bool></property>
      <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
-     <!-- Background is theme-aware; applied at runtime in setupUi(). -->
+    </widget>
+   </item>
 
-     <widget class="QWidget" name="cards_container">
-      <property name="geometry">
-       <rect><x>0</x><y>0</y><width>618</width><height>440</height></rect>
-      </property>
-      <layout class="QVBoxLayout" name="cards_layout_">
-       <property name="spacing"><number>8</number></property>
-       <property name="leftMargin"><number>0</number></property>
-       <property name="topMargin"><number>0</number></property>
-       <property name="rightMargin"><number>8</number></property>
-       <property name="bottomMargin"><number>0</number></property>
-       <item>
-        <spacer name="cards_stretch">
-         <property name="orientation"><enum>Qt::Vertical</enum></property>
-         <property name="sizeHint" stdset="0"><size><width>20</width><height>16</height></size></property>
-        </spacer>
-       </item>
-      </layout>
-     </widget>
-    </widget>
-    <widget class="QScrollArea" name="detail_scroll_">
-     <property name="widgetResizable"><bool>true</bool></property>
+   <!-- Details footer (VS Code-style): a greyish panel BELOW the table showing
+        the selected plugin's full description + changelog + metadata. Styled via
+        the QFrame#marketplaceDetailFooter QSS rule; height is bounded so it never
+        crowds out the table. -->
+   <item>
+    <widget class="QFrame" name="marketplaceDetailFooter">
      <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
-     <widget class="QWidget" name="detail_container_"/>
-    </widget>
+     <property name="minimumSize"><size><width>0</width><height>68</height></size></property>
+     <property name="maximumSize"><size><width>16777215</width><height>120</height></size></property>
+     <layout class="QVBoxLayout" name="detail_footer_layout">
+      <property name="leftMargin"><number>10</number></property>
+      <property name="topMargin"><number>6</number></property>
+      <property name="rightMargin"><number>10</number></property>
+      <property name="bottomMargin"><number>6</number></property>
+      <property name="spacing"><number>4</number></property>
+      <!-- Header row at the plugin-title height: title on the left, and (only
+           for installed plugins) a green enable/disable toggle on the right,
+           mirroring the table's Enabled column. Wired in updateDetailFooter. -->
+      <item>
+       <layout class="QHBoxLayout" name="detail_header_layout">
+        <property name="spacing"><number>8</number></property>
+        <item>
+         <widget class="QLabel" name="detail_title_">
+          <property name="text"><string/></property>
+          <property name="styleSheet"><string>font-weight:700; font-size:14px;</string></property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="detail_header_stretch">
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+          <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
+         </spacer>
+        </item>
+        <item>
+         <widget class="PJ::ToggleSwitch" name="detail_enable_toggle_"/>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QTextBrowser" name="detail_text_">
+        <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+        <property name="openExternalLinks"><bool>true</bool></property>
+       </widget>
+      </item>
+      <!-- Action row at the bottom-right (rebuilt per selection in
+           updateDetailFooter): Visit Website + Uninstall/Downgrade + the primary
+           action. A leading stretch is added in code to push them right. -->
+      <item>
+       <layout class="QHBoxLayout" name="detail_buttons_layout">
+        <property name="spacing"><number>8</number></property>
+       </layout>
+      </item>
+     </layout>
     </widget>
    </item>
 
@@ -140,9 +215,14 @@
    <header>pj_widgets/Search.h</header>
   </customwidget>
   <customwidget>
-   <class>PJ::ComboBox</class>
-   <extends>QComboBox</extends>
-   <header>pj_widgets/ComboBox.h</header>
+   <class>PJ::CheckButton</class>
+   <extends>QAbstractButton</extends>
+   <header>pj_widgets/CheckButton.h</header>
+  </customwidget>
+  <customwidget>
+   <class>PJ::ToggleSwitch</class>
+   <extends>QWidget</extends>
+   <header>pj_widgets/ToggleSwitch.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

@@ -6,7 +6,9 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QStorageInfo>
+#include <QStringList>
 #include <QUuid>
 #include <filesystem>
 
@@ -25,6 +27,9 @@ static constexpr const char* kPendingUninstallMarker = ".pj_pending_uninstall";
 static constexpr const char* kPendingInstallIntent = ".pj_pending_install";
 static constexpr const char* kQuarantinePrefix = ".pj_quarantine_";
 static constexpr int kMaxDiagnostics = 50;
+// QSettings key holding the QStringList of disabled extension ids (installed but
+// not loaded). Read by both the marketplace and the runtime plugin catalog.
+static constexpr const char* kDisabledExtensionsKey = "Marketplace/disabledExtensions";
 
 QString extRoot(const QString& extensions_dir, const QString& id) {
   return QDir(extensions_dir).absoluteFilePath(id);
@@ -80,11 +85,24 @@ bool isTransactionDirectoryName(const QString& name) {
   return name.startsWith(".pj_install_");
 }
 
-QString validateTransactionContents(const QString& transaction_root, const QString& expected_id) {
-  const QDir tx_dir(transaction_root);
+// Absolute path of the single top-level directory a freshly extracted archive must
+// contain, or an empty string when it holds anything else.
+QString soleTopLevelDirectory(const QString& transaction_root) {
   const QFileInfoList entries =
-      tx_dir.entryInfoList(QDir::Dirs | QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
-  if (entries.size() != 1 || !entries.first().isDir() || entries.first().fileName() != expected_id) {
+      QDir(transaction_root)
+          .entryInfoList(QDir::Dirs | QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
+  if (entries.size() != 1 || !entries.first().isDir()) {
+    return {};
+  }
+  return entries.first().absoluteFilePath();
+}
+
+// Registry installs additionally require that directory to be named for the id the
+// registry declared; a sideload cannot check that, since the id only becomes known
+// once the manifest inside that very directory has been read.
+QString validateTransactionContents(const QString& transaction_root, const QString& expected_id) {
+  const QString root = soleTopLevelDirectory(transaction_root);
+  if (root.isEmpty() || QFileInfo(root).fileName() != expected_id) {
     return QString("Downloaded artifact must contain exactly one top-level directory named \"%1\"").arg(expected_id);
   }
   return {};
@@ -132,6 +150,9 @@ DirectoryDiscovery discoverExtensionDirectory(const QString& ext_root) {
   result.record.install_date = QFileInfo(ext_root).lastModified();
   result.record.path = ext_root;
   result.record.enabled = true;
+  result.record.name = first.name.empty() ? result.record.id : QString::fromStdString(first.name);
+  result.record.description = QString::fromStdString(first.description);
+  result.record.category = QString::fromStdString(first.category);
   return result;
 }
 
@@ -151,7 +172,7 @@ QString validateRegistryIntent(
   return {};
 }
 
-bool writePendingInstallIntent(const QString& root, const Extension& ext, QString* error) {
+bool writePendingInstallIntent(const QString& root, const QString& id, const QString& version, QString* error) {
   QFile file(pendingInstallIntentPath(root));
   if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
     if (error != nullptr) {
@@ -160,7 +181,7 @@ bool writePendingInstallIntent(const QString& root, const Extension& ext, QStrin
     return false;
   }
 
-  const QByteArray data = ext.id.toUtf8() + '\n' + ext.version.toUtf8() + '\n';
+  const QByteArray data = id.toUtf8() + '\n' + version.toUtf8() + '\n';
   if (file.write(data) != data.size()) {
     if (error != nullptr) {
       *error = QString("Could not write staged install intent: %1").arg(file.errorString());
@@ -260,6 +281,173 @@ void ExtensionManager::initComponents() {
 void ExtensionManager::install(const Extension& ext) {
   refreshInstalledFromDisk();
   doInstall(ext, /*staging=*/false);
+}
+
+void ExtensionManager::installFromLocalZip(const QString& zip_path) {
+  // Until the manifest is read there is no id to name, so failures raised before
+  // that point are reported against the file name.
+  const QString file_label = QFileInfo(zip_path).fileName();
+
+  if (!pending_id_.isEmpty()) {
+    emitInstallFailure(file_label, QString("Install of \"%1\" is already in progress").arg(pending_id_));
+    return;
+  }
+  if (const QFileInfo info(zip_path); !info.isFile() || !info.isReadable()) {
+    emitInstallFailure(file_label, QString("Cannot read \"%1\"").arg(zip_path));
+    return;
+  }
+
+  // After the cheap guards: this walks the governed dir and dlopens each plugin, so
+  // a rejected click should not pay for it. Kept because it also sweeps stale
+  // transaction dirs and keeps installed_ coherent for the registration below; the
+  // conflict check no longer depends on it.
+  refreshInstalledFromDisk();
+
+  QDir().mkpath(extensions_dir_);
+  // Extraction lands beside the final destination so the promoting rename is an
+  // atomic same-filesystem move. The transaction directory is named after the
+  // file rather than the extension id, which is still unknown at this point; the
+  // ".pj_install_" prefix is what refreshInstalledFromDisk() recognises, so the
+  // in-progress guard below still protects it.
+  const QString transaction_root = makeTransactionRoot(extensions_dir_, u"local"_s);
+  QDir().mkpath(transaction_root);
+
+  pending_id_ = file_label;
+  pending_extract_dir_ = QDir::cleanPath(transaction_root);
+
+  dl_finished_conn_ = connect(downloader_, &DownloadManager::finished, this, [this, transaction_root](int id) {
+    if (id != pending_op_id_) {
+      return;
+    }
+    disconnectDlConns();
+    pending_id_.clear();
+    pending_op_id_ = -1;
+
+    auto fail = [&](const QString& failed_id, const QString& message) {
+      removeDirectoryIfSet(transaction_root);
+      pending_extract_dir_.clear();
+      emitInstallFailure(failed_id, message);
+    };
+
+    const QString root = soleTopLevelDirectory(transaction_root);
+    if (root.isEmpty()) {
+      fail({}, u"ZIP must contain exactly one top-level directory holding the plugin"_s);
+      return;
+    }
+
+    // The manifest read here is the whole validation: it dlopens the DSO at its
+    // transaction path and reports the id/version it declares about itself.
+    const DirectoryDiscovery discovered = discoverExtensionDirectory(root);
+    if (!discovered.found_plugin) {
+      fail({}, QString("Not a valid plugin package: %1").arg(discovered.error));
+      return;
+    }
+
+    const QString ext_id = discovered.record.id;
+    if (const QString id_error = invalidExtensionIdReason(ext_id); !id_error.isEmpty()) {
+      fail(ext_id, id_error);
+      return;
+    }
+    // Asked of the DESTINATION directory, not of installed_: that snapshot is
+    // scoped to the governed dir, which under a --plugin-dir override is not
+    // where this install lands. Reading it here is safe even though the comment
+    // in applyPendingInstalls warns against opening a directory about to be
+    // replaced — a confirmed replacement is staged, so the promotion happens in
+    // the next process, where this dlopen cannot serve a stale image.
+    if (isInstalled(ext_id)) {
+      if (!replace_confirmation_) {
+        fail(ext_id, QString("Extension \"%1\" is already installed").arg(ext_id));
+        return;
+      }
+      if (!replace_confirmation_(ext_id, installed_[ext_id].version, discovered.record.version)) {
+        fail(ext_id, QString("Replacing \"%1\" was cancelled").arg(ext_id));
+        return;
+      }
+
+      emit installStarted(ext_id);
+
+      // Staged rather than written over the live directory: the running session
+      // may hold this DSO loaded, and dlopen keys its cache by path name, so a
+      // same-path replacement would never be re-read. applyPendingInstalls()
+      // promotes the stage at the next launch and backs up the displaced copy.
+      // No version comparison: rebuilding without bumping the version is the
+      // normal case for a local archive.
+      QString intent_error;
+      if (!writePendingInstallIntent(root, ext_id, discovered.record.version, &intent_error)) {
+        fail(ext_id, intent_error);
+        return;
+      }
+      QDir().mkpath(pending_dir_);
+      const QString staged_root = pendingRoot(pending_dir_, ext_id);
+      if (QDir(staged_root).exists() && !QDir(staged_root).removeRecursively()) {
+        fail(ext_id, QString("Could not replace existing staged install directory \"%1\"").arg(staged_root));
+        return;
+      }
+      if (!QDir().rename(root, staged_root)) {
+        fail(ext_id, QString("Could not stage install to \"%1\"").arg(staged_root));
+        return;
+      }
+
+      removeDirectoryIfSet(transaction_root);
+      pending_extract_dir_.clear();
+      emit installPendingRestart(ext_id);
+      return;
+    }
+
+    emit installStarted(ext_id);
+
+    // The managed layout keys directories by extension id, whereas the archive
+    // used whatever name its author chose.
+    const QString dst = extRoot(extensions_dir_, ext_id);
+    replaceConflictingInstallDirs(ext_id, dst);
+    if (QDir(dst).exists() && !QDir(dst).removeRecursively()) {
+      fail(ext_id, QString("Could not replace existing extension directory \"%1\"").arg(dst));
+      return;
+    }
+    if (!QDir().rename(root, dst)) {
+      fail(ext_id, QString("Could not install to \"%1\"").arg(dst));
+      return;
+    }
+
+    // Re-read at the final location: rpath or relative-path assumptions can hold
+    // inside the transaction directory and break here. This is a different path
+    // from the pre-rename read, so the dlopen path-name cache cannot serve a
+    // stale image of it.
+    const DirectoryDiscovery final_check = discoverExtensionDirectory(dst);
+    if (!final_check.found_plugin || final_check.record.id != ext_id) {
+      QDir(dst).removeRecursively();
+      fail(
+          ext_id, QString("Post-install validation failed: %1")
+                      .arg(
+                          final_check.found_plugin ? QString("embedded id changed to \"%1\"").arg(final_check.record.id)
+                                                   : final_check.error));
+      return;
+    }
+
+    removeDirectoryIfSet(transaction_root);
+    pending_extract_dir_.clear();
+    registerInstalledExtension(ext_id, dst, final_check.record);
+    emit installFinished(ext_id, true);
+  });
+
+  dl_failed_conn_ =
+      connect(downloader_, &DownloadManager::failed, this, [this, transaction_root](int id, const QString& error) {
+        if (id != pending_op_id_) {
+          return;
+        }
+        disconnectDlConns();
+        const QString failed_label = pending_id_;
+        pending_id_.clear();
+        pending_op_id_ = -1;
+        pending_extract_dir_.clear();
+        removeDirectoryIfSet(transaction_root);
+        emitInstallFailure(failed_label, error);
+      });
+
+  // A local file is served through the same fetch path as a remote artifact: an
+  // empty expected checksum skips verification, which is correct here because a
+  // local archive has nothing to be verified against.
+  pending_op_id_ = downloader_->fetch(QUrl::fromLocalFile(zip_path), /*expected_checksum=*/QString(), transaction_root);
 }
 
 void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_existing) {
@@ -367,7 +555,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
 
         if (staging) {
           QString intent_error;
-          if (!writePendingInstallIntent(root, ext, &intent_error)) {
+          if (!writePendingInstallIntent(root, ext.id, ext.version, &intent_error)) {
             fail_after_extraction(intent_error);
             return;
           }
@@ -930,6 +1118,40 @@ void ExtensionManager::refreshInstalledFromDisk() {
     discovered[item.record.id] = item.record;
   }
   installed_ = std::move(discovered);
+
+  // Reflect the persisted enable/disable state on each record so the UI can read
+  // installedExtensions()[id].enabled without consulting QSettings itself.
+  const QStringList disabled = disabledExtensionIds();
+  for (auto it = installed_.begin(); it != installed_.end(); ++it) {
+    it.value().enabled = !disabled.contains(it.key());
+  }
+}
+
+QStringList ExtensionManager::disabledExtensionIds() {
+  return QSettings().value(QLatin1String(kDisabledExtensionsKey)).toStringList();
+}
+
+bool ExtensionManager::isEnabled(const QString& id) const {
+  return !disabledExtensionIds().contains(id);
+}
+
+void ExtensionManager::setEnabled(const QString& id, bool enabled) {
+  QStringList disabled = disabledExtensionIds();
+  const bool currently_disabled = disabled.contains(id);
+  if (enabled == !currently_disabled) {
+    return;  // already in the requested state
+  }
+  if (enabled) {
+    disabled.removeAll(id);
+  } else {
+    disabled.append(id);
+  }
+  QSettings().setValue(QLatin1String(kDisabledExtensionsKey), disabled);
+  // Keep the in-memory record in sync so the UI updates without a full rescan;
+  // the actual load/unload happens on the next launch.
+  if (installed_.contains(id)) {
+    installed_[id].enabled = enabled;
+  }
 }
 
 void ExtensionManager::setInstalledExtensions(QMap<QString, InstalledExtension> installed) {
