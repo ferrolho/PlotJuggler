@@ -467,7 +467,9 @@ QDomElement WasmPosesInFrameLayer::xmlSaveState(QDomDocument& document) const {
 }
 
 std::optional<WasmPosesInFrameLayer::ParsedSettings> WasmPosesInFrameLayer::parseSettings(const QDomElement& element) {
-  if (element.isNull() || element.tagName() != "poses_in_frame"_L1 || !detail::isLeafPayload(element)) {
+  // Accept-and-ignore the desktop build's nested <trail>: the browser has no
+  // trail layer, but a desktop-saved layout must still restore the poses.
+  if (element.isNull() || element.tagName() != "poses_in_frame"_L1 || !detail::isLeafPayload(element, "trail"_L1)) {
     return std::nullopt;
   }
   ParsedSettings settings;

@@ -21,6 +21,7 @@
 #include "pj_scene3d_widgets/passes/trail_render_pass.h"
 #include "pj_scene3d_widgets/scene3d_layer.h"
 
+class QFormLayout;
 class QWidget;
 
 namespace pj::scene3d {
@@ -102,6 +103,11 @@ class TrailLayer : public Scene3DLayer {
   void releaseGL() override;
 
   QWidget* createConfigWidget(QWidget* parent) override;
+  // Appends this trail's style rows (thickness, past/future colour + eye) to an
+  // existing form. Split out of createConfigWidget so an owner that embeds a
+  // trail — PosesInFrameLayer — shows the identical controls inside its own
+  // settings panel instead of duplicating them.
+  void appendStyleRows(QFormLayout* form, QWidget* parent);
 
   [[nodiscard]] const TrailSource& source() const {
     return source_;

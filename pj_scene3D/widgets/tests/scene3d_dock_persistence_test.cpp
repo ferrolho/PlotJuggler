@@ -1264,7 +1264,7 @@ TEST(Scene3DDockPersistence, TfTrailRemovedWhenItsDatasetUnloads) {
   EXPECT_TRUE(dock.layers().empty()) << "the TF trail must be removed with its dataset";
 }
 
-TEST(Scene3DDockPersistence, PoseLayerTrailRequestedSignalCreatesTrail) {
+TEST(Scene3DDockPersistence, PoseLayerOwnsEmbeddedTrailInsteadOfAddingALayer) {
   PJ::SessionManager session;
   pj::scene3d::TransformService transform_service(session);
   const DatasetTopic tf = registerTfDataset(session, "signal.dat", "/tf");
@@ -1277,39 +1277,49 @@ TEST(Scene3DDockPersistence, PoseLayerTrailRequestedSignalCreatesTrail) {
   ASSERT_TRUE(dock.addTopic(pose_topic, PJ::sdk::BuiltinObjectType::kPosesInFrame, u"poses"_s));
   ASSERT_EQ(dock.layers().size(), 1U);
 
-  // The config widget's "Create trail" button emits trailRequested(); the
-  // factory-creator connect must turn it into a pose-source trail layer.
   auto* poses = dynamic_cast<pj::scene3d::PosesInFrameLayer*>(dock.layerFor(pose_topic));
   ASSERT_NE(poses, nullptr);
-  emit poses->trailRequested();
-  ASSERT_EQ(dock.layers().size(), 2U);
-  bool found_trail = false;
-  for (const PJ::SceneLayerInfo& info : dock.layers()) {
-    if (auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(dock.layerFor(info.topic_id)); trail != nullptr) {
-      found_trail = true;
-      EXPECT_EQ(trail->source().kind, pj::scene3d::TrailSource::Kind::kPoseTopic);
-      EXPECT_EQ(trail->source().topic, pose_topic);
-    }
-  }
-  EXPECT_TRUE(found_trail);
+  EXPECT_FALSE(poses->trailEnabled()) << "the trail is opt-in";
 
-  // The pose SOURCE identity is payload-owned (the RobotModelLayer idiom): the
-  // trail's own <trail> element carries the resolvable topic reference.
+  poses->setTrailEnabled(true);
+  ASSERT_TRUE(poses->trailEnabled());
+  ASSERT_NE(poses->trail(), nullptr);
+  // The whole point of the embedded shape: no second Topics row, no separate
+  // settings panel — the trail is part of the pose layer.
+  EXPECT_EQ(dock.layers().size(), 1U) << "an owned trail must not register as a dock layer";
+  EXPECT_EQ(poses->trail()->source().kind, pj::scene3d::TrailSource::Kind::kPoseTopic);
+  EXPECT_EQ(poses->trail()->source().topic, pose_topic);
+
+  poses->trail()->setThickness(7.0F);
+  poses->trail()->setPastColor(QColor(u"#123456"_s));
+  poses->trail()->setFutureVisible(false);
+
   QDomDocument doc;
   const QDomElement state = dock.xmlSaveState(doc);
-  bool payload_checked = false;
+  // No layout element may carry the standalone trail role any more.
   for (QDomElement layer_el = state.firstChildElement(u"layer"_s); !layer_el.isNull();
        layer_el = layer_el.nextSiblingElement(u"layer"_s)) {
-    if (layer_el.attribute(u"role"_s) != u"trail"_s) {
-      continue;
-    }
-    const QDomElement payload = layer_el.firstChildElement(u"trail"_s);
-    EXPECT_EQ(payload.attribute(u"source_topic_name"_s), u"/odom"_s);
-    EXPECT_EQ(payload.attribute(u"source_dataset_source"_s), u"signal.dat"_s);
-    EXPECT_TRUE(layer_el.attribute(u"topic_name"_s).isEmpty()) << "the wrapper keeps its local-layer blanks";
-    payload_checked = true;
+    EXPECT_NE(layer_el.attribute(u"role"_s), u"trail"_s) << "a pose trail must persist nested, not as its own layer";
   }
-  EXPECT_TRUE(payload_checked);
+
+  PJ::Scene3DDockWidget load_dock;
+  load_dock.setSessionManager(&session);
+  load_dock.setTransformService(&transform_service);
+  ASSERT_TRUE(load_dock.xmlLoadState(state));
+  auto* restored = dynamic_cast<pj::scene3d::PosesInFrameLayer*>(load_dock.layerFor(pose_topic));
+  ASSERT_NE(restored, nullptr);
+  ASSERT_TRUE(restored->trailEnabled()) << "the nested <trail> payload is the enabled flag";
+  EXPECT_EQ(load_dock.layers().size(), 1U);
+  EXPECT_FLOAT_EQ(restored->trail()->thickness(), 7.0F);
+  EXPECT_EQ(restored->trail()->pastColor().name(QColor::HexRgb), u"#123456"_s);
+  EXPECT_FALSE(restored->trail()->futureVisible());
+
+  // Disabling drops the trail entirely (and with it the nested payload).
+  restored->setTrailEnabled(false);
+  EXPECT_EQ(restored->trail(), nullptr);
+  QDomDocument off_doc;
+  const QDomElement off_state = restored->xmlSaveState(off_doc);
+  EXPECT_TRUE(off_state.firstChildElement(u"trail"_s).isNull());
 }
 
 TEST(Scene3DDockPersistence, TrailRestoreRejectsMalformedElements) {

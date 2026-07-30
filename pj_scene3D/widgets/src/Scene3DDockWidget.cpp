@@ -77,6 +77,19 @@ using pj::scene3d::validateCameraState;
 using pj::scene3d::ValidatedCameraState;
 using pj::scene3d::VoxelGridLayer;
 
+// The TrailLayer a scene layer IS (a standalone TF-frame trail) or OWNS (a pose
+// layer's embedded trail), else nullptr. One lookup so every trail-wide fan-out
+// — notably the TF-buffer re-bind — reaches both flavors.
+pj::scene3d::TrailLayer* trailOf(ISceneLayer* layer) {
+  if (auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(layer); trail != nullptr) {
+    return trail;
+  }
+  if (const auto* poses = dynamic_cast<const PosesInFrameLayer*>(layer); poses != nullptr) {
+    return poses->trail();
+  }
+  return nullptr;
+}
+
 // Stable enum <-> on-disk-name table for the camera model, persisted in the
 // layout. The enum value == combo index, so the on-disk name stays independent of
 // the combo's display order; one table feeds both directions so they can't drift.
@@ -287,9 +300,6 @@ Scene3DDockWidget::Scene3DDockWidget(QWidget* parent) : SceneDockWidget(parent) 
         prepareTransformBufferForTopic(topic_id);
         auto layer = std::make_unique<PosesInFrameLayer>(topic_id, display_name, this);
         wireScene3DLayer(layer.get());
-        connect(layer.get(), &PosesInFrameLayer::trailRequested, this, [this, topic_id]() {
-          addTrailLayer(pj::scene3d::TrailSource::poseTopic(topic_id));
-        });
         return layer;
       });
   layerFactory().registerType(
@@ -997,7 +1007,7 @@ void Scene3DDockWidget::resetTransformBindingIfDatasetGone() {
 
 void Scene3DDockWidget::pushTransformBufferToTrailLayers() {
   for (const SceneLayerInfo& info : layers()) {
-    if (auto* trail = dynamic_cast<pj::scene3d::TrailLayer*>(layerFor(info.topic_id)); trail != nullptr) {
+    if (auto* trail = trailOf(layerFor(info.topic_id)); trail != nullptr) {
       trail->setTransformBuffer(tf_buffer_);
     }
   }

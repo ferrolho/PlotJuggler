@@ -12,10 +12,19 @@ namespace pj::scene3d::detail {
 // Layer payloads are attribute-only leaves. Unknown attributes are deliberately
 // ignored for forward compatibility, while unknown nested elements remain a
 // structural error because an older build cannot faithfully restore them.
-inline bool isLeafPayload(const QDomElement& element) {
+// `allowed_nested_tag` carves out the one exception: a layer that OWNS a
+// sub-layer persists it as a single nested payload of that tag
+// (PosesInFrameLayer's embedded <trail>). Every other nested element still
+// fails, and so does a second copy of the allowed one.
+inline bool isLeafPayload(const QDomElement& element, QLatin1String allowed_nested_tag = {}) {
+  bool seen_nested = false;
   for (QDomNode child = element.firstChild(); !child.isNull(); child = child.nextSibling()) {
     if (child.isElement()) {
-      return false;
+      if (allowed_nested_tag.isEmpty() || seen_nested || child.toElement().tagName() != allowed_nested_tag) {
+        return false;
+      }
+      seen_nested = true;
+      continue;
     }
     if ((child.isText() || child.isCDATASection()) && !child.nodeValue().trimmed().isEmpty()) {
       return false;

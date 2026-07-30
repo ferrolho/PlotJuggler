@@ -578,27 +578,6 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
   addGridRow(tm_grid, tm_row, tr("Model/URDF"), model_source_combo_, add_model_button_);
   connect(add_model_button_, &QToolButton::clicked, this, &Scene3DConfigPanel::onAddModelClicked);
 
-#ifndef PJ_TARGET_WASM
-  trail_frame_combo_ = new ComboBox;
-  trail_frame_combo_->setFocusPolicy(Qt::ClickFocus);
-  trail_frame_combo_->setToolTip(tr("TF frame whose motion trail to draw"));
-  add_trail_button_ = new QToolButton(this);
-  add_trail_button_->setAutoRaise(true);
-  add_trail_button_->setFocusPolicy(Qt::NoFocus);
-  add_trail_button_->setToolTip(tr("Add a motion trail for the selected frame"));
-  sizeTrailingButton(add_trail_button_);
-  addGridRow(tm_grid, tm_row, tr("Trail"), trail_frame_combo_, add_trail_button_);
-  connect(add_trail_button_, &QToolButton::clicked, this, [this]() {
-    if (bound_dock_ == nullptr || trail_frame_combo_ == nullptr) {
-      return;
-    }
-    const QString frame = trail_frame_combo_->currentData().toString();
-    if (!frame.isEmpty()) {
-      bound_dock_->addTrailLayer(pj::scene3d::TrailSource::tfFrame(frame));
-    }
-  });
-#endif  // PJ_TARGET_WASM: trails are native-only
-
   // One row per panel-added robot model (name + bin), appended below the
   // Model/URDF row by addRobotRow. Hosted in a widget that spans all three
   // columns and stays hidden while empty — an empty grid row would otherwise
@@ -639,6 +618,29 @@ void Scene3DConfigPanel::buildSceneControls(QVBoxLayout* root) {
       [this](const QVariant& v) { collision_opacity_->setValue(v.toDouble()); },
       qOverload<double>(&DoubleScrubber::valueChanged));
   addGridRow(tm_grid, tm_row, tr("Collision opacity"), collision_opacity_, collision_eye_);
+
+#ifndef PJ_TARGET_WASM
+  // Last row: unlike the rows above it does not edit existing scene state, it
+  // creates a new trail layer.
+  trail_frame_combo_ = new ComboBox;
+  trail_frame_combo_->setFocusPolicy(Qt::ClickFocus);
+  trail_frame_combo_->setToolTip(tr("TF frame whose motion trail to draw"));
+  add_trail_button_ = new QToolButton(this);
+  add_trail_button_->setAutoRaise(true);
+  add_trail_button_->setFocusPolicy(Qt::NoFocus);
+  add_trail_button_->setToolTip(tr("Add a motion trail for the selected frame"));
+  sizeTrailingButton(add_trail_button_);
+  addGridRow(tm_grid, tm_row, tr("Create Trail"), trail_frame_combo_, add_trail_button_);
+  connect(add_trail_button_, &QToolButton::clicked, this, [this]() {
+    if (bound_dock_ == nullptr || trail_frame_combo_ == nullptr) {
+      return;
+    }
+    const QString frame = trail_frame_combo_->currentData().toString();
+    if (!frame.isEmpty()) {
+      bound_dock_->addTrailLayer(pj::scene3d::TrailSource::tfFrame(frame));
+    }
+  });
+#endif  // PJ_TARGET_WASM: trails are native-only
 
   // Pin both grids' label column to the widest label across BOTH sections, read
   // back from the labels just added (no separate string list to keep in sync).

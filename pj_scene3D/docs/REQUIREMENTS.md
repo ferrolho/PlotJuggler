@@ -133,12 +133,29 @@ Behavioral contract: whole-range always (no duration window in v1); vertex cap 5
 decimation (endpoints kept); TF-unresolvable samples are skipped (the strip bridges the gap);
 scrubbing moves only the color split (no geometry rebuild — repaint-gate friendly); trails grow at
 the live edge under streaming and ring-trim at the cap; a full rebuild under live retention can
-only see the retention window. Created via right-click on a frame gizmo, the panel's "Trail" row,
-or a pose layer's "Create trail" button; persisted in layout XML (`role="trail"`, synthetic local
-id) including colors and thickness. Lifecycle: a missing FRAME merely orphans a TF trail (it
-revives if the frame returns), but unloading the bound TF dataset removes it; a pose-source trail
-is removed when its source topic is evicted. Deferred: duration window, orientation ticks, exact
-interpolated split, strip-breaking at gaps, `PosesInFrame` array-as-path.
+only see the retention window. Deferred: duration window, orientation ticks, exact interpolated
+split, strip-breaking at gaps, `PosesInFrame` array-as-path.
+
+The two sources differ in how a trail is created, and therefore in what owns it:
+
+- **TF trails are standalone layers.** Created by right-clicking a frame gizmo or from the panel's
+  "Trail" row; they get their own Topics row and settings panel, and persist as a layout layer
+  (`role="trail"`, synthetic local id). A missing FRAME merely orphans one (it revives if the frame
+  returns), but unloading the bound TF dataset removes it.
+- **Pose trails are owned by their pose layer.** A `kPosesInFrame` layer's settings panel carries a
+  "Trail" toggle; enabling it builds a trail this layer owns outright, so it has no Topics row and
+  no panel of its own — its thickness/colour rows are appended to the pose layer's own settings
+  (the identical controls, via `TrailLayer::appendStyleRows`). It persists as a nested `<trail>`
+  payload inside `<poses_in_frame>` — the payload's presence IS the enabled flag — and is torn
+  down with its owner, so it needs no separate prune rule. The trail is opt-in because building it
+  samples the topic's whole history.
+
+  Known consequence, not yet decided: because copy/paste and "Apply to family" round-trip a layer
+  through the same `xmlSaveState`/`xmlLoadState` pair, pasting also turns the trail on or off on
+  the target — so applying to a family of pose layers builds a trail on each (a synchronous
+  whole-history rebuild apiece), and pasting from a trail-less layer removes the target's trail.
+  Separating "save for layout" from "save for paste" needs an `ISceneLayer` API change; until then
+  this is the behavior.
 
 ## 4. Scene composition model
 

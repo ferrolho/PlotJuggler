@@ -7,7 +7,10 @@ coordinate-triad gizmos), dense voxel grids (`VoxelGridLayer`, drawn as
 GPU-instanced cubes), depth images back-projected into point clouds
 (`DepthCloudLayer`), and motion **trails** (`TrailLayer`: a frame's — or a
 pose topic's first-pose — trajectory over the whole time range as a
-split-colored screen-space ribbon; see ARCHITECTURE.md → "Trail layer")); `PosesInFrame` array-as-path rendering and laserscans remain
+split-colored screen-space ribbon. A TF trail is a standalone layer; a pose
+trail is instead OWNED by its `PosesInFrameLayer` (a "Trail" toggle in that
+layer's settings, no Topics row of its own) — see ARCHITECTURE.md →
+"Trail layer")); `PosesInFrame` array-as-path rendering and laserscans remain
 future work. Sibling widget family to `pj_scene2D`.
 
 `VoxelGridLayer` consumes `sdk::VoxelGrid` (SDK ≥ 0.10.0): a dense 3D lattice

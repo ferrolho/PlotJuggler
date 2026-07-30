@@ -545,20 +545,42 @@ the behavioral contract; the as-built mechanics:
   reduced to a thin host that honors the result. Restore branches BEFORE the
   object-type gate. `xmlLoadState` applies STYLE only — family copy/paste
   (PR #204) restyles, never retargets.
-  Pruning: a pose-source trail is dropped when its SOURCE topic is evicted
-  (`pruneEvictedObjects` checks it explicitly — synthetic ids skip the standard
-  sweep). A TF-source trail orphans on a merely-missing frame (it revives if
+  Pruning: a TF-source trail orphans on a merely-missing frame (it revives if
   the frame returns, like a follow target) but is REMOVED when the bound TF
   dataset unloads (`resetTransformBindingIfDatasetGone` deletes TF trails
   before dropping the binding — a gone dataset deletes, a gone frame orphans).
+- **Pose trails are owned, not registered.** `PosesInFrameLayer` holds a
+  `std::unique_ptr<TrailLayer>` (no QObject parent) that is never handed to the
+  dock, so it has no Topics row, no settings panel, and no synthetic id. The
+  owner forwards the full lifecycle — `attach`/`detach`, `initializeGL`/
+  `render`/`releaseGL`, `setFixedFrame`/`setTrackerTime`/`setVisible` — and
+  re-emits the trail's `repaintRequested`/`configurationChanged`/
+  `statusWarningChanged`, plus relays `statusWarning()`, since the dock only
+  polls REGISTERED layers and an embedded trail would otherwise fail silently.
+  Two forwarding hazards are load-bearing: the trail renders BEFORE the pose
+  layer's early-outs (it must still draw on ticks with no decoded pose set);
+  and unlike the gizmos the trail REBUILDS against the fixed frame, so the
+  owner caches `fixed_frame_` to hand to a trail enabled later. Enabling
+  happens outside a GL context, but needs no special handling: the view calls
+  `initializeGL()` on every layer every paint (see `Scene3DLayer::initializeGL`
+  — passes self-guard on `initialized_`), so the forward covers it.
+  Persistence nests the
+  trail's own `<trail>` element inside `<poses_in_frame>` (presence == enabled;
+  `isLeafPayloadWithOptionalChild` admits exactly that one child), reusing
+  `TrailLayer::xmlSaveState`/`xmlLoadState` — the style-only load is exactly
+  right here, because the source is the owner's topic and is never retargeted
+  by a payload.
 - **Entry points.** Right-click on a frame gizmo — `SceneViewWidget::
   contextMenuEvent` reuses the hover pick (`pickFrameAt`, the extracted core of
   `updateHoverFrame`) and accepts ONLY when a frame is hit, else `ignore()`s so
   the host dock's standard menu still appears; the dock owns the `QMenu`
-  (Create trail / Set as fixed frame / Follow this frame). Plus the
-  `Scene3DConfigPanel` "Trail" row (frame combo + add button) and a
-  "Create trail" button on `PosesInFrameLayer`'s config widget
-  (`trailRequested` signal, connected in the dock's factory creator).
+  (Create trail / Set as fixed frame / Follow this frame). Note `pickFrameAt`
+  walks the TF tree only, so pose gizmos are not pickable — a pose trail is
+  reached from its layer's settings instead. Plus the `Scene3DConfigPanel`
+  "Trail" row (frame combo + add button, TF only) and the "Trail" toggle on
+  `PosesInFrameLayer`'s config widget. Both flavors of trail are found through
+  the dock-local `trailOf()` helper (the layer IS one, or OWNS one), which is
+  what lets the TF-buffer re-bind fan-out reach embedded trails.
 
 ## Pointcloud layer (`PointCloudLayer`)
 

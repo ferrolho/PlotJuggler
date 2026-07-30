@@ -60,7 +60,12 @@ glm::dvec3 safeNormalize(const glm::dvec3& vector) {
 }  // namespace
 
 void TrailRenderPass::initializeGL() {
-  initialized_ = false;
+  // The view calls this on every layer every paintGL, so the guard every sibling
+  // pass carries is what keeps the shader from being recompiled per frame;
+  // releaseGL() clears the flag so a recreated context still rebuilds.
+  if (initialized_) {
+    return;
+  }
   auto result = gl::Program::fromSources(kVertSrc, kFragSrc);
   if (auto* program = std::get_if<gl::Program>(&result); program != nullptr) {
     program_ = std::make_unique<gl::Program>(std::move(*program));

@@ -7,7 +7,6 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLoggingCategory>
-#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <algorithm>
@@ -66,6 +65,10 @@ QString PosesInFrameLayer::sourceFrame() const {
   return QString::fromStdString(source_frame_);
 }
 
+QString PosesInFrameLayer::statusWarning() const {
+  return trail_ != nullptr ? trail_->statusWarning() : QString{};
+}
+
 QDomElement PosesInFrameLayer::xmlSaveState(QDomDocument& doc) const {
   QDomElement el = doc.createElement(u"poses_in_frame"_s);
   el.setAttribute(u"gizmo_size"_s, static_cast<double>(gizmo_size_));
@@ -73,11 +76,16 @@ QDomElement PosesInFrameLayer::xmlSaveState(QDomDocument& doc) const {
   el.setAttribute(u"x_arrow_only"_s, x_arrow_only_ ? 1 : 0);
   el.setAttribute(u"override_color"_s, override_color_enabled_ ? 1 : 0);
   el.setAttribute(u"override_color_value"_s, override_color_.name(QColor::HexRgb));
+  // The owned trail persists as a nested payload: its presence IS the enabled
+  // flag, and its style is written by the trail itself (one definition).
+  if (trail_ != nullptr) {
+    el.appendChild(trail_->xmlSaveState(doc));
+  }
   return el;
 }
 
 bool PosesInFrameLayer::xmlLoadState(const QDomElement& element) {
-  if (element.isNull() || element.tagName() != "poses_in_frame"_L1 || !detail::isLeafPayload(element)) {
+  if (element.isNull() || element.tagName() != "poses_in_frame"_L1 || !detail::isLeafPayload(element, "trail"_L1)) {
     return false;
   }
   float restored_size = 0.0f;
@@ -104,6 +112,14 @@ bool PosesInFrameLayer::xmlLoadState(const QDomElement& element) {
   setOverrideColorEnabled(restored_override_enabled);
   if (has_override_color) {
     setOverrideColor(restored_color);
+  }
+  // A <trail> child means the trail was on; TrailLayer::xmlLoadState is
+  // style-only by contract, which is exactly right here — the SOURCE is this
+  // layer's own topic, never something the payload retargets.
+  const QDomElement trail_el = element.firstChildElement(u"trail"_s);
+  setTrailEnabled(!trail_el.isNull());
+  if (trail_ != nullptr && !trail_->xmlLoadState(trail_el)) {
+    return false;
   }
   return true;
 }
@@ -132,11 +148,15 @@ bool PosesInFrameLayer::attach(const PJ::SceneLayerContext& ctx) {
     qCWarning(lcPoses) << "attach: bootstrap deferred for poses topic" << topic_id_.id
                        << "— render will start once a sample arrives";
   }
+  syncTrailToCurrentState();
   return true;
 }
 
 void PosesInFrameLayer::detach() {
   resetReplayState();
+  if (trail_ != nullptr) {
+    trail_->detach();
+  }
 }
 
 void PosesInFrameLayer::resetReplayState() {
@@ -221,14 +241,20 @@ void PosesInFrameLayer::renderAt(int64_t time_ns) {
 
 void PosesInFrameLayer::setFixedFrame(const QString& frame) {
   // The poses are frame-relative; render() re-resolves the fixed frame each paint
-  // via FrameContext, so a change only needs a repaint.
-  Q_UNUSED(frame);
+  // via FrameContext, so a change only needs a repaint. The trail is the
+  // exception — it rebuilds its polyline against the fixed frame.
+  fixed_frame_ = frame;
+  if (trail_ != nullptr) {
+    trail_->setFixedFrame(frame);
+  }
   emit repaintRequested();
 }
 
 void PosesInFrameLayer::setTrackerTime(PJ::Timepoint time) {
-  Q_UNUSED(time);  // render() reads frame_ctx.time via the tracker_dirty_ path
-  tracker_dirty_ = true;
+  tracker_dirty_ = true;  // render() reads frame_ctx.time via the tracker_dirty_ path
+  if (trail_ != nullptr) {
+    trail_->setTrackerTime(time);  // moves the past/future colour split
+  }
   emit repaintRequested();
 }
 
@@ -237,6 +263,9 @@ void PosesInFrameLayer::setVisible(bool visible) {
     return;
   }
   visible_ = visible;
+  if (trail_ != nullptr) {
+    trail_->setVisible(visible);  // the trail is part of this layer, not a peer
+  }
   emit visibilityChanged(visible);
   // Catch-up on un-hide is the dock's job (it re-delivers the last tracker time).
   emit repaintRequested();
@@ -244,15 +273,29 @@ void PosesInFrameLayer::setVisible(bool visible) {
 
 void PosesInFrameLayer::initializeGL() {
   pass_.initializeGL();
+  // The view calls this every paintGL before render(), so a trail enabled later
+  // (outside any GL context) initializes on the first paint that sees it.
+  if (trail_ != nullptr) {
+    trail_->initializeGL();
+  }
 }
 
 void PosesInFrameLayer::releaseGL() {
   pass_.releaseGL();
+  if (trail_ != nullptr) {
+    trail_->releaseGL();
+  }
 }
 
 void PosesInFrameLayer::render(const ViewParams& view_params, const FrameContext& frame_ctx) {
   if (!visible_) {
     return;
+  }
+  // Ahead of every early-out below: the trail carries its own geometry and
+  // resolves its own frame, so it must still draw on ticks where this instant
+  // has no decoded pose set (before the first sample, or an empty array).
+  if (trail_ != nullptr) {
+    trail_->render(view_params, frame_ctx);
   }
   // Drain a pending tracker move or style edit (one expansion per painted frame).
   if (tracker_dirty_) {
@@ -302,6 +345,44 @@ void PosesInFrameLayer::setXArrowOnly(bool x_arrow_only) {
   tracker_dirty_ = true;  // re-expand the current sample (triad <-> single arm)
   emit configurationChanged();
   emit repaintRequested();
+}
+
+void PosesInFrameLayer::setTrailEnabled(bool enabled) {
+  if (enabled == (trail_ != nullptr)) {
+    return;
+  }
+  if (!enabled) {
+    trail_.reset();
+    emit configurationChanged();
+    emit statusWarningChanged();  // the trail's warning, if any, goes with it
+    emit repaintRequested();
+    return;
+  }
+  trail_ = std::make_unique<TrailLayer>(topic_id_, TrailSource::poseTopic(topic_id_));
+  // Nothing else would ever repaint, persist, or surface a warning on the
+  // trail's behalf: it is not a dock layer, so it has no row of its own and the
+  // dock's wireScene3DLayer never sees it.
+  connect(trail_.get(), &TrailLayer::repaintRequested, this, &PosesInFrameLayer::repaintRequested);
+  connect(trail_.get(), &TrailLayer::configurationChanged, this, &PosesInFrameLayer::configurationChanged);
+  connect(trail_.get(), &TrailLayer::statusWarningChanged, this, &PosesInFrameLayer::statusWarningChanged);
+  syncTrailToCurrentState();
+  emit configurationChanged();
+  emit repaintRequested();
+}
+
+void PosesInFrameLayer::syncTrailToCurrentState() {
+  if (trail_ == nullptr || ctx_.session == nullptr) {
+    return;  // not attached yet — attach() calls this again once ctx_ is live
+  }
+  if (!trail_->attach(ctx_)) {
+    qCWarning(lcPoses) << "trail attach failed for poses topic" << topic_id_.id;
+    trail_.reset();
+    return;
+  }
+  if (!fixed_frame_.isEmpty()) {
+    trail_->setFixedFrame(fixed_frame_);
+  }
+  trail_->setVisible(visible_);
 }
 
 void PosesInFrameLayer::setOverrideColorEnabled(bool enabled) {
@@ -394,11 +475,27 @@ QWidget* PosesInFrameLayer::createConfigWidget(QWidget* parent) {
     setOverrideColorEnabled(true);  // apply now; the toggled-driven call lags the slide animation
   });
 
-  auto* trail_button = new QToolButton(container);
-  trail_button->setText(tr("Create trail"));
-  trail_button->setToolTip(tr("Trace this topic's first pose across the whole time range"));
-  form->addRow(tr("Trail:"), trail_button);
-  QObject::connect(trail_button, &QToolButton::clicked, this, [this]() { emit trailRequested(); });
+  // Trail: opt-in toggle, and when on the owned trail's own style rows are
+  // appended to THIS form — same label column as the rows above, and the single
+  // definition of those controls (TrailLayer::appendStyleRows).
+  auto* trail_toggle = new PJ::ToggleSwitch(container);
+  trail_toggle->setChecked(trail_ != nullptr, /*animate=*/false);
+  trail_toggle->setToolTip(tr("Trace this topic's pose across the whole time range"));
+  form->addRow(tr("Trail:"), trail_toggle);
+  const int trail_rows_begin = form->rowCount();
+  const auto refresh_trail_rows = [this, form, container, trail_rows_begin]() {
+    while (form->rowCount() > trail_rows_begin) {
+      form->removeRow(form->rowCount() - 1);
+    }
+    if (trail_ != nullptr) {
+      trail_->appendStyleRows(form, container);
+    }
+  };
+  refresh_trail_rows();
+  QObject::connect(trail_toggle, &PJ::ToggleSwitch::toggled, this, [this, refresh_trail_rows](bool on) {
+    setTrailEnabled(on);
+    refresh_trail_rows();
+  });
 
   return container;
 }

@@ -9,6 +9,7 @@
 #include <QString>
 #include <QStringList>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "pj_base/builtin/builtin_object.hpp"
 #include "pj_datastore/object_store.hpp"            // PJ::ObjectTopicId, PJ::SequentialUID
 #include "pj_scene3d_core/poses_in_frame_render.h"  // PoseTriadInstance
+#include "pj_scene3d_widgets/layers/trail_layer.h"
 #include "pj_scene3d_widgets/passes/poses_render_pass.h"
 #include "pj_scene3d_widgets/scene3d_layer.h"
 
@@ -45,6 +47,10 @@ class PosesInFrameLayer : public Scene3DLayer {
   [[nodiscard]] PJ::Range<PJ::Timepoint> timeRange() const override;
   [[nodiscard]] QStringList fallbackFrames() const override;
   [[nodiscard]] QString sourceFrame() const override;
+  // Relays the owned trail's warning ("waiting for TF", decode failures): the
+  // dock only polls REGISTERED layers, so without this an embedded trail that
+  // cannot draw would fail silently.
+  [[nodiscard]] QString statusWarning() const override;
   QDomElement xmlSaveState(QDomDocument& doc) const override;
   bool xmlLoadState(const QDomElement& element) override;
 
@@ -91,10 +97,22 @@ class PosesInFrameLayer : public Scene3DLayer {
     return override_color_;
   }
 
- signals:
-  // The config widget's "Create trail" button. The dock (which owns layer
-  // creation) responds by adding a TrailLayer bound to this topic.
-  void trailRequested();
+  // Trail: an optional TrailLayer this layer OWNS outright. It is never
+  // registered with the dock, so it gets no Topics row and no settings panel of
+  // its own — its style rows are appended to this layer's config widget, and it
+  // is attached/rendered/torn down by the forwarding hooks below. Enabling
+  // builds it (which samples the topic's whole history, hence opt-in);
+  // disabling destroys it, discarding the style.
+  void setTrailEnabled(bool enabled);
+  [[nodiscard]] bool trailEnabled() const {
+    return trail_ != nullptr;
+  }
+  // The owned trail, or nullptr when disabled. The dock reaches through this to
+  // re-bind the TF buffer, because layout restore replays layers BEFORE the
+  // <config_topic> that binds TF.
+  [[nodiscard]] TrailLayer* trail() const {
+    return trail_.get();
+  }
 
 #ifdef PJ_SCENE3D_TEST_HOOKS
   // Decode + expand at a chosen time with no GL context (the dock normally drives
@@ -120,6 +138,11 @@ class PosesInFrameLayer : public Scene3DLayer {
   void resetReplayState();
   // Track the (possibly changing) source frame_id; notify the dock on change.
   void updateSourceFrame(const std::string& frame_id);
+  // Bring a freshly-created trail up to this layer's current lifecycle state
+  // (context, fixed frame, tracker time, visibility, GL). Enabling can happen
+  // at any point after attach, so the trail must catch up rather than assume it
+  // was present from the start.
+  void syncTrailToCurrentState();
 
   PJ::ObjectTopicId topic_id_;
   QString display_name_;
@@ -151,6 +174,14 @@ class PosesInFrameLayer : public Scene3DLayer {
 
   std::vector<PoseTriadInstance> instances_;  // last expansion; also the test view
   PosesRenderPass pass_;
+
+  // Owned outright (no QObject parent) so destruction is deterministic and the
+  // dock never sees it as a layer. Null when the trail is disabled.
+  std::unique_ptr<TrailLayer> trail_;
+  // Last fixed frame pushed by the dock. A trail enabled later needs it: unlike
+  // the gizmos (re-resolved from FrameContext each paint) a trail REBUILDS
+  // against the fixed frame, so it cannot wait for the next setFixedFrame call.
+  QString fixed_frame_;
 };
 
 }  // namespace pj::scene3d

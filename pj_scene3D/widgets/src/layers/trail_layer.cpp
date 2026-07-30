@@ -631,7 +631,13 @@ QWidget* TrailLayer::createConfigWidget(QWidget* parent) {
   auto* source_label = new QLabel(source_text, container);
   form->addRow(tr("Tracks:"), source_label);
 
-  auto* thickness_spin = new PJ::DoubleScrubber(container);
+  appendStyleRows(form, container);
+
+  return container;
+}
+
+void TrailLayer::appendStyleRows(QFormLayout* form, QWidget* parent) {
+  auto* thickness_spin = new PJ::DoubleScrubber(parent);
   thickness_spin->setRange(1.0, 8.0);
   thickness_spin->setDecimals(0);
   thickness_spin->setSingleStep(1.0);
@@ -668,10 +674,10 @@ QWidget* TrailLayer::createConfigWidget(QWidget* parent) {
 
   // The past/future rows are twins: swatch + eye, differing only in the bound
   // half. Member-pointer setters keep the lambda captures tiny.
-  const auto add_color_row = [this, container, form, make_eye, refresh_eye](
+  const auto add_color_row = [this, parent, form, make_eye, refresh_eye](
                                  const QString& label, const QColor& color, bool visible_now, const QString& tip,
                                  void (TrailLayer::*set_color)(QColor), void (TrailLayer::*set_visible)(bool)) {
-    auto* row = new QWidget(container);
+    auto* row = new QWidget(parent);
     auto* row_layout = new QHBoxLayout(row);
     row_layout->setContentsMargins(
         PJ::theme::space(PJ::theme::Space::None), PJ::theme::space(PJ::theme::Space::None),
@@ -698,8 +704,6 @@ QWidget* TrailLayer::createConfigWidget(QWidget* parent) {
   add_color_row(
       tr("Future color:"), future_color_, future_visible_, tr("Show/hide the path after the current time"),
       &TrailLayer::setFutureColor, &TrailLayer::setFutureVisible);
-
-  return container;
 }
 
 }  // namespace pj::scene3d
