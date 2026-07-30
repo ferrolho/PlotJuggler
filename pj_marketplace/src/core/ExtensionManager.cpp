@@ -680,6 +680,9 @@ void ExtensionManager::uninstall(const QString& extension_id) {
         return;
       }
       installed_.remove(extension_id);
+      // Clear any disabled entry so a later reinstall of the same id starts
+      // clean (see registerInstalledExtension for the reinstall counterpart).
+      setEnabled(extension_id, true);
       emit uninstallPendingRestart(extension_id);
     } else {
       emitUninstallFailure(
@@ -689,6 +692,9 @@ void ExtensionManager::uninstall(const QString& extension_id) {
   }
 
   installed_.remove(extension_id);
+  // Clear any disabled entry so a later reinstall of the same id starts
+  // clean (see registerInstalledExtension for the reinstall counterpart).
+  setEnabled(extension_id, true);
   emit uninstallFinished(extension_id, true);
 }
 
@@ -1070,7 +1076,12 @@ void ExtensionManager::emitUninstallFailure(const QString& id, const QString& me
 void ExtensionManager::registerInstalledExtension(const QString& id, const QString& dst, InstalledExtension record) {
   record.path = dst;
   record.install_date = QFileInfo(dst).lastModified();
+  record.enabled = true;
   installed_[id] = record;
+  // A fresh install starts enabled. Clear any stale disabled entry that may
+  // linger from a previous uninstall of the same id, so the plugin loads
+  // instead of being silently skipped on the next launch.
+  setEnabled(id, true);
 }
 
 void ExtensionManager::refreshInstalledFromDisk() {

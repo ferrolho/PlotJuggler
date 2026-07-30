@@ -1826,11 +1826,12 @@ TEST_F(ExtensionManagerEnableDisableTest, RefreshFromDiskReflectsPersistedDisabl
   EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
 }
 
-// Disabling a plugin that is NOT installed still persists — an install that
-// arrives later must land in the disabled state. This is the sideload path:
-// the user might disable a plugin they know about before its ZIP even
-// arrives, and the choice has to survive the intervening install.
-TEST_F(ExtensionManagerEnableDisableTest, DisabledStateAppliesToLaterInstallOfSameId) {
+// A fresh install of an id resets any stale disabled entry — a previous
+// uninstall should normally have cleaned it up, but if a residual entry
+// lingers, the install wins and the plugin starts enabled. This also
+// guarantees the sideload path (disable-then-install) doesn't leave the
+// user with a silently unloaded plugin they just chose to install.
+TEST_F(ExtensionManagerEnableDisableTest, InstallResetsDisabledState) {
   mgr_->setEnabled("mock-data-source", false);
   ASSERT_FALSE(mgr_->isEnabled("mock-data-source"));
 
@@ -1840,9 +1841,31 @@ TEST_F(ExtensionManagerEnableDisableTest, DisabledStateAppliesToLaterInstallOfSa
   mgr_->install(ext);
   ASSERT_TRUE(waitForSignal(spy));
 
-  EXPECT_FALSE(mgr_->installedExtensions()["mock-data-source"].enabled)
-      << "install must honour a pre-existing disabled state";
-  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+  EXPECT_TRUE(mgr_->installedExtensions()["mock-data-source"].enabled)
+      << "install must clear any pre-existing disabled state";
+  EXPECT_TRUE(mgr_->isEnabled("mock-data-source"));
+  EXPECT_FALSE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "install must remove the id from the persisted disabled set";
+}
+
+// A successful uninstall also clears the persisted disabled entry, so the
+// id doesn't linger in QSettings as an orphan after the plugin is gone.
+TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(install_spy));
+
+  mgr_->setEnabled("mock-data-source", false);
+  ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
+
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallFinished);
+  mgr_->uninstall("mock-data-source");
+  ASSERT_TRUE(waitForSignal(uninstall_spy));
+
+  EXPECT_FALSE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "uninstall must remove the id from the persisted disabled set";
 }
 
 }  // namespace
