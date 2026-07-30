@@ -27,6 +27,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QHostAddress>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QString>
 #include <QTcpServer>
