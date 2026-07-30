@@ -1021,6 +1021,36 @@ TEST(SessionManagerRefillGuardTest, CommitKeepsRefilledDataAndFreesSnapshot) {
   }
 }
 
+// Provenance shares the refill transaction's fate: COMMIT rewrote the
+// dataset's content from a new source, so the provider record attached to the
+// OLD content is detached structurally at the commit point; ROLLBACK restores
+// the old content and keeps its record.
+TEST(SessionManagerRefillGuardTest, CommitDetachesSourceRecordRollbackKeepsIt) {
+  PJ::SessionManager session;
+  auto ds = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "reload.mcap"});
+  ASSERT_TRUE(ds.has_value()) << ds.error();
+  writeScalarSamples(session, *ds, "/a", {100, 200});
+  session.attachSourceRecord(
+      *ds, PJ::SourceRecord{
+               .provider_id = u"cloud-provider"_s,
+               .source_identity = u"digest"_s,
+               .descriptor_json = uR"({"d":1})"_s,
+           });
+
+  {
+    PJ::RefillGuard guard = session.beginRefill(*ds);
+    // Rollback (guard destroyed uncommitted).
+  }
+  ASSERT_NE(session.sourceRecord(*ds), nullptr) << "rollback restores the old content — its record stays";
+  EXPECT_EQ(session.sourceRecord(*ds)->provider_id, u"cloud-provider"_s);
+
+  {
+    PJ::RefillGuard guard = session.beginRefill(*ds);
+    guard.commit();
+  }
+  EXPECT_EQ(session.sourceRecord(*ds), nullptr) << "commit rewrote the content — the old record is stale provenance";
+}
+
 TEST(SessionManagerRefillGuardTest, ProcessorOutputsReplayBeforePruneAndKeepStableTopicIds) {
   PJ::SessionManager session;
   auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "reload.mcap"});
@@ -1197,6 +1227,293 @@ TEST(SessionManagerRefillGuardTest, MovedGuardRollsBackExactlyOnce) {
   EXPECT_EQ(about_count, 2) << "exactly one rollback despite the move (moved-from guard is inert)";
   EXPECT_TRUE(session.datasetDisplayRange(*ds).has_value()) << "data restored once";
   EXPECT_EQ(session.dataEngine().listTopics(*ds), topics_before) << "ids stable";
+}
+
+// --- SourceRecord: dataset-keyed provenance from provider plugins, and the
+// record tier of resolveDatasetIdentity ---
+
+TEST(SessionManagerSourceRecordTest, AttachQueryDetachRoundTrip) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "cloud.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+
+  EXPECT_EQ(session.sourceRecord(*dataset), nullptr) << "no record attached yet";
+
+  session.attachSourceRecord(
+      *dataset, PJ::SourceRecord{
+                    .provider_id = u"mcap-cloud"_s,
+                    .source_identity = u"sha256:abc"_s,
+                    .descriptor_json = u"{\"key\":\"run1.mcap\"}"_s,
+                });
+  const PJ::SourceRecord* record = session.sourceRecord(*dataset);
+  ASSERT_NE(record, nullptr);
+  EXPECT_EQ(record->provider_id, u"mcap-cloud"_s);
+  EXPECT_EQ(record->source_identity, u"sha256:abc"_s);
+  EXPECT_EQ(record->descriptor_json, u"{\"key\":\"run1.mcap\"}"_s);
+
+  session.detachSourceRecord(*dataset);
+  EXPECT_EQ(session.sourceRecord(*dataset), nullptr);
+  session.detachSourceRecord(*dataset);  // idempotent
+  EXPECT_EQ(session.sourceRecord(9999), nullptr) << "unknown dataset has no record";
+}
+
+TEST(SessionManagerSourceRecordTest, AttachOverwritesExistingRecord) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "cloud.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+
+  session.attachSourceRecord(*dataset, PJ::SourceRecord{u"provider-a"_s, u"identity-a"_s, u"{\"a\":1}"_s});
+  session.attachSourceRecord(*dataset, PJ::SourceRecord{u"provider-b"_s, u"identity-b"_s, u"{\"b\":2}"_s});
+
+  const PJ::SourceRecord* record = session.sourceRecord(*dataset);
+  ASSERT_NE(record, nullptr);
+  EXPECT_EQ(record->provider_id, u"provider-b"_s);
+  EXPECT_EQ(record->source_identity, u"identity-b"_s);
+  EXPECT_EQ(record->descriptor_json, u"{\"b\":2}"_s);
+}
+
+TEST(SessionManagerSourceRecordTest, RemoveDatasetDropsItsSourceRecord) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "gone.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  session.attachSourceRecord(*dataset, PJ::SourceRecord{u"p"_s, u"i"_s, u"{}"_s});
+  ASSERT_NE(session.sourceRecord(*dataset), nullptr);
+
+  session.removeDataset(*dataset);
+  EXPECT_EQ(session.sourceRecord(*dataset), nullptr)
+      << "dataset removal must invalidate its provenance record (same lifecycle as the source path)";
+}
+
+TEST(SessionManagerSourceRecordTest, RecordTierBeatsPathAndSourceName) {
+  QTemporaryDir dir;
+  ASSERT_TRUE(dir.isValid());
+  const QString path_a = dir.filePath(u"a/run.mcap"_s);
+  const QString path_b = dir.filePath(u"b/run.mcap"_s);
+  ASSERT_TRUE(QDir().mkpath(dir.filePath(u"a"_s)));
+  ASSERT_TRUE(QDir().mkpath(dir.filePath(u"b"_s)));
+  ASSERT_TRUE(QFile(path_a).open(QIODevice::WriteOnly));
+  ASSERT_TRUE(QFile(path_b).open(QIODevice::WriteOnly));
+
+  PJ::SessionManager session;
+  const auto a = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "run.mcap"});
+  const auto b = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "run.mcap"});
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  session.setDatasetSourcePath(*a, path_a);
+  session.setDatasetSourcePath(*b, path_b);
+  const PJ::SourceRecord record{u"mcap-cloud"_s, u"sha256:abc"_s, u"{\"key\":\"run.mcap\"}"_s};
+  session.attachSourceRecord(*a, record);
+
+  // The saved source/path qualifiers point at B, but the record names A: the
+  // record tier runs BEFORE the path/name tiers, so A wins.
+  const PJ::DatasetIdentityResolution resolved = session.resolveDatasetIdentity(999, u"run.mcap"_s, path_b, record);
+  ASSERT_TRUE(resolved.id.has_value());
+  EXPECT_EQ(*resolved.id, a.value());
+  EXPECT_FALSE(resolved.ambiguous);
+}
+
+TEST(SessionManagerSourceRecordTest, ExactIdVetoedWhenSuppliedRecordDisagrees) {
+  PJ::SessionManager session;
+  const auto a = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "a.mcap"});
+  const auto b = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "b.mcap"});
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  const PJ::SourceRecord record_a{u"p"_s, u"identity-a"_s, u"{\"a\":1}"_s};
+  const PJ::SourceRecord record_b{u"p"_s, u"identity-b"_s, u"{\"b\":2}"_s};
+  session.attachSourceRecord(*a, record_a);
+  session.attachSourceRecord(*b, record_b);
+
+  // saved_id names A (and A's source label matches), but the supplied record is
+  // B's: every supplied qualifier must agree for exact-id trust, so tier 1 is
+  // vetoed and the unique record match resolves to B instead.
+  const PJ::DatasetIdentityResolution resolved = session.resolveDatasetIdentity(*a, u"a.mcap"_s, {}, record_b);
+  ASSERT_TRUE(resolved.id.has_value());
+  EXPECT_EQ(*resolved.id, b.value());
+  EXPECT_FALSE(resolved.ambiguous);
+}
+
+TEST(SessionManagerSourceRecordTest, RecordMatchRequiresByteEqualDescriptor) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "cloud.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  session.attachSourceRecord(*dataset, PJ::SourceRecord{u"p"_s, u"same-identity"_s, u"{\"topics\":[\"/imu\"]}"_s});
+
+  // Same (provider, identity) fast path, but the full canonical descriptor
+  // differs: the identity digest alone must NOT be trusted.
+  const PJ::DatasetIdentityResolution resolved = session.resolveDatasetIdentity(
+      0, {}, {}, PJ::SourceRecord{u"p"_s, u"same-identity"_s, u"{\"topics\":[\"/gps\"]}"_s});
+  EXPECT_FALSE(resolved.id.has_value());
+  EXPECT_FALSE(resolved.ambiguous) << "a descriptor mismatch is a non-match, not ambiguity";
+}
+
+TEST(SessionManagerSourceRecordTest, MultipleConfirmedRecordMatchesAreAmbiguous) {
+  PJ::SessionManager session;
+  const auto first = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "one.mcap"});
+  const auto second = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "two.mcap"});
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  const PJ::SourceRecord record{u"p"_s, u"same"_s, u"{\"same\":true}"_s};
+  session.attachSourceRecord(*first, record);
+  session.attachSourceRecord(*second, record);
+
+  const PJ::DatasetIdentityResolution resolved = session.resolveDatasetIdentity(0, {}, {}, record);
+  EXPECT_FALSE(resolved.id.has_value());
+  EXPECT_TRUE(resolved.ambiguous) << "multiple confirmed record matches must never be guessed between";
+}
+
+// Regression pin: existing (record-less) callers must resolve identically —
+// both through the 3-argument form and through the overload with an empty
+// record — and an ATTACHED record must not perturb a record-less query.
+TEST(SessionManagerSourceRecordTest, EmptyRecordQueryKeepsExistingResolution) {
+  QTemporaryDir dir;
+  ASSERT_TRUE(dir.isValid());
+  const QString path = dir.filePath(u"run.mcap"_s);
+  ASSERT_TRUE(QFile(path).open(QIODevice::WriteOnly));
+
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "run.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  session.setDatasetSourcePath(*dataset, path);
+  session.attachSourceRecord(*dataset, PJ::SourceRecord{u"p"_s, u"i"_s, u"{}"_s});
+
+  const PJ::DatasetIdentityResolution three_arg = session.resolveDatasetIdentity(999, u"run.mcap"_s, path);
+  const PJ::DatasetIdentityResolution four_arg =
+      session.resolveDatasetIdentity(999, u"run.mcap"_s, path, PJ::SourceRecord{});
+  ASSERT_TRUE(three_arg.id.has_value());
+  ASSERT_TRUE(four_arg.id.has_value());
+  EXPECT_EQ(*three_arg.id, dataset.value());
+  EXPECT_EQ(*four_arg.id, dataset.value());
+  EXPECT_FALSE(three_arg.ambiguous);
+  EXPECT_FALSE(four_arg.ambiguous);
+}
+
+TEST(SessionManagerMergeTest, MergeInvalidatesContributorRecordsIncludingAnchor) {
+  PJ::SessionManager session;
+  const PJ::DatasetId anchor = addDataset(session, "anchor.mcap", "/a", {100, 200});
+  const PJ::DatasetId source1 = addDataset(session, "src1.mcap", "/b", {150, 250});
+  const PJ::DatasetId source2 = addDataset(session, "src2.mcap", "/c", {160, 260});
+  session.attachSourceRecord(anchor, PJ::SourceRecord{u"p"_s, u"anchor"_s, u"{\"a\":1}"_s});
+  session.attachSourceRecord(source1, PJ::SourceRecord{u"p"_s, u"src1"_s, u"{\"s\":1}"_s});
+  session.attachSourceRecord(source2, PJ::SourceRecord{u"p"_s, u"src2"_s, u"{\"s\":2}"_s});
+
+  const auto report = session.mergeDatasets(
+      anchor, {PJ::DatasetMergeSource{.dataset_id = source1, .raw_shift_ns = 0},
+               PJ::DatasetMergeSource{.dataset_id = source2, .raw_shift_ns = 0}});
+  ASSERT_TRUE(report.has_value()) << "the merge itself must succeed for this test to mean anything";
+
+  // Replaying any ONE contributor's descriptor cannot recreate the merged
+  // result, so every contributor's provenance — the anchor's included — is gone.
+  EXPECT_EQ(session.sourceRecord(anchor), nullptr);
+  EXPECT_EQ(session.sourceRecord(source1), nullptr);
+  EXPECT_EQ(session.sourceRecord(source2), nullptr);
+}
+
+TEST(SessionManagerMergeTest, RejectedMergeKeepsSourceRecords) {
+  PJ::SessionManager session;
+  const PJ::DatasetId anchor = addDataset(session, "anchor.mcap", "/a", {100, 200});
+  session.attachSourceRecord(anchor, PJ::SourceRecord{u"p"_s, u"anchor"_s, u"{\"a\":1}"_s});
+
+  // A self-source merge is rejected by the engine up front: nothing mutated, so
+  // provenance must survive.
+  const auto report = session.mergeDatasets(anchor, {PJ::DatasetMergeSource{.dataset_id = anchor, .raw_shift_ns = 0}});
+  ASSERT_FALSE(report.has_value());
+  EXPECT_NE(session.sourceRecord(anchor), nullptr);
+}
+
+// --- Toolbox bulk-import lifecycle (hoisted from MainWindow, #470) ---
+
+TEST(SessionManagerIngestTest, BeginUpdateEndTracksActiveSetAndEmits) {
+  PJ::SessionManager session;
+  EXPECT_FALSE(session.hasActiveIngests());
+
+  int began = 0;
+  int progressed = 0;
+  int ended = 0;
+  QObject::connect(
+      &session, &PJ::SessionManager::ingestBegan, &session, [&](PJ::DatasetId id, const QString& label, quint64 total) {
+        ++began;
+        EXPECT_EQ(id, 7U);
+        EXPECT_EQ(label, u"Cloud import"_s);
+        EXPECT_EQ(total, 100U);
+      });
+  QObject::connect(
+      &session, &PJ::SessionManager::ingestProgressed, &session, [&](PJ::DatasetId id, quint64 current, quint64 total) {
+        ++progressed;
+        EXPECT_EQ(id, 7U);
+        EXPECT_EQ(current, 50U);
+        EXPECT_EQ(total, 200U);
+      });
+  QObject::connect(&session, &PJ::SessionManager::ingestEnded, &session, [&](PJ::DatasetId id) {
+    ++ended;
+    EXPECT_EQ(id, 7U);
+  });
+
+  session.beginIngest(7, u"Cloud import"_s, 100);
+  EXPECT_EQ(began, 1);
+  EXPECT_TRUE(session.hasActiveIngests());
+  EXPECT_TRUE(session.ingestActive(7));
+  EXPECT_FALSE(session.ingestActive(8));
+  ASSERT_EQ(session.activeIngests().size(), 1U);
+  const auto& entry = session.activeIngests().at(7);
+  EXPECT_EQ(entry.label, u"Cloud import"_s);
+  EXPECT_EQ(entry.current, 0U);
+  EXPECT_EQ(entry.total, 100U);
+
+  session.updateIngest(7, 50, 200);  // total may be refined mid-flight
+  EXPECT_EQ(progressed, 1);
+  EXPECT_EQ(session.activeIngests().at(7).current, 50U);
+  EXPECT_EQ(session.activeIngests().at(7).total, 200U);
+
+  session.endIngest(7);
+  EXPECT_EQ(ended, 1);
+  EXPECT_FALSE(session.hasActiveIngests());
+  EXPECT_FALSE(session.ingestActive(7));
+  session.endIngest(7);  // idempotent: an unknown/already-ended dataset is silent
+  EXPECT_EQ(ended, 1);
+}
+
+TEST(SessionManagerIngestTest, UpdateIngestPublishesDatasetTopicsViaNotifyIngest) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "cloud.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  writeScalarSamples(session, *dataset, "/imu/x", {100, 200});
+  const auto expected_topics = session.dataEngine().listTopics(*dataset);
+  ASSERT_FALSE(expected_topics.empty());
+
+  int publications = 0;
+  QObject::connect(
+      &session, &PJ::SessionManager::samplesIngested, &session, [&](const QVector<PJ::TopicId>& ids, bool live) {
+        ++publications;
+        EXPECT_FALSE(live) << "bulk-import progress publishes non-live";
+        EXPECT_EQ(std::vector<PJ::TopicId>(ids.begin(), ids.end()), expected_topics);
+      });
+
+  session.beginIngest(*dataset, u"import"_s, 0);
+  session.updateIngest(*dataset, 1, 2);
+  EXPECT_EQ(publications, 1) << "updateIngest must publish the dataset's topics through notifyIngest";
+}
+
+TEST(SessionManagerIngestTest, UpdateIngestForUntrackedDatasetStillPublishesButStaysSilent) {
+  PJ::SessionManager session;
+  const auto dataset = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "cloud.mcap"});
+  ASSERT_TRUE(dataset.has_value());
+  writeScalarSamples(session, *dataset, "/imu/x", {100, 200});
+
+  int publications = 0;
+  int progressed = 0;
+  QObject::connect(&session, &PJ::SessionManager::samplesIngested, &session, [&](const QVector<PJ::TopicId>&, bool) {
+    ++publications;
+  });
+  QObject::connect(&session, &PJ::SessionManager::ingestProgressed, &session, [&](PJ::DatasetId, quint64, quint64) {
+    ++progressed;
+  });
+
+  // No beginIngest: the data publication must still happen (a lifecycle ordering
+  // slip must never drop flushed rows), but no lifecycle signal fires.
+  session.updateIngest(*dataset, 1, 2);
+  EXPECT_EQ(publications, 1);
+  EXPECT_EQ(progressed, 0);
+  EXPECT_FALSE(session.hasActiveIngests());
 }
 
 }  // namespace

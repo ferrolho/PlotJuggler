@@ -882,8 +882,12 @@ struct FileLoader::LoadContext {
   QString path;
   QPointer<QWidget> dialog_parent;
   QString source_name;
+  // The selected plugin's stable manifest id, carried alongside its display
+  // name (source_name) so the commit epilogue's fileLoaded reports both.
+  QString source_manifest_id;
   std::string config;
   DatasetId dataset_id = 0;
+  quint64 ticket = 0;  // the request's LoadRequestId, for the worker-path terminal
   bool replacing = false;
   // REPLACING loads only: display name applied at commit (plugin-supplied name,
   // else the incoming file's basename). Deferred so a rollback keeps the prior
@@ -952,6 +956,11 @@ FileLoader::FileLoader(
       message_gate_(std::make_shared<PluginMessageGate>()) {}
 
 FileLoader::~FileLoader() {
+  // Stricter admission than a reusable shutdown: the final synchronous
+  // terminal flush inside joinForShutdown runs loadFinished slots, and one of
+  // them starting fresh work here would leave an accepted request nothing can
+  // ever resolve (and a worker outliving this object).
+  destroying_ = true;
   joinForShutdown();
 }
 
@@ -1074,6 +1083,10 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   const QString& source_identity = input.source_identity;
   const QPointer<QWidget> dialog_parent = request.dialog_parent;
   const LoadHints& hints = request.hints;
+  const quint64 ticket = request.ticket;
+  // Strict replacement: the load is pinned to replace_dataset_id and every
+  // divergence (vanished target, fan-out expansion) fails instead of degrading.
+  const bool strict_replace = hints.require_replacement && hints.replace_dataset_id != 0;
 
   // Restore same-source datasets if a replacement load is cancelled or fails.
   std::vector<DatasetId> tombstoned_for_replace;
@@ -1103,10 +1116,14 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     }
   });
 
-  // One unified failure path — log, optionally pop a dialog, emit signal.
+  // One unified failure path — log, optionally pop a dialog, emit signals.
+  // Every fail() call is followed by co_return, so it is a terminal exit and
+  // resolves the request's ticket — terminalized BEFORE the re-entrant legacy
+  // surfaces (warning dialog, fileLoadFailed) run.
   const auto fail = [&](const QString& reason) -> bool {
     erase_created_live_dataset();
     rollback_tombstones();
+    emitLoadFinished(ticket, LoadOutcome::kFailed, source_identity, 0);
     qCWarning(lcFileLoader).noquote() << reason;
     reportLoadWarning(dialog_parent.data(), reason);
     emit fileLoadFailed(source_identity, reason);
@@ -1126,25 +1143,51 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   }
 
   // Interactive/native loads keep the established first-match behavior. A
-  // browser source-bound replay opts into the exact plugin saved in its layout:
-  // silently choosing another extension match could parse the same bytes with
-  // different semantics.
+  // layout that names a plugin (browser source-bound replay, desktop layout
+  // replay) opts into the exact plugin it saved: silently choosing another
+  // extension match could parse the same bytes with different semantics.
+  // Matching is tiered on SEPARATE identities — the stable MANIFEST id
+  // (expected_manifest_id, when the layout carries one) exact across ALL
+  // matches first, then the display name (expected_plugin_id) exact as the
+  // fallback. Each hint field only ever compares against its own candidate
+  // field, so a manifest mismatch still falls back to the saved display name,
+  // and an ID-only legacy layout starts at the name tier — it can never
+  // select a plugin whose manifest id merely collides with the display name.
+  // Both tiers sweep the whole candidate list so an id match on a later
+  // candidate beats a name collision on an earlier one.
   // GUI-thread catalog pointer. The async presenter resolves the dialog vtable
   // synchronously before suspension; the created source handle pins its DSO for
   // the rest of this coroutine/worker load.
   const LoadedDataSource* source = matches.front();
   if (hints.require_expected_plugin) {
-    const auto expected = std::find_if(matches.begin(), matches.end(), [&hints](const LoadedDataSource* candidate) {
-      return candidate != nullptr && QString::fromStdString(candidate->name) == hints.expected_plugin_id;
-    });
-    if (hints.expected_plugin_id.isEmpty() || expected == matches.end()) {
+    const auto match_by = [&matches](auto&& field_of) {
+      return std::find_if(matches.begin(), matches.end(), [&field_of](const LoadedDataSource* candidate) {
+        return candidate != nullptr && field_of(*candidate);
+      });
+    };
+    auto expected = matches.end();
+    if (!hints.expected_manifest_id.isEmpty()) {
+      expected = match_by([&hints](const LoadedDataSource& candidate) {
+        return QString::fromStdString(candidate.id) == hints.expected_manifest_id;
+      });
+    }
+    if (expected == matches.end() && !hints.expected_plugin_id.isEmpty()) {
+      expected = match_by([&hints](const LoadedDataSource& candidate) {
+        return QString::fromStdString(candidate.name) == hints.expected_plugin_id;
+      });
+    }
+    if (expected == matches.end()) {
+      const QString expected_label = !hints.expected_plugin_id.isEmpty()     ? hints.expected_plugin_id
+                                     : !hints.expected_manifest_id.isEmpty() ? hints.expected_manifest_id
+                                                                             : tr("(unspecified)");
       (void)fail(tr("The layout requires DataSource plugin '%1', but it is not installed for %2 files.")
-                     .arg(hints.expected_plugin_id.isEmpty() ? tr("(unspecified)") : hints.expected_plugin_id, ext));
+                     .arg(expected_label, ext));
       co_return;
     }
     source = *expected;
   }
   const QString source_name = QString::fromStdString(source->name);
+  const QString source_manifest_id = QString::fromStdString(source->id);
 
   DataSourceHandle handle = source->library.createHandle();
   if (!handle.valid()) {
@@ -1188,6 +1231,12 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   if (hints.replace_dataset_id != 0 && engine.getDataset(hints.replace_dataset_id) != nullptr) {
     existing_primary_id = hints.replace_dataset_id;
   } else {
+    if (strict_replace) {
+      // The caller pinned this load to one dataset, and silently loading the
+      // file fresh would break that association.
+      (void)fail(tr("Replacement target dataset %1 no longer exists.").arg(hints.replace_dataset_id));
+      co_return;
+    }
     // One pass over the datasets, ranking two match kinds (sameSourceIdentity
     // canonicalizes paths — filesystem syscalls — so compute it once per dataset):
     // 1. Path identity, honored only when the incoming path backs exactly ONE
@@ -1239,7 +1288,8 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     }
     catalog_.restoreDataset(existing_primary_id);
     session_.setDatasetSourcePath(existing_primary_id, source_identity);
-    emit fileLoaded(source_identity, QString(), source_name, emit_config);
+    emitLoadFinished(ticket, LoadOutcome::kLoaded, source_identity, existing_primary_id, {existing_primary_id});
+    emit fileLoaded(source_identity, QString(), source_name, emit_config, source_manifest_id);
     co_return;  // layout-replay reuse: done synchronously, no worker
   }
   // Tombstone of a matched dataset is deferred to the post-ingest swap (single-instance) or the fanout fallback
@@ -1314,35 +1364,52 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
 
   std::string config;
   bool skip_dialog = false;
+  // The layout preset's saved bytes — the one materialization both
+  // preset-driven policies start from.
+  const std::string preset_bytes = hints.preset_config_json.toStdString();
 
-  const bool hint_eligible = hints.skip_dialog &&
-                             (!hints.preset_config_json.isEmpty() || hints.rewrite_preset_filepath) &&
-                             hints.expected_plugin_id == source_name;
-  if (hint_eligible) {
-    const std::string preset =
-        hints.rewrite_preset_filepath
-            ? detail::rewriteReplayFilepaths(hints.preset_config_json.toStdString(), input.backing_path)
-            : hints.preset_config_json.toStdString();
-    if (auto status = handle.loadConfig(preset); status) {
-      config = preset;
-      skip_dialog = true;
-    } else {
-      // Silent fallback: layout's config didn't take. Use the QSettings
-      // pre-fill and let the dialog drive — caller's UX is "if it works,
-      // skip; if not, ask."
-      qCInfo(lcFileLoader).noquote() << tr("Layout preset rejected by '%1': %2 — falling back to dialog")
-                                            .arg(source_name, QString::fromStdString(status.error()));
-      config = buildLoadConfig(saved_config, input.backing_path);
-      if (auto retry = handle.loadConfig(config); !retry) {
-        (void)fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(retry.error())));
-        co_return;
+  if (hints.dialog_policy == DialogPolicy::kNever) {
+    // Automated (layout-driven) replay: the dialog is prohibited and the
+    // saved preset is AUTHORITATIVE — the browser replay's filepath rewrite
+    // when requested, the minimal fresh-filepath config for an intentionally
+    // empty preset (a plugin whose saveConfig returned nothing is
+    // legitimate), the saved bytes verbatim otherwise. A rejected preset
+    // FAILS the source: silently retrying with the QSettings pre-fill would
+    // replay the layout with a configuration the user never saved.
+    const std::string preset = hints.rewrite_preset_filepath
+                                   ? detail::rewriteReplayFilepaths(preset_bytes, input.backing_path)
+                               : preset_bytes.empty() ? buildLoadConfig(std::string_view{}, input.backing_path)
+                                                      : preset_bytes;
+    if (auto status = handle.loadConfig(preset); !status) {
+      (void)fail(tr("Plugin '%1' rejected the layout's saved configuration: %2")
+                     .arg(source_name, QString::fromStdString(status.error())));
+      co_return;
+    }
+    config = preset;
+    skip_dialog = true;
+  } else {
+    // kPreferPreset: skip the dialog when the preset names the SELECTED
+    // plugin (each hint identity against its own candidate field) and applies
+    // cleanly. kInteractive, a missing/mismatched hint, or a rejected preset
+    // all drive the dialog with the QSettings pre-fill.
+    const bool expected_matches_selected =
+        (!hints.expected_manifest_id.isEmpty() && hints.expected_manifest_id == source_manifest_id) ||
+        (!hints.expected_plugin_id.isEmpty() && hints.expected_plugin_id == source_name);
+    if (hints.dialog_policy == DialogPolicy::kPreferPreset && !preset_bytes.empty() && expected_matches_selected) {
+      if (auto status = handle.loadConfig(preset_bytes); status) {
+        config = preset_bytes;
+        skip_dialog = true;
+      } else {
+        qCInfo(lcFileLoader).noquote() << tr("Layout preset rejected by '%1': %2 — falling back to dialog")
+                                              .arg(source_name, QString::fromStdString(status.error()));
       }
     }
-  } else {
-    config = buildLoadConfig(saved_config, input.backing_path);
-    if (auto status = handle.loadConfig(config); !status) {
-      (void)fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(status.error())));
-      co_return;
+    if (!skip_dialog) {
+      config = buildLoadConfig(saved_config, input.backing_path);
+      if (auto status = handle.loadConfig(config); !status) {
+        (void)fail(tr("Plugin '%1': loadConfig failed: %2").arg(source_name, QString::fromStdString(status.error())));
+        co_return;
+      }
     }
   }
 
@@ -1382,7 +1449,13 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
       // (automation greps for it on every platform).
       qCInfo(lcFileLoader).noquote() << "PJ_FILE_LOAD_REJECTED" << u"plugin=%1"_s.arg(source_name)
                                      << u"identity=%1"_s.arg(source_identity);
+      // The user declined the load: a terminal cancel for the ticket, while
+      // the legacy signals stay silent as they always have on this exit.
+      // Clean up before emitting so a slot observing the terminal sees the
+      // rolled-back state.
+      erase_created_live_dataset();
       rollback_tombstones();
+      emitLoadFinished(ticket, LoadOutcome::kCancelled, source_identity, 0);
       co_return;
     }
     if (dlg.payload.has_value()) {
@@ -1418,6 +1491,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     cancel_mode_.store(0);
     erase_created_live_dataset();
     rollback_tombstones();
+    emitLoadFinished(ticket, LoadOutcome::kCancelled, source_identity, 0);
     emit fileLoadFailed(source_identity, tr("Load cancelled"));
     co_return;
   }
@@ -1435,6 +1509,17 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   // imports — each entry becomes its own DatasetId. For single-instance
   // importers the helper returns `{ config }` and the legacy flow runs unchanged.
   const auto fanouts = detail::extractFanout(config);
+
+  // Strict replacement cannot survive a fan-out expansion: one pinned target
+  // cannot absorb N results, and the fan-out fallback (tombstone the target,
+  // mint fresh ids) would silently break the caller's dataset association.
+  // Rejected HERE, before the fan-out arm below mutates the target.
+  if (strict_replace && fanouts.size() != 1) {
+    (void)fail(tr("Cannot replace dataset %1: the selected configuration expands into %2 datasets.")
+                   .arg(hints.replace_dataset_id)
+                   .arg(fanouts.size()));
+    co_return;
+  }
 
   // Live DatasetIds that fanout entries actually loaded data into (Completed or
   // Cancel-kept); the post-load TF ingest below runs on these. The pre-branch
@@ -1459,6 +1544,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   std::size_t completed = 0;
   std::size_t failed = 0;
   bool discarded = false;  // The stop was "Remove All" (mode 2): drop even completed entries.
+  bool stopped = false;    // A user stop (either mode) ended the fan-out loop early.
   QStringList failed_labels;
 
   if (fanouts.size() == 1) {
@@ -1467,6 +1553,12 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // ProgressDialog above is unused here (destroyed when this prologue returns);
     // progress + cancellation flow through ingestStarted/ingestProgress +
     // cancelCurrent (the title-bar IngestProgressWidget), wired by MainWindow. ---
+    // Unreachable by construction: a live strict-replace target binds
+    // dataset_id to the pinned id, and the vanished-target and fan-out guards
+    // above fail every divergence — so a kLoaded strict replacement always
+    // reports produced == {replace_dataset_id}.
+    Q_ASSERT(!strict_replace || dataset_id == hints.replace_dataset_id);
+
     // issue #98: apply the plugin's dataset name before start() so the
     // commit-driven catalog rebuild surfaces curves under the right tree-root.
     // On a REPLACING load the rename waits for commit (finishLoadOnGui): the
@@ -1484,8 +1576,10 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     ctx_->path = source_identity;
     ctx_->dialog_parent = request.dialog_parent;
     ctx_->source_name = source_name;
+    ctx_->source_manifest_id = source_manifest_id;
     ctx_->config = config;
     ctx_->dataset_id = dataset_id;
+    ctx_->ticket = ticket;
     ctx_->replacing = replacing;
     if (replacing) {
       ctx_->commit_display_name = !plugin_name.isEmpty() ? plugin_name : display_name;
@@ -1587,7 +1681,6 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // the shared prefix; the per-episode `display_suffix` still forms the leaf.
     const QString fanout_name = detail::parseDisplayName(config);
     const QString base = fanout_name.isEmpty() ? basename : fanout_name;
-    bool stopped = false;  // Cancel or Abort by the user during the loop.
 
     // Keep SDK control slots on the GUI thread. Only the finite import's
     // blocking start() call runs on a worker; the coroutine frame keeps the
@@ -1886,6 +1979,7 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // it as a discarded load, mirroring the single-instance discard — recording
     // it (recents, loadedSources, layout data-source entries) or logging a
     // success would resurrect a source the user explicitly removed.
+    emitLoadFinished(ticket, LoadOutcome::kCancelled, source_identity, 0);
     emit fileLoadFailed(source_identity, tr("Import discarded"));
     co_return;
   }
@@ -1894,13 +1988,23 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
     // announcing a dataset-less success.
     const QString reason =
         tr("All %1 entries of '%2' failed to load:\n%3").arg(failed).arg(display_name, failed_labels.join(u"\n"_s));
+    emitLoadFinished(ticket, LoadOutcome::kFailed, source_identity, 0);
     reportLoadWarning(dialog_parent, reason);
     emit fileLoadFailed(source_identity, reason);
     co_return;
   }
 
+  // "Stop and Keep" ended the fan-out early: the kept data is real (and the
+  // legacy fileLoaded below reports it as before), but the request ended by
+  // user cancel and the ticket classifies it as such. The primary dataset is
+  // the first entry that took data — the id the replace/reuse logic would
+  // treat as this source's principal dataset.
+  const DatasetId fanout_primary_id = fanout_loaded_ids.empty() ? 0 : fanout_loaded_ids.front();
+  emitLoadFinished(
+      ticket, stopped ? LoadOutcome::kCancelled : LoadOutcome::kLoaded, source_identity, fanout_primary_id,
+      QVector<DatasetId>(fanout_loaded_ids.begin(), fanout_loaded_ids.end()));
   logSuccessfulLoad(engine, catalog_, source_identity, source_name, fanout_loaded_ids);
-  emit fileLoaded(source_identity, QString(), source_name, QString::fromStdString(captured_config));
+  emit fileLoaded(source_identity, QString(), source_name, QString::fromStdString(captured_config), source_manifest_id);
   co_return;  // fanout completed; process the next queued request
 }
 
@@ -1909,10 +2013,23 @@ bool FileLoader::loadFile(const QString& path, QWidget* dialog_parent, const Loa
 }
 
 bool FileLoader::loadFile(LoadInput input, QWidget* dialog_parent, const LoadHints& hints) {
+  return loadFileTicketed(std::move(input), dialog_parent, hints) != 0;
+}
+
+LoadRequestId FileLoader::loadFileTicketed(LoadInput input, QWidget* dialog_parent, const LoadHints& hints) {
+  if (destroying_) {
+    // The destructor's final terminal flush is delivering loadFinished right
+    // now; an accepted request could never be resolved and its worker would
+    // outlive the loader. Rejected per the 0-on-rejection contract — no
+    // signals or dialogs from a dying loader.
+    qCWarning(lcFileLoader) << "[FileLoader] load request rejected: the loader is being destroyed";
+    return 0;
+  }
   if (input.display_name.isEmpty() || input.backing_path.isEmpty() || input.source_identity.isEmpty()) {
     // An unusable input (e.g. a trailing-slash directory path whose fileName() is
     // empty) must surface the same user-visible failure as any other load error,
     // not fail silently — MainWindow's layout replay relies on that contract.
+    // Rejected means never accepted: no ticket, no loadFinished.
     const QString path = !input.source_identity.isEmpty() ? input.source_identity
                          : !input.backing_path.isEmpty()  ? input.backing_path
                                                           : input.display_name;
@@ -1920,16 +2037,22 @@ bool FileLoader::loadFile(LoadInput input, QWidget* dialog_parent, const LoadHin
     qCWarning(lcFileLoader).noquote() << reason;
     reportLoadWarning(dialog_parent, reason);
     emit fileLoadFailed(path, reason);
-    return false;
+    return 0;
   }
 #ifdef PJ_TARGET_WASM
   if (!input.content_sha256.isEmpty()) {
     browser_content_sha256_.insert(input.source_identity, input.content_sha256);
   }
 #endif
-  queue_.push_back(LoadRequest{.input = std::move(input), .dialog_parent = dialog_parent, .hints = hints});
+  ++next_load_ticket_;
+  if (next_load_ticket_ == 0) {
+    ++next_load_ticket_;  // reserve zero for "invalid", even after wraparound
+  }
+  const quint64 ticket = next_load_ticket_;
+  queue_.push_back(
+      LoadRequest{.input = std::move(input), .dialog_parent = dialog_parent, .hints = hints, .ticket = ticket});
   startNext();
-  return true;  // accepted/enqueued — completion is async (fileLoaded/fileLoadFailed)
+  return ticket;  // accepted/enqueued — completion is async (loadFinished + legacy signals)
 }
 
 void FileLoader::startNext() {
@@ -1942,6 +2065,9 @@ void FileLoader::startNext() {
   begin_load_task_.reset();
   if (queue_.empty()) {
     load_generation_ = 0;  // idle: no load to bind a stop-dialog to
+    current_load_ticket_ = 0;
+    current_load_identity_.clear();
+    current_ticket_terminal_ = false;
     emit queueDrained();
     return;
   }
@@ -1954,6 +2080,14 @@ void FileLoader::startNext() {
   }
   // Old queued callbacks can never match a reused loader.
   load_generation_ = next_load_generation_;
+  // Ticket and generation advance TOGETHER, before loadGenerationAdvanced goes
+  // out, so a slot reading currentLoadTicket() there sees a consistent pair.
+  current_load_ticket_ = request.ticket;
+  current_load_identity_ = request.input.source_identity;
+  current_ticket_terminal_ = false;
+  // Announce the ticket↔generation association first: a consumer tracking a
+  // ticket learns its generation before any generation-keyed UI reacts.
+  emit requestStarted(current_load_ticket_, load_generation_);
   // Before the coroutine runs: stale-generation UI must be gone before this
   // load can raise its own (application-modal) dialogs.
   emit loadGenerationAdvanced(load_generation_);
@@ -1995,8 +2129,16 @@ void FileLoader::onWorkerFinished(std::uint64_t generation) {
   const bool replacing = ctx_->replacing;
   const QString path = ctx_->path;
   const QString source_name = ctx_->source_name;
+  const quint64 ticket = ctx_->ticket;
+  // Terminal classification for the ticket. A user stop (either mode) reports
+  // kCancelled even where the wind-down otherwise ends in fileLoaded (keep) or
+  // fileLoadFailed (discard, or a stop the plugin surfaced as a failed start).
+  // Each arm terminalizes the ticket the moment its outcome is decided —
+  // BEFORE its legacy-emitting wind-down runs — so a re-entrant shutdown from
+  // a legacy slot cannot resolve the request a second time.
 
   if (cancel == 2) {  // Discard
+    emitLoadFinished(ticket, LoadOutcome::kCancelled, path, 0);
     qCWarning(lcFileLoader) << "[FileLoader] import discarded by user; partial data dropped";
     if (!replacing) {
       // Real-delete the abandoned first-load shell: evict its objects, drop catalog
@@ -2014,6 +2156,7 @@ void FileLoader::onWorkerFinished(std::uint64_t generation) {
       failReplacingLoad(dataset_id, path, tr("Import discarded"));
     }
   } else if (!ctx_->start_ok && cancel == 0) {  // start() failed (and not a user stop)
+    emitLoadFinished(ticket, LoadOutcome::kFailed, path, 0);
     const QString reason = tr("Plugin '%1': start failed: %2").arg(source_name, ctx_->start_error);
     qCWarning(lcFileLoader).noquote() << reason;
     if (!replacing) {
@@ -2039,6 +2182,10 @@ void FileLoader::onWorkerFinished(std::uint64_t generation) {
       // Derived outputs were detached with the raw dataset. Replay them before
       // pruning, while failure can still restore the complete prior snapshot.
       if (const Status replayed = ctx_->refill_guard->recomputeProcessors(); !replayed.has_value()) {
+        // Error terminal — except under a user keep-stop, whose ticket keeps
+        // reporting kCancelled (the user DID stop it; the replay error only
+        // decided that nothing could be kept).
+        emitLoadFinished(ticket, cancel == 0 ? LoadOutcome::kFailed : LoadOutcome::kCancelled, path, 0);
         const QString reason = tr("Plugin '%1': derived-series replay failed: %2")
                                    .arg(source_name, QString::fromStdString(replayed.error()));
         qCWarning(lcFileLoader).noquote() << reason;
@@ -2060,7 +2207,10 @@ void FileLoader::onWorkerFinished(std::uint64_t generation) {
       }
     }
     if (refill_ok) {
-      finishLoadOnGui();  // emits fileLoaded; resets ctx_
+      emitLoadFinished(
+          ticket, cancel == 1 ? LoadOutcome::kCancelled : LoadOutcome::kLoaded, path, dataset_id, {dataset_id});
+      // emits loadCommitting (unless keep-stopped) + fileLoaded; resets ctx_
+      finishLoadOnGui(/*fully_loaded=*/cancel == 0);
     }
   }
 
@@ -2129,27 +2279,18 @@ void FileLoader::refreshAfterReplacingRollback(DatasetId dataset_id) {
 #endif
 }
 
-void FileLoader::finishLoadOnGui() {
+void FileLoader::finishLoadOnGui(bool fully_loaded) {
+  // Locals, not ctx_ reads, past the loadCommitting emission below: a seam
+  // slot may re-enter joinForShutdown, which resets ctx_.
   const DatasetId dataset_id = ctx_->dataset_id;
+  const quint64 ticket = ctx_->ticket;
+  const bool replacing = ctx_->replacing;
 
   // A replacing load may have pointed the dataset at a different file; surface
   // the new name in the same catalog rebuild that surfaces the new data.
-  if (ctx_->replacing && !ctx_->commit_display_name.isEmpty()) {
+  if (replacing && !ctx_->commit_display_name.isEmpty()) {
     catalog_.setDatasetDisplayName(dataset_id, ctx_->commit_display_name);
   }
-  catalog_.rebuildFromDatastore();
-
-  // Per pj_scene3D REQUIREMENTS §9: TF buffer is per-dataset, populated at load
-  // time. A reload changed its data in place, so invalidate before re-ingesting
-  // (ingest is idempotent per dataset and would otherwise skip).
-#ifdef PJ_WITH_SCENE3D
-  if (transform_service_ != nullptr) {
-    if (ctx_->replacing) {
-      transform_service_->invalidateDataset(dataset_id);
-    }
-    transform_service_->ingestFrameTransformsForDataset(dataset_id);
-  }
-#endif
 
   // Capture the plugin's canonical post-load state for layout persistence.
   std::string captured_config;
@@ -2158,16 +2299,43 @@ void FileLoader::finishLoadOnGui() {
                                              .arg(ctx_->source_name, QString::fromStdString(status.error()));
     captured_config.clear();
   }
-
   session_.setDatasetSourcePath(dataset_id, ctx_->path);
+  const QString path = ctx_->path;
+  const QString source_name = ctx_->source_name;
+  const QString source_manifest_id = ctx_->source_manifest_id;
+
+  // (A replacing load's stale provider record was already detached by
+  // RefillGuard::commit — structurally, before this seam — so a promotion
+  // listener can attach the new content's record below.)
+
+  // Pre-catalog commit seam: dataset, source path, and captured config are all
+  // installed; the catalog rebuild that publishes the load follows immediately
+  // after, so a promotion service can attach source records atomically with
+  // catalog publication. Skipped on a keep-stop — the seam is for loads that
+  // finish kLoaded.
+  if (fully_loaded) {
+    emit loadCommitting(ticket, QVector<DatasetId>{dataset_id}, source_name, QString::fromStdString(captured_config));
+  }
+  catalog_.rebuildFromDatastore();
+
+  // Per pj_scene3D REQUIREMENTS §9: TF buffer is per-dataset, populated at load
+  // time. A reload changed its data in place, so invalidate before re-ingesting
+  // (ingest is idempotent per dataset and would otherwise skip).
+#ifdef PJ_WITH_SCENE3D
+  if (transform_service_ != nullptr) {
+    if (replacing) {
+      transform_service_->invalidateDataset(dataset_id);
+    }
+    transform_service_->ingestFrameTransformsForDataset(dataset_id);
+  }
+#endif
+
   // The terminal flush (onWorkerFinished) committed the file's rows straight to
   // DataEngine via the plugin write host, bypassing SessionManager::commitChunks —
   // so the cross-dataset time origin was never re-evaluated. Refresh it now: a short
   // file whose data is EARLIER than any prior dataset must reframe every plot to the
   // new origin. No-op when "Use time offset" is off.
   session_.refreshDatasetTimeReference(dataset_id);
-  const QString path = ctx_->path;
-  const QString source_name = ctx_->source_name;
   logSuccessfulLoad(session_.dataEngine(), catalog_, path, source_name, {dataset_id});
   ctx_.reset();  // drop the handle/host before notifying — the load is complete
 #if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
@@ -2181,7 +2349,7 @@ void FileLoader::finishLoadOnGui() {
   // post-import cold-reader state rather than borrowing either load context.
   probeColdObjectFetch(session_.objectStore(), dataset_id);
 #endif
-  emit fileLoaded(path, QString(), source_name, QString::fromStdString(captured_config));
+  emit fileLoaded(path, QString(), source_name, QString::fromStdString(captured_config), source_manifest_id);
 }
 
 void FileLoader::reportLoadWarning(QWidget* parent, const QString& reason) {
@@ -2261,6 +2429,91 @@ void FileLoader::cancelCurrent(std::uint64_t generation, bool keep_partial) {
   cancelCurrent(keep_partial);
 }
 
+bool FileLoader::cancelLoad(quint64 ticket, bool keep_partial) {
+  if (QThread::currentThread() != thread()) {
+    // Best-effort degrade for the one entry a batch worker may call off the
+    // loader's thread: the real answer requires this object's thread, so the
+    // cancel is marshalled and the caller learns the result via loadFinished.
+    cancelLoadAsync(ticket, keep_partial);
+    return false;
+  }
+  if (ticket == 0) {
+    return false;
+  }
+  // Still queued: remove the request before it ever starts, and schedule its
+  // terminal — nothing else will ever resolve this ticket.
+  for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+    if (it->ticket == ticket) {
+      const QString identity = it->input.source_identity;
+      queue_.erase(it);
+      emitLoadFinished(ticket, LoadOutcome::kCancelled, identity, 0);
+      return true;
+    }
+  }
+  // The active request. current_ticket_terminal_ closes the finished-but-not-
+  // yet-advanced event-loop hop: the terminal is already scheduled, so a
+  // cancel landing there must not latch cancel_mode_ against the NEXT load. A
+  // ticket can never name a LATER load — tickets advance with
+  // load_generation_ in startNext — so the generation-guarded delegate always
+  // targets the load this ticket was minted for.
+  if (ticket != current_load_ticket_ || !active_load_ || current_ticket_terminal_) {
+    return false;
+  }
+  cancelCurrent(load_generation_, keep_partial);
+  return true;
+}
+
+void FileLoader::cancelLoadAsync(quint64 ticket, bool keep_partial) {
+  QMetaObject::invokeMethod(
+      this, [this, ticket, keep_partial]() { (void)cancelLoad(ticket, keep_partial); }, Qt::QueuedConnection);
+}
+
+void FileLoader::emitLoadFinished(
+    quint64 ticket, LoadOutcome outcome, const QString& effective_path, DatasetId dataset_id,
+    QVector<DatasetId> produced_dataset_ids) {
+  if (ticket == current_load_ticket_) {
+    if (current_ticket_terminal_) {
+      // Already resolved — e.g. a re-entrant joinForShutdown ran inside a
+      // legacy signal slot after this path terminalized. Exactly-once: first
+      // wins. A DIFFERENT outcome here means an exit path broke the
+      // terminalize-before-legacy-emission convention — make that loud.
+      if (outcome != current_ticket_outcome_) {
+        qCWarning(lcFileLoader) << "[FileLoader] conflicting second resolution for ticket" << ticket << ": recorded"
+                                << static_cast<int>(current_ticket_outcome_) << ", ignoring"
+                                << static_cast<int>(outcome);
+      }
+      return;
+    }
+    // Mark terminal BEFORE anything can re-enter: every exit path calls this
+    // ahead of its legacy fileLoaded/fileLoadFailed emission, so a slot
+    // re-entering cancelLoad/joinForShutdown sees the request as resolved
+    // instead of latching cancel_mode_ or resolving it a second time.
+    current_ticket_terminal_ = true;
+    current_ticket_outcome_ = outcome;
+  }
+  pending_terminals_.push_back(
+      PendingTerminal{ticket, outcome, effective_path, dataset_id, std::move(produced_dataset_ids)});
+  // Queued delivery keeps the no-terminal-before-enqueue-returns contract;
+  // joinForShutdown flushes the deque synchronously instead, so teardown
+  // cannot lose a scheduled terminal.
+  QMetaObject::invokeMethod(this, [this]() { deliverPendingTerminal(); }, Qt::QueuedConnection);
+}
+
+void FileLoader::deliverPendingTerminal() {
+  if (pending_terminals_.empty()) {
+    return;  // a shutdown flush ran before this metacall was delivered
+  }
+  const PendingTerminal terminal = std::move(pending_terminals_.front());
+  pending_terminals_.pop_front();
+  emit loadFinished(terminal.ticket, terminal.outcome, terminal.effective_path, terminal.dataset_id, terminal.produced);
+}
+
+void FileLoader::flushPendingTerminals() {
+  while (!pending_terminals_.empty()) {
+    deliverPendingTerminal();
+  }
+}
+
 bool FileLoader::isBusy() const {
   return active_load_ || !queue_.empty();
 }
@@ -2270,6 +2523,22 @@ DatasetId FileLoader::activeLoadDatasetId() const {
 }
 
 void FileLoader::joinForShutdown() {
+  // Terminal bookkeeping for the requests this shutdown discards: the active
+  // load (unless it already resolved) and every queued request. Resolved at
+  // the END, once the loader is fully reset and reusable, so a slot reacting
+  // to a cancellation can immediately start a fresh load.
+  struct CancelledRequest {
+    quint64 ticket;
+    QString identity;
+  };
+  std::vector<CancelledRequest> cancelled_requests;
+  if (active_load_ && !current_ticket_terminal_) {
+    cancelled_requests.push_back({current_load_ticket_, current_load_identity_});
+  }
+  for (const LoadRequest& request : queue_) {
+    cancelled_requests.push_back({request.ticket, request.input.source_identity});
+  }
+
   shutting_down_ = true;
   // Invalidate every queued callback before waiting. next_load_generation_
   // remains untouched, so a subsequent load cannot reuse this token.
@@ -2325,6 +2594,9 @@ void FileLoader::joinForShutdown() {
   }
   queue_.clear();
   active_load_ = false;
+  current_load_ticket_ = 0;
+  current_load_identity_.clear();
+  current_ticket_terminal_ = false;
   // Clear the shutdown's discard flag so the NEXT load's prologue does not
   // mistake it for a user cancel issued while suspended (the V12a check reads
   // cancel_mode_ at prologue resume).
@@ -2334,6 +2606,16 @@ void FileLoader::joinForShutdown() {
   // lambdas — and re-enable prologue completion.
   message_gate_ = std::make_shared<PluginMessageGate>();
   shutting_down_ = false;
+  // Every discarded request still resolves its ticket, in FIFO order.
+  for (const CancelledRequest& cancelled : cancelled_requests) {
+    emitLoadFinished(cancelled.ticket, LoadOutcome::kCancelled, cancelled.identity, 0);
+  }
+  // The deliberate exception to queued terminal delivery: shutdown (and so
+  // destruction) must not lose terminals, so everything still pending — the
+  // cancellations above plus any terminal resolved earlier but not yet
+  // delivered — goes out NOW, before this call returns. The loader is fully
+  // reset, so re-entrancy from these slots is contained.
+  flushPendingTerminals();
 }
 
 QString FileLoader::sourcePathForDataset(DatasetId dataset_id) const {

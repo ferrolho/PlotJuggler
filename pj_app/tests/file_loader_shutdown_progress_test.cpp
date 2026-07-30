@@ -89,7 +89,7 @@ TEST(FileLoaderShutdownProgressChild, DispatchesQueuedProgressAfterJoin) {
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Progress Shutdown Source"_s;
   hints.preset_config_json = u"{}"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
   ASSERT_TRUE(loader.loadFile(input_path, nullptr, hints));
 
   ASSERT_TRUE(waitForProbeMarker(probe_path, QByteArrayLiteral("progress_callback_returned")))

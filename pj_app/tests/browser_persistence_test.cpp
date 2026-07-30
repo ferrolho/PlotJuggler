@@ -146,6 +146,12 @@ TEST(BrowserPersistencePolicy, AcceptsOnlyBoundedSourceFreeLayoutRecipes) {
   EXPECT_FALSE(
       BrowserPersistence::isSafeGenericLayoutRecipe(
           "<root pj4_version=\"4\" binding=\"generic\"><x>pj-upload://dead</x></root>"));
+  // Cloud-materialized source records are source-bound by definition; even a
+  // hand-crafted document carrying one outside <previouslyLoaded_Datafiles>
+  // must never enter durable browser storage.
+  EXPECT_FALSE(
+      BrowserPersistence::isSafeGenericLayoutRecipe(
+          "<root pj4_version=\"4\" binding=\"generic\"><materialize provider=\"p\"/></root>"));
   EXPECT_FALSE(BrowserPersistence::isSafeGenericLayoutRecipe(QByteArray(256 * 1024 + 1, 'x')));
 }
 

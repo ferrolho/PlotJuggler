@@ -3,7 +3,7 @@
 
 // Test-only DataSource plugin that advertises kCapabilityHasDialog and carries an
 // embedded dialog, used to exercise FileLoader's shutdown-while-suspended-at-the-
-// plugin-config-dialog path. When a load runs without skip_dialog, the prologue
+// plugin-config-dialog path. When a load runs with the interactive dialog policy, the prologue
 // coroutine suspends on DataSourceDialogAwaiter with this dialog open; tearing the
 // loader down must reject the plugin (exactly one onRejected) BEFORE the embedded
 // dialog is destroyed — otherwise a late reject reads a freed plugin ctx (UAF).

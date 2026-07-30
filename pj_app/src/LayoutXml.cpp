@@ -157,10 +157,22 @@ QList<DataSourceRef> extractDataSource(const QDomDocument& doc, const QDir& layo
     const QDomElement plugin = file_info.firstChildElement(u"plugin"_s);
     if (!plugin.isNull()) {
       info.plugin_id = plugin.attribute(u"ID"_s);
+      info.plugin_manifest_id = plugin.attribute(u"manifest_id"_s);
       info.rewrite_plugin_filepath = plugin.attribute(u"filepath_mode"_s) == "source"_L1;
       // QDomElement::text() concatenates all child text/CDATA — exactly
       // the round-trip of doc.createCDATASection above.
       info.plugin_config_json = plugin.text();
+    }
+
+    // Optional provider source record, a sibling of <plugin> (see
+    // DataSourceRef::materialize_*). Old layouts have no such child and parse
+    // exactly as before. directCdataText (not text()) reads the element's OWN
+    // CDATA only, so a future child element cannot leak into the descriptor.
+    const QDomElement materialize = file_info.firstChildElement(u"materialize"_s);
+    if (!materialize.isNull()) {
+      info.materialize_provider = materialize.attribute(u"provider"_s);
+      info.materialize_identity = materialize.attribute(u"identity"_s);
+      info.materialize_descriptor_json = directCdataText(materialize);
     }
     sources.push_back(std::move(info));
   }

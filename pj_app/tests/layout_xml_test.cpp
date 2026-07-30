@@ -294,6 +294,104 @@ TEST(ExtractDataSource, PluginCdataWithClosingSequenceRoundTrips) {
   EXPECT_EQ(refs.front().plugin_config_json, json);
 }
 
+TEST(ExtractDataSource, PluginManifestIdParsedWhenPresentAndEmptyWhenAbsent) {
+  // New layouts write BOTH the display name (ID — what old readers keep using)
+  // and the stable manifest id (manifest_id) on <plugin>. Old layouts carry
+  // only ID; the manifest id field must then stay empty.
+  QDomDocument doc = buildDataSourceDoc(u"/tmp/x.mcap"_s, QString(), u"MCAP Loader"_s, u"{}"_s);
+  {
+    const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+    ASSERT_EQ(refs.size(), 1);
+    EXPECT_EQ(refs.front().plugin_id, u"MCAP Loader"_s);
+    EXPECT_TRUE(refs.front().plugin_manifest_id.isEmpty());
+  }
+  QDomElement plugin = doc.documentElement()
+                           .firstChildElement(u"previouslyLoaded_Datafiles"_s)
+                           .firstChildElement(u"fileInfo"_s)
+                           .firstChildElement(u"plugin"_s);
+  plugin.setAttribute(u"manifest_id"_s, u"mcap-loader"_s);
+  QDomDocument reparsed;
+  ASSERT_TRUE(reparsed.setContent(doc.toByteArray(2)));
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(reparsed, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().plugin_id, u"MCAP Loader"_s);
+  EXPECT_EQ(refs.front().plugin_manifest_id, u"mcap-loader"_s);
+}
+
+// ---------- <materialize> provider source records ---------------------------
+
+// Appends a <materialize> child to the doc's only <fileInfo>, mirroring
+// MainWindow::appendDataSourceElement's save shape: provider/identity as
+// attributes, the canonical descriptor JSON as a CDATA payload written through
+// appendJsonAsCdata (so a "]]>"-bearing descriptor splits across sections).
+void appendMaterialize(QDomDocument& doc, const QString& provider, const QString& identity, const QString& descriptor) {
+  QDomElement file_info =
+      doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s).firstChildElement(u"fileInfo"_s);
+  QDomElement materialize = doc.createElement(u"materialize"_s);
+  materialize.setAttribute(u"provider"_s, provider);
+  materialize.setAttribute(u"identity"_s, identity);
+  PJ::layout_xml::appendJsonAsCdata(doc, materialize, descriptor);
+  file_info.appendChild(materialize);
+}
+
+TEST(ExtractDataSource, MaterializeRecordSurvivesSerializeReparseByteExact) {
+  // The descriptor bytes are a cross-repo identity contract: they must come
+  // back VERBATIM through the real XML file pipeline, including newlines and
+  // the CDATA-hostile "]]>" sequence.
+  const QString descriptor = u"{\n  \"provider\": \"mcap-cloud\",\n  \"pattern\": \"a ]]> b\"\n}"_s;
+  const QString plugin_json = uR"({"topics":[]})"_s;
+  QDomDocument doc = buildDataSourceDoc(u"/tmp/cache.mcap"_s, QString(), u"MCAP Loader"_s, plugin_json);
+  appendMaterialize(doc, u"mcap-cloud"_s, u"mcap-cloud:v1:sha256/128:ab12"_s, descriptor);
+
+  QDomDocument reparsed;
+  ASSERT_TRUE(reparsed.setContent(doc.toByteArray(2)));
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(reparsed, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().materialize_provider, u"mcap-cloud"_s);
+  EXPECT_EQ(refs.front().materialize_identity, u"mcap-cloud:v1:sha256/128:ab12"_s);
+  EXPECT_EQ(refs.front().materialize_descriptor_json, descriptor);
+  // <materialize> is a SIBLING of <plugin>: the plugin child must parse exactly
+  // as before, with no descriptor bytes leaking into its config payload.
+  EXPECT_EQ(refs.front().plugin_id, u"MCAP Loader"_s);
+  EXPECT_EQ(refs.front().plugin_config_json, plugin_json);
+}
+
+TEST(ExtractDataSource, MaterializeAbsentLeavesFieldsEmpty) {
+  // Old layouts (no <materialize> child) parse identically: all three fields
+  // stay empty and every pre-existing field is untouched.
+  const QString json = uR"({"topics":["a"]})"_s;
+  const QDomDocument doc = buildDataSourceDoc(u"/tmp/x.mcap"_s, u"robot"_s, u"CSV"_s, json);
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_TRUE(refs.front().materialize_provider.isEmpty());
+  EXPECT_TRUE(refs.front().materialize_identity.isEmpty());
+  EXPECT_TRUE(refs.front().materialize_descriptor_json.isEmpty());
+  EXPECT_EQ(refs.front().plugin_id, u"CSV"_s);
+  EXPECT_EQ(refs.front().plugin_config_json, json);
+}
+
+TEST(ExtractDataSource, UnknownFileInfoChildrenStayIgnoredAndParsingIsReadOnly) {
+  // Forward/backward tolerance: a genuinely unknown <fileInfo> child changes
+  // nothing (the old-reader guarantee <materialize> relies on), and extracting
+  // never mutates the document (byte-stable before/after).
+  QDomDocument doc = buildDataSourceDoc(u"/tmp/x.mcap"_s, QString(), u"MCAP Loader"_s, uR"({"a":1})"_s);
+  appendMaterialize(doc, u"mcap-cloud"_s, u"id-1"_s, uR"({"key":"cloud/a.mcap"})"_s);
+  QDomElement file_info =
+      doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s).firstChildElement(u"fileInfo"_s);
+  QDomElement unknown = doc.createElement(u"future_extension"_s);
+  unknown.setAttribute(u"x"_s, u"1"_s);
+  file_info.appendChild(unknown);
+
+  const QByteArray before = doc.toByteArray(2);
+  const QList<DataSourceRef> refs = PJ::layout_xml::extractDataSource(doc, QDir::current());
+  EXPECT_EQ(doc.toByteArray(2), before);
+  ASSERT_EQ(refs.size(), 1);
+  EXPECT_EQ(refs.front().plugin_config_json, uR"({"a":1})"_s);
+  EXPECT_EQ(refs.front().materialize_provider, u"mcap-cloud"_s);
+  EXPECT_EQ(refs.front().materialize_identity, u"id-1"_s);
+  EXPECT_EQ(refs.front().materialize_descriptor_json, uR"({"key":"cloud/a.mcap"})"_s);
+}
+
 TEST(ExtractDataSource, MultipleFileInfosParsedInOrder) {
   // A multi-file session: two distinct files, each with its own plugin config.
   // Host-absolute paths (QDir::tempPath()) — a hardcoded POSIX "/tmp/x" is

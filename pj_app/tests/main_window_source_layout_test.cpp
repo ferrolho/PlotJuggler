@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -131,6 +132,112 @@ TEST(MainWindowSourceLayoutTest, OneFanoutFileRoundTripsEveryOffsetAndTrackOrder
   EXPECT_EQ(session.sourceDisplayOffset(left).value.count(), 11'000);
   EXPECT_EQ(session.sourceDisplayOffset(right).value.count(), -22'000);
   EXPECT_EQ(PJ::MainWindowSourceLayoutTestPeer::trackOrder(window), (std::vector<PJ::DatasetId>{right, left}));
+}
+
+// A dataset carrying a SessionManager::SourceRecord (provider provenance) must
+// save a <materialize> child under its <fileInfo> — a SIBLING of <plugin>, with
+// provider/identity attributes and the descriptor JSON as VERBATIM CDATA bytes
+// (a cross-repo identity contract, so it must survive the real XML pipeline
+// byte-exact, "]]>" included). A recordless source must emit no such child.
+TEST(MainWindowSourceLayoutTest, PrimaryDatasetSourceRecordEmitsMaterializeChild) {
+  QTemporaryDir extensions_dir;
+  QTemporaryDir project_dir;
+  ASSERT_TRUE(extensions_dir.isValid());
+  ASSERT_TRUE(project_dir.isValid());
+  const auto make_source_file = [&project_dir](const QString& name) {
+    const QString path = project_dir.filePath(name);
+    QFile file(path);
+    EXPECT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+    return path;
+  };
+  const QString cloud_path = make_source_file(QStringLiteral("cache.mcap"));
+  const QString plain_path = make_source_file(QStringLiteral("plain.mcap"));
+
+  PJ::MainWindow window(extensions_dir.path());
+  PJ::AppSession& app = PJ::MainWindowSourceLayoutTestPeer::session(window);
+  PJ::SessionManager& session = app.sessionManager();
+  const PJ::DatasetId cloud_dataset = addDataset(app, "cache.mcap", "/cloud");
+  const PJ::DatasetId plain_dataset = addDataset(app, "plain.mcap", "/plain");
+  ASSERT_NE(cloud_dataset, 0U);
+  ASSERT_NE(plain_dataset, 0U);
+  app.catalogModel().rebuildFromDatastore();
+  session.setDatasetSourcePath(cloud_dataset, cloud_path);
+  session.setDatasetSourcePath(plain_dataset, plain_path);
+  session.recordLoadedSource(
+      cloud_path, QString{}, QStringLiteral("MCAP Loader"), QStringLiteral("{}"), QStringLiteral("mcap-loader"));
+  session.recordLoadedSource(plain_path, QString{}, QStringLiteral("MCAP Loader"), QStringLiteral("{}"));
+
+  const QString descriptor = QStringLiteral("{\n  \"key\": \"cloud/a ]]> b.mcap\",\n  \"v\": 1\n}");
+  session.attachSourceRecord(
+      cloud_dataset, PJ::SourceRecord{
+                         .provider_id = QStringLiteral("mcap-cloud"),
+                         .source_identity = QStringLiteral("mcap-cloud:v1:sha256/128:ab12"),
+                         .descriptor_json = descriptor,
+                     });
+
+  QDomDocument doc;
+  QDomElement root = doc.createElement(QStringLiteral("root"));
+  root.setAttribute(QStringLiteral("pj4_version"), QStringLiteral("4"));
+  doc.appendChild(root);
+  const QDir layout_dir(project_dir.path());
+  QDomElement wrapper = PJ::MainWindowSourceLayoutTestPeer::appendSources(window, doc, layout_dir);
+  ASSERT_FALSE(wrapper.isNull());
+  root.appendChild(wrapper);
+
+  // Locate each file's <fileInfo>. The recorded source order is stable, but key
+  // off the filename attribute so the assertion doesn't depend on it.
+  QDomElement cloud_info;
+  QDomElement plain_info;
+  for (QDomElement file_info = wrapper.firstChildElement(QStringLiteral("fileInfo")); !file_info.isNull();
+       file_info = file_info.nextSiblingElement(QStringLiteral("fileInfo"))) {
+    const QString filename = file_info.attribute(QStringLiteral("filename"));
+    if (filename.endsWith(QStringLiteral("cache.mcap"))) {
+      cloud_info = file_info;
+    } else if (filename.endsWith(QStringLiteral("plain.mcap"))) {
+      plain_info = file_info;
+    }
+  }
+  ASSERT_FALSE(cloud_info.isNull());
+  ASSERT_FALSE(plain_info.isNull());
+
+  // Old-reader pin: <materialize> is emitted as a DIRECT child of <fileInfo>,
+  // a sibling of the <plugin> element (never nested inside it).
+  const QDomElement materialize = cloud_info.firstChildElement(QStringLiteral("materialize"));
+  ASSERT_FALSE(materialize.isNull());
+  EXPECT_EQ(materialize.parentNode(), cloud_info);
+  const QDomElement cloud_plugin = cloud_info.firstChildElement(QStringLiteral("plugin"));
+  ASSERT_FALSE(cloud_plugin.isNull());
+  EXPECT_EQ(cloud_plugin.parentNode(), cloud_info);
+  // The plugin element writes BOTH identities: the display name (ID — what old
+  // readers keep consuming) and the stable manifest id, when one was recorded.
+  EXPECT_EQ(cloud_plugin.attribute(QStringLiteral("ID")), QStringLiteral("MCAP Loader"));
+  EXPECT_EQ(cloud_plugin.attribute(QStringLiteral("manifest_id")), QStringLiteral("mcap-loader"));
+  const QDomElement plain_plugin = plain_info.firstChildElement(QStringLiteral("plugin"));
+  ASSERT_FALSE(plain_plugin.isNull());
+  EXPECT_EQ(plain_plugin.attribute(QStringLiteral("ID")), QStringLiteral("MCAP Loader"));
+  EXPECT_FALSE(plain_plugin.hasAttribute(QStringLiteral("manifest_id")))
+      << "a source recorded without a manifest id must not grow the attribute";
+  EXPECT_EQ(materialize.attribute(QStringLiteral("provider")), QStringLiteral("mcap-cloud"));
+  EXPECT_EQ(materialize.attribute(QStringLiteral("identity")), QStringLiteral("mcap-cloud:v1:sha256/128:ab12"));
+  EXPECT_TRUE(plain_info.firstChildElement(QStringLiteral("materialize")).isNull())
+      << "a recordless source must not grow a materialize child";
+
+  // Verbatim descriptor bytes through the REAL pipeline: serialize + reparse +
+  // extractDataSource must return byte-identical descriptor JSON.
+  QDomDocument reparsed;
+  ASSERT_TRUE(reparsed.setContent(doc.toByteArray(2)));
+  const QList<PJ::layout_xml::DataSourceRef> refs = PJ::layout_xml::extractDataSource(reparsed, layout_dir);
+  ASSERT_EQ(refs.size(), 2);
+  const auto cloud_ref = std::find_if(refs.cbegin(), refs.cend(), [](const PJ::layout_xml::DataSourceRef& ref) {
+    return ref.serialized_path.endsWith(QStringLiteral("cache.mcap"));
+  });
+  ASSERT_NE(cloud_ref, refs.cend());
+  EXPECT_EQ(cloud_ref->materialize_provider, QStringLiteral("mcap-cloud"));
+  EXPECT_EQ(cloud_ref->materialize_identity, QStringLiteral("mcap-cloud:v1:sha256/128:ab12"));
+  EXPECT_EQ(cloud_ref->materialize_descriptor_json, descriptor);
+  EXPECT_EQ(cloud_ref->plugin_id, QStringLiteral("MCAP Loader"));
+  EXPECT_EQ(cloud_ref->plugin_manifest_id, QStringLiteral("mcap-loader"));
 }
 
 }  // namespace

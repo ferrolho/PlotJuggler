@@ -55,7 +55,7 @@ class MainWindowHistoryTestPeer {
   }
 
   static void completeFileLoad(MainWindow& window, const QString& path) {
-    window.onFileLoaded(path, {}, u"test-loader"_s, u"{}"_s);
+    window.onFileLoaded(path, {}, u"test-loader"_s, u"{}"_s, u"test-loader-id"_s);
   }
 
   static void setProgressiveRestoreInFlight(MainWindow& window, bool active) {

@@ -514,9 +514,14 @@ bool BrowserPersistence::isSafeGenericLayoutRecipe(const QByteArray& xml) {
     return false;
   }
   const QDomElement root = document.documentElement();
+  // <materialize> (a cloud-provider source record) is source-bound by
+  // definition; in a well-formed layout it only ever appears under
+  // <previouslyLoaded_Datafiles>, but reject it anywhere so a hand-crafted
+  // document cannot smuggle one into durable browser storage.
   if (root.tagName() != "root"_L1 || root.attribute(u"binding"_s) != "generic"_L1 ||
       !root.firstChildElement(u"previouslyLoaded_Datafiles"_s).isNull() ||
-      !document.elementsByTagName(u"plugin"_s).isEmpty() || !document.elementsByTagName(u"transform"_s).isEmpty()) {
+      !document.elementsByTagName(u"plugin"_s).isEmpty() || !document.elementsByTagName(u"transform"_s).isEmpty() ||
+      !document.elementsByTagName(u"materialize"_s).isEmpty()) {
     return false;
   }
   // Scan the decoded DOM as well as the original bytes so XML entities cannot

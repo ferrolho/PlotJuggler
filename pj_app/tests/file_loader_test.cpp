@@ -97,6 +97,19 @@ const PJ_data_source_vtable_t* alternateMockSourceVtable(const PJ_data_source_vt
   return &alternate;
 }
 
+// Decoy whose MANIFEST ID equals the real mock source's DISPLAY NAME. With the
+// tiered matcher (manifest id across ALL candidates first, display name only
+// as a fallback), an expected id of "Mock File Source" must select THIS plugin
+// by its manifest id even though the real mock — an earlier extension match —
+// carries that exact string as its display name.
+const PJ_data_source_vtable_t* decoyWithIdEqualToMockDisplayName(const PJ_data_source_vtable_t* source) {
+  static PJ_data_source_vtable_t decoy;
+  decoy = *source;
+  decoy.manifest_json =
+      R"({"id":"Mock File Source","name":"Manifest Tier Decoy","version":"1.0.0","file_extensions":[".mock"]})";
+  return &decoy;
+}
+
 // In-process DataSource used to put fanout cancellation at an exact point:
 // entry 1 has completed, entry 2 has appended one row, and entry 3 has not
 // started. Keeping the probe in this executable makes the GUI/worker handoff a
@@ -324,18 +337,85 @@ class FanoutProbeSource final : public PJ::DataSourcePluginBase {
   PJ::DataSourceState state_ = PJ::DataSourceState::kIdle;
 };
 
-const PJ_data_source_vtable_t* fanoutProbeVtable() {
+// One static vtable per in-process test source: registerStaticDataSource keeps
+// a non-owning pointer for the catalog lifetime, and the create hook must be a
+// capture-less noexcept factory. One manifest per Source type — the first
+// call's manifest wins (each wrapper below passes a single literal).
+template <typename Source>
+const PJ_data_source_vtable_t* staticSourceVtable(const char* manifest_json) {
   static const PJ_data_source_vtable_t* vtable = PJ::DataSourcePluginBase::vtableWithCreate(
       []() noexcept -> void* {
         try {
-          return new FanoutProbeSource();
+          return new Source();
         } catch (...) {
           return nullptr;
         }
       },
+      manifest_json);
+  return vtable;
+}
+
+const PJ_data_source_vtable_t* fanoutProbeVtable() {
+  return staticSourceVtable<FanoutProbeSource>(
       R"({"id":"fanout-probe-source","name":"Fanout Probe Source","version":"1.0.0",)"
       R"("file_extensions":[".fanoutprobe"]})");
-  return vtable;
+}
+
+// Review finding 4: a source whose loadConfig REJECTS one specific preset
+// (marker "poison") but accepts everything else. Distinguishes the strict
+// DialogPolicy::kNever contract (rejected preset -> the load FAILS) from the
+// interactive fallback (rejected preset -> silently retry with the QSettings
+// pre-fill, which this plugin accepts, and the load would SUCCEED).
+class RejectingPresetSource final : public PJ::DataSourcePluginBase {
+ public:
+  uint64_t capabilities() const override {
+    return PJ::kCapabilityFiniteImport | PJ::kCapabilityDirectIngest;
+  }
+
+  std::string saveConfig() const override {
+    return config_;
+  }
+
+  PJ::Status loadConfig(std::string_view config_json) override {
+    if (config_json.find("poison") != std::string_view::npos) {
+      return PJ::unexpected("poisoned preset rejected");
+    }
+    config_.assign(config_json);
+    return PJ::okStatus();
+  }
+
+  PJ::Status start() override {
+    state_ = PJ::DataSourceState::kStarting;
+    auto topic = writeHost().ensureTopic("cfg/value");
+    if (!topic) {
+      return PJ::unexpected(topic.error());
+    }
+    if (auto status = writeHost().appendRecord(*topic, PJ::Timestamp{100}, {{.name = "value", .value = 1.0}});
+        !status) {
+      return PJ::unexpected(status.error());
+    }
+    state_ = PJ::DataSourceState::kStopped;
+    runtimeHost().requestStop(PJ::DataSourceState::kStopped, "import complete");
+    return PJ::okStatus();
+  }
+
+  void stop() override {
+    state_ = PJ::DataSourceState::kStopped;
+  }
+
+  PJ::DataSourceState currentState() const override {
+    return state_;
+  }
+
+ private:
+  std::string config_ = "{}";
+  PJ::DataSourceState state_ = PJ::DataSourceState::kIdle;
+};
+
+const PJ_data_source_vtable_t* rejectingPresetVtable() {
+  return staticSourceVtable<RejectingPresetSource>(
+      R"({"id":"rejecting-preset-source","name":"Rejecting Preset Source","version":"1.0.0",)"
+      R"("file_extensions":[".cfgreject"]})");
 }
 
 class FileLoaderTest : public ::testing::Test {
@@ -381,7 +461,7 @@ class FileLoaderTest : public ::testing::Test {
     PJ::LoadHints hints;
     hints.expected_plugin_id = u"Fanout Probe Source"_s;
     hints.preset_config_json = config;
-    hints.skip_dialog = true;
+    hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
     hints.require_expected_plugin = true;
     return hints;
   }
@@ -401,7 +481,7 @@ class FileLoaderTest : public ::testing::Test {
     PJ::LoadHints hints;
     hints.expected_plugin_id = u"Mock File Source"_s;
     hints.preset_config_json = config;
-    hints.skip_dialog = true;
+    hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
     hints.prefer_reuse = prefer_reuse;
     return hints;
   }
@@ -644,13 +724,146 @@ TEST_F(FileLoaderTest, ExactPluginOptInSelectsRequestedNonFirstExtensionMatch) {
       load_and_capture_plugin(makeMockFile(u"exact-selection.mock"_s), exact_hints);
   ASSERT_TRUE(exact_succeeded);
   EXPECT_EQ(exact_plugin, u"Alternate Mock File Source"_s)
-      << "exact layout replay must select the requested non-first match";
+      << "exact layout replay must select the requested non-first match (display-name fallback tier)";
+
+  // Same selection through the plugin's stable MANIFEST id (what new layouts
+  // persist as manifest_id, carried in its OWN hint field): the id tier must
+  // resolve the same plugin without any display-name hint.
+  PJ::LoadHints manifest_hints = loadHints();
+  manifest_hints.expected_plugin_id.clear();
+  manifest_hints.expected_manifest_id = u"alternate-mock-file-source"_s;
+  manifest_hints.require_expected_plugin = true;
+  const auto [manifest_succeeded, manifest_plugin] =
+      load_and_capture_plugin(makeMockFile(u"manifest-selection.mock"_s), manifest_hints);
+  ASSERT_TRUE(manifest_succeeded);
+  EXPECT_EQ(manifest_plugin, u"Alternate Mock File Source"_s)
+      << "a manifest-id hint must select the requested non-first match";
+}
+
+// Review finding 5: a manifest-id mismatch must FALL BACK to the saved
+// display name — the two identities ride separate fields, so an uninstalled
+// manifest id does not doom a layout whose display name still matches.
+TEST_F(FileLoaderTest, ManifestIdMismatchFallsBackToDisplayName) {
+  auto& extensions = app_session_->extensionCatalog();
+  const auto original_matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(original_matches.size(), 1u);
+  ASSERT_TRUE(extensions.pluginCatalog().registerStaticDataSource(
+      alternateMockSourceVtable(original_matches.front()->library.vtable())));
+
+  PJ::LoadHints hints = loadHints();
+  hints.expected_manifest_id = u"uninstalled-provider-id"_s;  // no candidate carries this
+  hints.expected_plugin_id = u"Alternate Mock File Source"_s;
+  hints.require_expected_plugin = true;
+
+  QString selected_plugin;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded,
+      [&](const QString&, const QString&, const QString& plugin_id, const QString&, const QString&) {
+        selected_plugin = plugin_id;
+      });
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+  QObject::disconnect(loaded);
+  EXPECT_EQ(selected_plugin, u"Alternate Mock File Source"_s)
+      << "a manifest mismatch must fall back to the saved display name, not fail or first-match";
+}
+
+// Review finding 5: a legacy ID-only layout (display name only, no
+// manifest_id) starts at the NAME tier — it must never select a plugin whose
+// MANIFEST id merely collides with the saved display name (that would be a
+// silent semantic change of which plugin parses the bytes).
+TEST_F(FileLoaderTest, IdOnlyLayoutNeverMatchesByManifestId) {
+  auto& extensions = app_session_->extensionCatalog();
+  const auto original_matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(original_matches.size(), 1u);
+  ASSERT_TRUE(extensions.pluginCatalog().registerStaticDataSource(
+      decoyWithIdEqualToMockDisplayName(original_matches.front()->library.vtable())));
+
+  PJ::LoadHints hints = loadHints();  // legacy layout: display name only
+  hints.expected_plugin_id = u"Mock File Source"_s;
+  ASSERT_TRUE(hints.expected_manifest_id.isEmpty());
+  hints.require_expected_plugin = true;
+
+  QString selected_name;
+  QString selected_manifest_id;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded,
+      [&](const QString&, const QString&, const QString& plugin_id, const QString&, const QString& manifest_id) {
+        selected_name = plugin_id;
+        selected_manifest_id = manifest_id;
+      });
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+  QObject::disconnect(loaded);
+  EXPECT_EQ(selected_name, u"Mock File Source"_s)
+      << "the ID-only layout must resolve by display name, not by the decoy's colliding manifest id";
+  EXPECT_EQ(selected_manifest_id, u"mock-file-source"_s);
+}
+
+// The consult-locked tier order: manifest id exact — scanned across ALL
+// extension matches — outranks a display-name match on an EARLIER candidate.
+// The decoy's manifest id equals the real mock's display name, so a matcher
+// that compares (id OR name) per candidate in order, or name before id, would
+// select the wrong plugin.
+TEST_F(FileLoaderTest, ManifestIdTierOutranksDisplayNameTierAcrossAllCandidates) {
+  auto& extensions = app_session_->extensionCatalog();
+  const auto original_matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(original_matches.size(), 1u);
+  ASSERT_TRUE(extensions.pluginCatalog().registerStaticDataSource(
+      decoyWithIdEqualToMockDisplayName(original_matches.front()->library.vtable())));
+  const auto matches = extensions.findSourcesForExtension(u".mock"_s);
+  ASSERT_EQ(matches.size(), 2u);
+  ASSERT_EQ(QString::fromStdString(matches.front()->name), u"Mock File Source"_s)
+      << "the display-name collision must sit BEFORE the manifest-id owner";
+  ASSERT_EQ(QString::fromStdString(matches.back()->id), u"Mock File Source"_s);
+
+  PJ::LoadHints hints = loadHints();
+  // As a NEW layout would save the decoy: both identities, in their own
+  // fields. The manifest tier must win even though an EARLIER candidate's
+  // display name equals the manifest id.
+  hints.expected_manifest_id = u"Mock File Source"_s;  // the DECOY's manifest id
+  hints.expected_plugin_id = u"Manifest Tier Decoy"_s;
+  hints.require_expected_plugin = true;
+
+  QString selected_name;
+  QString selected_manifest_id;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded,
+      [&](const QString&, const QString&, const QString& plugin_id, const QString&, const QString& manifest_id) {
+        selected_name = plugin_id;
+        selected_manifest_id = manifest_id;
+      });
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+  QObject::disconnect(loaded);
+  EXPECT_EQ(selected_name, u"Manifest Tier Decoy"_s)
+      << "manifest-id tier must win over an earlier candidate's display name";
+  EXPECT_EQ(selected_manifest_id, u"Mock File Source"_s) << "fileLoaded must report the selected plugin's manifest id";
+}
+
+// hint_eligible must accept an expected id that is the plugin's MANIFEST id
+// (not only its display name): the dialog stays skipped and the layout preset
+// applies byte-exact. A regression re-opens the dialog (headless here — the
+// load would fall to the QSettings/dialog path and the preset marker is lost).
+TEST_F(FileLoaderTest, ManifestIdHintStillSkipsDialogAndAppliesPreset) {
+  const QString preset = uR"({"filepath":"desktop-layout-value","marker":"manifest-id-hint"})"_s;
+  PJ::LoadHints hints = loadHints(preset);
+  hints.expected_plugin_id.clear();
+  hints.expected_manifest_id = u"mock-file-source"_s;  // manifest id only, no display name
+  hints.require_expected_plugin = true;
+
+  QString emitted_config;
+  const auto loaded = QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded,
+      [&](const QString&, const QString&, const QString&, const QString& config) { emitted_config = config; });
+  ASSERT_TRUE(loadAndWait(mock_path_, hints));
+  QObject::disconnect(loaded);
+  EXPECT_EQ(emitted_config, preset);
+  EXPECT_NE(datasetNamed("sensors.mock"), 0u);
 }
 
 TEST_F(FileLoaderTest, BrowserLayoutPresetRewritesOnlyFilepathToFreshBackingPath) {
   const QString stale_path = u"/pj_uploads/expired/1/sensors.mock"_s;
   PJ::LoadHints hints =
       loadHints(uR"({"filepath":"/pj_uploads/expired/1/sensors.mock","delimiter":";","nested":{"keep":7}})"_s);
+  hints.dialog_policy = PJ::DialogPolicy::kNever;  // the rewrite rides automated replay only
   hints.require_expected_plugin = true;
   hints.rewrite_preset_filepath = true;
 
@@ -712,7 +925,7 @@ TEST_F(FileLoaderTest, DesktopPresetBytesRemainUntouchedWithoutRewriteOptIn) {
 
 TEST_F(FileLoaderTest, BrowserLayoutEmptyPresetCanStillInjectFreshBackingPathAndSkipDialog) {
   PJ::LoadHints hints = loadHints(QString());
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kNever;  // the rewrite rides automated replay only
   hints.require_expected_plugin = true;
   hints.rewrite_preset_filepath = true;
 
@@ -874,7 +1087,7 @@ TEST_F(FileLoaderTest, RealDeleteThenPreferReuseReloadReIngestsFreshDataset) {
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Mock File Source"_s;
   hints.preset_config_json = u"{}"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
   hints.prefer_reuse = true;
   // The dataset was erased, so prefer_reuse finds nothing to reuse and falls through
   // to a FRESH single-instance load — which is async (worker). Wait for it.
@@ -1403,11 +1616,817 @@ TEST_F(FileLoaderTest, JoinForShutdownDuringReplacingReloadRestoresPriorData) {
   EXPECT_NE(datasetNamed("sensors.mock"), 0u);
 }
 
+// ---------------------------------------------------------------------------
+// LoadTicket: request-scoped load tracking. loadFileTicketed mints a ticket at
+// enqueue; every ACCEPTED request must resolve with EXACTLY ONE loadFinished —
+// on the success, failure, cancel(queued), cancel(active), dialog-reject, and
+// shutdown paths alike. cancelLoad targets one request by ticket.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Records every loadFinished emission so tests can assert exactly-once and the
+// terminal payload (outcome / effective path / dataset ids) per ticket.
+struct LoadFinishedRecorder {
+  struct Event {
+    quint64 ticket;
+    PJ::LoadOutcome outcome;
+    QString path;
+    PJ::DatasetId dataset_id;
+    QVector<PJ::DatasetId> produced;
+  };
+
+  explicit LoadFinishedRecorder(PJ::FileLoader& loader) {
+    connection = QObject::connect(
+        &loader, &PJ::FileLoader::loadFinished, &loader,
+        [this](
+            quint64 ticket, PJ::LoadOutcome outcome, const QString& path, PJ::DatasetId dataset_id,
+            const QVector<PJ::DatasetId>& produced) {
+          events.push_back(
+              Event{
+                  .ticket = ticket, .outcome = outcome, .path = path, .dataset_id = dataset_id, .produced = produced});
+        });
+  }
+  ~LoadFinishedRecorder() {
+    QObject::disconnect(connection);
+  }
+  LoadFinishedRecorder(const LoadFinishedRecorder&) = delete;
+  LoadFinishedRecorder& operator=(const LoadFinishedRecorder&) = delete;
+
+  [[nodiscard]] std::size_t countForTicket(quint64 ticket) const {
+    return static_cast<std::size_t>(
+        std::count_if(events.begin(), events.end(), [ticket](const Event& e) { return e.ticket == ticket; }));
+  }
+
+  std::vector<Event> events;
+  QMetaObject::Connection connection;
+};
+
+// Deliver queued loadFinished terminals: two zero-timer loop passes, because a
+// terminal may itself be scheduled from another queued event (a worker's
+// completion metacall, a cross-thread cancel marshal).
+void flushQueuedTerminals() {
+  for (int pass = 0; pass < 2; ++pass) {
+    QEventLoop loop;
+    QTimer::singleShot(0, &loop, &QEventLoop::quit);
+    loop.exec();
+  }
+}
+
+// Pump the event loop until the loader's queue drains (bounded, so a regression
+// fails instead of hanging CI), then deliver any queued terminals.
+void pumpUntilIdle(PJ::FileLoader& loader) {
+  QEventLoop loop;
+  QObject::connect(&loader, &PJ::FileLoader::queueDrained, &loop, &QEventLoop::quit);
+  if (loader.isBusy()) {
+    QTimer::singleShot(15000, &loop, [&loop]() { loop.quit(); });
+    loop.exec();
+  }
+  flushQueuedTerminals();
+}
+
+}  // namespace
+
+TEST_F(FileLoaderTest, TicketedLoadReportsLoadedExactlyOnce) {
+  LoadFinishedRecorder recorder(*loader_);
+  int legacy_loaded = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [&](const QString&, const QString&, const QString&, const QString&) { ++legacy_loaded; });
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints());
+  ASSERT_NE(ticket, 0u);
+  EXPECT_EQ(loader_->currentLoadTicket(), ticket) << "the accepted request is the current load";
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u) << "exactly one terminal per accepted request";
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kLoaded);
+  EXPECT_EQ(recorder.events[0].path, mock_path_);
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  EXPECT_EQ(recorder.events[0].dataset_id, dataset_id) << "the terminal must carry the loaded primary dataset";
+  EXPECT_EQ(recorder.events[0].produced, QVector<PJ::DatasetId>{dataset_id});
+  EXPECT_EQ(legacy_loaded, 1) << "legacy fileLoaded stays untouched";
+  EXPECT_EQ(loader_->currentLoadTicket(), 0u) << "idle again after the drain";
+}
+
+TEST_F(FileLoaderTest, TicketedLoadRejectionReturnsZeroWithoutLoadFinished) {
+  LoadFinishedRecorder recorder(*loader_);
+  int legacy_failed = 0;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString&) {
+    ++legacy_failed;
+  });
+
+  // Trailing-slash directory → empty display_name → rejected at enqueue.
+  const QString dir_path = data_dir_.path() + u"/"_s;
+  EXPECT_EQ(loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(dir_path)), 0u);
+
+  flushQueuedTerminals();
+  EXPECT_TRUE(recorder.events.empty()) << "a rejected request was never accepted, so no loadFinished";
+  EXPECT_EQ(legacy_failed, 1) << "the legacy rejection surface stays intact";
+  EXPECT_FALSE(loader_->isBusy());
+}
+
+TEST_F(FileLoaderTest, TicketedSynchronousPrologueFailureReportsFailedExactlyOnce) {
+  LoadFinishedRecorder recorder(*loader_);
+  const QString bad = makeMockFile(u"ticket.unhandledext"_s);
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(bad));
+  ASSERT_NE(ticket, 0u) << "an enqueued request is accepted even if its prologue fails";
+  EXPECT_TRUE(recorder.events.empty())
+      << "terminals are queued: even a synchronous prologue failure must not resolve before enqueue returns";
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed);
+  EXPECT_EQ(recorder.events[0].path, bad);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u);
+  EXPECT_TRUE(recorder.events[0].produced.isEmpty());
+}
+
+TEST_F(FileLoaderTest, TicketedWorkerStartFailureReportsFailedExactlyOnce) {
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints(uR"({"fail_start":true})"_s));
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u) << "a failed load leaves no dataset behind";
+}
+
+TEST_F(FileLoaderTest, CancelQueuedTicketResolvesCancelledWithoutStarting) {
+  const QString a = makeMockFile(u"ticket_qa.mock"_s);
+  const QString b = makeMockFile(u"ticket_qb.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+  EXPECT_GT(ticket_b, ticket_a) << "tickets are minted monotonically at enqueue";
+  EXPECT_EQ(loader_->currentLoadTicket(), ticket_a) << "b is queued behind the active a";
+
+  EXPECT_TRUE(loader_->cancelLoad(ticket_b));
+  EXPECT_TRUE(recorder.events.empty()) << "the queued-cancel terminal is delivered via the event loop, never inline";
+  EXPECT_FALSE(loader_->cancelLoad(ticket_b)) << "cancelling an already-terminal ticket is a no-op";
+
+  pumpUntilIdle(*loader_);
+
+  EXPECT_EQ(recorder.countForTicket(ticket_a), 1u);
+  EXPECT_EQ(recorder.countForTicket(ticket_b), 1u);
+  ASSERT_EQ(recorder.events.size(), 2u);
+  // b's terminal was scheduled at cancel time, before a's completion could
+  // schedule its own — delivery keeps that order.
+  EXPECT_EQ(recorder.events[0].ticket, ticket_b);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[0].path, b);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u);
+  EXPECT_TRUE(recorder.events[0].produced.isEmpty());
+  EXPECT_EQ(recorder.events[1].ticket, ticket_a);
+  EXPECT_EQ(recorder.events[1].outcome, PJ::LoadOutcome::kLoaded);
+  EXPECT_EQ(datasetNamed("ticket_qb.mock"), 0u) << "the cancelled queued request must never load";
+}
+
+TEST_F(FileLoaderTest, CancelActiveTicketDiscardReportsCancelledExactlyOnce) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"ticket_cancel.fanoutprobe"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  quint64 ticket = 0;
+  bool cancel_sent = false;
+  const auto cancel_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestStarted, loader_.get(),
+      [this, &ticket, &cancel_sent](const QString&, int, int, bool) {
+        if (cancel_sent) {
+          return;
+        }
+        cancel_sent = true;
+        EXPECT_TRUE(loader_->cancelLoad(ticket, /*keep_partial=*/false));
+        releaseFanoutProbeCancelEntry();
+      });
+
+  // Single-instance probe entry that parks on the worker until the cancel
+  // rendezvous releases it — the cancel deterministically hits an ACTIVE load.
+  ticket = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(path), nullptr, fanoutProbeHints(uR"({"display_suffix":"cancel"})"_s));
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+  QObject::disconnect(cancel_connection);
+
+  ASSERT_TRUE(cancel_sent) << "the probe never reached its cancellation rendezvous";
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[0].path, path);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u) << "a discarded load reports no dataset";
+  EXPECT_TRUE(recorder.events[0].produced.isEmpty());
+  EXPECT_EQ(datasetNamed("ticket_cancel.fanoutprobe"), 0u) << "discard must drop the partial dataset";
+  EXPECT_FALSE(loader_->cancelLoad(ticket)) << "cancelling an already-terminal ticket is a no-op";
+}
+
+TEST_F(FileLoaderTest, CancelActiveTicketKeepPartialReportsCancelledWithKeptDataset) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path = makeMockFile(u"ticket_keep.fanoutprobe"_s);
+  LoadFinishedRecorder recorder(*loader_);
+  int legacy_loaded = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [&](const QString&, const QString&, const QString&, const QString&) { ++legacy_loaded; });
+  int committing = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadCommitting, loader_.get(),
+      [&](quint64, const QVector<PJ::DatasetId>&, const QString&, const QString&) { ++committing; });
+
+  quint64 ticket = 0;
+  bool cancel_sent = false;
+  const auto cancel_connection = QObject::connect(
+      loader_.get(), &PJ::FileLoader::ingestStarted, loader_.get(),
+      [this, &ticket, &cancel_sent](const QString&, int, int, bool) {
+        if (cancel_sent) {
+          return;
+        }
+        cancel_sent = true;
+        EXPECT_TRUE(loader_->cancelLoad(ticket, /*keep_partial=*/true));
+        releaseFanoutProbeCancelEntry();
+      });
+
+  ticket = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(path), nullptr, fanoutProbeHints(uR"({"display_suffix":"cancel"})"_s));
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+  QObject::disconnect(cancel_connection);
+
+  ASSERT_TRUE(cancel_sent) << "the probe never reached its cancellation rendezvous";
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled) << "a user stop is Cancelled even when kept";
+  const PJ::DatasetId kept = recorder.events[0].dataset_id;
+  ASSERT_NE(kept, 0u) << "keep-partial reports the dataset holding the kept rows";
+  EXPECT_EQ(recorder.events[0].produced, QVector<PJ::DatasetId>{kept});
+  EXPECT_EQ(singleTopicRowCount(kept), 1) << "the partial row parsed before the stop is kept";
+  EXPECT_EQ(legacy_loaded, 1) << "keep-partial still finalizes through the legacy fileLoaded";
+  EXPECT_EQ(committing, 0) << "the pre-catalog commit seam fires only for fully-loaded requests";
+}
+
+TEST_F(FileLoaderTest, CancelUnknownTicketIsANoOp) {
+  LoadFinishedRecorder recorder(*loader_);
+  EXPECT_FALSE(loader_->cancelLoad(0));
+  EXPECT_FALSE(loader_->cancelLoad(424242));
+  flushQueuedTerminals();
+  EXPECT_TRUE(recorder.events.empty());
+}
+
+TEST_F(FileLoaderTest, JoinForShutdownReportsCancelledForActiveAndQueuedTickets) {
+  const QString a = makeMockFile(u"ticket_sa.mock"_s);
+  const QString b = makeMockFile(u"ticket_sb.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+
+  loader_->joinForShutdown();  // discards the active load and drains the queue
+
+  // Shutdown is the deliberate exception to queued terminal delivery: teardown
+  // must not lose terminals, so they are flushed synchronously here.
+  ASSERT_EQ(recorder.events.size(), 2u) << "shutdown must resolve every accepted request before returning";
+  EXPECT_EQ(recorder.events[0].ticket, ticket_a);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[0].path, a);
+  EXPECT_EQ(recorder.events[1].ticket, ticket_b);
+  EXPECT_EQ(recorder.events[1].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[1].path, b);
+  EXPECT_FALSE(loader_->isBusy());
+
+  // The loader stays usable after shutdown, and the fresh request gets a fresh
+  // terminal of its own.
+  const quint64 ticket_c = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints());
+  ASSERT_NE(ticket_c, 0u);
+  pumpUntilIdle(*loader_);
+  EXPECT_EQ(recorder.countForTicket(ticket_c), 1u);
+  ASSERT_EQ(recorder.events.size(), 3u);
+  EXPECT_EQ(recorder.events[2].outcome, PJ::LoadOutcome::kLoaded);
+}
+
+// Review finding 1: ~FileLoader used to purge queued terminal emissions, so
+// accepted loads got NO terminal when the loader died without another event
+// loop pass. Destruction must deliver every outstanding terminal.
+TEST_F(FileLoaderTest, DestroyWithoutPumpingDeliversAllTerminals) {
+  const QString a = makeMockFile(u"ticket_da.mock"_s);
+  const QString b = makeMockFile(u"ticket_db.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+
+  loader_.reset();  // destructor: active worker + queued request, NO event-loop pass
+
+  ASSERT_EQ(recorder.events.size(), 2u) << "destruction must deliver a terminal for every accepted request";
+  EXPECT_EQ(recorder.events[0].ticket, ticket_a);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[1].ticket, ticket_b);
+  EXPECT_EQ(recorder.events[1].outcome, PJ::LoadOutcome::kCancelled);
+}
+
+// Review finding 1, resolved-but-undelivered flavor: a terminal that was
+// already scheduled (the load resolved) but not yet delivered must be flushed
+// by destruction with its TRUE outcome — not dropped, not rewritten to
+// kCancelled.
+TEST_F(FileLoaderTest, DestroyDeliversResolvedButUndeliveredTerminal) {
+  const QString bad = makeMockFile(u"ticket_dd.unhandledext"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(bad));
+  ASSERT_NE(ticket, 0u);
+  EXPECT_TRUE(recorder.events.empty()) << "the sync failure resolves after enqueue returns";
+
+  loader_.reset();  // destructor before any event-loop pass
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed) << "the resolved outcome survives teardown";
+}
+
+// Codex residual R1: the destructor's synchronous terminal flush delivers
+// loadFinished while the loader is mid-destruction, and joinForShutdown has
+// already restored reusability (shutting_down_ false) — so a slot could
+// legally start NEW work whose terminal nothing would ever resolve and whose
+// worker would outlive the loader. Admission during destruction must be
+// rejected outright: ticket 0, nothing enqueued, destruction stays clean.
+TEST_F(FileLoaderTest, LoadRequestedDuringDestructorFlushIsRejected) {
+  const QString a = makeMockFile(u"ticket_destroy.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+  PJ::FileLoader* raw = loader_.get();
+  quint64 reentrant_ticket = 42;  // sentinel: must become 0
+  QObject::connect(
+      raw, &PJ::FileLoader::loadFinished, raw,
+      [&, raw](quint64, PJ::LoadOutcome, const QString&, PJ::DatasetId, const QVector<PJ::DatasetId>&) {
+        reentrant_ticket = raw->loadFileTicketed(PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints());
+      });
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+
+  loader_.reset();  // destructor flush delivers a's terminal; the slot tries to start new work
+
+  EXPECT_EQ(reentrant_ticket, 0u) << "admission during destruction must be rejected";
+  EXPECT_EQ(recorder.countForTicket(ticket_a), 1u);
+  EXPECT_EQ(recorder.events.size(), 1u) << "no terminal may be lost, and none minted for the rejected request";
+}
+
+// Review finding 2: legacy fileLoadFailed/fileLoaded fire before the ticket
+// used to be marked terminal, so a direct slot re-entering joinForShutdown
+// recorded a shutdown kCancelled AND the original path then scheduled its own
+// kFailed — two terminals. The ticket must be terminalized before any
+// externally re-entrant legacy emission.
+TEST_F(FileLoaderTest, ReentrantShutdownFromLegacyFailureSlotYieldsOneTerminal) {
+  const QString bad = makeMockFile(u"ticket_reentrant.unhandledext"_s);
+  LoadFinishedRecorder recorder(*loader_);
+  int shutdowns = 0;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString&) {
+    ++shutdowns;
+    loader_->joinForShutdown();
+  });
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(bad));
+  ASSERT_NE(ticket, 0u);
+  ASSERT_EQ(shutdowns, 1) << "the failure slot must have re-entered shutdown";
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.countForTicket(ticket), recorder.events.size());
+  ASSERT_EQ(recorder.events.size(), 1u) << "a re-entrant shutdown must not add a second terminal";
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed)
+      << "the original failure outcome wins over the re-entrant shutdown's cancel";
+}
+
+// The stop-dialog binds to loadGeneration(); currentLoadTicket() must expose
+// the ticket that generation belongs to at every loadGenerationAdvanced, so a
+// ticket can never be attributed to a later load's generation.
+TEST_F(FileLoaderTest, CurrentLoadTicketTracksEachGenerationAdvance) {
+  const QString a = makeMockFile(u"ticket_ga.mock"_s);
+  const QString b = makeMockFile(u"ticket_gb.mock"_s);
+
+  std::vector<std::pair<std::uint64_t, quint64>> advances;  // (generation, ticket)
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadGenerationAdvanced, loader_.get(),
+      [&](std::uint64_t generation) { advances.emplace_back(generation, loader_->currentLoadTicket()); });
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(advances.size(), 2u);
+  EXPECT_EQ(advances[0].second, ticket_a);
+  EXPECT_EQ(advances[1].second, ticket_b);
+  EXPECT_NE(advances[0].first, advances[1].first) << "each ticket maps to its own generation";
+}
+
+// The prefer_reuse fast path resolves without a worker; its terminal must
+// still be delivered through the event loop, never inside loadFileTicketed.
+TEST_F(FileLoaderTest, PreferReuseTerminalArrivesAsynchronously) {
+  ASSERT_TRUE(load());     // sensors.mock, tracked path
+  flushQueuedTerminals();  // deliver the setup load's terminal before recording
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints(u"{}"_s, /*prefer_reuse=*/true));
+  ASSERT_NE(ticket, 0u);
+  EXPECT_TRUE(recorder.events.empty()) << "the synchronous reuse path must not resolve before enqueue returns";
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kLoaded);
+  EXPECT_EQ(recorder.events[0].dataset_id, dataset_id);
+  EXPECT_EQ(recorder.events[0].produced, QVector<PJ::DatasetId>{dataset_id});
+}
+
+// requestStarted announces the (ticket, generation) association the moment a
+// request becomes current, immediately before that generation's
+// loadGenerationAdvanced.
+TEST_F(FileLoaderTest, RequestStartedPairsTicketWithItsGeneration) {
+  const QString a = makeMockFile(u"ticket_ra.mock"_s);
+  const QString b = makeMockFile(u"ticket_rb.mock"_s);
+
+  enum class Kind { kStarted, kAdvanced };
+  std::vector<Kind> order;
+  std::vector<std::pair<quint64, std::uint64_t>> starts;  // (ticket, generation)
+  std::vector<std::uint64_t> advances;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::requestStarted, loader_.get(), [&](quint64 ticket, std::uint64_t generation) {
+        order.push_back(Kind::kStarted);
+        starts.emplace_back(ticket, generation);
+      });
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadGenerationAdvanced, loader_.get(), [&](std::uint64_t generation) {
+        order.push_back(Kind::kAdvanced);
+        advances.push_back(generation);
+      });
+
+  const quint64 ticket_a = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(a), nullptr, loadHints());
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+  pumpUntilIdle(*loader_);
+
+  const std::vector<Kind> expected_order{Kind::kStarted, Kind::kAdvanced, Kind::kStarted, Kind::kAdvanced};
+  EXPECT_EQ(order, expected_order) << "requestStarted precedes its generation's loadGenerationAdvanced";
+  ASSERT_EQ(starts.size(), 2u);
+  ASSERT_EQ(advances.size(), 2u);
+  EXPECT_EQ(starts[0].first, ticket_a);
+  EXPECT_EQ(starts[1].first, ticket_b);
+  EXPECT_EQ(starts[0].second, advances[0]);
+  EXPECT_EQ(starts[1].second, advances[1]);
+  EXPECT_GT(starts[1].second, starts[0].second);
+}
+
+// The one FileLoader entry a batch worker may hit off-thread: cancelLoadAsync
+// marshals to the loader's thread and the cancel resolves through the normal
+// queued terminal.
+TEST_F(FileLoaderTest, CancelLoadAsyncFromWorkerThreadCancelsQueuedTicket) {
+  ASSERT_TRUE(installFanoutProbe());
+  const QString path_a = makeMockFile(u"ticket_async.fanoutprobe"_s);
+  const QString path_b = makeMockFile(u"ticket_async_b.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+
+  // A parks on the worker at the cancel rendezvous, so B stays QUEUED while
+  // the off-thread cancel runs.
+  const quint64 ticket_a = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(path_a), nullptr, fanoutProbeHints(uR"({"display_suffix":"cancel"})"_s));
+  const quint64 ticket_b = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(path_b), nullptr, loadHints());
+  ASSERT_NE(ticket_a, 0u);
+  ASSERT_NE(ticket_b, 0u);
+  EXPECT_EQ(loader_->currentLoadTicket(), ticket_a);
+
+  std::thread off_thread([this, ticket_b]() { loader_->cancelLoadAsync(ticket_b, /*keep_partial=*/false); });
+  off_thread.join();
+  EXPECT_TRUE(recorder.events.empty()) << "the marshal and the terminal both ride the event loop";
+  flushQueuedTerminals();
+
+  EXPECT_EQ(recorder.countForTicket(ticket_b), 1u) << "the off-thread cancel must resolve the queued ticket";
+  ASSERT_FALSE(recorder.events.empty());
+  EXPECT_EQ(recorder.events[0].ticket, ticket_b);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+
+  // Wind down A through the ticket API and drain.
+  EXPECT_TRUE(loader_->cancelLoad(ticket_a, /*keep_partial=*/false));
+  releaseFanoutProbeCancelEntry();
+  pumpUntilIdle(*loader_);
+  EXPECT_EQ(recorder.countForTicket(ticket_a), 1u);
+  EXPECT_EQ(recorder.events.size(), 2u);
+  EXPECT_EQ(datasetNamed("ticket_async_b.mock"), 0u) << "the cancelled queued request must never load";
+}
+
+// Strict replacement: require_replacement forbids the silent degrade to a
+// fresh load when the replace target vanished before the request was dequeued.
+TEST_F(FileLoaderTest, RequireReplacementFailsWhenTargetVanished) {
+  LoadFinishedRecorder recorder(*loader_);
+  QString failure_reason;
+  int legacy_failed = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString& reason) {
+        ++legacy_failed;
+        failure_reason = reason;
+      });
+
+  PJ::LoadHints hints = loadHints();
+  hints.replace_dataset_id = 424242;  // never existed
+  hints.require_replacement = true;
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(mock_path_), nullptr, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u);
+  EXPECT_EQ(legacy_failed, 1);
+  EXPECT_TRUE(failure_reason.contains(u"424242"_s))
+      << "the failure must name the vanished target, got: " << failure_reason.toStdString();
+  EXPECT_TRUE(session().createReader().listDatasets().empty()) << "strict replacement must not create a fresh dataset";
+}
+
+TEST_F(FileLoaderTest, RequireReplacementReplacesExistingTarget) {
+  ASSERT_TRUE(load());     // sensors.mock
+  flushQueuedTerminals();  // deliver the setup load's terminal before recording
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  LoadFinishedRecorder recorder(*loader_);
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints hints = loadHints();
+  hints.replace_dataset_id = dataset_id;
+  hints.require_replacement = true;
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(other_path), nullptr, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kLoaded)
+      << "a live target replaces exactly as without the flag";
+  EXPECT_EQ(recorder.events[0].dataset_id, dataset_id);
+  EXPECT_EQ(recorder.events[0].produced, QVector<PJ::DatasetId>{dataset_id});
+  EXPECT_EQ(session().createReader().listDatasets().size(), 1u);
+}
+
+// Review finding 6: the require_replacement target-exists check ran at
+// dequeue, but a fan-out expansion then tombstoned the target, minted fresh
+// ids, and reported kLoaded — strict replacement defeated. A config that
+// expands to fan-out must be rejected BEFORE any target mutation.
+TEST_F(FileLoaderTest, RequireReplacementRejectsFanoutExpansion) {
+  ASSERT_TRUE(load());     // sensors.mock, 3 rows
+  flushQueuedTerminals();  // deliver the setup load's terminal before recording
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  ASSERT_EQ(singleTopicRowCount(dataset_id), 3);
+  LoadFinishedRecorder recorder(*loader_);
+  QString failure_reason;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(),
+      [&](const QString&, const QString& reason) { failure_reason = reason; });
+
+  const QString fan_path = makeMockFile(u"strict_fan.mock"_s);
+  PJ::LoadHints hints =
+      loadHints(uR"({"__pj_fanout":["{\"display_suffix\":\"left\"}","{\"display_suffix\":\"right\"}"]})"_s);
+  hints.replace_dataset_id = dataset_id;
+  hints.require_replacement = true;
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(fan_path), nullptr, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed) << "fan-out must not defeat strict replacement";
+  EXPECT_TRUE(recorder.events[0].produced.isEmpty());
+  EXPECT_TRUE(failure_reason.contains(QString::number(dataset_id)))
+      << "the diagnostic must name the pinned target, got: " << failure_reason.toStdString();
+  EXPECT_TRUE(engineHasDataset(dataset_id)) << "the pinned target must be untouched";
+  EXPECT_EQ(singleTopicRowCount(dataset_id), 3) << "the pinned target's data must be untouched";
+  EXPECT_EQ(datasetNamed("strict_fan/left"), 0u) << "no fan-out dataset may be created";
+  EXPECT_EQ(datasetNamed("strict_fan/right"), 0u);
+  EXPECT_EQ(catalog().items().size(), 1u) << "the target's curves survive (no tombstone)";
+}
+
+// Review finding 3: a successful replacement rewrites the dataset's content
+// from a NEW source, so the target's old provider SourceRecord is stale
+// provenance — it must be detached BEFORE the loadCommitting seam, where a
+// promotion listener attaches the record for the new content.
+TEST_F(FileLoaderTest, SuccessfulReplaceDetachesStaleSourceRecordBeforeCommitSeam) {
+  ASSERT_TRUE(load());  // sensors.mock
+  flushQueuedTerminals();
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  session().attachSourceRecord(
+      dataset_id, PJ::SourceRecord{
+                      .provider_id = u"stale-cloud-provider"_s,
+                      .source_identity = u"stale-digest"_s,
+                      .descriptor_json = uR"({"stale":true})"_s,
+                  });
+  ASSERT_NE(session().sourceRecord(dataset_id), nullptr);
+
+  bool stale_gone_at_seam = false;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadCommitting, loader_.get(),
+      [&](quint64, const QVector<PJ::DatasetId>& produced, const QString&, const QString&) {
+        if (produced.contains(dataset_id)) {
+          stale_gone_at_seam = session().sourceRecord(dataset_id) == nullptr;
+          // What a promotion listener does with the seam: attach the NEW
+          // content's record atomically with catalog publication.
+          session().attachSourceRecord(
+              dataset_id, PJ::SourceRecord{
+                              .provider_id = u"new-provider"_s,
+                              .source_identity = u"new-digest"_s,
+                              .descriptor_json = uR"({"new":true})"_s,
+                          });
+        }
+      });
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints hints = loadHints();
+  hints.replace_dataset_id = dataset_id;
+  ASSERT_TRUE(loadAndWait(other_path, hints));
+  flushQueuedTerminals();
+
+  EXPECT_TRUE(stale_gone_at_seam) << "the stale record must be gone by the time the commit seam fires";
+  const PJ::SourceRecord* record = session().sourceRecord(dataset_id);
+  ASSERT_NE(record, nullptr) << "the seam-attached record must survive the commit";
+  EXPECT_EQ(record->provider_id, u"new-provider"_s);
+}
+
+TEST_F(FileLoaderTest, FailedReplaceKeepsSourceRecord) {
+  ASSERT_TRUE(load());  // sensors.mock
+  flushQueuedTerminals();
+  const PJ::DatasetId dataset_id = datasetNamed("sensors.mock");
+  ASSERT_NE(dataset_id, 0u);
+  session().attachSourceRecord(
+      dataset_id, PJ::SourceRecord{
+                      .provider_id = u"cloud-provider"_s,
+                      .source_identity = u"digest"_s,
+                      .descriptor_json = uR"({"d":1})"_s,
+                  });
+
+  const QString other_path = makeMockFile(u"other.mock"_s);
+  PJ::LoadHints hints = loadHints(uR"({"fail_start":true})"_s);
+  hints.replace_dataset_id = dataset_id;
+  EXPECT_FALSE(loadAndWait(other_path, hints));
+  flushQueuedTerminals();
+
+  const PJ::SourceRecord* record = session().sourceRecord(dataset_id);
+  ASSERT_NE(record, nullptr) << "a rolled-back replace must keep the target's provenance";
+  EXPECT_EQ(record->provider_id, u"cloud-provider"_s);
+}
+
+// A fan-out load reports EVERY dataset it produced; the primary argument stays
+// the first loaded entry as the single-id convenience.
+TEST_F(FileLoaderTest, FanoutLoadReportsAllProducedDatasets) {
+  const QString path = makeMockFile(u"ticket_fan.mock"_s);
+  LoadFinishedRecorder recorder(*loader_);
+  const PJ::LoadHints hints =
+      loadHints(uR"({"__pj_fanout":["{\"display_suffix\":\"left\"}","{\"display_suffix\":\"right\"}"]})"_s);
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(path), nullptr, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  const PJ::DatasetId left = datasetNamed("ticket_fan/left");
+  const PJ::DatasetId right = datasetNamed("ticket_fan/right");
+  ASSERT_NE(left, 0u);
+  ASSERT_NE(right, 0u);
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kLoaded);
+  ASSERT_EQ(recorder.events[0].produced.size(), 2);
+  EXPECT_EQ(recorder.events[0].dataset_id, recorder.events[0].produced.front());
+  EXPECT_TRUE(recorder.events[0].produced.contains(left));
+  EXPECT_TRUE(recorder.events[0].produced.contains(right));
+}
+
+// The pre-catalog commit seam: loadCommitting fires synchronously while a
+// fully-loaded single-instance request commits — dataset + source path +
+// captured config installed, catalog rebuild not yet published — and strictly
+// before fileLoaded/loadFinished.
+TEST_F(FileLoaderTest, LoadCommittingFiresWithSourceInstalledBeforeCatalogAndTerminal) {
+  LoadFinishedRecorder recorder(*loader_);
+  struct CommitObservation {
+    quint64 ticket = 0;
+    QVector<PJ::DatasetId> produced;
+    QString plugin_id;
+    QString config;
+    QString source_path_at_commit;
+    std::size_t catalog_items_at_commit = 999;
+    bool dataset_in_engine = false;
+  };
+  std::vector<CommitObservation> commits;
+  QStringList sequence;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadCommitting, loader_.get(),
+      [&](quint64 ticket, const QVector<PJ::DatasetId>& produced, const QString& plugin_id, const QString& config) {
+        CommitObservation obs;
+        obs.ticket = ticket;
+        obs.produced = produced;
+        obs.plugin_id = plugin_id;
+        obs.config = config;
+        if (!produced.isEmpty()) {
+          obs.source_path_at_commit = loader_->sourcePathForDataset(produced.front());
+          obs.dataset_in_engine = engineHasDataset(produced.front());
+        }
+        obs.catalog_items_at_commit = catalog().items().size();
+        commits.push_back(obs);
+        sequence << u"committing"_s;
+      });
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [&](const QString&, const QString&, const QString&, const QString&) { sequence << u"fileLoaded"_s; });
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadFinished, loader_.get(),
+      [&](quint64, PJ::LoadOutcome, const QString&, PJ::DatasetId, const QVector<PJ::DatasetId>&) {
+        sequence << u"loadFinished"_s;
+      });
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints());
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(commits.size(), 1u) << "one commit seam per fully-loaded request";
+  EXPECT_EQ(commits[0].ticket, ticket);
+  ASSERT_EQ(commits[0].produced.size(), 1);
+  EXPECT_EQ(commits[0].plugin_id, u"Mock File Source"_s);
+  EXPECT_TRUE(commits[0].dataset_in_engine) << "the produced dataset must exist by commit time";
+  EXPECT_EQ(commits[0].source_path_at_commit, mock_path_) << "the source path must be installed by commit time";
+  // The fast mock never flushes mid-load (50ms worker throttle), so no
+  // samplesIngested-gate rebuild precedes the commit: the catalog must still
+  // be unpublished at the seam and published right after.
+  EXPECT_EQ(commits[0].catalog_items_at_commit, 0u)
+      << "loadCommitting must fire BEFORE the catalog rebuild publishes the load";
+  EXPECT_EQ(catalog().items().size(), 1u);
+  const QStringList expected_sequence{u"committing"_s, u"fileLoaded"_s, u"loadFinished"_s};
+  EXPECT_EQ(sequence, expected_sequence);
+}
+
+TEST_F(FileLoaderTest, LoadCommittingSkippedOnFailedLoad) {
+  int committing = 0;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::loadCommitting, loader_.get(),
+      [&](quint64, const QVector<PJ::DatasetId>&, const QString&, const QString&) { ++committing; });
+
+  const quint64 ticket = loader_->loadFileTicketed(
+      PJ::LoadInput::fromNativePath(mock_path_), nullptr, loadHints(uR"({"fail_start":true})"_s));
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  EXPECT_EQ(committing, 0) << "the commit seam fires only for loads that finish kLoaded";
+}
+
+// Review finding 4: under DialogPolicy::kNever the layout's preset is
+// AUTHORITATIVE — a preset the plugin rejects must FAIL the source (kFailed)
+// instead of silently retrying with the QSettings pre-fill (which this
+// plugin would accept, turning a broken replay into a wrong-config success).
+TEST_F(FileLoaderTest, DialogPolicyNeverRejectedPresetFailsInsteadOfFallback) {
+  ASSERT_TRUE(app_session_->extensionCatalog().pluginCatalog().registerStaticDataSource(rejectingPresetVtable()));
+  const QString path = makeMockFile(u"strict.cfgreject"_s);
+  LoadFinishedRecorder recorder(*loader_);
+  QString failure_reason;
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(),
+      [&](const QString&, const QString& reason) { failure_reason = reason; });
+
+  PJ::LoadHints hints;
+  hints.expected_plugin_id = u"Rejecting Preset Source"_s;
+  hints.preset_config_json = uR"({"poison":true})"_s;
+  hints.dialog_policy = PJ::DialogPolicy::kNever;
+  hints.require_expected_plugin = true;
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(path), nullptr, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kFailed)
+      << "a rejected authoritative preset must fail the source, never fall back";
+  EXPECT_FALSE(failure_reason.isEmpty());
+  EXPECT_TRUE(failure_reason.contains(u"poisoned preset rejected"_s))
+      << "the diagnostic must surface the plugin's rejection, got: " << failure_reason.toStdString();
+  EXPECT_TRUE(session().createReader().listDatasets().empty()) << "no dataset may survive the strict rejection";
+}
+
 // Fixture for the shutdown-while-suspended-at-the-plugin-config-dialog path.
 // Stages the test-only dialog_probe_source plugin (kCapabilityHasDialog, embedded
 // dialog that records onRejected/destroy order to PJ_DIALOG_PROBE_FILE) and drives
-// a real FileLoader against it WITHOUT skip_dialog, so the prologue coroutine
-// suspends on DataSourceDialogAwaiter with the dialog open.
+// a real FileLoader against it with the INTERACTIVE dialog policy, so the
+// prologue coroutine suspends on DataSourceDialogAwaiter with the dialog open.
 class DialogShutdownTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -1458,7 +2477,7 @@ class DialogShutdownTest : public ::testing::Test {
 // "rejected" or a "destroyed" that precedes it (recorded across the DSO boundary
 // via the probe file). joinForShutdown must also return without hanging.
 TEST_F(DialogShutdownTest, ShutdownWhileSuspendedAtDialogRejectsBeforeDestroy) {
-  QWidget parent;  // real GUI-thread parent so the dialog actually opens (no skip_dialog)
+  QWidget parent;  // real GUI-thread parent so the dialog actually opens (interactive policy)
 
   const QString path = data_dir_.filePath(u"probe.dlgprobe"_s);
   {
@@ -1467,7 +2486,9 @@ TEST_F(DialogShutdownTest, ShutdownWhileSuspendedAtDialogRejectsBeforeDestroy) {
     file.close();
   }
 
-  // No hints → skip_dialog stays false → the prologue awaits the plugin dialog.
+  LoadFinishedRecorder recorder(*loader_);
+
+  // No hints → the interactive dialog policy → the prologue awaits the plugin dialog.
   ASSERT_TRUE(loader_->loadFile(path, &parent, PJ::LoadHints{}));
 
   // Pump the event loop until the plugin config dialog is actually shown.
@@ -1494,6 +2515,13 @@ TEST_F(DialogShutdownTest, ShutdownWhileSuspendedAtDialogRejectsBeforeDestroy) {
   loader_->joinForShutdown();
   EXPECT_FALSE(loader_->isBusy());
   EXPECT_EQ(visibleDialog(&parent), nullptr) << "shutdown must close the plugin dialog";
+
+  // A shutdown that destroys the suspended prologue still resolves its ticket
+  // (terminal delivery is queued).
+  flushQueuedTerminals();
+  ASSERT_EQ(recorder.events.size(), 1u) << "shutdown must resolve the dialog-suspended request's ticket";
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[0].path, path);
 
   const std::vector<std::string> markers = readProbeLines(probe_path_);
   const auto rejected_count = std::count(markers.begin(), markers.end(), std::string("rejected"));
@@ -1534,6 +2562,7 @@ TEST_F(DialogShutdownTest, CancelWhileSuspendedAtDialogIsHonoredOnResume) {
   QObject::connect(
       loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
       [&](const QString&, const QString&, const QString&, const QString&) { ++loaded_count; });
+  LoadFinishedRecorder recorder(*loader_);
 
   ASSERT_TRUE(loader_->loadFile(path, &parent, PJ::LoadHints{}));
 
@@ -1575,12 +2604,124 @@ TEST_F(DialogShutdownTest, CancelWhileSuspendedAtDialogIsHonoredOnResume) {
   EXPECT_FALSE(loader_->isBusy());
   EXPECT_EQ(loaded_count, 0) << "a load cancelled while suspended must NOT complete";
   EXPECT_EQ(failed_count, 1) << "the honored cancel must surface as one fileLoadFailed";
+  // The ticket surface classifies this exit as a user cancel, exactly once.
+  flushQueuedTerminals();
+  ASSERT_EQ(recorder.events.size(), 1u);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
   // The dataset shell created before the dialog must be rolled back: the count
   // returns to whatever it was BEFORE this load began (0 here).
   EXPECT_EQ(app_session_->sessionManager().createReader().listDatasets().size(), datasets_while_suspended - 1)
       << "the cancelled load's dataset shell must be erased on rollback";
   EXPECT_EQ(app_session_->sessionManager().createReader().listDatasets().size(), 0u)
       << "no dataset may survive a cancel honored at prologue resume";
+}
+
+// The user rejecting the plugin config dialog is a terminal exit with NO legacy
+// signal at all (deliberately — see beginLoad's kRejected arm). The ticket
+// surface must still resolve it: exactly one loadFinished(kCancelled), while
+// fileLoaded/fileLoadFailed stay silent as before.
+TEST_F(DialogShutdownTest, ConfigDialogRejectReportsCancelledTicketExactlyOnce) {
+  QWidget parent;
+
+  const QString path = data_dir_.filePath(u"reject_probe.dlgprobe"_s);
+  {
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+  }
+
+  int failed_count = 0;
+  int loaded_count = 0;
+  QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, loader_.get(), [&](const QString&, const QString&) {
+    ++failed_count;
+  });
+  QObject::connect(
+      loader_.get(), &PJ::FileLoader::fileLoaded, loader_.get(),
+      [&](const QString&, const QString&, const QString&, const QString&) { ++loaded_count; });
+  LoadFinishedRecorder recorder(*loader_);
+
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(path), &parent, PJ::LoadHints{});
+  ASSERT_NE(ticket, 0u);
+
+  // Pump until the plugin config dialog is shown (prologue suspended).
+  QEventLoop wait_for_dialog;
+  QTimer poll;
+  poll.setInterval(5);
+  QObject::connect(&poll, &QTimer::timeout, &wait_for_dialog, [&]() {
+    if (visibleDialog(&parent) != nullptr) {
+      wait_for_dialog.quit();
+    }
+  });
+  QTimer::singleShot(3000, &wait_for_dialog, &QEventLoop::quit);
+  poll.start();
+  wait_for_dialog.exec();
+  poll.stop();
+  QDialog* dialog = visibleDialog(&parent);
+  ASSERT_NE(dialog, nullptr) << "the plugin config dialog never opened";
+
+  dialog->reject();
+
+  QEventLoop settle;
+  QObject::connect(loader_.get(), &PJ::FileLoader::queueDrained, &settle, &QEventLoop::quit);
+  QTimer::singleShot(5000, &settle, &QEventLoop::quit);
+  if (loader_->isBusy()) {
+    settle.exec();
+  }
+
+  EXPECT_FALSE(loader_->isBusy());
+  flushQueuedTerminals();
+  ASSERT_EQ(recorder.events.size(), 1u) << "a rejected config dialog must resolve the ticket exactly once";
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kCancelled);
+  EXPECT_EQ(recorder.events[0].path, path);
+  EXPECT_EQ(recorder.events[0].dataset_id, 0u);
+  EXPECT_EQ(loaded_count, 0) << "the reject path stays silent on the legacy signals";
+  EXPECT_EQ(failed_count, 0) << "the reject path stays silent on the legacy signals";
+}
+
+// Review finding 4: an automated (layout-driven) replay of a source whose
+// saved config is legitimately EMPTY must load without EVER prompting — the
+// dialog is prohibited under DialogPolicy::kNever and the empty preset is
+// authoritative (it becomes the minimal fresh-filepath config). This plugin
+// HAS a dialog, so any fallback-to-dialog regression parks the load on an
+// open dialog and times this test out.
+TEST_F(DialogShutdownTest, DialogPolicyNeverEmptyPresetNeverOpensDialog) {
+  QWidget parent;  // a real parent: the dialog COULD open if the strict flag failed
+
+  const QString path = data_dir_.filePath(u"nodialog.dlgprobe"_s);
+  {
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+  }
+
+  LoadFinishedRecorder recorder(*loader_);
+  bool dialog_seen = false;
+  QTimer dialog_watch;
+  dialog_watch.setInterval(5);
+  QObject::connect(&dialog_watch, &QTimer::timeout, &parent, [&]() {
+    if (visibleDialog(&parent) != nullptr) {
+      dialog_seen = true;
+    }
+  });
+  dialog_watch.start();
+
+  PJ::LoadHints hints;
+  hints.expected_plugin_id = u"Dialog Probe Source"_s;
+  hints.preset_config_json.clear();  // an empty saveConfig is legitimate
+  hints.dialog_policy = PJ::DialogPolicy::kNever;
+  hints.require_expected_plugin = true;
+  const quint64 ticket = loader_->loadFileTicketed(PJ::LoadInput::fromNativePath(path), &parent, hints);
+  ASSERT_NE(ticket, 0u);
+  pumpUntilIdle(*loader_);
+  dialog_watch.stop();
+
+  EXPECT_FALSE(dialog_seen) << "an automated replay must never prompt";
+  ASSERT_EQ(recorder.events.size(), 1u) << "the load must complete without waiting on any dialog";
+  EXPECT_EQ(recorder.events[0].ticket, ticket);
+  EXPECT_EQ(recorder.events[0].outcome, PJ::LoadOutcome::kLoaded)
+      << "the empty preset is authoritative and loads with the minimal fresh-filepath config";
+  EXPECT_TRUE(readProbeLines(probe_path_).empty()) << "the embedded dialog must never be exercised";
 }
 
 // Images and depth images must ingest PURE-LAZY (like point clouds) so their raw
@@ -1697,7 +2838,7 @@ TEST_F(MessageBoxMarshalTest, WorkerThreadMessageBoxIsMarshaledToGuiThread) {
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Msgbox Mock Source"_s;
   hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
 
   // The GUI thread opens the message box asynchronously while only the ingest
   // worker waits. This timer clicks Continue so askContinue returns true and
@@ -1779,7 +2920,7 @@ TEST_F(MessageBoxMarshalTest, GuiThreadLoadConfigReceivesClickedMessageBoxAnswer
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Msgbox Mock Source"_s;
   hints.preset_config_json = uR"({"ask_msgbox_in_load_config":true})"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
 
   QEventLoop loop;
   bool ok = false;
@@ -1855,7 +2996,7 @@ TEST_F(MessageBoxMarshalTest, ShutdownRejectsWorkerMessageBeforeJoining) {
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Msgbox Mock Source"_s;
   hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
   ASSERT_TRUE(loader_->loadFile(path, &parent, hints));
 
   QEventLoop wait_for_dialog;
@@ -1908,7 +3049,7 @@ TEST_F(MessageBoxMarshalTest, ShutdownAnswersQueuedWorkerMessageWithMinusOne) {
   PJ::LoadHints hints;
   hints.expected_plugin_id = u"Msgbox Mock Source"_s;
   hints.preset_config_json = uR"({"ask_msgbox":true})"_s;
-  hints.skip_dialog = true;
+  hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
   ASSERT_TRUE(loader_->loadFile(path, &parent, hints));
 
   // Deliberately do NOT pump the event loop: the worker's queued GUI open sits

@@ -292,7 +292,8 @@ class MainWindow : public QMainWindow {
   // Updates playback bounds after a data file has populated datastore and
   // object-store topics.
   void onFileLoaded(
-      const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json);
+      const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json,
+      const QString& plugin_manifest_id);
 
   // Removes selected catalog entries from the curve/object tree.
   void onCatalogTrashRequested(QStringList keys, bool covers_all);
@@ -1052,17 +1053,21 @@ class MainWindow : public QMainWindow {
   // Owned by QObject parentage while open; guards against stacking multiple
   // stop confirmations from repeated title-bar clicks.
   QPointer<MessageBox> ingest_stop_dialog_;
-  // Toolbox bulk-import progress (the second producer of ingest_progress_,
-  // arbitration: FileLoader wins a collision). One entry per import dataset,
-  // present between on_ingest_started and on_ingest_finished (host teardown /
-  // release fire finished for anything the plugin left open, so pairing
-  // holds). `owner` weak-guards the PanelSession whose ToolboxRuntimeHost runs
-  // the import — a closed panel can never be stop-routed into freed memory;
-  // `host` is dereferenced only after the owner check succeeds. Membership also
-  // tells the on_data_changed TF bridge the dataset is still growing
-  // (incremental fold, no invalidate). `adopted` says the strip currently
-  // shows a toolbox import; one that started while a file load owned the strip
-  // re-adopts it (via `label`, last-started wins) once the file queue drains.
+  // Toolbox bulk-import STOP ROUTING only (the second producer of
+  // ingest_progress_, arbitration: FileLoader wins a collision). The lifecycle
+  // bookkeeping — which datasets are actively importing, label/progress, and
+  // the "still growing" query the on_data_changed TF bridge uses — lives in
+  // SessionManager (beginIngest/updateIngest/endIngest, #470 hoist); this hash
+  // keeps only what stop routing needs and mirrors that lifecycle: one entry
+  // per import dataset between on_ingest_started and on_ingest_finished (host
+  // teardown / release fire finished for anything the plugin left open, so
+  // pairing holds). `owner` weak-guards the PanelSession whose
+  // ToolboxRuntimeHost runs the import — a closed panel can never be
+  // stop-routed into freed memory; `host` is dereferenced only after the owner
+  // check succeeds. `toolbox_strip_adopted_` says the strip currently shows a
+  // toolbox import; one that started while a file load owned the strip
+  // re-adopts it (via `toolbox_ingest_label_`, last-started wins) once the
+  // file queue drains.
   struct ToolboxIngestRef {
     std::weak_ptr<void> owner;
     PJ::ToolboxRuntimeHost* host = nullptr;

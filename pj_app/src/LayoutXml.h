@@ -86,12 +86,27 @@ struct DataSourceRef {
   QString content_sha256;
   QString plugin_id;           // Empty when the layout had no <plugin> child.
   QString plugin_config_json;  // Empty when the layout had no <plugin> child.
+  // Stable plugin identity from <plugin manifest_id="...">. New layouts write
+  // BOTH the display name (ID — what old readers keep using) and this manifest
+  // id; the loader matches by manifest id first, falling back to the display
+  // name. Empty for layouts written before the attribute existed.
+  QString plugin_manifest_id;
   // Browser-authored source layouts persist a logical filename in plugin JSON
   // because their staged backing path expires with the page. On desktop replay,
   // this additive opt-in asks FileLoader to replace that logical filepath with
   // resolved_path immediately before loadConfig(). Older/native layouts omit the
   // marker and therefore retain their existing pass-through behavior.
   bool rewrite_plugin_filepath = false;
+  // Provider-generic source record from an optional <materialize> child of
+  // <fileInfo> (a sibling of <plugin>): the provider plugin able to re-obtain
+  // this source (provider attribute), that provider's durable identity for it
+  // (identity attribute), and the full canonical descriptor JSON (the CDATA
+  // payload, preserved byte-exact — the bytes are a cross-repo identity
+  // contract and must never be re-serialized). All three are empty when the
+  // layout carries no <materialize> child (every pre-existing layout).
+  QString materialize_provider;
+  QString materialize_identity;
+  QString materialize_descriptor_json;
   // Source Timeline state, re-bound by source path on reload (DatasetIds are
   // re-minted each session, so the file path is the only stable identity).
   // display_offset_ns is the per-source display shift (display = raw - offset);

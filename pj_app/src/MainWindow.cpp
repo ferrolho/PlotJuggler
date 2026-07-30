@@ -420,6 +420,7 @@ struct MainWindow::BrowserLayoutRuntime {
     QString prefix;
     QString content_sha256;
     QString plugin_id;
+    QString plugin_manifest_id;
     QString plugin_config_json;
     std::vector<DatasetShape> datasets;
   };
@@ -1632,7 +1633,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     // Only hide once nothing is still producing into the strip: a file load may
     // have started, or a toolbox import may have re-adopted it, since the linger
     // began.
-    if (toolbox_active_imports_.isEmpty() && !file_loader_->isBusy()) {
+    if (!session_->sessionManager().hasActiveIngests() && !file_loader_->isBusy()) {
       ingest_progress_->setActive(false);
     }
   });
@@ -1645,7 +1646,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
       // owner lock and is skipped): flag-only cooperative cancel, no
       // keep/discard dialog — toolbox imports keep what already landed (the
       // ABI has no host-side rollback), so there is no second choice to offer.
-      if (!toolbox_active_imports_.isEmpty()) {
+      if (session_->sessionManager().hasActiveIngests()) {
         stopAllToolboxImports();
         return;  // strip hides when on_ingest_finished drains the import set
       }
@@ -1730,7 +1731,7 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   connect(file_loader_.get(), &FileLoader::queueDrained, this, [this]() {
     // A toolbox bulk import that started while this file load owned the strip
     // takes it over now instead of the strip hiding on a still-running import.
-    if (!toolbox_active_imports_.isEmpty()) {
+    if (session_->sessionManager().hasActiveIngests()) {
       adoptToolboxIngestStrip();
       return;
     }
@@ -2224,6 +2225,11 @@ std::optional<QDomDocument> MainWindow::browserSourceLayoutDocument(QString& err
     if (!record.plugin_id.isEmpty()) {
       QDomElement plugin = doc.createElement(u"plugin"_s);
       plugin.setAttribute(u"ID"_s, record.plugin_id);
+      // Both identities, exactly like the desktop writer: old readers keep
+      // consuming ID; new readers match by the stable manifest id first.
+      if (!record.plugin_manifest_id.isEmpty()) {
+        plugin.setAttribute(u"manifest_id"_s, record.plugin_manifest_id);
+      }
       plugin.setAttribute(u"filepath_mode"_s, u"source"_s);
       const std::string logical_config =
           detail::rewriteReplayFilepaths(record.plugin_config_json.toStdString(), logical_path);
@@ -2588,9 +2594,11 @@ void MainWindow::reloadSource(const QString& path, const QString& plugin_id, con
   // Prevent re-entry; success re-enables via onFileLoaded.
   ui_->leftPanel->setReloadEnabled(false);
   LoadHints hints{
+      .expected_manifest_id = QString(),  // interactive reload: the display name is the recorded identity
       .expected_plugin_id = plugin_id,
       .preset_config_json = plugin_config_json,
-      .skip_dialog = !plugin_id.isEmpty() && !plugin_config_json.isEmpty(),
+      .dialog_policy = !plugin_id.isEmpty() && !plugin_config_json.isEmpty() ? DialogPolicy::kPreferPreset
+                                                                             : DialogPolicy::kInteractive,
   };
   file_loader_->loadFile(path, this, hints);
 }
@@ -2708,7 +2716,8 @@ void MainWindow::reconcileHistoryWithDataUniverse() {
 }
 
 void MainWindow::onFileLoaded(
-    const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json) {
+    const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json,
+    const QString& plugin_manifest_id) {
   // MainWindow is the shell that wires load completion to the runtime —
   // recording the source (incl. plugin id + json) and seeding playback are
   // pj_runtime concerns; we just relay. Prefix is empty in v1 until the
@@ -2717,7 +2726,7 @@ void MainWindow::onFileLoaded(
   // refresh, so never expose its logical identity as a recent/reloadable path.
   // The dataset itself still carries that identity for same-session disambiguation.
   if (!isBrowserUploadIdentity(path)) {
-    session_->sessionManager().recordLoadedSource(path, prefix, plugin_id, plugin_config_json);
+    session_->sessionManager().recordLoadedSource(path, prefix, plugin_id, plugin_config_json, plugin_manifest_id);
   }
 #ifdef PJ_TARGET_WASM
   if (isBrowserUploadIdentity(path) && browser_layout_runtime_ != nullptr) {
@@ -2739,6 +2748,7 @@ void MainWindow::onFileLoaded(
                     .prefix = prefix,
                     .content_sha256 = file_loader_->browserContentSha256(path),
                     .plugin_id = plugin_id,
+                    .plugin_manifest_id = plugin_manifest_id,
                     .plugin_config_json = plugin_config_json,
                     .datasets = std::move(datasets),
                 });
@@ -4297,6 +4307,24 @@ void MainWindow::onRebuildToolboxMenu() {
   }
 }
 
+// LoadHints for replaying ONE layout-recorded source — the shape the desktop
+// reload (loadLayoutFromPath) and the browser source-bound replay share: both
+// saved plugin identities ride their own tier fields, a layout that names a
+// plugin requires it, and replay is automated (dialogs prohibited, the saved
+// preset authoritative — DialogPolicy::kNever).
+static LoadHints layoutReplayHints(const layout_xml::DataSourceRef& source, bool prefer_reuse, bool rewrite) {
+  const bool names_plugin = !source.plugin_manifest_id.isEmpty() || !source.plugin_id.isEmpty();
+  return LoadHints{
+      .expected_manifest_id = source.plugin_manifest_id,
+      .expected_plugin_id = source.plugin_id,
+      .preset_config_json = source.plugin_config_json,
+      .dialog_policy = DialogPolicy::kNever,
+      .prefer_reuse = prefer_reuse,
+      .require_expected_plugin = names_plugin,
+      .rewrite_preset_filepath = rewrite,
+  };
+}
+
 void MainWindow::loadLayoutFromPath(const QString& path) {
   // 1. Open + parse
   QFile file(path);
@@ -4426,14 +4454,9 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
         // on failure; fall through and let the unresolved-curve handling below
         // catch an empty load.
         for (const auto& replay : pending) {
-          LoadHints hints{
-              .expected_plugin_id = replay.plugin_id,
-              .preset_config_json = replay.plugin_config_json,
-              .skip_dialog = !replay.plugin_id.isEmpty() && !replay.plugin_config_json.isEmpty(),
-              .prefer_reuse = true,
-              .rewrite_preset_filepath = replay.rewrite_plugin_filepath,
-          };
-          file_loader_->loadFile(replay.resolved_path, this, hints);
+          file_loader_->loadFile(
+              replay.resolved_path, this,
+              layoutReplayHints(replay, /*prefer_reuse=*/true, replay.rewrite_plugin_filepath));
         }
       }
       // choice == 1 (Use current data) → fall through and apply the layout to
@@ -4525,6 +4548,22 @@ void MainWindow::beginBrowserSourceReplay(
   if (browser_layout_runtime_ == nullptr || browser_layout_runtime_->replay.has_value()) {
     finishBrowserLayoutLoad(browser_name, false, u"busy"_s);
     return;
+  }
+  // Cloud-materialized sources cannot be re-obtained in the browser: their
+  // provider plugins are desktop-only and the saved descriptor names a fetch
+  // this page cannot perform. Fail with an explicit diagnostic instead of
+  // silently prompting the user to reselect a cache file that only ever
+  // existed on a desktop filesystem.
+  for (const layout_xml::DataSourceRef& source : sources) {
+    if (!source.materialize_provider.isEmpty() || !source.materialize_identity.isEmpty() ||
+        !source.materialize_descriptor_json.isEmpty()) {
+      showBrowserLayoutWarning(
+          this, tr("Load source-bound layout"),
+          tr("This layout references cloud-materialized data sources, which are unsupported in the browser. "
+             "Open it in the desktop PlotJuggler instead."));
+      finishBrowserLayoutLoad(browser_name, false, u"materialized-source"_s);
+      return;
+    }
   }
   browser_layout_runtime_->replay.emplace(
       BrowserLayoutRuntime::Replay{
@@ -4907,15 +4946,10 @@ void MainWindow::startBrowserReplayImports() {
 
   for (int index = 0; index < replay.sources.size(); ++index) {
     const layout_xml::DataSourceRef& source = replay.sources[index];
-    const bool has_saved_plugin = !source.plugin_id.isEmpty();
-    const LoadHints hints{
-        .expected_plugin_id = source.plugin_id,
-        .preset_config_json = source.plugin_config_json,
-        .skip_dialog = has_saved_plugin,
-        .prefer_reuse = false,
-        .require_expected_plugin = has_saved_plugin,
-        .rewrite_preset_filepath = has_saved_plugin,
-    };
+    // The browser preset carries the previous upload's expired MEMFS path, so
+    // a saved plugin also opts into the filepath rewrite.
+    const bool has_saved_plugin = !source.plugin_manifest_id.isEmpty() || !source.plugin_id.isEmpty();
+    const LoadHints hints = layoutReplayHints(source, /*prefer_reuse=*/false, /*rewrite=*/has_saved_plugin);
     if (!file_loader_->loadFile(std::move(replay.staged_inputs[static_cast<std::size_t>(index)]), this, hints)) {
       replay.load_failed = true;
       replay.load_failure = tr("A staged source could not be queued for import.");
@@ -6481,12 +6515,41 @@ QDomElement MainWindow::appendDataSourceElement(QDomDocument& doc, const QDir& l
     if (!src.plugin_id.isEmpty()) {
       QDomElement plugin = doc.createElement(u"plugin"_s);
       plugin.setAttribute(u"ID"_s, src.plugin_id);
+      // Write BOTH identities: old readers keep matching by the display name
+      // in ID; new readers prefer the stable manifest id, which survives a
+      // plugin display-name change.
+      if (!src.plugin_manifest_id.isEmpty()) {
+        plugin.setAttribute(u"manifest_id"_s, src.plugin_manifest_id);
+      }
       // CDATA so the JSON survives round-tripping without XML escape mangling.
       // appendJsonAsCdata splits across multiple CDATA sections when the JSON
       // contains a literal "]]>" sequence (otherwise it'd terminate the
       // CDATA early and corrupt the layout file).
       layout_xml::appendJsonAsCdata(doc, plugin, src.plugin_config_json);
       file_info.appendChild(plugin);
+    }
+
+    // Provider provenance: when this file's primary dataset carries a
+    // SessionManager::SourceRecord, persist it as a <materialize> SIBLING of
+    // <plugin> (old readers ignore unknown fileInfo children). The descriptor
+    // JSON is written VERBATIM as CDATA — the bytes are a cross-repo identity
+    // contract, never re-serialized or prettified. Provider sources attach the
+    // record to their (single) produced dataset, so the primary — the first
+    // live dataset in catalog/load order, the same one mirrored onto the
+    // legacy flat attributes above — is scanned first; a record on a later
+    // fan-out member (not expected) is used only when the primary has none,
+    // and only one record is ever emitted per fileInfo.
+    for (const DatasetId id : datasets_for_file) {
+      const SourceRecord* record = session_->sessionManager().sourceRecord(id);
+      if (record == nullptr || record->provider_id.isEmpty()) {
+        continue;  // no provenance, or unroutable without a provider id
+      }
+      QDomElement materialize = doc.createElement(u"materialize"_s);
+      materialize.setAttribute(u"provider"_s, record->provider_id);
+      materialize.setAttribute(u"identity"_s, record->source_identity);
+      layout_xml::appendJsonAsCdata(doc, materialize, record->descriptor_json);
+      file_info.appendChild(materialize);
+      break;
     }
 
     wrapper.appendChild(file_info);
@@ -8030,9 +8093,9 @@ void MainWindow::launchToolbox(
         // A still-growing import folds incrementally (cursor-based) — the
         // invalidate + full re-ingest would re-decode the whole accumulated TF
         // history on every per-topic notify (quadratic over the import). The
-        // terminal release-time report runs after on_ingest_finished removed
-        // the dataset from the active set, so the full pass still happens once.
-        if (!toolbox_active_imports_.contains(id)) {
+        // terminal release-time report runs after on_ingest_finished ended the
+        // ingest in the SessionManager, so the full pass still happens once.
+        if (!session_->sessionManager().ingestActive(id)) {
           transform_service_->invalidateDataset(id);
         }
         transform_service_->ingestFrameTransformsForDataset(id);
@@ -8086,21 +8149,28 @@ void MainWindow::launchToolbox(
   };
 
   // Progressive bulk-import surface (all GUI-thread, marshalled by the host).
+  // Lifecycle BOOKKEEPING lives in SessionManager (begin/update/endIngest —
+  // #470 hoist); these callbacks forward to it and keep only presentation:
+  // the strip widgets, FileLoader-vs-toolbox arbitration, and stop routing.
   // Weak capture: these callbacks are owned by the host inside the very
   // PanelSession they reference, so a strong capture would leak the session;
   // an expired owner (panel closed mid-import) simply drops the tick.
   const std::weak_ptr<void> session_weak = session;
-  callbacks.on_ingest_started = [this, session_weak](DatasetId dataset, std::string label, uint64_t) {
+  callbacks.on_ingest_started = [this, session_weak](DatasetId dataset, std::string label, uint64_t total) {
     const auto owner = session_weak.lock();
     if (owner == nullptr) {
       return;
     }
-    // Record the import even when FileLoader owns the strip: the entry keeps
-    // started/finished paired, and label/owner/host let the import re-adopt
-    // the strip after the file queue drains.
+    const QString import_label = QString::fromStdString(label);
+    // Lifecycle state (which datasets are importing, label/total) is the
+    // session's; recorded even when FileLoader owns the strip so
+    // started/finished stay paired and the import can re-adopt the strip later.
+    session_->sessionManager().beginIngest(dataset, import_label, total);
+    // Presentation-side stop routing: which live host to cancel for this
+    // dataset (weak owner guards a closed panel).
     toolbox_active_imports_.insert(
         dataset, ToolboxIngestRef{owner, std::static_pointer_cast<PanelSession>(owner)->host.get()});
-    toolbox_ingest_label_ = QString::fromStdString(label);
+    toolbox_ingest_label_ = import_label;
     if (file_loader_->isBusy()) {
       return;  // FileLoader wins the strip; the import still runs, just undisplayed
     }
@@ -8108,18 +8178,18 @@ void MainWindow::launchToolbox(
   };
   callbacks.on_ingest_progress = [this](DatasetId dataset, uint64_t current, uint64_t total) {
     // Toolbox analog of FileLoader::publishIngestProgress — the host flushed
-    // pending rows before this fired, so publish them to plots/playback (the
-    // catalog tree grows via samplesIngested -> rebuildIfChanged) and fold new
-    // FrameTransforms incrementally. The full catalog rebuild + playback focus
-    // stay on notify_data_changed.
-    const auto ids = session_->sessionManager().dataEngine().listTopics(dataset);
-    session_->sessionManager().notifyIngest(QVector<TopicId>(ids.begin(), ids.end()), /*live=*/false);
+    // pending rows before this fired. updateIngest publishes them to
+    // plots/playback through notifyIngest (the catalog tree grows via
+    // samplesIngested -> rebuildIfChanged) and records progress; new
+    // FrameTransforms fold incrementally below. The full catalog rebuild +
+    // playback focus stay on notify_data_changed.
+    session_->sessionManager().updateIngest(dataset, current, total);
 #ifdef PJ_WITH_SCENE3D
     if (transform_service_ != nullptr) {
       transform_service_->ingestFrameTransformsForDataset(dataset);
     }
 #endif
-    if (file_loader_->isBusy() || toolbox_active_imports_.isEmpty()) {
+    if (file_loader_->isBusy() || !session_->sessionManager().hasActiveIngests()) {
       return;
     }
     if (!toolbox_strip_adopted_) {
@@ -8135,8 +8205,11 @@ void MainWindow::launchToolbox(
     }
   };
   callbacks.on_ingest_finished = [this](DatasetId dataset) {
+    // Lifecycle first (so a notify_data_changed fired during teardown already
+    // sees the dataset as no-longer-growing), then drop the stop-routing ref.
+    session_->sessionManager().endIngest(dataset);
     toolbox_active_imports_.remove(dataset);
-    if (!toolbox_active_imports_.isEmpty()) {
+    if (session_->sessionManager().hasActiveIngests()) {
       return;
     }
     toolbox_strip_adopted_ = false;

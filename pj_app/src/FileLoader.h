@@ -8,6 +8,7 @@
 #include <QPointer>
 #include <QString>
 #include <QStringList>
+#include <QVector>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -45,28 +46,53 @@ class SessionManager;
 // can safely outlive both a shutdown and the FileLoader itself.
 struct PluginMessageGate;
 
+// How a load resolves its plugin configuration relative to the data-source
+// dialog (LoadHints::dialog_policy).
+enum class DialogPolicy {
+  // Plain interactive load: the dialog drives, pre-filled from QSettings.
+  kInteractive,
+  // Apply the saved preset and skip the dialog when the preset names the
+  // SELECTED plugin and applies cleanly; anything else (missing or
+  // mismatched hint, rejected preset) falls back to the interactive dialog.
+  kPreferPreset,
+  // Automated (layout-driven) replay: dialogs are PROHIBITED and the saved
+  // preset is AUTHORITATIVE — even an intentionally empty one (a plugin
+  // whose saveConfig returned nothing is legitimate; it gets the minimal
+  // fresh-filepath config). A preset the plugin rejects FAILS the source
+  // (kFailed). Also skips the QSettings persist an interactive load performs.
+  kNever,
+};
+
 // Hints supplied by callers that already know what plugin to use and what
-// config to apply (e.g. layout-driven reload). When skip_dialog is true and
-// the layout's preset_config_json applies cleanly to the matching plugin,
-// FileLoader::loadFile bypasses the data-source dialog entirely. On any
-// failure (id mismatch, loadConfig rejection), the dialog falls back open
-// with the existing QSettings-based pre-fill.
+// config to apply (e.g. layout-driven reload). dialog_policy decides how the
+// saved preset_config_json and the data-source dialog interact — see
+// DialogPolicy above.
 struct LoadHints {
-  QString expected_plugin_id;  // Empty -> no hint; FileLoader picks plugin by extension as usual.
+  // Stable embedded-manifest id of the plugin the layout saved (new layouts'
+  // manifest_id attribute). Non-empty -> the manifest-id tier of the
+  // require_expected_plugin scan applies, swept across ALL extension matches
+  // before any display-name comparison. Never matched against display names.
+  QString expected_manifest_id;
+  // Display name of the plugin the layout saved (the ID attribute — the only
+  // identity legacy layouts carry). Matched against candidate display names
+  // ONLY, as the fallback tier after expected_manifest_id: an ID-only legacy
+  // layout therefore starts at the name tier and can never silently select a
+  // plugin whose MANIFEST id merely collides with the saved display name.
+  QString expected_plugin_id;
   QString preset_config_json;  // Empty -> no hint; QSettings pre-fill is used.
-  // Normally honored when both fields above are non-empty and the plugin id
-  // matches. rewrite_preset_filepath also permits an empty saved config because
-  // it constructs the minimal fresh-filepath config required by browser replay.
-  bool skip_dialog = false;
+  DialogPolicy dialog_policy = DialogPolicy::kInteractive;
   // Layout replay reuses matching DatasetIds; normal load/reload replaces them.
   bool prefer_reuse = false;
-  // Browser source-bound replay must use the plugin recorded by the layout. If
-  // it is not among the extension matches, fail visibly instead of silently
-  // choosing the first plugin. Default false preserves desktop selection.
+  // A layout that NAMES a plugin (browser source-bound replay, and desktop
+  // layout replay since manifest ids landed) must use that plugin. If it is
+  // not among the extension matches — by manifest id or display name — fail
+  // the load visibly instead of silently choosing the first plugin. Default
+  // false preserves plain interactive selection.
   bool require_expected_plugin = false;
   // A saved browser preset contains the old upload's vanished MEMFS filepath.
   // Rewrite only that field to LoadInput::backing_path before loadConfig().
-  // Default false preserves desktop preset bytes exactly.
+  // Honored by the kNever policy (automated replay is the only rewrite
+  // consumer). Default false preserves desktop preset bytes exactly.
   bool rewrite_preset_filepath = false;
   // Non-zero -> this load REPLACES the given dataset regardless of source
   // identity (the dataset "Replace" action: the incoming file is usually a
@@ -74,8 +100,24 @@ struct LoadHints {
   // refill keeps DatasetId/TopicIds (and so curve keys) stable where topic
   // names match, cancel/failure restores the prior data, and the dataset is
   // renamed to the new source only on commit. A vanished target degrades to a
-  // plain fresh load.
+  // plain fresh load unless require_replacement forbids it.
   DatasetId replace_dataset_id = 0;
+  // With replace_dataset_id: the target must still exist when the request is
+  // dequeued — a vanished target FAILS the load (kFailed, naming the target)
+  // instead of degrading to a plain fresh load. No effect without
+  // replace_dataset_id. Default false preserves the degrade.
+  bool require_replacement = false;
+};
+
+// Ticket naming one ACCEPTED load request, minted at enqueue time by
+// FileLoader::loadFileTicketed. Monotonic per loader; 0 means invalid/none.
+using LoadRequestId = quint64;
+
+// Terminal classification of one accepted load request (FileLoader::loadFinished).
+enum class LoadOutcome {
+  kLoaded,     // data committed; fileLoaded fired for this request
+  kFailed,     // the load errored out; fileLoadFailed carried the reason
+  kCancelled,  // user stop (keep or discard), config-dialog reject, queued cancel, or shutdown
 };
 
 // Drives the file-import path: pick a file, find the matching DataSource
@@ -147,6 +189,18 @@ class FileLoader : public QObject {
   bool loadFile(const QString& path, QWidget* dialog_parent, const LoadHints& hints);
   bool loadFile(LoadInput input, QWidget* dialog_parent = nullptr, const LoadHints& hints = {});
 
+  // Ticketed enqueue: identical semantics to loadFile (the overloads above
+  // delegate here), but returns the request's LoadRequestId — 0 when the input
+  // is rejected outright (nothing enqueued, no loadFinished for it). Every
+  // ACCEPTED request emits loadFinished EXACTLY ONCE, on every path: success,
+  // failure, cancel (queued or active), config-dialog reject, and shutdown.
+  // Terminals are delivered through the event loop — even a request that
+  // resolves synchronously inside this call cannot see its loadFinished before
+  // the caller has recorded the returned ticket — with ONE deliberate
+  // exception: joinForShutdown (and so destruction) flushes undelivered
+  // terminals synchronously, because teardown must never lose them.
+  LoadRequestId loadFileTicketed(LoadInput input, QWidget* dialog_parent = nullptr, const LoadHints& hints = {});
+
   // Cancel the in-progress worker load. keep_partial=true keeps the rows parsed
   // so far (Primary/"Cancel"); false discards the dataset being filled
   // (Secondary/"Discard"). No-op when no worker load is running.
@@ -159,11 +213,39 @@ class FileLoader : public QObject {
   // load. keep_partial as above.
   void cancelCurrent(std::uint64_t generation, bool keep_partial);
 
+  // Cancel ONE request by ticket. A still-QUEUED request is removed at once
+  // (its loadFinished(kCancelled) is scheduled before returning and arrives
+  // via the event loop); the ACTIVE request is cancelled through the
+  // generation machinery (equivalent to cancelCurrent(loadGeneration(),
+  // keep_partial) — its terminal arrives when the load winds down). Returns
+  // false — and resolves nothing — for an unknown or already-terminal ticket,
+  // so repeated cancels are idempotent. On the loader's (GUI) thread the
+  // queue/ticket state is single-threaded by design (workers only marshal
+  // back via queued calls), so a queued→active transition cannot race this
+  // call. Called from ANY OTHER thread it degrades to best-effort: the cancel
+  // is marshalled (see cancelLoadAsync) and the return value is always false.
+  bool cancelLoad(quint64 ticket, bool keep_partial = false);
+
+  // Fire-and-forget cancel-by-ticket, callable from any thread (the one entry
+  // a batch worker may hit off-thread): queues the cancel onto the loader's
+  // thread, where it runs with cancelLoad's exact semantics. The result is
+  // observable only through loadFinished.
+  void cancelLoadAsync(quint64 ticket, bool keep_partial = false);
+
   // Monotonic id of the load currently being processed (worker or suspended
   // prologue), or 0 when idle. Bumped each time a queued request begins. The
   // stop-dialog uses it to bind its cancel/auto-dismiss to one specific load.
   [[nodiscard]] std::uint64_t loadGeneration() const {
     return load_generation_;
+  }
+
+  // Ticket of the request currently being processed — the one loadGeneration()
+  // belongs to — or 0 when idle. Advanced together with the generation in
+  // startNext, so reading both from a loadGenerationAdvanced slot yields a
+  // consistent (generation, ticket) pair for the stop-dialog; a ticket can
+  // never be attributed to a later load's generation.
+  [[nodiscard]] quint64 currentLoadTicket() const {
+    return current_load_ticket_;
   }
 
   // True while a load is running (worker active or mid-prologue) or queued.
@@ -221,8 +303,13 @@ class FileLoader : public QObject {
   /// fileLoaded exposes the reminted datasets.
   void sourceReplacementAboutToCommit(const QString& path, DatasetId dataset_id);
 
+  // `plugin_id` is the selected plugin's DISPLAY name (the historical value);
+  // `plugin_manifest_id` is its stable embedded-manifest id — the durable
+  // identity the layout writer persists alongside the display name. Existing
+  // 4-argument slots keep compiling (Qt slots may take fewer arguments).
   void fileLoaded(
-      const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json);
+      const QString& path, const QString& prefix, const QString& plugin_id, const QString& plugin_config_json,
+      const QString& plugin_manifest_id);
   void fileLoadFailed(const QString& path, const QString& reason);
 
   // Emitted when a load begins ingesting (after the modal dialog). `title` is the
@@ -241,6 +328,38 @@ class FileLoader : public QObject {
   // cannot signal the transition.
   void loadGenerationAdvanced(std::uint64_t generation);
 
+  // A queued request became the CURRENT load (emitted from startNext, right
+  // before that generation's loadGenerationAdvanced). Announces the
+  // ticket↔generation association while keeping the two id spaces
+  // independent: tickets are minted at enqueue, generations at dequeue.
+  void requestStarted(quint64 ticket, std::uint64_t generation);
+
+  // Terminal result of one ACCEPTED request (see loadFileTicketed): exactly
+  // one emission per ticket, on every path — including exits the legacy
+  // signals stay silent on (config-dialog reject, queued cancel, shutdown) —
+  // ALWAYS delivered through the event loop, never inside the call that
+  // resolved the request. `effective_path` is the request's source identity
+  // (what fileLoaded / fileLoadFailed report). `produced_dataset_ids` are ALL
+  // datasets holding this load's data (fan-out: every loaded entry);
+  // `dataset_id` is the single-id convenience — the primary (first) produced
+  // dataset, or 0 when the load left none (failures, discards, rejects).
+  void loadFinished(
+      quint64 ticket, LoadOutcome outcome, const QString& effective_path, DatasetId dataset_id,
+      const QVector<DatasetId>& produced_dataset_ids);
+
+  // Pre-catalog commit seam, SYNCHRONOUS: fires while a fully-loaded request
+  // commits through finishLoadOnGui — its dataset, source path, and captured
+  // plugin config are installed, and the catalog rebuild that publishes the
+  // load has NOT yet run (it follows immediately after, then fileLoaded and
+  // the queued loadFinished). A promotion service uses this to attach source
+  // records atomically with catalog publication. Emitted only for loads that
+  // finish kLoaded via the single-instance commit path — never for failures,
+  // discards, keep-partial stops, nor the prefer_reuse and fan-out epilogues
+  // (which do not commit through finishLoadOnGui).
+  void loadCommitting(
+      quint64 ticket, const QVector<DatasetId>& produced_ids, const QString& plugin_id,
+      const QString& captured_config_json);
+
  private:
 #ifdef PJ_TARGET_WASM
   // Shared browser-picker completion for openFromDialog / replaceFromDialog:
@@ -257,6 +376,7 @@ class FileLoader : public QObject {
     LoadHints hints;
     int file_index = 1;
     int file_total = 1;
+    quint64 ticket = 0;  // minted at enqueue (loadFileTicketed); never 0 once queued
   };
   // Per-load state that must outlive the GUI prologue into the worker and back.
   // Defined in the .cpp (holds a DataSourceHandle + DataSourceRuntimeHost).
@@ -284,6 +404,31 @@ class FileLoader : public QObject {
   // scenes track the load live, and advance the progress strip.
   void publishIngestProgress(DatasetId dataset_id, int current, int maximum);
 
+  // One scheduled loadFinished payload awaiting event-loop delivery, or a
+  // synchronous flush at shutdown/destruction: delivery-or-flush, never loss.
+  struct PendingTerminal {
+    quint64 ticket;
+    LoadOutcome outcome;
+    QString effective_path;
+    DatasetId dataset_id;
+    QVector<DatasetId> produced;
+  };
+
+  // The single terminalize point for loadFinished: no-ops if the current
+  // request already resolved, otherwise marks it terminal FIRST — every exit
+  // path calls this BEFORE emitting any externally re-entrant legacy signal,
+  // so a slot re-entering cancelLoad/joinForShutdown sees the request as
+  // resolved — then queues the emission onto the event loop.
+  void emitLoadFinished(
+      quint64 ticket, LoadOutcome outcome, const QString& effective_path, DatasetId dataset_id,
+      QVector<DatasetId> produced_dataset_ids = {});
+  // Deliver the oldest pending terminal (queued from emitLoadFinished); no-op
+  // when a shutdown flush already emptied the deque.
+  void deliverPendingTerminal();
+  // Emit every pending terminal NOW, in FIFO order — the shutdown/destruction
+  // exception to queued delivery.
+  void flushPendingTerminals();
+
   // GUI: dequeue and begin the next load if idle. Emits queueDrained when the
   // queue empties with neither a suspended prologue nor a worker.
   void startNext();
@@ -301,8 +446,10 @@ class FileLoader : public QObject {
   // startNext().
   void onWorkerFinished(std::uint64_t generation);
   // GUI: post-ingest reconciliation for the just-finished single-instance load
-  // (catalog rebuild, TF ingest, saveConfig, source-path tracking, fileLoaded).
-  void finishLoadOnGui();
+  // (saveConfig, source-path tracking, the loadCommitting seam, catalog
+  // rebuild, TF ingest, fileLoaded). fully_loaded=false (a user keep-stop)
+  // commits identically but skips the loadCommitting seam.
+  void finishLoadOnGui(bool fully_loaded);
   // GUI: after a replacing reload's RefillGuard has rolled the dataset back to its
   // pre-reload data (start-fail / discard / shutdown), reflect the restored data in
   // the catalog and rebuild the per-dataset TF buffer. The guard restores the data +
@@ -369,6 +516,30 @@ class FileLoader : public QObject {
   // joinForShutdown() never reuses an old token: queued worker/progress calls
   // from an earlier load can therefore be rejected after shutdown + reuse.
   std::uint64_t next_load_generation_ = 0;
+  // Ticket counter for loadFileTicketed: minted at ENQUEUE (one per accepted
+  // request, unlike generations which are minted at dequeue), monotonic,
+  // never 0. GUI-thread only.
+  quint64 next_load_ticket_ = 0;
+  // Ticket of the request currently processing, advanced together with
+  // load_generation_ in startNext; 0 while idle. GUI-thread only.
+  quint64 current_load_ticket_ = 0;
+  // Source identity of the current request, kept for the shutdown terminal (a
+  // prologue suspended at its config dialog has no ctx_ to read a path from).
+  QString current_load_identity_;
+  // True once the current request resolved (its loadFinished is scheduled or
+  // delivered). Set BEFORE the resolving path emits any legacy signal, so a
+  // re-entrant cancelLoad/joinForShutdown from such a slot cannot resolve the
+  // request a second time, and a cancel landing in the finished-but-not-yet-
+  // advanced event-loop hop cannot latch cancel_mode_ against the NEXT load.
+  // Cleared when startNext installs the next request.
+  bool current_ticket_terminal_ = false;
+  // Outcome recorded when the current request terminalized — only meaningful
+  // while current_ticket_terminal_ is set. Lets the first-wins guard flag a
+  // conflicting second resolution loudly instead of swallowing it silently.
+  LoadOutcome current_ticket_outcome_ = LoadOutcome::kLoaded;
+  // Terminals scheduled but not yet delivered (FIFO). Normally drained one
+  // per queued metacall; joinForShutdown flushes the remainder synchronously.
+  std::deque<PendingTerminal> pending_terminals_;
   // Cancellation request for the current worker load: 0=none, 1=keep, 2=discard.
   // Written by cancelCurrent/joinForShutdown (GUI), read by the worker.
   std::atomic<int> cancel_mode_{0};
@@ -378,6 +549,12 @@ class FileLoader : public QObject {
   // dialog/prologue coroutine; cleared when shutdown completes so the loader
   // stays usable afterwards.
   bool shutting_down_ = false;
+  // Set by the destructor before its joinForShutdown. Unlike a reusable
+  // shutdown — whose final flush deliberately lets a loadFinished slot start
+  // fresh work on the reset loader — nothing outlives the destructor to
+  // resolve a newly accepted request or join its worker, so admission is
+  // rejected (loadFileTicketed returns 0) while this is set.
+  bool destroying_ = false;
 };
 
 }  // namespace PJ

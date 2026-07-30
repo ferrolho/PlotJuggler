@@ -148,18 +148,63 @@ class ToolboxRuntimeHost {
   // render-parser registrar — on a toolbox-created dataset.
   std::unordered_map<uint32_t, std::unique_ptr<DataSourceRuntimeHost>> parser_ingests_;
   // Progress bookkeeping shared with the hooks installed on a context's
-  // DataSourceRuntimeHost. `active` spans progress_start→progress_finish and
-  // opts the dataset into every notify's ingested report while the import
-  // runs; `total` backs on_ingest_progress; `last_flush` is touched only on
-  // the plugin's ingest thread (single progress caller per context, per the
-  // data-source protocol). Map guarded by parser_ingest_mu_; entries live as
-  // long as their context.
+  // DataSourceRuntimeHost. `total` backs on_ingest_progress; `last_flush` is
+  // touched only on the plugin's ingest thread (single progress caller per
+  // context, per the data-source protocol). Map guarded by parser_ingest_mu_;
+  // entries are RETAINED until host teardown — release copies instead of
+  // erasing, and a re-created context REUSES its dataset's entry. Eager
+  // cleanup is deliberately absent: an undelivered terminal must stay
+  // visible to the destructor's sweep, and after delivery a live re-created
+  // context may hold the same entry at idle phase — indistinguishable from a
+  // dead slot, so erasing would untrack it and break the shell's keyed
+  // started/finished pairing. The per-notify scan cost is O(datasets),
+  // which is small.
   struct IngestProgress {
-    std::atomic<bool> active{false};
+    // Packed terminal-delivery word: low 2 bits = phase, high bits = the ARM
+    // GENERATION (bumped by every progress_start). One word, one CAS per
+    // transition, so a STALE queued finish can never consume a NEWER
+    // sequence's terminal — a delivery CASes exactly the word its claim
+    // produced, and any re-arm changed the generation. Transition table:
+    //   progress_start   (g, *)             -> (g+1, kActive)     CAS-loop RMW
+    //   claim            (g, kActive)       -> (g, kFinishQueued) single CAS;
+    //     (finish hook /                       losers no-op: a prior claim of
+    //      release)                            the same sequence, a re-arm
+    //                                          (generation moved), the sweep
+    //   delivery         (g, kFinishQueued) -> (g, kIdle)         single CAS
+    //                                          on the CLAIMED word; fires iff
+    //                                          it wins (a re-armed or swept
+    //                                          word fails structurally)
+    //   destructor sweep (any)              -> 0; fires iff the prior phase
+    //                                          was not kIdle (generation-
+    //                                          agnostic: live OR queued still
+    //                                          owes its finish; queued
+    //                                          metacalls die with marshaller_)
+    // Claims never retry across generations (single-shot CAS): the RELEASE
+    // path claims under parser_ingest_mu_ — a re-arm needs the same lock via
+    // create — so it can only take its own context's sequence; the finish
+    // hook claims lock-free, where a lost CAS means already-terminated or
+    // superseded, both correctly no-ops.
+    static constexpr uint64_t kPhaseMask = 0x3;
+    static constexpr uint64_t kPhaseIdle = 0x0;
+    static constexpr uint64_t kPhaseActive = 0x1;
+    static constexpr uint64_t kPhaseFinishQueued = 0x2;
+    static constexpr uint64_t kGenerationStep = 0x4;
+    std::atomic<uint64_t> state{0};
     std::atomic<uint64_t> total{0};
     std::chrono::steady_clock::time_point last_flush;
   };
   std::unordered_map<uint32_t, std::shared_ptr<IngestProgress>> ingest_progress_;
+  // Claim this sequence's terminal: single CAS (gen, kActive) ->
+  // (gen, kFinishQueued). Returns the claimed word, or 0 when there is
+  // nothing to claim — no active sequence (progressFinish without a start
+  // stays a documented safe no-op), already claimed, or superseded by a
+  // re-arm.
+  [[nodiscard]] static uint64_t claimIngestFinish(IngestProgress& progress);
+  // Marshal on_ingest_finished for a successful claim. The delivery CASes
+  // exactly `claimed_word` back to (gen, kIdle) and fires only if it wins, so
+  // a stale delivery can never steal a newer sequence's terminal; an
+  // undelivered claim stays kFinishQueued for the destructor's sweep.
+  void postIngestFinished(DatasetId dataset_id, const std::shared_ptr<IngestProgress>& progress, uint64_t claimed_word);
   // See setFlushThrottleMs.
   int flush_throttle_ms_ = 50;
   // Datasets that received a parser-ingest context since the last

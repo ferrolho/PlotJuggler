@@ -40,6 +40,19 @@ struct DatasetIdentityResolution {
   bool ambiguous = false;
 };
 
+/// Provenance for a dataset produced by a provider plugin: which plugin made it
+/// (provider_id), that provider's durable identity for the source
+/// (source_identity — typically a canonical-descriptor digest, a FAST-PATH key
+/// only), and the full canonical descriptor JSON needed to re-obtain the
+/// dataset. Deliberately dataset-keyed, NOT part of LoadedSource: loaded
+/// sources are path-level and dedup-by-path, while one file/fetch fans out to
+/// many datasets, each with its own provenance.
+struct SourceRecord {
+  QString provider_id;
+  QString source_identity;
+  QString descriptor_json;
+};
+
 // Owns the datastore for the current app session. v1 scalar commit calls are
 // expected on the GUI thread so plot adapters never observe mutation during
 // paint. The object-topic parser registry is the exception: it is written from
@@ -98,6 +111,23 @@ class SessionManager : public QObject {
   /// streaming/test dataset and for an id no longer tracked by FileLoader.
   [[nodiscard]] QString datasetSourcePath(DatasetId dataset_id) const;
 
+  /// Attaches (or overwrites) the provenance record for `dataset_id` — how this
+  /// dataset came to be and how to re-obtain it. Same GUI-thread-only contract
+  /// as the source-path registry it parallels. Three events invalidate a
+  /// record structurally: removeDataset drops it, a successful destructive
+  /// merge invalidates every contributor's record (mergeDatasets), and a
+  /// committed in-place refill detaches it (RefillGuard::commit — the content
+  /// no longer comes from the recorded source; a promotion listener re-attaches
+  /// in FileLoader's loadCommitting seam).
+  void attachSourceRecord(DatasetId dataset_id, SourceRecord record);
+
+  /// The provenance record attached to `dataset_id`, or nullptr when none. The
+  /// pointer is invalidated by the next attach/detach/removeDataset/merge —
+  /// copy the record out instead of retaining the pointer.
+  [[nodiscard]] const SourceRecord* sourceRecord(DatasetId dataset_id) const;
+
+  void detachSourceRecord(DatasetId dataset_id);
+
   /// The physical-path normalization every stored source path goes through
   /// (setDatasetSourcePath, recordLoadedSource): canonicalFilePath when the
   /// file exists (resolving symlink/relative aliases), cleaned absolute path
@@ -119,6 +149,22 @@ class SessionManager : public QObject {
   /// exists; otherwise it resolves to nothing (not ambiguous).
   [[nodiscard]] DatasetIdentityResolution resolveDatasetIdentity(
       DatasetId saved_id, const QString& saved_source, const QString& saved_path = {}) const;
+
+  /// Record-qualified overload for identities that also persisted the dataset's
+  /// SourceRecord. Resolution order becomes:
+  ///  1. the exact `saved_id`, trusted only while EVERY supplied qualifier —
+  ///     now including the source record — still agrees;
+  ///  2. a unique attached-record match: (provider_id, source_identity) is only
+  ///     the fast path — trust requires CONFIRMING the full canonical
+  ///     descriptor, i.e. byte-equal descriptor_json (a matching identity with
+  ///     different descriptor bytes is NOT a match and falls through);
+  ///  3./4. the existing path and source-name tiers, unchanged.
+  /// Multiple confirmed record matches return `{id=nullopt, ambiguous=true}` —
+  /// never a guess. An empty `saved_record` makes this identical to the
+  /// 3-argument form (which forwards here).
+  [[nodiscard]] DatasetIdentityResolution resolveDatasetIdentity(
+      DatasetId saved_id, const QString& saved_source, const QString& saved_path,
+      const SourceRecord& saved_record) const;
 
   /// Topic-aware fallback for a same-file single<->fan-out remint. When full-path
   /// identity alone names several datasets (resolveDatasetIdentity returns
@@ -199,6 +245,50 @@ class SessionManager : public QObject {
   // propagates to samplesIngested; follow-live consumers (PlotWidget auto-fit,
   // Scene2DDockWidget frame advance) act only when it is true.
   void notifyIngest(QVector<PJ::TopicId> ids, bool live = false);
+
+  // --- Progressive bulk-import lifecycle (hoisted from MainWindow, #470). The
+  // session owns WHICH datasets are actively receiving a progressive import so
+  // any observer (the title-bar progress strip today, a batch coordinator
+  // tomorrow) can watch begin/progress/end without going through the window;
+  // presentation (strip widgets, FileLoader arbitration, stop routing to the
+  // importing hosts) stays in the app layer. GUI-thread only — the
+  // ToolboxRuntimeHost marshals its callbacks there. ---
+  struct ActiveIngest {
+    QString label;
+    quint64 current = 0;
+    quint64 total = 0;  // 0 = size unknown (indeterminate progress)
+  };
+
+  /// Marks `dataset_id` as actively importing and emits ingestBegan. A repeated
+  /// begin for the same dataset restarts its entry (fresh label/total).
+  void beginIngest(DatasetId dataset_id, QString label, quint64 total);
+
+  /// Progress tick. First publishes the dataset's committed topics through
+  /// notifyIngest — the SAME non-live data-publication seam every ingest path
+  /// uses (the host flushed pending rows before firing progress), so plots,
+  /// playback, and the catalog observe the new rows. Then records
+  /// current/total and emits ingestProgressed for a tracked import. The
+  /// publication runs even for an untracked dataset so a begin/progress
+  /// ordering slip can never drop flushed data; only the lifecycle signal is
+  /// gated on membership.
+  void updateIngest(DatasetId dataset_id, quint64 current, quint64 total);
+
+  /// Ends the import: erases the entry and emits ingestEnded. Silent no-op for
+  /// a dataset that is not actively importing (begin/finished pairing is the
+  /// host's contract; a double end must not double-signal).
+  void endIngest(DatasetId dataset_id);
+
+  [[nodiscard]] bool hasActiveIngests() const noexcept {
+    return !active_ingests_.empty();
+  }
+  [[nodiscard]] bool ingestActive(DatasetId dataset_id) const {
+    return active_ingests_.count(dataset_id) != 0;
+  }
+  /// Live view of every active import, keyed by dataset. Invalidated by
+  /// begin/endIngest — copy out anything that crosses an event-loop boundary.
+  [[nodiscard]] const std::unordered_map<DatasetId, ActiveIngest>& activeIngests() const noexcept {
+    return active_ingests_;
+  }
 
   // In-place reload swap: replace `primary_id`'s scalar + object data with the
   // data staged under `staged_id` in `staged_engine`/`staged_store`, keeping the
@@ -297,6 +387,10 @@ class SessionManager : public QObject {
     QString prefix;
     QString plugin_id;           // Empty when the loader didn't record a plugin (e.g. legacy paths).
     QString plugin_config_json;  // Plugin's saveConfig() JSON at load time.
+    // The plugin's stable manifest id (its embedded-manifest "id" field), the
+    // durable identity layouts persist alongside the display name above.
+    // Empty when the loader predates the field or didn't record a plugin.
+    QString plugin_manifest_id;
   };
 
   // All data files loaded into this session, in load order (deduped by path —
@@ -320,7 +414,9 @@ class SessionManager : public QObject {
   // file's position); otherwise the source is appended. This dedup-by-physical-
   // path keeps reloads from growing duplicate <fileInfo> entries while additive
   // loads of distinct files all persist.
-  void recordLoadedSource(QString path, QString prefix, QString plugin_id = {}, QString plugin_config_json = {});
+  void recordLoadedSource(
+      QString path, QString prefix, QString plugin_id = {}, QString plugin_config_json = {},
+      QString plugin_manifest_id = {});
   void clearLoadedSource() noexcept {
     loaded_sources_.clear();
   }
@@ -376,6 +472,14 @@ class SessionManager : public QObject {
   // drop that dataset's offset caches and replot/re-snap without re-indexing
   // samples. Connect with qOverload<PJ::DatasetId>(...).
   void displayOffsetChanged(PJ::DatasetId dataset_id);
+
+  // Progressive bulk-import lifecycle (begin/update/endIngest). `total` == 0
+  // means the size is unknown (indeterminate). All GUI-thread; ingestProgressed
+  // fires AFTER the tick's samplesIngested publication, so an observer sees the
+  // data before the progress number that announced it.
+  void ingestBegan(PJ::DatasetId dataset_id, QString label, quint64 total);
+  void ingestProgressed(PJ::DatasetId dataset_id, quint64 current, quint64 total);
+  void ingestEnded(PJ::DatasetId dataset_id);
 
  private:
   // RefillGuard drives the transactional reload through this class's public
@@ -477,6 +581,15 @@ class SessionManager : public QObject {
   // and both scene families resolve the same (id, source, full-path) contract.
   // Paths are stored normalized (see setDatasetSourcePath).
   std::unordered_map<DatasetId, QString> dataset_source_paths_;
+  // Dataset-keyed provenance from provider plugins (attachSourceRecord) —
+  // sibling registry to dataset_source_paths_ with the same lifecycle: erased
+  // on removeDataset, invalidated for every contributor of a successful
+  // destructive merge (the anchor included).
+  std::unordered_map<DatasetId, SourceRecord> dataset_source_records_;
+  // Datasets currently receiving a progressive toolbox import
+  // (beginIngest -> endIngest). Lifecycle state only; presentation and
+  // stop-routing live in the app layer.
+  std::unordered_map<DatasetId, ActiveIngest> active_ingests_;
   std::vector<LoadedSource> loaded_sources_;
 };
 

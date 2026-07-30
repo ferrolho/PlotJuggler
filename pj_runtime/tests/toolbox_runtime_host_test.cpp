@@ -8,6 +8,7 @@
 #include <QString>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -53,6 +54,45 @@ class ToolboxRuntimeHostTest : public ::testing::Test {
     }
     const auto metadata = reader.getMetadata(topics.front());
     return metadata.has_value() ? metadata->total_row_count : 0;
+  }
+
+  // Bring-up shared by the teardown-terminal tests: hermetic catalog deps, a
+  // host wired with `callbacks`, and one parser-ingest context — with its
+  // progress sequence STARTED unless start_progress is false (a test that
+  // needs the started callback QUEUED starts it from a worker thread via
+  // `view`). Out-param + void return so gtest ASSERTs abort the helper;
+  // callers wrap the call in ASSERT_NO_FATAL_FAILURE.
+  struct StartedIngest {
+    std::unique_ptr<PJ::test::HermeticCatalog> catalog;
+    std::optional<PJ::ToolboxRuntimeHostView> runtime;
+    std::optional<PJ::DataSourceRuntimeHostView> view;
+    uint32_t source_id = 0;
+  };
+  void startHermeticIngest(
+      PJ::ToolboxRuntimeHost::Callbacks callbacks, StartedIngest& out, bool start_progress = true) {
+    QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
+    out.catalog = std::make_unique<PJ::test::HermeticCatalog>(plugin_file.absolutePath());
+    PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
+    deps.catalog = &out.catalog->service;
+    host_ = std::make_unique<PJ::ToolboxRuntimeHost>(
+        engine_, object_store_, settings_, std::move(callbacks), std::move(deps));
+    auto services = registered();
+    auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
+    ASSERT_TRUE(toolbox_or.has_value());
+    auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
+    ASSERT_TRUE(runtime_or.has_value());
+    out.runtime.emplace(*runtime_or);
+
+    const auto source = *(*toolbox_or).createDataSource("cloud download");
+    out.source_id = source.id;
+    PJ_data_source_runtime_host_t ingest_raw{};
+    PJ_error_t error{};
+    ASSERT_TRUE(
+        out.runtime->raw().vtable->create_parser_ingest(out.runtime->raw().ctx, source.id, &ingest_raw, &error));
+    out.view.emplace(ingest_raw);
+    if (start_progress) {
+      ASSERT_TRUE(out.view->progressStart("import", 10, true).has_value());  // on-thread: started delivered directly
+    }
   }
 
   PJ::DataEngine engine_;
@@ -379,6 +419,7 @@ TEST_F(ToolboxRuntimeHostTest, ProgressHooksFlushWritesAndDriveIngestCallbacks) 
   EXPECT_EQ(progressed[0].visible_rows, 1u);  // the flush preceded the callback
 
   progress.progressFinish();
+  QCoreApplication::processEvents();  // terminals always queue, so they can never overtake a queued begin
   ASSERT_EQ(finished.size(), 1u);
   EXPECT_EQ(finished[0], static_cast<PJ::DatasetId>(source.id));
 
@@ -528,6 +569,276 @@ TEST_F(ToolboxRuntimeHostTest, ProgressCallbacksArePairedAndMarshalled) {
   QCoreApplication::processEvents();
   EXPECT_EQ(finished_calls.load(), 1);  // release after a clean finish adds nothing
   host_.reset();
+}
+
+// An OFF-THREAD release queues on_ingest_finished to the constructing thread;
+// destroying the host before that metacall is pumped PURGES it (queued calls
+// die with marshaller_). The teardown sweep must still deliver the terminal —
+// exactly once — or the shell's hoisted lifecycle bookkeeping
+// (SessionManager::hasActiveIngests) wedges true forever and the residual
+// stop-routing entry holds an expired owner.
+TEST_F(ToolboxRuntimeHostTest, OffThreadReleaseThenImmediateTeardownStillFiresFinishedOnce) {
+  std::atomic<int> finished_calls{0};
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest));
+
+  // [thread-safe] release from a worker: finished is QUEUED, not delivered.
+  std::thread worker([&]() { (void)ingest.runtime->releaseParserIngest(ingest.source_id); });
+  worker.join();
+  EXPECT_EQ(finished_calls.load(), 0);
+
+  host_.reset();  // no pump before destruction: the queued metacall is purged
+  EXPECT_EQ(finished_calls.load(), 1) << "teardown must deliver the queued-but-undelivered finished";
+  QCoreApplication::processEvents();  // nothing residual may fire afterwards
+  EXPECT_EQ(finished_calls.load(), 1);
+}
+
+// The complementary exactly-once half: a finished that WAS delivered before
+// teardown must not be re-fired by the destructor's sweep.
+TEST_F(ToolboxRuntimeHostTest, DeliveredFinishedIsNotRefiredByTeardown) {
+  std::atomic<int> finished_calls{0};
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest));
+
+  std::thread worker([&]() { (void)ingest.runtime->releaseParserIngest(ingest.source_id); });
+  worker.join();
+  QCoreApplication::processEvents();  // normal delivery
+  EXPECT_EQ(finished_calls.load(), 1);
+
+  host_.reset();
+  EXPECT_EQ(finished_calls.load(), 1) << "the sweep must skip a DELIVERED terminal";
+}
+
+// The guarantee MainWindow's hoisted bookkeeping now leans on: destroying a
+// host with an ACTIVE progress sequence (progress_start, no finish and no
+// release) still pairs the started callback with a finished.
+TEST_F(ToolboxRuntimeHostTest, TeardownWithActiveProgressFiresFinished) {
+  std::atomic<int> started_calls{0};
+  std::atomic<int> finished_calls{0};
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) { ++started_calls; };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest));
+  ASSERT_EQ(started_calls.load(), 1);
+  EXPECT_EQ(finished_calls.load(), 0);
+
+  host_.reset();  // mid-import teardown: the sweep closes the pairing
+  EXPECT_EQ(finished_calls.load(), 1);
+}
+
+// Collapse semantics pin: a released import whose finished is still queued,
+// SUPERSEDED by a re-created-and-started context for the same dataset, must
+// NOT fire that stale finish after the re-arm. SessionManager's bookkeeping
+// is dataset-keyed (beginIngest RESTARTS the entry, endIngest erases it, a
+// double end is a silent no-op): a superseded finish landing mid-import
+// would erase the re-armed entry — progress UI hidden early, the real finish
+// downgraded to a no-op double-end. Exactly one finish per dataset, at the
+// LAST sequence's real terminal.
+TEST_F(ToolboxRuntimeHostTest, RearmedImportSwallowsSupersededQueuedFinish) {
+  std::atomic<int> started_calls{0};
+  std::atomic<int> finished_calls{0};
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) { ++started_calls; };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest));
+
+  // Off-thread release queues A's finished without delivering it.
+  std::thread worker([&]() { (void)ingest.runtime->releaseParserIngest(ingest.source_id); });
+  worker.join();
+  EXPECT_EQ(finished_calls.load(), 0);
+
+  // Re-create AND start the same dataset's import BEFORE the queued call pumps.
+  PJ_data_source_runtime_host_t second_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(ingest.runtime->raw().vtable->create_parser_ingest(
+      ingest.runtime->raw().ctx, ingest.source_id, &second_raw, &error));
+  const PJ::DataSourceRuntimeHostView second(second_raw);
+  ASSERT_TRUE(second.progressStart("import-b", 5, true).has_value());
+  ASSERT_EQ(started_calls.load(), 2);
+
+  QCoreApplication::processEvents();  // A's stale delivery must lose to the re-arm
+  EXPECT_EQ(finished_calls.load(), 0) << "a superseded finish must not drain the re-armed import";
+
+  host_.reset();  // the re-armed sequence's terminal closes the pairing
+  EXPECT_EQ(finished_calls.load(), 1) << "exactly one finish for the dataset";
+}
+
+// The erase-after-delivery regression (Codex S2): re-create the context but
+// do NOT start it, then let the PRIOR sequence's queued finish deliver. The
+// live re-created context must stay tracked — its later start/release must
+// pair started/finished exactly — and teardown must add nothing.
+TEST_F(ToolboxRuntimeHostTest, RecreatedContextStaysTrackedAfterPriorTerminalDelivers) {
+  std::atomic<int> started_calls{0};
+  std::atomic<int> finished_calls{0};
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) { ++started_calls; };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) { ++finished_calls; };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest));
+
+  std::thread worker([&]() { (void)ingest.runtime->releaseParserIngest(ingest.source_id); });
+  worker.join();
+
+  // Re-create the context for the same dataset WITHOUT starting it, then let
+  // the prior sequence's queued finish deliver normally.
+  PJ_data_source_runtime_host_t second_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(ingest.runtime->raw().vtable->create_parser_ingest(
+      ingest.runtime->raw().ctx, ingest.source_id, &second_raw, &error));
+  const PJ::DataSourceRuntimeHostView second(second_raw);
+  QCoreApplication::processEvents();
+  EXPECT_EQ(finished_calls.load(), 1) << "the prior sequence's finish delivers normally";
+
+  // The re-created context must still be tracked: its own sequence pairs.
+  ASSERT_TRUE(second.progressStart("import-b", 5, true).has_value());
+  ASSERT_EQ(started_calls.load(), 2);
+  std::thread worker2([&]() { (void)ingest.runtime->releaseParserIngest(ingest.source_id); });
+  worker2.join();
+  QCoreApplication::processEvents();
+  EXPECT_EQ(finished_calls.load(), 2) << "the re-created context's release must still pair its finish";
+
+  host_.reset();
+  EXPECT_EQ(finished_calls.load(), 2) << "teardown adds nothing for delivered terminals";
+}
+
+// Final Codex round: a queued finish must carry its own sequence's identity.
+// Two complete off-thread sequences (start + release each, nothing pumped in
+// between) share the retained progress entry; the pump must deliver
+// begin A, begin B, then exactly ONE finish — B's, AFTER begin B — so a
+// dataset-keyed consumer (begin restarts the entry, finish erases it, double
+// end is a no-op) ends DRAINED. Pre-fix, A's stale delivery consumed B's
+// kFinishQueued between the two begins and B's real finish was discarded:
+// order begin, finish, begin — the key wedged active forever.
+TEST_F(ToolboxRuntimeHostTest, StaleQueuedFinishCannotStealNewerSequencesTerminal) {
+  std::vector<std::string> order;  // host-thread callback order
+  int keyed_active = 0;            // dataset-keyed mock: begin -> restart entry, finish -> erase
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) {
+    order.emplace_back("begin");
+    keyed_active = 1;
+  };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) {
+    order.emplace_back("finish");
+    keyed_active = 0;
+  };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest, /*start_progress=*/false));
+
+  // Sequence A entirely off-thread: its begin AND finish are both queued.
+  std::thread first_seq([&]() {
+    (void)ingest.view->progressStart("import-a", 10, true);
+    (void)ingest.runtime->releaseParserIngest(ingest.source_id);
+  });
+  first_seq.join();
+
+  // Sequence B: re-create (a control call, no queued callbacks), then start +
+  // release off-thread — its begin and finish queue BEHIND A's pair.
+  PJ_data_source_runtime_host_t second_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(ingest.runtime->raw().vtable->create_parser_ingest(
+      ingest.runtime->raw().ctx, ingest.source_id, &second_raw, &error));
+  const PJ::DataSourceRuntimeHostView second(second_raw);
+  std::thread second_seq([&]() {
+    (void)second.progressStart("import-b", 5, true);
+    (void)ingest.runtime->releaseParserIngest(ingest.source_id);
+  });
+  second_seq.join();
+  ASSERT_TRUE(order.empty()) << "nothing may deliver before the pump";
+
+  QCoreApplication::processEvents();
+  const std::vector<std::string> expected{"begin", "begin", "finish"};
+  EXPECT_EQ(order, expected) << "the single finish must be B's, delivered AFTER begin B";
+  EXPECT_EQ(keyed_active, 0) << "the dataset-keyed tracking must drain";
+
+  host_.reset();
+  EXPECT_EQ(order.size(), 3u) << "teardown adds nothing — B's terminal was already delivered";
+}
+
+// Closing Codex round: release is a [thread-safe] slot, so it may legally run
+// ON the marshaller thread while the sequence's begin — queued by an
+// off-thread progress_start — is still in flight. The finish must ENQUEUE
+// behind that begin, never deliver directly: finish-before-begin lands the
+// end on an absent key (silent no-op) and the late begin then re-inserts an
+// entry nothing will ever erase.
+TEST_F(ToolboxRuntimeHostTest, GuiThreadReleaseFinishCannotOvertakeQueuedBegin) {
+  std::vector<std::string> order;
+  int keyed_active = 0;  // dataset-keyed mock: begin -> restart entry, finish -> erase
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) {
+    order.emplace_back("begin");
+    keyed_active = 1;
+  };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) {
+    order.emplace_back("finish");
+    keyed_active = 0;
+  };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest, /*start_progress=*/false));
+
+  std::thread starter([&]() { (void)ingest.view->progressStart("import", 10, true); });
+  starter.join();
+  ASSERT_TRUE(order.empty()) << "the off-thread begin must still be queued";
+
+  // GUI-thread release while the begin is still queued.
+  ASSERT_TRUE(ingest.runtime->releaseParserIngest(ingest.source_id).has_value());
+
+  QCoreApplication::processEvents();
+  const std::vector<std::string> expected{"begin", "finish"};
+  EXPECT_EQ(order, expected) << "the finish must enqueue BEHIND its own sequence's queued begin";
+  EXPECT_EQ(keyed_active, 0) << "the dataset-keyed tracking must drain";
+}
+
+// Two-arm variant of the same hazard: sequence A fully off-thread (begin A
+// queued, its finish queued then superseded), sequence B started off-thread
+// (begin B queued) and released ON the GUI thread. Delivery must read
+// begin A, begin B, finish B — pre-fix the direct finish landed first.
+TEST_F(ToolboxRuntimeHostTest, GuiThreadReleaseTwoArmVariantKeepsBeginBeforeFinish) {
+  std::vector<std::string> order;
+  int keyed_active = 0;
+  PJ::ToolboxRuntimeHost::Callbacks callbacks;
+  callbacks.on_ingest_started = [&](PJ::DatasetId, std::string, uint64_t) {
+    order.emplace_back("begin");
+    keyed_active = 1;
+  };
+  callbacks.on_ingest_finished = [&](PJ::DatasetId) {
+    order.emplace_back("finish");
+    keyed_active = 0;
+  };
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(std::move(callbacks), ingest, /*start_progress=*/false));
+
+  // Sequence A entirely off-thread: begin A and finish A both queue.
+  std::thread first_seq([&]() {
+    (void)ingest.view->progressStart("import-a", 10, true);
+    (void)ingest.runtime->releaseParserIngest(ingest.source_id);
+  });
+  first_seq.join();
+
+  // Sequence B: re-create, start off-thread (begin B queues; the re-arm
+  // supersedes A's queued finish), then release ON the GUI thread.
+  PJ_data_source_runtime_host_t second_raw{};
+  PJ_error_t error{};
+  ASSERT_TRUE(ingest.runtime->raw().vtable->create_parser_ingest(
+      ingest.runtime->raw().ctx, ingest.source_id, &second_raw, &error));
+  const PJ::DataSourceRuntimeHostView second(second_raw);
+  std::thread second_start([&]() { (void)second.progressStart("import-b", 5, true); });
+  second_start.join();
+  ASSERT_TRUE(order.empty()) << "both begins must still be queued";
+  ASSERT_TRUE(ingest.runtime->releaseParserIngest(ingest.source_id).has_value());
+
+  QCoreApplication::processEvents();
+  const std::vector<std::string> expected{"begin", "begin", "finish"};
+  EXPECT_EQ(order, expected) << "begin A, begin B, then B's finish — nothing may overtake a queued begin";
+  EXPECT_EQ(keyed_active, 0) << "the dataset-keyed tracking must drain";
+
+  host_.reset();
+  EXPECT_EQ(order.size(), 3u) << "teardown adds nothing — B's terminal was already delivered";
 }
 
 // Rapid progress_update calls inside the throttle window must not stack

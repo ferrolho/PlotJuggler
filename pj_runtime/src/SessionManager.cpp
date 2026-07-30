@@ -87,8 +87,27 @@ QString SessionManager::datasetSourcePath(DatasetId dataset_id) const {
   return it != dataset_source_paths_.end() ? it->second : QString{};
 }
 
+void SessionManager::attachSourceRecord(DatasetId dataset_id, SourceRecord record) {
+  dataset_source_records_.insert_or_assign(dataset_id, std::move(record));
+}
+
+const SourceRecord* SessionManager::sourceRecord(DatasetId dataset_id) const {
+  const auto it = dataset_source_records_.find(dataset_id);
+  return it != dataset_source_records_.end() ? &it->second : nullptr;
+}
+
+void SessionManager::detachSourceRecord(DatasetId dataset_id) {
+  dataset_source_records_.erase(dataset_id);
+}
+
 DatasetIdentityResolution SessionManager::resolveDatasetIdentity(
     DatasetId saved_id, const QString& saved_source, const QString& saved_path) const {
+  return resolveDatasetIdentity(saved_id, saved_source, saved_path, SourceRecord{});
+}
+
+DatasetIdentityResolution SessionManager::resolveDatasetIdentity(
+    DatasetId saved_id, const QString& saved_source, const QString& saved_path,
+    const SourceRecord& saved_record) const {
   // normalizedSourcePath canonicalizes an existing file but falls back to the
   // cleaned-absolute form once the file is gone. For a plain (non-symlinked) path
   // both forms coincide, so a deleted-on-disk source still compares equal to its
@@ -102,11 +121,48 @@ DatasetIdentityResolution SessionManager::resolveDatasetIdentity(
   const auto path_matches = [this, &normalized_saved_path](DatasetId id) {
     return normalized_saved_path.isEmpty() || datasetSourcePath(id) == normalized_saved_path;
   };
+  const bool record_supplied = !saved_record.provider_id.isEmpty() || !saved_record.source_identity.isEmpty() ||
+                               !saved_record.descriptor_json.isEmpty();
+  // Full-record agreement: (provider_id, source_identity) is only the FAST
+  // path — the identity digest could collide or drift — so trust additionally
+  // requires the full canonical descriptor to confirm, i.e. byte-equal
+  // descriptor_json. An unsupplied record (all fields empty) constrains nothing,
+  // which keeps every record-less caller's resolution byte-identical.
+  const auto record_matches = [this, &saved_record, record_supplied](DatasetId id) {
+    if (!record_supplied) {
+      return true;
+    }
+    const auto it = dataset_source_records_.find(id);
+    return it != dataset_source_records_.end() && it->second.provider_id == saved_record.provider_id &&
+           it->second.source_identity == saved_record.source_identity &&
+           it->second.descriptor_json == saved_record.descriptor_json;
+  };
 
   if (saved_id != 0) {
     const DatasetInfo* exact = data_engine_.getDataset(saved_id);
-    if (source_matches(exact) && path_matches(saved_id)) {
+    if (source_matches(exact) && path_matches(saved_id) && record_matches(saved_id)) {
       return DatasetIdentityResolution{.id = saved_id};
+    }
+  }
+
+  // Record tier: a unique confirmed record match outranks the path/name tiers
+  // (provenance is more durable than either label). An identity hit whose
+  // descriptor bytes differ is NOT a match (record_matches above) and falls
+  // through; several confirmed matches are ambiguous — never guess.
+  if (record_supplied) {
+    std::optional<DatasetId> record_match;
+    for (const auto& entry : dataset_source_records_) {
+      const DatasetId candidate = entry.first;
+      if (!record_matches(candidate) || data_engine_.getDataset(candidate) == nullptr) {
+        continue;
+      }
+      if (record_match.has_value()) {
+        return DatasetIdentityResolution{.id = std::nullopt, .ambiguous = true};
+      }
+      record_match = candidate;
+    }
+    if (record_match.has_value()) {
+      return DatasetIdentityResolution{.id = record_match};
     }
   }
 
@@ -405,6 +461,35 @@ void SessionManager::notifyIngest(QVector<TopicId> ids, bool live) {
   emit samplesIngested(std::move(ids), live);
 }
 
+void SessionManager::beginIngest(DatasetId dataset_id, QString label, quint64 total) {
+  active_ingests_.insert_or_assign(dataset_id, ActiveIngest{label, /*current=*/0, total});
+  emit ingestBegan(dataset_id, std::move(label), total);
+}
+
+void SessionManager::updateIngest(DatasetId dataset_id, quint64 current, quint64 total) {
+  // Publish the tick's flushed rows through the one non-live data-publication
+  // seam every ingest path shares (plots/playback/catalog listen on
+  // samplesIngested; notifyIngest suppresses the empty-non-live case itself).
+  // This runs even for an untracked dataset so a begin/progress ordering slip
+  // never drops data; only the lifecycle signal below is membership-gated.
+  const auto ids = data_engine_.listTopics(dataset_id);
+  notifyIngest(QVector<TopicId>(ids.begin(), ids.end()), /*live=*/false);
+
+  const auto it = active_ingests_.find(dataset_id);
+  if (it == active_ingests_.end()) {
+    return;
+  }
+  it->second.current = current;
+  it->second.total = total;
+  emit ingestProgressed(dataset_id, current, total);
+}
+
+void SessionManager::endIngest(DatasetId dataset_id) {
+  if (active_ingests_.erase(dataset_id) != 0) {
+    emit ingestEnded(dataset_id);
+  }
+}
+
 void SessionManager::notifyDatasetAboutToBeReplaced(DatasetId dataset_id) {
   invalidateDatasetMinTimestamp(dataset_id);
   emit datasetAboutToBeReplaced(dataset_id);
@@ -488,6 +573,14 @@ void RefillGuard::commit() {
   prior_object_topic_ids_.clear();
   replaced_source_topic_ids_.clear();
   processor_output_topic_ids_.clear();
+  // The refill rewrote the dataset's content from a NEW source, so whatever
+  // provider provenance the OLD content carried is stale — a promoted cloud
+  // dataset refilled from a local file must not keep the cloud descriptor for
+  // the local bytes. Structural here (any in-place refill, not one caller's
+  // path); a rollback never reaches commit and keeps the record.
+  if (session_ != nullptr) {
+    session_->detachSourceRecord(dataset_id_);
+  }
 }
 
 Status RefillGuard::recomputeProcessors() {
@@ -679,6 +772,17 @@ std::optional<DatasetMergeReport> SessionManager::mergeDatasets(
     return std::nullopt;  // engine rejected: nothing mutated — let the caller skip the catalog update
   }
 
+  // The merge is now destructive and committed: no single contributor's
+  // original descriptor can re-obtain the merged result, so invalidate the
+  // provenance records of EVERY contributor — the anchor included. (Observed
+  // but deliberately untouched: dataset_source_paths_ is likewise not cleaned
+  // here; the caller owns the post-merge catalog/source bookkeeping. Records
+  // are the only provenance this class owns end-to-end.)
+  dataset_source_records_.erase(anchor);
+  for (const auto& source : sources) {
+    dataset_source_records_.erase(source.dataset_id);
+  }
+
   // (3) Fold the object topics the same way. This shares the scalar merge's
   // structural validation, so it cannot fail once the scalar merge above
   // succeeded on the same inputs.
@@ -797,9 +901,11 @@ std::shared_ptr<std::mutex> SessionManager::parserMutexForObjectTopic(ObjectTopi
   return slot != nullptr ? slot->mutex : nullptr;
 }
 
-void SessionManager::recordLoadedSource(QString path, QString prefix, QString plugin_id, QString plugin_config_json) {
+void SessionManager::recordLoadedSource(
+    QString path, QString prefix, QString plugin_id, QString plugin_config_json, QString plugin_manifest_id) {
   LoadedSource source{
-      normalizedSourcePath(path), std::move(prefix), std::move(plugin_id), std::move(plugin_config_json)};
+      normalizedSourcePath(path), std::move(prefix), std::move(plugin_id), std::move(plugin_config_json),
+      std::move(plugin_manifest_id)};
   // Dedup by physical path (matching datasetSourcePath's normalization): a reload
   // — including a symlink/relative alias — updates its entry in place (keeping
   // list order) rather than appending a duplicate.
@@ -820,6 +926,10 @@ void SessionManager::evictDatasetObjects(DatasetId dataset_id) {
 void SessionManager::removeDataset(DatasetId dataset_id) {
   data_engine_.removeDataset(dataset_id);
   dataset_source_paths_.erase(dataset_id);
+  // Provenance shares the source-path lifecycle: a removed dataset's record
+  // must never resolve a future identity query (the record tier skips ids the
+  // engine no longer knows, but a reminted id could collide).
+  dataset_source_records_.erase(dataset_id);
   // The engine no longer holds this dataset; drop its pinned earliest-sample and
   // the memoized cross-dataset origin so globalTimeReference() re-scans the
   // survivors (removing the earliest dataset must re-base the display origin).
