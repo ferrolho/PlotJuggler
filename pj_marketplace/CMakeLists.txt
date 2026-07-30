@@ -195,6 +195,13 @@ if(TARGET mock_data_source_plugin AND TARGET mock_file_source_plugin
   )
   target_compile_options(extension_manager_test PRIVATE ${PJ_WARNING_FLAGS})
   add_test(NAME extension_manager_test COMMAND extension_manager_test)
+else()
+  # There is no legitimate configuration where tests are wanted but these fixtures
+  # are absent, so silence here means a real problem — most likely that a top-level
+  # add_subdirectory reorder moved pj_marketplace ahead of the module defining one
+  # of them. Without this the whole suite drops out of ctest and everything still
+  # reports green, which is exactly how it went unnoticed once already.
+  message(WARNING "extension_manager_test skipped: mock plugin fixtures are not configured yet")
 endif()
 
 # Integration test — requires network access, excluded from CTest by default.

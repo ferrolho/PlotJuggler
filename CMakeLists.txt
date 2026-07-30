@@ -228,11 +228,17 @@ endif()
 if(PJ_BUILD_DEMOS AND NOT EMSCRIPTEN)
     add_subdirectory(pj_scene3D/demos)
 endif()
+add_subdirectory(pj_dialog_host)
+add_subdirectory(pj_runtime)
+# After pj_runtime: pj_marketplace's extension_manager_test guards itself with
+# if(TARGET mock_data_source_v2_plugin ...), and that fixture is defined by
+# pj_runtime. Configured earlier, the guard silently evaluated false and the test
+# executable was never created. Link order is unaffected — CMake derives build
+# order from the dependency graph (pj_runtime links pj_marketplace), so only
+# configure-time target visibility depends on the position of this call.
 if(NOT EMSCRIPTEN OR PJ_WASM_WITH_MARKETPLACE)
     add_subdirectory(pj_marketplace)
 endif()
-add_subdirectory(pj_dialog_host)
-add_subdirectory(pj_runtime)
 add_subdirectory(pj_widgets)
 add_subdirectory(pj_scene_common)
 add_subdirectory(pj_plotting)
