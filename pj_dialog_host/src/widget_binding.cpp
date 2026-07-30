@@ -23,6 +23,7 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFile>
+#include <QFontMetrics>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
@@ -1357,6 +1358,35 @@ static void applyToWidget(
       // stale recorded seq.
       tw->setProperty("_pj_table_delta_seq", QVariant());
       rows_replaced = true;
+    }
+    // Grow the data columns to fit their content the first time real rows land.
+    // installTreeLikeHeader runs before applyTableRows, so its seed widths only
+    // saw the header labels — MCAP's "Schema" column opened clipped to the word
+    // "Schema" even though its cells read "std_msgs/Float64". Grow-only (never
+    // below the seeded default) and capped, applied once via the policy's
+    // non-redistributing setter so it never fights a later user drag.
+    if (rows_replaced && tw->rowCount() > 0 && tw->property("pjTreeLikeHeader").toBool() &&
+        !tw->horizontalHeader()->isHidden() && !tw->property("pjDataColsContentFit").toBool()) {
+      tw->setProperty("pjDataColsContentFit", true);
+      auto* header = tw->horizontalHeader();
+      auto* policy = PJ::HeaderResizePolicy::install(header, kNameColumn, 20);
+      constexpr int kDataColumnMaxWidth = 320;
+      // Cell text width + left/right item padding; setSectionWidth still raises to
+      // the header label's own minimum, so a short-content column never shrinks
+      // below its title (QTableView::sizeHintForColumn is protected — measure
+      // directly, which also avoids QHeaderView::resizeSection's drag rebalance).
+      constexpr int kCellPadding = 16;
+      const QFontMetrics metrics(tw->font());
+      for (int i = kNameColumn + 1; i < header->count(); ++i) {
+        int content = 0;
+        for (int r = 0; r < tw->rowCount(); ++r) {
+          if (const QTableWidgetItem* item = tw->item(r, i)) {
+            content = std::max(content, metrics.horizontalAdvance(item->text()));
+          }
+        }
+        const int want = std::clamp(content + kCellPadding, header->sectionSize(i), kDataColumnMaxWidth);
+        policy->setSectionWidth(i, want);
+      }
     }
     // Batch deltas, seq-gated per widget: apply only when the seq differs from
     // the last one applied here; a delivery that also carried a full `rows`

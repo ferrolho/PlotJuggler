@@ -7,6 +7,7 @@
 
 #include <QAbstractItemView>
 #include <QApplication>
+#include <QBoxLayout>
 #include <QBuffer>
 #include <QComboBox>
 #include <QDialog>
@@ -136,6 +137,43 @@ void applySectionBandMetrics(QWidget* root, const std::optional<ChromeMetrics>& 
   }
   for (auto* band : root->findChildren<SectionHeaderBand*>()) {
     band->onChromeMetricsChanged(*metrics);
+  }
+}
+
+// Opt-in via the `pjButtonsFillWidth` .ui property on a QDialogButtonBox: make
+// its buttons span the box width instead of hugging one edge. QDialogButtonBox
+// lays its buttons out in a QBoxLayout padded with style-driven stretch spacers;
+// a plugin .ui cannot reach those inner items, so the host neutralizes the
+// spacers' stretch and gives each button an Expanding policy + stretch weight.
+void applyButtonBoxFillWidth(QWidget* root) {
+  if (root == nullptr) {
+    return;
+  }
+  for (auto* box : root->findChildren<QDialogButtonBox*>()) {
+    if (!box->property("pjButtonsFillWidth").toBool()) {
+      continue;
+    }
+    auto* box_layout = qobject_cast<QBoxLayout*>(box->layout());
+    if (box_layout == nullptr) {
+      continue;
+    }
+    box_layout->setContentsMargins(0, 0, 0, 0);
+    // Framework-based padding so a filled button reads with snug breathing room
+    // rather than hugging its text; the widget stylesheet cascades over the app
+    // QSS, so border/background/hover still come from the theme.
+    const QString button_padding =
+        QStringLiteral("QPushButton { padding: %1px; }").arg(theme::space(theme::Space::Snug));
+    for (int i = 0; i < box_layout->count(); ++i) {
+      QLayoutItem* item = box_layout->itemAt(i);
+      if (QWidget* button = item->widget()) {
+        button->setSizePolicy(QSizePolicy::Expanding, button->sizePolicy().verticalPolicy());
+        button->setStyleSheet(button_padding);
+        box_layout->setStretch(i, 1);
+      } else {
+        // A style-inserted stretch spacer — stop it from eating the width.
+        box_layout->setStretch(i, 0);
+      }
+    }
   }
 }
 
@@ -642,6 +680,7 @@ struct DialogEngine::AsyncRunner {
       }
       adaptStyledWidgets(parser_dialog_widget);
       applySectionBandMetrics(parser_dialog_widget, config_.section_band_metrics);
+      applyButtonBoxFillWidth(parser_dialog_widget);
 
       // 5. Insert into slot and show container
       parser_slot_layout->addWidget(parser_dialog_widget);
@@ -753,6 +792,7 @@ struct DialogEngine::AsyncRunner {
     }
     fit_to_content();
     applySectionBandMetrics(loaded, config_.section_band_metrics);
+    applyButtonBoxFillWidth(loaded);
 
     // The one sub-dialog currently open (pre-branch exec() allowed only one at a
     // time). While it is set, maybe_open_sub_dialog is a no-op — a plugin that
@@ -790,6 +830,7 @@ struct DialogEngine::AsyncRunner {
       }
       adaptStyledWidgets(sub_loaded);
       applySectionBandMetrics(sub_loaded, config_.section_band_metrics);
+      applyButtonBoxFillWidth(sub_loaded);
       const QSize authored_sub_content_size = authoredDialogContentSize(sub_loaded);
 
       auto* sub_dialog = new PJ::Dialog(dialog);

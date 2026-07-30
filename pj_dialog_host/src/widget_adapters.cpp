@@ -291,10 +291,15 @@ static void insertDualOptionsWidget(QWidget* parent, const QList<QRadioButton*>&
         break;
       }
     }
+    // A row can opt out of the push-to-right-edge treatment — e.g. an inline
+    // "label → input → then: → group" row that wants the group to sit one snug
+    // gap after its preceding label — by tagging its first radio with the
+    // pjInlineGroup dynamic property. The group then keeps its authored slot.
+    const bool keep_inline = !radios.isEmpty() && radios.first()->property("pjInlineGroup").toBool();
     for (QRadioButton* radio : radios) {
       box->removeWidget(radio);
     }
-    if (horizontal && !trailing_widget) {
+    if (horizontal && !trailing_widget && !keep_inline) {
       // Drop the trailing horizontal spacer that used to hold the group on the left,
       // then re-append as [stretch][group][inset] so the group is pushed to the
       // right edge of its row with the canonical comfortable inset — lining up
