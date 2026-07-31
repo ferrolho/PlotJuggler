@@ -176,6 +176,47 @@ TEST(DualOptionsWidgetTest, VerticalKeyboardUsesUpDown) {
   EXPECT_EQ(widget.selectedIndex(), 0);
 }
 
+TEST(DualOptionsWidgetTest, DisabledSegmentIsNotSelectable) {
+  PJ::DualOptionsWidget widget(QStringList{u"Row"_s, u"Column"_s, u"Combine"_s});
+  widget.setSegmentEnabled(2, false);
+  EXPECT_FALSE(widget.isSegmentEnabled(2));
+  QSignalSpy spy(&widget, &PJ::DualOptionsWidget::selectionChanged);
+
+  // Programmatic selection of a disabled segment is a no-op (nothing emitted).
+  widget.setSelectedIndex(2);
+  EXPECT_EQ(widget.selectedIndex(), 0);
+  EXPECT_EQ(spy.count(), 0);
+
+  // An enabled segment still selects normally.
+  widget.setSelectedIndex(1);
+  EXPECT_EQ(widget.selectedIndex(), 1);
+  ASSERT_EQ(spy.count(), 1);
+
+  // Re-enabling makes it selectable again.
+  widget.setSegmentEnabled(2, true);
+  widget.setSelectedIndex(2);
+  EXPECT_EQ(widget.selectedIndex(), 2);
+}
+
+TEST(DualOptionsWidgetTest, KeyboardAndClickSkipDisabledSegment) {
+  PJ::DualOptionsWidget widget(QStringList{u"Row"_s, u"Column"_s, u"Combine"_s});
+  widget.setSegmentEnabled(2, false);
+  widget.resize(widget.sizeHint());
+  widget.show();
+  ASSERT_TRUE(QTest::qWaitForWindowExposed(&widget));
+  widget.setFocus();
+
+  QTest::keyClick(&widget, Qt::Key_Right);
+  EXPECT_EQ(widget.selectedIndex(), 1);
+  QTest::keyClick(&widget, Qt::Key_Right);
+  EXPECT_EQ(widget.selectedIndex(), 1) << "Right cannot reach the disabled last segment";
+  QTest::keyClick(&widget, Qt::Key_Space);
+  EXPECT_EQ(widget.selectedIndex(), 0) << "Space cycles past the disabled segment, wrapping to 0";
+
+  QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, QPoint(widget.width() - 2, widget.height() / 2));
+  EXPECT_EQ(widget.selectedIndex(), 0) << "a click on the disabled segment is inert";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

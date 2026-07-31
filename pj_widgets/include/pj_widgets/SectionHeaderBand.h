@@ -204,6 +204,10 @@ class SectionHeaderBand : public QWidget {
   void ensureFilter();
   // Create the right-docked combo on first request (idempotent).
   void ensureTrailingCombo();
+  // Size the trailing combo: filling the band's content box vertically when
+  // fillDockedWidgets is set (snug top/bottom band padding), else its natural
+  // input-row height capped at contentHeight(). Idempotent.
+  void applyTrailingComboHeight();
   // Create the right-docked action button on first request (idempotent).
   void ensureTrailingButton();
   // Create the checkable text toggle on first request (idempotent).

@@ -63,6 +63,19 @@ static QList<QRadioButton*> adaptedRadios(const PJ::DualOptionsWidget* dual) {
   return radios;
 }
 
+// Mirror each source radio's enabled state onto its segment, so a disabled option
+// greys out and cannot be switched to rather than disabling the whole control —
+// which stays interactive while any segment remains enabled.
+static void applyRadioEnabledStates(DualOptionsWidget* dual, const QList<QRadioButton*>& radios) {
+  bool any_enabled = false;
+  for (qsizetype i = 0; i < radios.size(); ++i) {
+    const bool segment_enabled = radios[i]->isEnabled();
+    dual->setSegmentEnabled(static_cast<int>(i), segment_enabled);
+    any_enabled = any_enabled || segment_enabled;
+  }
+  dual->setEnabled(any_enabled);
+}
+
 static void syncDualOptionsFromRadios(QRadioButton* radio) {
   auto* dual = pairedDualOptionsWidget(radio);
   if (dual == nullptr) {
@@ -73,18 +86,17 @@ static void syncDualOptionsFromRadios(QRadioButton* radio) {
     return;
   }
 
-  bool enabled = true;
+  applyRadioEnabledStates(dual, radios);
+
   bool visible = false;
   int selected = 0;
   for (qsizetype i = 0; i < radios.size(); ++i) {
     radios[i]->hide();
-    enabled = enabled && radios[i]->isEnabled();
     visible = visible || radios[i]->property(kDualOptionsDesiredVisibleProperty).toBool();
     if (radios[i]->isChecked()) {
       selected = static_cast<int>(i);
     }
   }
-  dual->setEnabled(enabled);
   dual->setVisible(visible);
 
   const QSignalBlocker blocker(dual);
@@ -363,7 +375,7 @@ static bool tryAdaptRadios(QList<QRadioButton*> radios) {
 
   auto* dual = new DualOptionsWidget(labels, parent);
   dual->setToolTip(parent->toolTip());
-  dual->setEnabled(std::all_of(radios.begin(), radios.end(), [](QRadioButton* r) { return r->isEnabled(); }));
+  applyRadioEnabledStates(dual, radios);
   dual->setSelectedIndex(selected);
   QObjectList radio_objects;
   for (QRadioButton* radio : radios) {
@@ -380,7 +392,7 @@ static bool tryAdaptRadios(QList<QRadioButton*> radios) {
 
   QObject::connect(dual, &DualOptionsWidget::selectionChanged, dual, [dual](int index) {
     const QList<QRadioButton*> group_radios = adaptedRadios(dual);
-    if (index >= 0 && index < group_radios.size()) {
+    if (index >= 0 && index < group_radios.size() && group_radios[index]->isEnabled()) {
       group_radios[index]->setChecked(true);
     }
   });

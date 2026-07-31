@@ -32,6 +32,21 @@ struct InternalScope {
   }
 };
 
+// Several PJ controls are pinned to one input-row height by the app QSS, and
+// QStyleSheetStyle applies that over any C++ size. This property selects the rule
+// that lifts the cap; re-polish so it counts even though the widget was styled
+// before it was docked.
+void markBandDocked(QWidget* widget) {
+  if (widget->property("pjBandDocked").toBool()) {
+    return;
+  }
+  widget->setProperty("pjBandDocked", true);
+  if (QStyle* style = widget->style(); style != nullptr) {
+    style->unpolish(widget);
+    style->polish(widget);
+  }
+}
+
 }  // namespace
 
 SectionHeaderBand::SectionHeaderBand(const QString& title, QWidget* parent) : QWidget(parent) {
@@ -146,7 +161,7 @@ void SectionHeaderBand::ensureTrailingCombo() {
   trailing_combo_ = new ComboBox(this);
   trailing_combo_->setObjectName(trailing_combo_name_);
   trailing_combo_->setEditable(combo_editable_);
-  trailing_combo_->setMaximumHeight(contentHeight());
+  applyTrailingComboHeight();
   if (combo_expanding_) {
     // "Label + input" banner row: the combo takes over the stretch and fills
     // the band right after the title (e.g. a "Server:" URL bar).
@@ -159,6 +174,21 @@ void SectionHeaderBand::ensureTrailingCombo() {
     // appended; the dropdown docks to the right edge (with a little inset).
     layout_->addWidget(trailing_combo_, 0, Qt::AlignVCenter);
     layout_->addSpacing(theme::space(theme::Space::Comfortable));
+  }
+}
+
+void SectionHeaderBand::applyTrailingComboHeight() {
+  if (trailing_combo_ == nullptr) {
+    return;
+  }
+  if (fill_docked_widgets_) {
+    // QComboBox pins its own min/max-height in QSS, so the cap has to be lifted
+    // before a fixed band height can take effect.
+    markBandDocked(trailing_combo_);
+    trailing_combo_->setFixedHeight(contentHeight());
+  } else {
+    trailing_combo_->setMinimumHeight(0);
+    trailing_combo_->setMaximumHeight(contentHeight());
   }
 }
 
@@ -352,9 +382,7 @@ void SectionHeaderBand::onChromeMetricsChanged(const ChromeMetrics& metrics) {
   current_metrics_ = metrics;
   setFixedHeight(metrics.bandHeight());
   applyBandLayoutMetrics();
-  if (trailing_combo_ != nullptr) {
-    trailing_combo_->setMaximumHeight(contentHeight());
-  }
+  applyTrailingComboHeight();
   if (filter_search_ != nullptr) {
     filter_search_->setChromeMetrics(metrics);
   }
@@ -389,6 +417,7 @@ QString SectionHeaderBand::titleObjectName() const {
 
 void SectionHeaderBand::setFillDockedWidgets(bool fill) {
   fill_docked_widgets_ = fill;
+  applyTrailingComboHeight();
   for (const auto& docked : docked_widgets_) {
     if (!docked.isNull()) {
       applyDockedWidgetMetrics(docked);
@@ -397,17 +426,7 @@ void SectionHeaderBand::setFillDockedWidgets(bool fill) {
 }
 
 void SectionHeaderBand::applyDockedWidgetMetrics(QWidget* widget) const {
-  // Several PJ controls are pinned to one input-row height by the app QSS, and
-  // QStyleSheetStyle applies that over any C++ size. The property selects the rule
-  // that lifts the cap; re-polish so it counts even though the widget was styled
-  // before it was docked. Same contract as the band's own Search field.
-  if (!widget->property("pjBandDocked").toBool()) {
-    widget->setProperty("pjBandDocked", true);
-    if (QStyle* style = widget->style(); style != nullptr) {
-      style->unpolish(widget);
-      style->polish(widget);
-    }
-  }
+  markBandDocked(widget);
   // A fixed height, not a stretching size policy: it is what survives the later
   // setSizePolicy calls of whoever adapts the widget (the dialog host swaps a
   // docked QCheckBox for a ToggleSwitch and re-declares its policy afterwards).

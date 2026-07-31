@@ -27,6 +27,8 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
+#include <QItemSelection>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -461,6 +463,89 @@ static void applyTableRows(
 }
 
 namespace {
+// Opt-in marker set in the plugin .ui, naming the sibling QListWidget that drives
+// a table's column selection. The host hardcodes no widget name, so the
+// list-drives-table-columns pairing stays domain-neutral.
+constexpr const char* kColumnSelectorListProperty = "pjColumnSelectorList";
+
+// Grey out an item while leaving it visible: a disabled item is neither enabled
+// nor selectable. Shared by the list and table disable paths.
+template <typename ItemT>
+void setItemEnabled(ItemT* item, bool enabled) {
+  Qt::ItemFlags flags = item->flags();
+  flags.setFlag(Qt::ItemIsEnabled, enabled);
+  flags.setFlag(Qt::ItemIsSelectable, enabled);
+  item->setFlags(flags);
+}
+
+// Swallows user selection gestures (mouse press/release/double-click) on the view
+// it filters, so the view's selection can only be driven programmatically. Used by
+// the column-selector wiring below; keyboard selection is separately blocked by
+// NoFocus on the host widget. eventFilter is a QObject virtual, so no moc is needed.
+class SelectionGestureBlocker : public QObject {
+ public:
+  using QObject::QObject;
+
+ protected:
+  bool eventFilter(QObject* /*obj*/, QEvent* event) override {
+    switch (event->type()) {
+      case QEvent::MouseButtonPress:
+      case QEvent::MouseButtonRelease:
+      case QEvent::MouseButtonDblClick:
+        return true;
+      default:
+        return false;
+    }
+  }
+};
+
+// Mirror a list's current selection onto its column-selector table: select every
+// column whose header text matches a selected list row, clearing the rest. Purely
+// programmatic (no signal dependency), so it stays correct whether the list
+// selection changed via the user or via applyToWidget (which sets it under a
+// signal blocker, so itemSelectionChanged never fires for programmatic changes).
+static void syncColumnSelectorTable(QTableWidget* tw, QListWidget* list) {
+  const QList<QListWidgetItem*> chosen = list->selectedItems();
+  if (chosen.isEmpty() || tw->columnCount() == 0 || tw->rowCount() == 0) {
+    tw->clearSelection();
+    return;
+  }
+  std::set<QString> wanted;
+  for (const QListWidgetItem* item : chosen) {
+    wanted.insert(item->text());
+  }
+  QItemSelection selection;
+  for (int c = 0; c < tw->columnCount(); ++c) {
+    const QTableWidgetItem* header = tw->horizontalHeaderItem(c);
+    if (header != nullptr && wanted.count(header->text()) > 0) {
+      selection.select(tw->model()->index(0, c), tw->model()->index(tw->rowCount() - 1, c));
+    }
+  }
+  tw->selectionModel()->select(selection, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Columns);
+}
+
+// Re-sync every column-selector table whose list — or the table itself — carries
+// data in this payload. applyToWidget sets list selection under a per-widget
+// signal blocker, so itemSelectionChanged never fires for a programmatic change;
+// without this pass a plugin-driven change (e.g. clearing the selection on a mode
+// switch) would leave a stale column highlight. applyWidgetData runs on every tick
+// carrying any change at all, so anything else would rebuild the selection at the
+// dialog's full tick rate.
+void syncColumnSelectorTables(QWidget* root, const std::vector<std::string>& payload_names) {
+  const auto in_payload = [&payload_names](const QString& widget_name) {
+    return std::find(payload_names.begin(), payload_names.end(), widget_name.toStdString()) != payload_names.end();
+  };
+  for (auto* tw : root->findChildren<QTableWidget*>()) {
+    const QString list_name = tw->property(kColumnSelectorListProperty).toString();
+    if (list_name.isEmpty() || (!in_payload(list_name) && !in_payload(tw->objectName()))) {
+      continue;
+    }
+    if (auto* list = root->findChild<QListWidget*>(list_name)) {
+      syncColumnSelectorTable(tw, list);
+    }
+  }
+}
+
 // Bridges radio-cell clicks back to the dialog event stream. connectWidgetSignals
 // owns the event callback but the radio cells don't exist yet then (rows arrive
 // later via applyWidgetData), so it stashes this holder on the table and
@@ -1275,11 +1360,29 @@ static void applyToWidget(
         lw->addItem(item);
       }
     }
+    if (auto v = view.listMultiSelect(name)) {
+      // MultiSelection: each click toggles that row, so several rows can be
+      // picked with plain clicks (no modifier) — the intuitive multi-select.
+      lw->setSelectionMode(*v ? QAbstractItemView::MultiSelection : QAbstractItemView::SingleSelection);
+    }
     if (auto v = view.selectedItems(name)) {
       std::set<std::string> selected(v->begin(), v->end());
       for (int i = 0; i < lw->count(); ++i) {
         auto* item = lw->item(i);
         item->setSelected(selected.count(item->text().toStdString()) > 0);
+      }
+    }
+    // Grey out (disable + un-selectable) items whose text is in the disabled set,
+    // keeping them visible; re-enable the rest. Runs after items/selection so it
+    // tracks the latest list contents.
+    if (auto v = view.listDisabledItems(name)) {
+      std::set<QString> disabled;
+      for (const std::string& entry : *v) {
+        disabled.insert(QString::fromStdString(entry));
+      }
+      for (int i = 0; i < lw->count(); ++i) {
+        auto* item = lw->item(i);
+        setItemEnabled(item, disabled.count(item->text()) == 0);
       }
     }
     // Empty-state overlay: a centered hint floating over the list viewport while
@@ -1475,18 +1578,10 @@ static void applyToWidget(
     if (disabled_rows) {
       std::set<int> disabled(disabled_rows->begin(), disabled_rows->end());
       for (int r = 0; r < tw->rowCount(); ++r) {
-        bool is_disabled = disabled.count(view_to_plugin[static_cast<std::size_t>(r)]) > 0;
+        const bool enabled = disabled.count(view_to_plugin[static_cast<std::size_t>(r)]) == 0;
         for (int c = 0; c < tw->columnCount(); ++c) {
           if (auto* item = tw->item(r, c)) {
-            auto flags = item->flags();
-            if (is_disabled) {
-              flags &= ~Qt::ItemIsEnabled;
-              flags &= ~Qt::ItemIsSelectable;
-            } else {
-              flags |= Qt::ItemIsEnabled;
-              flags |= Qt::ItemIsSelectable;
-            }
-            item->setFlags(flags);
+            setItemEnabled(item, enabled);
           }
         }
       }
@@ -1970,13 +2065,15 @@ static void applyToWidget(
 
 void applyWidgetData(
     QWidget* root, const PJ::WidgetDataView& view, PJ::AppSession* session, PJ::CatalogModel* catalog) {
-  for (const auto& name : view.widgetNames()) {
+  const std::vector<std::string> names = view.widgetNames();
+  for (const auto& name : names) {
     auto* w = root->findChild<QWidget*>(QString::fromStdString(name));
     if (!w) {
       continue;
     }
     applyToWidget(w, name, view, session, catalog);
   }
+  syncColumnSelectorTables(root, names);
   // NOTE: styled-widget adaptation is NOT re-run here on every data tick. It is
   // structural (depends on the widget tree, built once at load), so the engines
   // call adaptStyledWidgets once after loading the .ui (see widget_adapters),
@@ -2185,6 +2282,25 @@ void connectWidgetSignals(QWidget* root, WidgetEventCallback callback) {
       new RadioEmitHolder(tw, [callback, name, tw](int row) {
         callback(name, WidgetEventBuilder::tableRadioSelected(viewRowToPluginRow(tw, row)));
       });
+      // Column-selector wiring: a table naming a sibling QListWidget in
+      // kColumnSelectorListProperty becomes a read-only column mirror of that
+      // list. Selecting a list row highlights the matching table COLUMN (matched
+      // by header text), and all direct user selection on the table is disabled —
+      // the list is the only driver.
+      if (const QString list_name = tw->property(kColumnSelectorListProperty).toString(); !list_name.isEmpty()) {
+        if (auto* list = root->findChild<QListWidget*>(list_name)) {
+          tw->setSelectionBehavior(QAbstractItemView::SelectColumns);
+          tw->setSelectionMode(QAbstractItemView::ExtendedSelection);
+          tw->setFocusPolicy(Qt::NoFocus);
+          tw->horizontalHeader()->setSectionsClickable(false);
+          tw->verticalHeader()->setSectionsClickable(false);
+          tw->viewport()->installEventFilter(new SelectionGestureBlocker(tw));
+          // Live sync on user selection; the programmatic case is covered by the
+          // post-apply pass in applyWidgetData (see syncColumnSelectorTable).
+          QObject::connect(
+              list, &QListWidget::itemSelectionChanged, tw, [list, tw]() { syncColumnSelectorTable(tw, list); });
+        }
+      }
       continue;
     }
     if (auto* btn = qobject_cast<QPushButton*>(w)) {

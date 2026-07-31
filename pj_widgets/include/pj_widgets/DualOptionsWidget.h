@@ -109,10 +109,17 @@ class DualOptionsWidget : public QWidget {
   [[nodiscard]] QSize sizeHint() const override;
   [[nodiscard]] QSize minimumSizeHint() const override;
 
+  // Per-segment enable. A disabled segment renders greyed and cannot be
+  // selected — click, keyboard navigation, and setSelectedIndex all skip it —
+  // so it is impossible to switch to. Out-of-range indices are ignored; a
+  // segment with no explicit state defaults to enabled.
+  void setSegmentEnabled(int index, bool enabled);
+  [[nodiscard]] bool isSegmentEnabled(int index) const;
+
  public slots:
-  // Selects the segment at index (0 = leftmost). Out-of-range indices are
-  // ignored; no-op when already selected. Emits selectionChanged when the
-  // value actually changes.
+  // Selects the segment at index (0 = leftmost). Out-of-range or DISABLED
+  // indices are ignored; no-op when already selected. Emits selectionChanged
+  // when the value actually changes.
   void setSelectedIndex(int index);
 
  signals:
@@ -127,8 +134,15 @@ class DualOptionsWidget : public QWidget {
 
  private:
   void animateSelectedIndex(int index);
+  // First enabled segment reached by stepping `step` from the current selection.
+  // `wrap` rolls past the ends (Space cycling) instead of stopping at them (arrow
+  // keys). Returns the current selection when no other segment is reachable.
+  [[nodiscard]] int nextEnabledIndex(int step, bool wrap) const;
 
   QStringList options_{"Option A", "Option B"};
+  // Per-index enable flags, always sized to options_. A false entry greys the
+  // segment and blocks selecting it.
+  QList<bool> segment_enabled_{true, true};
   Qt::Orientation orientation_ = Qt::Horizontal;
   int selected_ = 0;
   qreal visual_selection_ = 0.0;

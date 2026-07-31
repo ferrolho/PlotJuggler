@@ -64,6 +64,9 @@ void DualOptionsWidget::setOptions(const QStringList& options) {
     return;
   }
   options_ = options;
+  // Prior enable state survives wherever the index still exists; segments the
+  // new option list adds default to enabled.
+  segment_enabled_.resize(options_.size(), true);
   if (selected_ >= optionCount()) {
     setSelectedIndex(optionCount() - 1);
   }
@@ -71,12 +74,24 @@ void DualOptionsWidget::setOptions(const QStringList& options) {
   update();
 }
 
+void DualOptionsWidget::setSegmentEnabled(int index, bool enabled) {
+  if (index < 0 || index >= optionCount() || segment_enabled_[index] == enabled) {
+    return;
+  }
+  segment_enabled_[index] = enabled;
+  update();
+}
+
+bool DualOptionsWidget::isSegmentEnabled(int index) const {
+  return index < 0 || index >= optionCount() || segment_enabled_[index];
+}
+
 void DualOptionsWidget::setOptions(const QString& opt0, const QString& opt1) {
   setOptions(QStringList{opt0, opt1});
 }
 
 void DualOptionsWidget::setSelectedIndex(int index) {
-  if (index == selected_ || index < 0 || index >= optionCount()) {
+  if (index == selected_ || index < 0 || index >= optionCount() || !isSegmentEnabled(index)) {
     return;
   }
   selected_ = index;
@@ -230,10 +245,11 @@ void DualOptionsWidget::paintEvent(QPaintEvent* /*event*/) {
   painter.setPen(QPen(selected_border, border_width));
   painter.drawRoundedRect(selected_box, corner_radius, corner_radius);
 
-  const QColor label_color =
-      isEnabled() ? text_color_ : theme::onSurface(theme::Surface::Backdrop, theme::Emphasis::Disabled, fw_theme);
-  painter.setPen(label_color);
+  const QColor disabled_label = theme::onSurface(theme::Surface::Backdrop, theme::Emphasis::Disabled, fw_theme);
   for (int i = 0; i < optionCount(); ++i) {
+    // A whole disabled widget, or an individually disabled segment, greys that
+    // label so an unavailable option reads as unavailable.
+    painter.setPen((isEnabled() && isSegmentEnabled(i)) ? text_color_ : disabled_label);
     painter.drawText(segment_box(static_cast<qreal>(i)), Qt::AlignCenter, options_[i]);
   }
 }
@@ -242,8 +258,9 @@ void DualOptionsWidget::mousePressEvent(QMouseEvent* event) {
   if (event->button() == Qt::LeftButton) {
     const int pos = orientation_ == Qt::Horizontal ? event->pos().x() : event->pos().y();
     const int extent = std::max(1, orientation_ == Qt::Horizontal ? width() : height());
-    const int index = static_cast<int>(pos * optionCount() / extent);
-    setSelectedIndex(std::clamp(index, 0, optionCount() - 1));
+    const int index = std::clamp(static_cast<int>(pos * optionCount() / extent), 0, optionCount() - 1);
+    // setSelectedIndex no-ops on a disabled segment, so a click on one is inert.
+    setSelectedIndex(index);
     event->accept();
     return;
   }
@@ -256,18 +273,19 @@ void DualOptionsWidget::keyPressEvent(QKeyEvent* event) {
     // control feels natural whether it is laid out horizontally or vertically.
     case Qt::Key_Left:
     case Qt::Key_Up:
-      setSelectedIndex(selected_ - 1);
+      setSelectedIndex(nextEnabledIndex(-1, /*wrap=*/false));
       event->accept();
       break;
     case Qt::Key_Right:
     case Qt::Key_Down:
-      setSelectedIndex(selected_ + 1);
+      setSelectedIndex(nextEnabledIndex(+1, /*wrap=*/false));
       event->accept();
       break;
     case Qt::Key_Space:
     case Qt::Key_Return:
-      // Cycles through the segments; for two options this is the classic toggle.
-      setSelectedIndex((selected_ + 1) % optionCount());
+      // Cycles to the next enabled segment; for two options this is the classic
+      // toggle.
+      setSelectedIndex(nextEnabledIndex(+1, /*wrap=*/true));
       event->accept();
       break;
     default:
@@ -280,6 +298,22 @@ void DualOptionsWidget::changeEvent(QEvent* event) {
   if (event->type() == QEvent::EnabledChange) {
     update();
   }
+}
+
+int DualOptionsWidget::nextEnabledIndex(int step, bool wrap) const {
+  const int count = optionCount();
+  for (int offset = 1; offset < count; ++offset) {
+    int candidate = selected_ + (step * offset);
+    if (wrap) {
+      candidate = ((candidate % count) + count) % count;
+    } else if (candidate < 0 || candidate >= count) {
+      break;
+    }
+    if (isSegmentEnabled(candidate)) {
+      return candidate;
+    }
+  }
+  return selected_;
 }
 
 void DualOptionsWidget::animateSelectedIndex(int index) {

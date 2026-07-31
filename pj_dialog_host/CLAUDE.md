@@ -32,6 +32,25 @@ Public headers live under `include/pj_plugins/host_qt/` — the namespace mirror
 | `chart_preview_widget.hpp` | Embedded chart widget used by toolboxes (e.g. FFT preview). Qwt-based (no Qt Charts dependency). |
 | `drop_event_filter.hpp` | Event filter that turns Qt drops into SDK drag-drop events. |
 
+## `.ui` dynamic-property contracts
+
+Beyond the typed `WidgetData` protocol, the host honours a few **opt-in dynamic
+properties** a plugin sets directly in its `.ui` file. They are structural (read
+when the tree is loaded or adapted, not per tick) and carry no widget names in
+the host, so they stay domain-neutral: any plugin whose layout fits the shape can
+adopt one.
+
+| Property | Set on | Effect |
+|---|---|---|
+| `pjColumnSelectorList` (string) | `QTableWidget` | Names a sibling `QListWidget` that drives this table's column selection. The table becomes a read-only mirror: selecting list rows highlights the matching table **columns** (paired by header text) and direct user selection on the table is blocked, so the list stays the only driver. |
+| `pjInteriorGrid` (bool) | `QTableView` / `QTableWidget` | Draws an interior-only cell grid (no outer border ruling). |
+| `pjInlineGroup` (bool) | the radio buttons of a group | Keeps the group in its authored layout slot instead of letting the host re-place it when adapting radios into a `DualOptionsWidget`. |
+| `pjButtonsFillWidth` (bool) | `QDialogButtonBox` | Stretches the box's buttons to share the full row width. |
+
+When adding another such contract, hoist the name to a `constexpr const char* k…Property`
+next to its reader and add a row here — a bare string literal in one `.cpp` is
+invisible to the plugin authors who are supposed to use it.
+
 ## Tests
 
 Three test executables: `tests/dialog_engine_test.cpp`, `tests/panel_engine_test.cpp` (with `tests/mock_panel_plugin.cpp`), and `tests/widget_binding_test.cpp`. Add tests when extending the protocol coverage.
