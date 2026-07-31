@@ -67,6 +67,7 @@ class DiagnosticHistory;
 class DockWidget;
 class FileLoader;
 class IDataWidget;
+class LayoutImportBatch;
 class PanelEngine;
 class PlotDocker;
 class PlotWidget;
@@ -111,6 +112,7 @@ class MainWindow : public QMainWindow {
   friend class MainWindowViewportReframeTestPeer;
   friend class MainWindowHistoryTestPeer;
   friend class MainWindowPanelGeometryTestPeer;
+  friend class MainWindowLayoutImportTestPeer;
 
  public:
   // Creates the main window using the default extension directory.
@@ -620,7 +622,17 @@ class MainWindow : public QMainWindow {
   using TimelineResolutionPlan = std::vector<DatasetId>;
 
   // Layout helpers.
-  void loadLayoutFromPath(const QString& path);
+  //
+  // Whether the load may open dialogs (reload / trust / missing-curve
+  // prompts). Threaded EXPLICITLY through the whole restore — including any
+  // LayoutImportBatch, which captures it at construction — because late
+  // async continuations run long after the caller's stack (and any
+  // startup-time flag) has unwound (D5).
+  enum class LayoutLoadInteractivity {
+    kInteractive,  ///< user-driven (menu / recent list): prompts allowed
+    kAutomated,    ///< --layout CLI: auto-reload, never any dialog
+  };
+  void loadLayoutFromPath(const QString& path, LayoutLoadInteractivity interactivity);
 #ifdef PJ_TARGET_WASM
   enum class BrowserLayoutLoadResult { kApplied, kPending, kFailed };
 
@@ -642,11 +654,28 @@ class MainWindow : public QMainWindow {
   void finishBrowserLayoutLoad(const QString& browser_name, bool applied, const QString& reason = {});
   void updateBrowserLayoutActions();
 #endif
+  // How a complete-snapshot restore handles curves no loaded dataset can provide.
+  enum class MissingCurvePolicy {
+    kPrompt,      ///< layout load: prompt the user (cancel aborts, remove strips them)
+    kSilentDrop,  ///< compatibility restore: unresolved curves may be discarded
+    kExact,       ///< history/rollback: fail rather than drop unresolved state
+    // Non-interactive batch restore (D5): never prompts, never opens a
+    // dialog — unresolved intents are RETAINED (never stripped/cleared) and
+    // reported through a diagnostic, so a later binding pass can still
+    // resolve them once their data arrives.
+    kRetainAndDiagnose,
+  };
+
   // Applies a parsed layout to already-loaded data: curve rebind, plot/panel
-  // restore, recent-files. The progressive reload path uses beginProgressiveLayoutRestore
-  // instead so the structure can appear before the load queue drains.
-  void applyRestoredLayout(QDomDocument doc, const QString& path);
-  void beginProgressiveLayoutRestore(QDomDocument doc, const QString& path);
+  // restore, recent-files. `policy` governs unresolved curves (the sync leg
+  // of the same policy the progressive drain captures). The progressive
+  // reload path uses beginProgressiveLayoutRestore instead so the structure
+  // can appear before the load queue drains.
+  void applyRestoredLayout(QDomDocument doc, const QString& path, MissingCurvePolicy policy);
+  // `policy` is the caller-derived unresolved-intent policy (the load's
+  // interactivity) — captured into progressive_missing_curve_policy_ for the
+  // drain; never inferred from batch presence.
+  void beginProgressiveLayoutRestore(QDomDocument doc, const QString& path, MissingCurvePolicy policy);
   void cancelProgressiveLayoutRestore();
   [[nodiscard]] bool rollbackProgressiveWorkspace();
   [[nodiscard]] bool abortProgressiveRestore();
@@ -671,6 +700,46 @@ class MainWindow : public QMainWindow {
   [[nodiscard]] QStringList unresolvedPendingSceneRestores();
   void clearPendingSceneRestores();
   void onProgressiveLayoutDrained();
+  // The end-of-drain owner of every unresolved-state teardown decision
+  // (binder intents, blocking scene pends, the scene-pend clear), switching
+  // on the SAME policy enum applyWorkspace honors: kRetainAndDiagnose keeps
+  // the intents (D5) and diagnoses; kPrompt runs the missing-curve prompt.
+  // Returns false when the user cancelled (the restore was aborted).
+  [[nodiscard]] bool finalizeUnresolvedRestoreState(MissingCurvePolicy policy);
+  // Dialog-vs-diagnostic fork for drain-time restore failures: a
+  // kRetainAndDiagnose (non-interactive) restore reports through the
+  // diagnostic sink, every other policy through a warning dialog.
+  void reportLayoutRestoreIssue(MissingCurvePolicy policy, const char* id, const QString& message);
+  // Builds the batch coordinator for one materialize-bearing restore, wiring
+  // the shell effects (the one-shot workspace checkpoint, removeDatasetData,
+  // the consolidated trust prompt, the diagnostic sink) as its hook seams.
+  // Takes bool (not LayoutLoadInteractivity) deliberately: the batch is
+  // MainWindow-free and must not name a MainWindow-scoped enum.
+  [[nodiscard]] std::unique_ptr<LayoutImportBatch> makeLayoutImportBatch(bool interactive);
+  // True while a layout-import batch still has work in flight — a pending
+  // import keeps the restore alive even when FileLoader is idle.
+  [[nodiscard]] bool layoutImportBatchActive() const;
+  // The single routing predicate for a restore that must go progressive:
+  // either the loader is still chewing the reload queue, or a batch import
+  // is producing data the drain must wait for (§6.2 "a pending import keeps
+  // the restore alive").
+  [[nodiscard]] bool restoreHasPendingAsyncWork(bool reload_requested) const;
+  // The progressive-drain gate: proceeds only when NO registered restore
+  // waiter is still pending (FileLoader's queue, the batch, and — later —
+  // whatever T7 registers). A cancelled batch instead unwinds the
+  // progressive state: its rollback already restored the pre-layout
+  // workspace.
+  void maybeSettleProgressiveRestore();
+  // Drops the current batch (graceful if finished; HARD shutdown — children
+  // cancelled+joined, no rollback — if still running). Also ends the D5
+  // retention channel a kRetainAndDiagnose drain left alive (see
+  // pending_items_added_conn_).
+  void resetLayoutImportBatch();
+  // The FULL supersede: tears down any in-flight progressive transaction
+  // (waiters/doc/binder/flag) AND retires the batch — every new layout load
+  // and closeEvent go through this, because a load that stays synchronous
+  // never reaches beginProgressiveLayoutRestore to clean up the old one.
+  void supersedeActiveRestore();
   // Re-applies the timeline state (offsets + track order) stashed by a progressive
   // restore, now that the async worker has registered the reloaded datasets' source
   // paths. Called from onProgressiveLayoutDrained BEFORE the viewport re-frame so the
@@ -688,12 +757,6 @@ class MainWindow : public QMainWindow {
   // load (which prompts on the unresolved set) and undo/redo restore.
   [[nodiscard]] QList<layout_xml::SeriesPath> rebindCurvesToLoadedDatasets(QDomDocument& doc);
 
-  // How a complete-snapshot restore handles curves no loaded dataset can provide.
-  enum class MissingCurvePolicy {
-    kPrompt,      ///< layout load: prompt the user (cancel aborts, remove strips them)
-    kSilentDrop,  ///< compatibility restore: unresolved curves may be discarded
-    kExact,       ///< history/rollback: fail rather than drop unresolved state
-  };
   enum class TimelineRestoreMode {
     kExact,
     kPortableSourceReplacement,
@@ -1105,8 +1168,36 @@ class MainWindow : public QMainWindow {
   QElapsedTimer undo_timer_;
   bool applying_state_ = false;
   bool progressive_layout_in_flight_ = false;
+  // The progressive binder's itemsAdded retry channel. Torn down with the
+  // restore on every arm EXCEPT a kRetainAndDiagnose drain, which leaves it
+  // alive as D5's retention channel (retained intents can still bind when
+  // their data arrives later; T7 drives this) until the next restore or
+  // resetLayoutImportBatch supersedes it.
   QMetaObject::Connection pending_items_added_conn_;
-  QMetaObject::Connection pending_queue_drained_conn_;
+  // One reason the progressive drain must keep waiting, plus the connection
+  // that re-runs the gate when that reason may have cleared. The gate
+  // (maybeSettleProgressiveRestore) proceeds only once no waiter is pending;
+  // FileLoader registers isBusy() on queueDrained, the batch registers
+  // !isFinished() on finished, and T7 rides the same surface.
+  struct RestoreWaiter {
+    std::function<bool()> pending;
+    QMetaObject::Connection conn;
+  };
+  std::vector<RestoreWaiter> restore_waiters_;
+  template <typename Sender, typename Signal>
+  void addRestoreWaiter(std::function<bool()> pending, Sender* sender, Signal signal) {
+    restore_waiters_.push_back(
+        RestoreWaiter{
+            .pending = std::move(pending),
+            .conn = connect(sender, signal, this, &MainWindow::maybeSettleProgressiveRestore),
+        });
+  }
+  void clearRestoreWaiters();
+  // The drain-time policy for unresolved intents, captured at
+  // beginProgressiveLayoutRestore from the SAME batch-interactivity decision
+  // the whole restore rides (D5: policy is data captured up front, never a
+  // late read of live batch state).
+  MissingCurvePolicy progressive_missing_curve_policy_ = MissingCurvePolicy::kPrompt;
   bool pending_binding_rebuild_scheduled_ = false;
   // Trailing-edge coalescer for scene-dock workspaceChanged: layer/view
   // scrubbers emit per drag tick, and each push would serialize the whole
@@ -1124,9 +1215,16 @@ class MainWindow : public QMainWindow {
   QDomDocument progressive_layout_doc_;
   std::optional<CapturedWorkspace> progressive_previous_workspace_;
   std::optional<PendingSourceReplacement> pending_source_replacement_;
-  // Set only while a --layout CLI load runs, so loadLayoutFromPath auto-reloads the
-  // layout's source(s) instead of prompting.
-  bool startup_auto_reload_ = false;
+  // The layout-import transaction owner (§6.2): non-null only from a restore
+  // that found materialize-bearing sources until its drain settles. Declared
+  // AFTER session_/file_loader_ so its destructor (which reaches both) runs
+  // first. Ordinary layouts never construct one.
+  std::unique_ptr<LayoutImportBatch> layout_import_batch_;
+  // One-shot handover of the batch's workspace checkpoint into
+  // beginProgressiveLayoutRestore, so the batch hook's capture and the
+  // progressive snapshot are ONE capture: set by the
+  // begin_workspace_checkpoint hook, consumed (or dropped) at begin.
+  std::shared_ptr<const CapturedWorkspace> batch_workspace_checkpoint_;
   // True between enableAutoplay() and the first range-driven playback start (the
   // --autoplay one-shot); cleared once playback begins so user control is respected.
   bool autoplay_pending_ = false;

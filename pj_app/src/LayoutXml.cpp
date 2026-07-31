@@ -576,6 +576,26 @@ void remapDatasetSourcePaths(QDomDocument& doc, const DatasetPathRemapper& remap
   });
 }
 
+void remapFileInfoFilenames(QDomDocument& doc, const DatasetPathRemapper& remap) {
+  if (!remap) {
+    return;
+  }
+  const QDomElement wrapper = doc.documentElement().firstChildElement(u"previouslyLoaded_Datafiles"_s);
+  for (QDomElement file_info = wrapper.firstChildElement(u"fileInfo"_s); !file_info.isNull();
+       file_info = file_info.nextSiblingElement(u"fileInfo"_s)) {
+    // Mirror extractDataSource's selection rule: entries with no filename are
+    // not sources and are never rewritten.
+    const QString filename = file_info.attribute(u"filename"_s);
+    if (filename.isEmpty()) {
+      continue;
+    }
+    const QString remapped = remap(filename);
+    if (remapped != filename) {
+      file_info.setAttribute(u"filename"_s, remapped);
+    }
+  }
+}
+
 void stripUnresolvedCurves(QDomDocument& doc) {
   std::vector<QDomNode> victims;
   forEachPlotCurve(doc, [&](const QDomElement& curve) {

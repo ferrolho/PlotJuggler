@@ -53,6 +53,7 @@
 #include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/SessionManager.h"
 #include "pj_widgets/MessageBox.h"
+#include "support/loader_test_support.h"
 using namespace Qt::StringLiterals;
 
 #ifndef PJ_MOCK_FILE_SOURCE_PLUGIN_PATH
@@ -467,23 +468,11 @@ class FileLoaderTest : public ::testing::Test {
   }
 
   [[nodiscard]] QString makeMockFile(const QString& name) {
-    const QString path = data_dir_.filePath(name);
-    QFile file(path);
-    EXPECT_TRUE(file.open(QIODevice::WriteOnly));
-    file.close();
-    return path;
+    return pj_app_test::makeMockFile(data_dir_, name);
   }
 
-  // Unified hints builder: skip the dialog, target the mock source, with an
-  // optional preset config (e.g. {"fail_start":true} or a __pj_fanout list) and
-  // the prefer_reuse flag a layout replay sets.
   [[nodiscard]] PJ::LoadHints loadHints(const QString& config = u"{}"_s, bool prefer_reuse = false) {
-    PJ::LoadHints hints;
-    hints.expected_plugin_id = u"Mock File Source"_s;
-    hints.preset_config_json = config;
-    hints.dialog_policy = PJ::DialogPolicy::kPreferPreset;
-    hints.prefer_reuse = prefer_reuse;
-    return hints;
+    return pj_app_test::mockLoadHints(config, prefer_reuse);
   }
 
   // Back-compat alias used by the progressive-load tests.
@@ -491,36 +480,8 @@ class FileLoaderTest : public ::testing::Test {
     return loadHints(u"{}"_s, prefer_reuse);
   }
 
-  // Enqueue a load and pump the event loop until it completes. Single-instance
-  // loads and fanout run on a worker thread, so completion is asynchronous
-  // (fileLoaded/fileLoadFailed). Layout reuse and early failures may still
-  // complete synchronously (the signal fires before exec(), so done is already
-  // set and we skip the loop).
   [[nodiscard]] bool loadAndWait(const QString& path, const PJ::LoadHints& hints) {
-    QEventLoop loop;
-    bool ok = false;
-    bool done = false;
-    const auto on_loaded = QObject::connect(
-        loader_.get(), &PJ::FileLoader::fileLoaded, &loop,
-        [&](const QString&, const QString&, const QString&, const QString&) {
-          ok = true;
-          done = true;
-          loop.quit();
-        });
-    const auto on_failed =
-        QObject::connect(loader_.get(), &PJ::FileLoader::fileLoadFailed, &loop, [&](const QString&, const QString&) {
-          ok = false;
-          done = true;
-          loop.quit();
-        });
-    loader_->loadFile(path, nullptr, hints);
-    if (!done) {
-      QTimer::singleShot(10000, &loop, [&loop]() { loop.quit(); });  // safety: fail, don't hang CI
-      loop.exec();
-    }
-    QObject::disconnect(on_loaded);
-    QObject::disconnect(on_failed);
-    return ok;
+    return pj_app_test::loadAndWait(*loader_, path, hints);
   }
 
   [[nodiscard]] bool load(const QString& path) {
@@ -1666,11 +1627,7 @@ struct LoadFinishedRecorder {
 // terminal may itself be scheduled from another queued event (a worker's
 // completion metacall, a cross-thread cancel marshal).
 void flushQueuedTerminals() {
-  for (int pass = 0; pass < 2; ++pass) {
-    QEventLoop loop;
-    QTimer::singleShot(0, &loop, &QEventLoop::quit);
-    loop.exec();
-  }
+  pj_app_test::flushQueuedEvents(2);
 }
 
 // Pump the event loop until the loader's queue drains (bounded, so a regression
@@ -3081,16 +3038,4 @@ TEST_F(MessageBoxMarshalTest, ShutdownAnswersQueuedWorkerMessageWithMinusOne) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  // ProgressDialog (shown during ingest) needs a QApplication; run offscreen.
-  qputenv("QT_QPA_PLATFORM", QByteArrayLiteral("offscreen"));
-  ::testing::InitGoogleTest(&argc, argv);
-  QApplication app(argc, argv);
-  // Keep test QSettings out of the user's real PlotJuggler4.conf.
-  QCoreApplication::setOrganizationName(u"PJ4Tests"_s);
-  QCoreApplication::setApplicationName(u"file_loader_test"_s);
-  static QTemporaryDir settings_dir;
-  QSettings::setDefaultFormat(QSettings::IniFormat);
-  QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings_dir.path());
-  return RUN_ALL_TESTS();
-}
+PJ_APP_TEST_MAIN("file_loader_test")

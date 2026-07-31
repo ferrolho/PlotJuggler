@@ -97,14 +97,18 @@
 #include "FanoutConfig.h"
 #include "FileSelectionService.h"
 #endif
+#include "LayoutImportBatch.h"
+#include "LayoutReplayHints.h"
 #include "LayoutXml.h"
 #include "PendingDisplayBinder.h"
 #include "PreferencesDialog.h"
 #include "RasterKeyMap.h"
+#include "SourcePromotionHost.h"
 #include "SourceTimelineController.h"
 #include "StreamingSourceManager.h"
 #include "Theme.h"
 #include "TitleBar.h"
+#include "ToolboxHostWiring.h"
 #include "TopicDemandController.h"
 #include "pj_base/dataset.hpp"
 #include "pj_base/types.hpp"
@@ -3974,6 +3978,11 @@ void MainWindow::linkedZoomOut() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+  // Any in-flight restore (progressive transaction + layout-import batch) is
+  // torn down FIRST — the batch hard-shut (provider jobs cancelled+joined,
+  // its FileLoader tickets discarded) so no provider worker can call back
+  // into the loader/session while they tear down.
+  supersedeActiveRestore();
   // Stop and join any in-flight worker load (discard) and drain the queue BEFORE
   // the session/datastore tear down, so a worker can't write into a freed engine
   // or fire a queued completion at a half-destroyed window.
@@ -4102,7 +4111,7 @@ void MainWindow::onLoadLayout() {
     return;
   }
   QSettings().setValue(kLastLayoutDirKey, QFileInfo(path).absolutePath());
-  loadLayoutFromPath(path);
+  loadLayoutFromPath(path, LayoutLoadInteractivity::kInteractive);
 #endif
 }
 
@@ -4206,7 +4215,7 @@ void MainWindow::onLoadRecentLayout(const QString& path) {
     QSettings().setValue(kRecentLayoutsKey, recent);
     return;
   }
-  loadLayoutFromPath(path);
+  loadLayoutFromPath(path, LayoutLoadInteractivity::kInteractive);
 #endif
 }
 
@@ -4307,37 +4316,29 @@ void MainWindow::onRebuildToolboxMenu() {
   }
 }
 
-// LoadHints for replaying ONE layout-recorded source — the shape the desktop
-// reload (loadLayoutFromPath) and the browser source-bound replay share: both
-// saved plugin identities ride their own tier fields, a layout that names a
-// plugin requires it, and replay is automated (dialogs prohibited, the saved
-// preset authoritative — DialogPolicy::kNever).
-static LoadHints layoutReplayHints(const layout_xml::DataSourceRef& source, bool prefer_reuse, bool rewrite) {
-  const bool names_plugin = !source.plugin_manifest_id.isEmpty() || !source.plugin_id.isEmpty();
-  return LoadHints{
-      .expected_manifest_id = source.plugin_manifest_id,
-      .expected_plugin_id = source.plugin_id,
-      .preset_config_json = source.plugin_config_json,
-      .dialog_policy = DialogPolicy::kNever,
-      .prefer_reuse = prefer_reuse,
-      .require_expected_plugin = names_plugin,
-      .rewrite_preset_filepath = rewrite,
-  };
-}
+// layoutReplayHints — the LoadHints shape shared by the desktop reload, the
+// browser source-bound replay, and the batch's stock loads — lives in
+// LayoutReplayHints.h.
 
-void MainWindow::loadLayoutFromPath(const QString& path) {
+void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity interactivity) {
+  const bool interactive = interactivity == LayoutLoadInteractivity::kInteractive;
+  // The interactivity-derived policy governs EVERY failure surface of this
+  // load, including the pre-classification entry failures below — a
+  // kAutomated (--layout) run must never open a modal (Codex r2-3).
+  const MissingCurvePolicy restore_policy =
+      interactive ? MissingCurvePolicy::kPrompt : MissingCurvePolicy::kRetainAndDiagnose;
   // 1. Open + parse
   QFile file(path);
   if (!file.open(QIODevice::ReadOnly)) {
-    MessageBox::warning(this, tr("Load Layout"), tr("Cannot open '%1' for reading.").arg(path));
+    reportLayoutRestoreIssue(restore_policy, "layout-open-failed", tr("Cannot open '%1' for reading.").arg(path));
     return;
   }
   QDomDocument doc;
   const QDomDocument::ParseResult parse_result = doc.setContent(&file);
   if (!parse_result) {
     file.close();
-    MessageBox::warning(
-        this, tr("Load Layout"),
+    reportLayoutRestoreIssue(
+        restore_policy, "layout-parse-failed",
         tr("'%1' is not a valid PJ4 layout: %2 (line %3, col %4)")
             .arg(path, parse_result.errorMessage)
             .arg(parse_result.errorLine)
@@ -4386,17 +4387,45 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
   // range values change (see normalizePlotRangeBasis).
   layout_xml::normalizePlotRangeBasis(doc);
   const QList<layout_xml::DataSourceRef> replays = layout_xml::extractDataSource(doc, layout_dir);
+  // NOTE: any previous in-flight restore is superseded only at this load's
+  // COMMIT POINTS (the do_reload branch below and applyRestoredLayout), not
+  // here — a Cancel at the reload or trust prompt must be a complete no-op
+  // that leaves the old restore draining, exactly as on main (regression
+  // review). Classification below reads only loadedSources()/catalog state
+  // and prepare() touches only the NEW document, so neither needs the old
+  // restore dead.
   // Set when the user chose "Reload original": the data loads (possibly async on
   // a worker), so the layout apply below must wait for the load queue to drain.
   bool reload_requested = false;
   if (binding != "generic"_L1 && !replays.empty()) {
+    // Fork the classification ONCE: materialize-bearing sources are
+    // batch-owned (§6.2 — the batch rewrites `doc` and classifies them
+    // against their provider's effective paths), plain sources keep today's
+    // classification untouched. On WASM everything stays plain and `batch`
+    // is never constructed — ordinary layouts traverse zero new code.
+    std::unique_ptr<LayoutImportBatch> batch;
+#ifndef PJ_TARGET_WASM
+    QList<layout_xml::DataSourceRef> plain_refs;
+    plain_refs.reserve(replays.size());
+    for (const auto& replay : replays) {
+      if (!layout_xml::hasMaterializeRecord(replay)) {
+        plain_refs.push_back(replay);
+      }
+    }
+    if (plain_refs.size() != replays.size()) {
+      batch = makeLayoutImportBatch(interactive);
+      batch->prepare(doc, replays);
+    }
+#else
+    const QList<layout_xml::DataSourceRef>& plain_refs = replays;
+#endif
     // Classify each referenced file: already loaded (skip), missing on disk
     // (warn + skip), or reloadable. A file counts as already loaded only while
     // the catalog has data — a remembered-but-cleared source must reload.
     const auto& loaded = session_->sessionManager().loadedSources();
     const bool catalog_has_data = !session_->catalogModel().isEmpty();
     QList<layout_xml::DataSourceRef> pending;
-    for (const auto& replay : replays) {
+    for (const auto& replay : plain_refs) {
       if (replay.resolved_path.isEmpty()) {
         continue;
       }
@@ -4417,16 +4446,21 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
       pending.push_back(replay);
     }
 
-    if (!pending.empty()) {
+    if (!pending.empty() || (batch != nullptr && batch->hasPendingWork())) {
       // The --layout CLI option auto-reloads the layout's source(s) without
       // prompting; interactively, one consolidated prompt covers the whole pending
       // set (never one box per file; "Load Layout only" is the fall-through).
-      bool do_reload = startup_auto_reload_;
-      if (!startup_auto_reload_) {
+      bool do_reload = !interactive;
+      if (interactive) {
         QStringList file_lines;
         file_lines.reserve(pending.size());
         for (const auto& replay : pending) {
           file_lines.push_back(u"  %1"_s.arg(replay.resolved_path));
+        }
+        if (batch != nullptr) {
+          for (const QString& line : batch->pendingSourceLines()) {
+            file_lines.push_back(u"  %1"_s.arg(line));
+          }
         }
         // Themed prompt (frameless, vertical button column in the app chrome).
         // The button order below defines the index question() returns:
@@ -4436,7 +4470,7 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
         constexpr int kCancel = 2;
         const int choice = MessageBox::question(
             this, tr("Load Layout"),
-            tr("This layout was saved with %n data source(s):\n\n%1", nullptr, static_cast<int>(pending.size()))
+            tr("This layout was saved with %n data source(s):\n\n%1", nullptr, static_cast<int>(file_lines.size()))
                 .arg(file_lines.join(QLatin1Char('\n'))),
             {{tr("Reload source file"), MessageBox::kPrimaryRole},
              {tr("Load Layout only"), MessageBox::kNeutralRole},
@@ -4448,31 +4482,69 @@ void MainWindow::loadLayoutFromPath(const QString& path) {
       }
       if (do_reload) {
         reload_requested = true;
+        LayoutImportBatch::StartResult batch_result = LayoutImportBatch::StartResult::kNoAsyncWork;
+        if (batch != nullptr) {
+          // Trust gate (one consolidated prompt / non-interactive refusal)
+          // and then the batch's stock loads + first import job. Runs BEFORE
+          // the plain loads below so "Cancel layout load" at the trust gate
+          // aborts with NOTHING enqueued yet.
+          batch_result = batch->start();
+          if (batch_result == LayoutImportBatch::StartResult::kCancelledByUser) {
+            // Trust-gate Cancel means "keep what I had": start() guarantees
+            // nothing was enqueued or captured on this path (pinned by the
+            // batch tests), so returning here leaves any in-flight OLD
+            // restore draining untouched — base-equivalent semantics.
+            return;
+          }
+        }
+        // COMMIT POINT: this load will now mutate the session, so the old
+        // restore's transaction is superseded HERE — after every cancel
+        // return, before the batch member handover and the plain enqueues.
+        // Codex r1 F2's property still holds: the batch's own enqueues above
+        // and this teardown share one synchronous stretch (no event
+        // delivery in between), so no stale waiter can observe them.
+        supersedeActiveRestore();
+        if (batch_result == LayoutImportBatch::StartResult::kRunning) {
+          layout_import_batch_ = std::move(batch);
+        }
         // Load each pending file. Distinct files append as separate datasets
         // (FileLoader replaces in place only on a basename match), so the full
-        // multi-file session is restored. FileLoader shows its own error dialog
-        // on failure; fall through and let the unresolved-curve handling below
-        // catch an empty load.
+        // multi-file session is restored. Interactively, FileLoader shows its
+        // own error dialog on failure; an AUTOMATED load passes a null dialog
+        // parent — the documented headless-load shape, which suppresses the
+        // aggregated load-failure dialog and the plugin message-box service
+        // (D5: an unattended load must not open modals; Codex r1 F4). Either
+        // way, fall through and let the unresolved-curve handling below catch
+        // an empty load.
         for (const auto& replay : pending) {
           file_loader_->loadFile(
-              replay.resolved_path, this,
+              replay.resolved_path, interactive ? this : nullptr,
               layoutReplayHints(replay, /*prefer_reuse=*/true, replay.rewrite_plugin_filepath));
         }
       }
       // choice == 1 (Use current data) → fall through and apply the layout to
-      // the currently loaded data.
+      // the currently loaded data. A prepared-but-unstarted batch dies here:
+      // "Load Layout only" imports nothing.
     }
   }
 
-  // The reloaded data may still be arriving on the worker thread. In that case,
-  // build the layout structure now and bind remaining curves live as topics arrive.
-  // If nothing is loading (generic / use-current / a reload that finished
-  // synchronously) apply immediately through the complete restore path.
-  if (reload_requested && file_loader_->isBusy()) {
-    beginProgressiveLayoutRestore(doc, path);
+  // The reloaded data may still be arriving on the worker thread — or a batch
+  // import may be producing it with FileLoader entirely idle. In either case,
+  // build the layout structure now and bind remaining curves live as topics
+  // arrive. If nothing is loading (generic / use-current / a reload that
+  // finished synchronously) apply immediately through the complete restore path.
+  // BOTH legs ride the same interactivity-derived policy (D5) — never batch
+  // survival: a mixed layout whose materialize sources all fail
+  // synchronously discards its batch while a plain sibling still goes
+  // progressive (Codex r1 F3). The sync leg is likewise reachable
+  // non-interactively (§6.4 cross-machine degradation) and must not open
+  // the catalog-empty warning or the missing-curve prompt. Interactive
+  // loads keep kPrompt unchanged.
+  if (restoreHasPendingAsyncWork(reload_requested)) {
+    beginProgressiveLayoutRestore(doc, path, restore_policy);
     return;
   }
-  applyRestoredLayout(doc, path);
+  applyRestoredLayout(doc, path, restore_policy);
 }
 
 #ifdef PJ_TARGET_WASM
@@ -5159,11 +5231,12 @@ void MainWindow::updateBrowserLayoutActions() {
 #endif
 
 void MainWindow::loadLayoutAtStartup(const QString& path) {
-  // --layout CLI entry: load the layout and auto-reload its data source(s) with no
-  // prompt (the flag is read in loadLayoutFromPath's source-classification block).
-  startup_auto_reload_ = true;
-  loadLayoutFromPath(path);
-  startup_auto_reload_ = false;
+  // --layout CLI entry: load the layout and auto-reload its data source(s)
+  // with no prompt. Interactivity is threaded as an explicit parameter (and
+  // captured by any LayoutImportBatch at construction) instead of a member
+  // flag, because a flag reset on return cannot govern late async
+  // continuations (D5).
+  loadLayoutFromPath(path, LayoutLoadInteractivity::kAutomated);
 }
 
 void MainWindow::enableAutoplay() {
@@ -5226,7 +5299,7 @@ void MainWindow::restoreBrowserChromeAndPanels(const QDomDocument& doc, const QS
 }
 #endif
 
-void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path) {
+void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, MissingCurvePolicy policy) {
   // 3. Filters + curve rebinding + plot apply happen together in restoreWorkspaceState
   // below. Each curve resolves against whichever loaded dataset actually holds its
   // topic+field (first match in load order), so a multi-file layout restores
@@ -5235,16 +5308,25 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path) {
   // undo/redo uses; there is deliberately no "apply to which
   // dataset?" prompt — a saved layout binds to its data, not to one chosen set.
   // Paths no loaded dataset can provide are surfaced via the missing-curve prompt.
+  // (A restore with pending async work never reaches this leg — the
+  // restoreHasPendingAsyncWork routing sent it progressive.)
   if (session_->catalogModel().datasets().empty()) {
-    MessageBox::warning(
-        this, tr("Load Layout"), tr("No data is loaded. Open a data source before applying this layout."));
+    // D5: a kRetainAndDiagnose (non-interactive) apply reports through the
+    // diagnostic sink; interactive keeps the modal warning. A no-data return
+    // is a NO-OP — an in-flight previous restore keeps draining.
+    reportLayoutRestoreIssue(
+        policy, "layout-apply-no-data", tr("No data is loaded. Open a data source before applying this layout."));
     return;
   }
+  // COMMIT POINT: the workspace is about to be replaced — supersede any
+  // in-flight previous restore now (a no-op when the do_reload branch
+  // already did; see supersedeActiveRestore).
+  supersedeActiveRestore();
   // 4. Recreate filters, rebind curves, and apply plots/toggles through the ONE restore
   // path shared with undo/redo (kPrompt: a curve no loaded dataset can provide raises the
   // missing-curve prompt). Filters are recreated BEFORE the curve rebind so each derived
   // output topic is in the catalog. Panel/chrome restores below stay layout-only.
-  switch (restoreWorkspaceState(doc, MissingCurvePolicy::kPrompt)) {
+  switch (restoreWorkspaceState(doc, policy)) {
     case RestoreResult::kCancelled:
       return;  // user aborted at the missing-curve prompt
     case RestoreResult::kFailed:
@@ -5252,9 +5334,10 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path) {
       // half-mutated: the new data is loaded but the user's plots/panels never came
       // back. Rolling back a synchronous ingest is not currently feasible (FileLoader
       // has no "unload" API and the DataEngine doesn't support transactional commits).
-      // The warning is the best signal we can offer.
-      MessageBox::warning(
-          this, tr("Load Layout"),
+      // The warning (dialog-vs-diagnostic per the policy) is the best signal
+      // we can offer.
+      reportLayoutRestoreIssue(
+          policy, "layout-apply-failed",
           tr("Layout was parsed but could not be applied. If a data source was reloaded, it is still loaded."));
       return;
     case RestoreResult::kApplied:
@@ -5318,9 +5401,23 @@ void MainWindow::restoreChromeAndPanels(const QDomDocument& doc, const QString& 
   emitDiagnostic(DiagnosticLevel::kInfo, "Layout", "loaded", tr("Loaded layout: %1").arg(QFileInfo(path).fileName()));
 }
 
-void MainWindow::beginProgressiveLayoutRestore(QDomDocument doc, const QString& path) {
+void MainWindow::beginProgressiveLayoutRestore(QDomDocument doc, const QString& path, MissingCurvePolicy policy) {
   cancelProgressiveLayoutRestore();
-  progressive_previous_workspace_ = capturePortableWorkspace();
+  if (layoutImportBatchActive() && batch_workspace_checkpoint_ != nullptr) {
+    // ONE capture per batch restore: reuse the checkpoint the batch's
+    // begin_workspace_checkpoint hook took inside start() moments ago —
+    // only async enqueues happened since (loads queued, jobs launched; no
+    // synchronous workspace mutation), so the two capture points are
+    // state-equivalent.
+    progressive_previous_workspace_ = *batch_workspace_checkpoint_;
+  } else {
+    progressive_previous_workspace_ = capturePortableWorkspace();
+  }
+  batch_workspace_checkpoint_.reset();
+  // The caller-derived policy (the load's interactivity — NEVER inferred
+  // from batch survival, Codex r1 F3), captured now and consumed at the
+  // drain long after every caller stack has unwound (D5: policy is data).
+  progressive_missing_curve_policy_ = policy;
   progressive_layout_in_flight_ = true;
   progressive_layout_doc_ = doc;
 
@@ -5344,7 +5441,10 @@ void MainWindow::beginProgressiveLayoutRestore(QDomDocument doc, const QString& 
 
   if (!applied) {
     static_cast<void>(abortProgressiveRestore());
-    MessageBox::warning(this, tr("Load Layout"), tr("Layout was parsed but could not be applied."));
+    // Dialog-vs-diagnostic per the caller-derived policy (Codex r1 F6): a
+    // kRetainAndDiagnose (non-interactive) restore never opens the modal.
+    reportLayoutRestoreIssue(
+        policy, "layout-progressive-apply-failed", tr("Layout was parsed but could not be applied."));
     return;
   }
 
@@ -5353,18 +5453,32 @@ void MainWindow::beginProgressiveLayoutRestore(QDomDocument doc, const QString& 
         retryPendingSceneRestores(items);
         flushPendingCurveBindings(items);
       });
-  pending_queue_drained_conn_ = connect(
-      file_loader_.get(), &FileLoader::queueDrained, this, &MainWindow::onProgressiveLayoutDrained,
-      Qt::SingleShotConnection);
+  // The drain gate is a waiter list: each entry names one reason to keep
+  // waiting and the signal that may clear it. queueDrained can fire several
+  // times between sequential batch children, so waiters are ordinary
+  // connections the gate clears when it settles (which also subsumes the
+  // old SingleShot special case for ordinary restores).
+  addRestoreWaiter([this]() { return file_loader_->isBusy(); }, file_loader_.get(), &FileLoader::queueDrained);
+  if (layoutImportBatchActive()) {
+    addRestoreWaiter(
+        [this]() { return layout_import_batch_ != nullptr && !layout_import_batch_->isFinished(); },
+        layout_import_batch_.get(), &LayoutImportBatch::finished);
+  }
   retryPendingSceneRestores({});
   flushPendingCurveBindings({});
 }
 
+void MainWindow::clearRestoreWaiters() {
+  for (const RestoreWaiter& waiter : restore_waiters_) {
+    QObject::disconnect(waiter.conn);
+  }
+  restore_waiters_.clear();
+}
+
 void MainWindow::cancelProgressiveLayoutRestore() {
   QObject::disconnect(pending_items_added_conn_);
-  QObject::disconnect(pending_queue_drained_conn_);
   pending_items_added_conn_ = {};
-  pending_queue_drained_conn_ = {};
+  clearRestoreWaiters();
   if (pending_binder_ != nullptr) {
     pending_binder_->clear();
   }
@@ -5530,24 +5644,102 @@ void MainWindow::clearPendingSceneRestores() {
   forEachSceneDock([](SceneDockWidget* scene_dock) { scene_dock->clearPendingRestores(); });
 }
 
+void MainWindow::reportLayoutRestoreIssue(MissingCurvePolicy policy, const char* id, const QString& message) {
+  // D5: a kRetainAndDiagnose (non-interactive batch) restore must never open
+  // a dialog from a late continuation; every other policy keeps the dialog.
+  if (policy == MissingCurvePolicy::kRetainAndDiagnose) {
+    emitDiagnostic(DiagnosticLevel::kWarning, "Layout", id, message);
+  } else {
+    MessageBox::warning(this, tr("Load Layout"), message);
+  }
+}
+
+bool MainWindow::finalizeUnresolvedRestoreState(MissingCurvePolicy policy) {
+  if (pending_binder_ != nullptr) {
+    QStringList shown;
+    QSet<QString> seen;
+    for (const layout_xml::SeriesPath& path : pending_binder_->unresolved()) {
+      const QString display = path.display();
+      if (!display.isEmpty() && !seen.contains(display)) {
+        seen.insert(display);
+        shown.push_back(display);
+      }
+    }
+    // Unresolved BLOCKING scene references join the same prompt: Remove drops
+    // them (so the committed baseline never carries blocking pends — an exact
+    // undo back to it must be able to succeed), Cancel aborts the restore.
+    for (const QString& topic : unresolvedPendingSceneRestores()) {
+      if (!topic.isEmpty() && !seen.contains(topic)) {
+        seen.insert(topic);
+        shown.push_back(topic);
+      }
+    }
+    bool retain_unresolved_intents = false;
+    if (!shown.isEmpty()) {
+      if (policy == MissingCurvePolicy::kRetainAndDiagnose) {
+        // No prompt, no dialog — name the unresolved intents in a diagnostic
+        // and RETAIN them (no binder clear) so a later binding pass can still
+        // resolve them once their data arrives (D5).
+        emitDiagnostic(
+            DiagnosticLevel::kWarning, "Layout", "layout-import-unresolved-curves",
+            tr("%n layout reference(s) could not be bound after the import: %1", nullptr,
+               static_cast<int>(shown.size()))
+                .arg(shown.join(u", "_s)));
+        retain_unresolved_intents = true;
+      } else {
+        switch (promptMissingCurves(shown)) {
+          case MissingCurveChoice::kRemove:
+            // Remaining curves were never bound (nothing to strip from live
+            // widgets); blocking scene pends are dropped so they cannot poison
+            // later exact snapshots.
+            forEachSceneDock([](SceneDockWidget* scene_dock) { scene_dock->clearBlockingPendingRestores(); });
+            break;
+          case MissingCurveChoice::kCancel: {
+            static_cast<void>(abortProgressiveRestore());
+          }
+            return false;
+        }
+      }
+    }
+    if (!retain_unresolved_intents) {
+      pending_binder_->clear();
+    }
+  }
+
+  broadcastTrackerTime(toAxisDouble(session_->playbackEngine().currentTime()));
+  const QStringList unresolved_scenes = unresolvedPendingSceneRestores();
+  if (!unresolved_scenes.isEmpty()) {
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "scene_restore_pending",
+        tr("%n scene layer(s) could not be rebound after progressive load.", nullptr,
+           static_cast<int>(unresolved_scenes.size())));
+  }
+  clearPendingSceneRestores();
+  return true;
+}
+
 void MainWindow::onProgressiveLayoutDrained() {
-  QObject::disconnect(pending_items_added_conn_);
-  pending_items_added_conn_ = {};
+  // The drain-time policy was captured at beginProgressiveLayoutRestore (D5:
+  // policy is data, never a late read of live batch state).
+  const MissingCurvePolicy policy = progressive_missing_curve_policy_;
+  // B3 / D5 retention channel: the kRetainAndDiagnose arm keeps the
+  // itemsAdded connection alive past the drain so retained intents can still
+  // bind when their data arrives later (T7 drives this); every other arm
+  // tears it down here as before.
+  if (policy != MissingCurvePolicy::kRetainAndDiagnose) {
+    QObject::disconnect(pending_items_added_conn_);
+    pending_items_added_conn_ = {};
+  }
 
   // All file inputs now exist. Rebuild the complete saved processor graph
   // before the binder's last pass so derived curves resolve to fresh outputs.
   if (!progressive_layout_doc_.isNull() && !restoreDataProcessors(progressive_layout_doc_.documentElement())) {
     const bool rolled_back = abortProgressiveRestore();
-    if (!rolled_back) {
-      MessageBox::warning(
-          this, tr("Load Layout"),
-          tr("A saved data processor could not be restored, and the previous workspace could not be fully "
-             "restored against the reloaded data. The partial layout was kept as the new undo baseline."));
-    } else {
-      MessageBox::warning(
-          this, tr("Load Layout"),
-          tr("A saved data processor could not be restored; the previous workspace was restored."));
-    }
+    reportLayoutRestoreIssue(
+        policy, "processor-restore-failed",
+        rolled_back ? tr("A saved data processor could not be restored; the previous workspace was restored.")
+                    : tr("A saved data processor could not be restored, and the previous workspace could not be fully "
+                         "restored against the reloaded data. The partial layout was kept as the new undo baseline."));
     return;
   }
 
@@ -5558,8 +5750,8 @@ void MainWindow::onProgressiveLayoutDrained() {
   // baseline. Independent of the binder's existence.
   if (settleSceneRestores().failed) {
     const bool rolled_back = abortProgressiveRestore();
-    MessageBox::warning(
-        this, tr("Load Layout"),
+    reportLayoutRestoreIssue(
+        policy, "scene-restore-failed",
         rolled_back ? tr("A saved scene element was invalid; the previous workspace was restored.")
                     : tr("A saved scene element was invalid, and the previous workspace could not be fully restored "
                          "against the reloaded data. The partial layout was kept as the new undo baseline."));
@@ -5583,54 +5775,14 @@ void MainWindow::onProgressiveLayoutDrained() {
     // fall back to zoomOut; clear_after drops the one-shot stash. Still under the
     // in-flight gate, so onUndoableChange stays suppressed until the single snapshot below.
     forEachPlot([](PlotWidget* plot) { plot->applySavedViewportOrZoom(/*clear_after=*/true); });
-
-    QStringList shown;
-    QSet<QString> seen;
-    for (const layout_xml::SeriesPath& path : pending_binder_->unresolved()) {
-      const QString display = path.display();
-      if (!display.isEmpty() && !seen.contains(display)) {
-        seen.insert(display);
-        shown.push_back(display);
-      }
-    }
-    // Unresolved BLOCKING scene references join the same prompt: Remove drops
-    // them (so the committed baseline never carries blocking pends — an exact
-    // undo back to it must be able to succeed), Cancel aborts the restore.
-    for (const QString& topic : unresolvedPendingSceneRestores()) {
-      if (!topic.isEmpty() && !seen.contains(topic)) {
-        seen.insert(topic);
-        shown.push_back(topic);
-      }
-    }
-    if (!shown.isEmpty()) {
-      switch (promptMissingCurves(shown)) {
-        case MissingCurveChoice::kRemove:
-          // Remaining curves were never bound (nothing to strip from live
-          // widgets); blocking scene pends are dropped so they cannot poison
-          // later exact snapshots.
-          forEachSceneDock([](SceneDockWidget* scene_dock) { scene_dock->clearBlockingPendingRestores(); });
-          break;
-        case MissingCurveChoice::kCancel: {
-          static_cast<void>(abortProgressiveRestore());
-        }
-          return;
-      }
-    }
-    pending_binder_->clear();
   }
 
-  broadcastTrackerTime(toAxisDouble(session_->playbackEngine().currentTime()));
-  const QStringList unresolved_scenes = unresolvedPendingSceneRestores();
-  if (!unresolved_scenes.isEmpty()) {
-    emitDiagnostic(
-        DiagnosticLevel::kWarning, "Layout", "scene_restore_pending",
-        tr("%n scene layer(s) could not be rebound after progressive load.", nullptr,
-           static_cast<int>(unresolved_scenes.size())));
+  // One owner for every unresolved-state teardown decision (binder intents,
+  // blocking scene pends, the scene-pend clear), switching on the policy.
+  if (!finalizeUnresolvedRestoreState(policy)) {
+    return;  // user cancelled at the missing-curve prompt
   }
-  clearPendingSceneRestores();
 
-  QObject::disconnect(pending_queue_drained_conn_);
-  pending_queue_drained_conn_ = {};
   progressive_layout_in_flight_ = false;
   commitRestoredLayout(progressive_layout_doc_);
   progressive_layout_doc_.clear();
@@ -5640,6 +5792,151 @@ void MainWindow::onProgressiveLayoutDrained() {
 void MainWindow::commitRestoredLayout(const QDomDocument& doc) {
   restorePinnedToolboxes(doc.documentElement());
   resetUndoHistory();
+}
+
+bool MainWindow::layoutImportBatchActive() const {
+  return layout_import_batch_ != nullptr && layout_import_batch_->isActive();
+}
+
+void MainWindow::resetLayoutImportBatch() {
+  // A still-running batch takes the destructor's HARD shutdown (children
+  // cancelled+joined, no rollback) — this path replaces or retires it.
+  layout_import_batch_.reset();
+  batch_workspace_checkpoint_.reset();
+  if (!progressive_layout_in_flight_) {
+    // Outside a live restore, the only connection that can still be up is
+    // the D5 retention channel a kRetainAndDiagnose drain left alive — it
+    // ends when a new restore (or shutdown) supersedes it. A restore still
+    // in flight keeps its channel: begin/cancel own it there.
+    QObject::disconnect(pending_items_added_conn_);
+    pending_items_added_conn_ = {};
+  }
+}
+
+void MainWindow::supersedeActiveRestore() {
+  // Tear down an in-flight progressive transaction COMPLETELY (waiters,
+  // itemsAdded channel, binder, old document, in-flight flag), then retire
+  // the batch. Invoked on EVERY new layout load and at close: a superseding
+  // load that takes the SYNC path never reaches beginProgressiveLayoutRestore,
+  // and a stale waiter settled by a late queueDrained from the OLD load
+  // would otherwise commit the old document over the new workspace.
+  if (progressive_layout_in_flight_) {
+    cancelProgressiveLayoutRestore();
+  }
+  resetLayoutImportBatch();
+}
+
+bool MainWindow::restoreHasPendingAsyncWork(bool reload_requested) const {
+  // §6.2 "a pending import keeps the restore alive": a provider job is
+  // invisible to FileLoader's queue, so the batch is its own source of
+  // pending async work. BOTH halves are gated on reload_requested — only the
+  // do_reload branch supersedes the previous restore before enqueuing, so
+  // only there does layout_import_batch_ provably belong to THIS load; on
+  // the non-reload path the member may still be a superseded predecessor's
+  // batch, and this load must fall through to the sync apply (which
+  // supersedes right before mutating).
+  return reload_requested && (file_loader_->isBusy() || layoutImportBatchActive());
+}
+
+void MainWindow::maybeSettleProgressiveRestore() {
+  if (!progressive_layout_in_flight_) {
+    return;
+  }
+  // The gate: every registered waiter must have cleared. Each waiter's
+  // signal re-runs this check.
+  for (const RestoreWaiter& waiter : restore_waiters_) {
+    if (waiter.pending && waiter.pending()) {
+      return;
+    }
+  }
+  // The cancelled-batch unwind is genuinely batch-specific, so it stays
+  // inline: the batch's rollback already removed its produced datasets and
+  // exact-restored the PRE-LAYOUT workspace; drop the progressive
+  // scaffolding without committing (and without a second rollback).
+  if (layout_import_batch_ != nullptr && layout_import_batch_->result().cancelled) {
+    cancelProgressiveLayoutRestore();
+    resetLayoutImportBatch();
+    emitDiagnostic(
+        DiagnosticLevel::kInfo, "Layout", "layout-import-cancelled",
+        tr("Layout import was cancelled; the previous workspace was restored."));
+    return;
+  }
+  clearRestoreWaiters();
+  onProgressiveLayoutDrained();
+  // The batch is retired here — its policy already lives in
+  // progressive_missing_curve_policy_, so nothing at (or after) the drain
+  // reads it. The D5 retention channel (pending_items_added_conn_)
+  // deliberately survives a kRetainAndDiagnose drain; a plain
+  // layout_import_batch_.reset() leaves it untouched.
+  layout_import_batch_.reset();
+  batch_workspace_checkpoint_.reset();
+}
+
+std::unique_ptr<LayoutImportBatch> MainWindow::makeLayoutImportBatch(bool interactive) {
+  LayoutImportBatch::Hooks hooks;
+  hooks.begin_workspace_checkpoint = [this]() -> std::function<bool()> {
+    // ONE capture serves both rollback surfaces: the closure below (the
+    // batch's cancel rollback) and beginProgressiveLayoutRestore, which
+    // reuses the handover instead of re-capturing (a full DOM build +
+    // serialization on the GUI thread). The batch cannot name the private
+    // CapturedWorkspace type, so the capture lives in shared closure state.
+    auto captured = std::make_shared<const CapturedWorkspace>(capturePortableWorkspace());
+    batch_workspace_checkpoint_ = captured;
+    return [this, captured]() {
+      return restoreWorkspaceState(*captured, MissingCurvePolicy::kExact, TimelineRestoreMode::kExact) ==
+             RestoreResult::kApplied;
+    };
+  };
+  hooks.remove_dataset = [this](DatasetId dataset_id) {
+    // The un-import primitive, guarded by liveness (O(1)): a provider-
+    // reported id that never materialized (or was already removed) is a no-op.
+    if (session_->catalogModel().datasetSourceName(dataset_id).has_value()) {
+      removeDatasetData(dataset_id);
+    }
+  };
+  if (interactive) {
+    hooks.confirm_import = [this](const QStringList& lines) {
+      // The consolidated trust/size confirmation — ONE prompt for the whole
+      // batch, shaped like the 3-way layout reload prompt above.
+      constexpr int kTrust = 0;
+      constexpr int kSkip = 1;
+      QStringList shown;
+      shown.reserve(lines.size());
+      for (const QString& line : lines) {
+        shown.push_back(u"  %1"_s.arg(line));
+      }
+      // §7 guard 1 requires EXPLICIT confirmation of an untrusted origin, so
+      // "Trust and import" deliberately does NOT take the primary role: only
+      // kPrimaryRole becomes the Enter-default (MessageBox::addButton), and
+      // the preceding reload prompt's Enter-default would otherwise chain
+      // straight into granting a credentialed network fetch (Enter-Enter).
+      // Same shape as promptMissingCurves: no default button; Esc = Cancel.
+      const int choice = MessageBox::question(
+          this, tr("Load Layout"),
+          tr("This layout asks to download %n data source(s) from a cloud provider:\n\n%1", nullptr,
+             static_cast<int>(lines.size()))
+              .arg(shown.join(QLatin1Char('\n'))),
+          {{tr("Trust and import"), MessageBox::kNeutralRole},
+           {tr("Skip these sources"), MessageBox::kNeutralRole},
+           {tr("Cancel layout load"), MessageBox::kCancelRole}});
+      if (choice == kTrust) {
+        return LayoutImportBatch::TrustChoice::kTrustAndImport;
+      }
+      if (choice == kSkip) {
+        return LayoutImportBatch::TrustChoice::kSkip;
+      }
+      return LayoutImportBatch::TrustChoice::kCancelLayout;
+    };
+  }
+  hooks.diagnostics = diagnosticSink();
+  // §7 guard 3's per-machine download ceiling. 0 = no ceiling for now — the
+  // batch mechanism honors any non-zero value (refuse/confirm at query time
+  // + the per-job max_transfer_bytes enforcement channel); the configurable
+  // cap is future preferences work.
+  constexpr std::uint64_t kLayoutImportMaxTransferBytes = 0;
+  return std::make_unique<LayoutImportBatch>(
+      session_->sessionManager(), session_->extensionCatalog(), *file_loader_, session_->catalogModel(), interactive,
+      kLayoutImportMaxTransferBytes, std::move(hooks));
 }
 
 void MainWindow::saveLayoutToPath(const QString& path, bool include_data_source) {
@@ -6297,6 +6594,22 @@ MainWindow::RestoreResult MainWindow::applyWorkspace(
         break;
     }
   }
+  if (policy == MissingCurvePolicy::kRetainAndDiagnose && !unresolved.isEmpty()) {
+    // D5: never a dialog. The unresolved curves stay in the document (their
+    // intents are re-registered with the pending binder by
+    // rebuildPendingDisplayBindings below and RETAINED for later binding);
+    // the diagnostic names them. Distinct id from the drain-time
+    // "layout-import-unresolved-curves": this is the SYNC restore leg.
+    QStringList shown;
+    shown.reserve(unresolved.size());
+    for (const layout_xml::SeriesPath& sp : unresolved) {
+      shown.push_back(sp.display());
+    }
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "layout-import-unresolved-curves-sync",
+        tr("%n layout curve(s) could not be bound: %1", nullptr, static_cast<int>(shown.size()))
+            .arg(shown.join(u", "_s)));
+  }
   // kSilentDrop compatibility restores leave unresolved curves for xmlLoadState
   // to discard. Undo/redo uses kExact.
   // 3. Apply plots + global toggles.
@@ -6324,6 +6637,12 @@ MainWindow::RestoreResult MainWindow::applyWorkspace(
         tr("%n scene layer(s) could not be rebound and were omitted.", nullptr,
            static_cast<int>(scenes.blocking_topics.size())));
     forEachSceneDock([](SceneDockWidget* scene_dock) { scene_dock->clearBlockingPendingRestores(); });
+  }
+  if (policy == MissingCurvePolicy::kRetainAndDiagnose && !scenes.blocking_topics.isEmpty()) {
+    // Retained (not cleared): a later binding pass may still satisfy them.
+    emitDiagnostic(
+        DiagnosticLevel::kWarning, "Layout", "scene_restore_pending",
+        tr("%n scene layer(s) are not yet bound.", nullptr, static_cast<int>(scenes.blocking_topics.size())));
   }
   forEachPlot([](PlotWidget* plot) { plot->applySavedViewportOrZoom(/*clear_after=*/true); });
   // 4. Seed the just-recreated docks with the current playhead. currentTimeChanged
@@ -8037,24 +8356,46 @@ void MainWindow::launchToolbox(
   //    destroyed first) must be torn down while the host + settings backend it
   //    persists through are still alive. Lambda capture-destruction order is
   //    unspecified, so a struct (reverse-declaration destruction) is required.
+  //
+  //    KEEP IN SYNC: HeadlessDescriptorProviderSession::create mirrors this
+  //    whole service-assembly block for the dialog-free layout-import path (a
+  //    provider plugin must see an identical host environment headless vs
+  //    interactive). Any service newly registered here — or any change to the
+  //    callbacks' host-side semantics — must be applied there too; the
+  //    verbatim-shared snippets live in ToolboxHostWiring.h.
   struct PanelSession {
     std::unique_ptr<QSettingsBackend> settings;
     std::unique_ptr<ServiceRegistryBuilder> builder;
     std::unique_ptr<ToolboxRuntimeHost> host;
     std::unique_ptr<DataProcessorsRuntimeHost> dp_host;
+    std::unique_ptr<SourcePromotionHost> promotion_host;
     std::shared_ptr<ToolboxHandle> handle;
 
     // Teardown order is load-bearing, so make it explicit here rather than relying
-    // on member-declaration order alone: the plugin (handle) persists its state
-    // through the settings backend in its destructor, so it must be torn down
-    // first, then the service views (builder) into host/dp_host/settings, then the
-    // bridge + host. dp_host holds only an external DataProcessorService& (session-
-    // owned, outlives this), so it just has to outlive the builder views into it;
-    // host holds a SettingsBackend&, so settings goes last. This survives a future
-    // member reorder; the implicit reverse-declaration destruction that follows
-    // only resets already-null pointers.
+    // on member-declaration order alone. Two-phase promotion teardown (Codex
+    // r1 F5): shutdown() FIRST — it fails every accepted-but-unfinished
+    // promotion callback, which reaches plugin code, so the plugin
+    // instance/DSO (handle) must still be alive — but the host OBJECT stays
+    // alive until handle.reset() has destroyed the plugin instance (which
+    // joins its workers): unlike the headless session, the interactive path
+    // has no job registry to join, so a straggler provider worker may still
+    // call the raw service pointer in that window and must hit a LIVE mutex
+    // and the safe synchronous shutting_down_ rejection, not a
+    // use-after-free. Then the plugin (handle), which persists its state
+    // through the settings backend in its destructor; only now the promotion
+    // host; then the service views (builder) into host/dp_host/settings,
+    // then the bridge + host. dp_host holds only an external
+    // DataProcessorService& (session-owned, outlives this), so it just has
+    // to outlive the builder views into it; host holds a SettingsBackend&,
+    // so settings goes last. This survives a future member reorder; the
+    // implicit reverse-declaration destruction that follows only resets
+    // already-null pointers.
     ~PanelSession() {
+      if (promotion_host != nullptr) {
+        promotion_host->shutdown();
+      }
       handle.reset();
+      promotion_host.reset();
       builder.reset();
       dp_host.reset();
       host.reset();
@@ -8139,13 +8480,7 @@ void MainWindow::launchToolbox(
     if (diagnostic_history_ == nullptr) {
       return;
     }
-    DiagnosticLevel diag = DiagnosticLevel::kInfo;
-    if (level == PJ_TOOLBOX_MESSAGE_ERROR) {
-      diag = DiagnosticLevel::kError;
-    } else if (level == PJ_TOOLBOX_MESSAGE_WARNING) {
-      diag = DiagnosticLevel::kWarning;
-    }
-    diagnostic_history_->record(diag, source, u"toolbox"_s, QString::fromStdString(message));
+    diagnostic_history_->record(toolboxDiagnosticLevel(level), source, u"toolbox"_s, QString::fromStdString(message));
   };
 
   // Progressive bulk-import surface (all GUI-thread, marshalled by the host).
@@ -8220,19 +8555,11 @@ void MainWindow::launchToolbox(
   };
 
   // Parser-ingest deps: the plugin catalog for ensureParserBinding lookups and
-  // the SessionManager registrar for render-time object parsers. The registrar
-  // may fire on the toolbox worker thread mid-download — marshal to the GUI
-  // thread (same discipline as the host's own callbacks); the queued
-  // registration always lands before the later-queued notify_data_changed
-  // catalog rebuild. shared_ptr wrapper: std::function requires copyable.
+  // the SessionManager registrar for render-time object parsers (queued-marshal
+  // wiring shared with the headless path — see ToolboxHostWiring.h).
   ToolboxRuntimeHost::ParserIngestDeps ingest_deps;
   ingest_deps.catalog = &session_->extensionCatalog();
-  ingest_deps.register_object_parser = [this](ObjectTopicId id, std::unique_ptr<MessageParserHandle> parser) {
-    auto shared = std::make_shared<std::unique_ptr<MessageParserHandle>>(std::move(parser));
-    QMetaObject::invokeMethod(
-        this, [this, id, shared]() { session_->sessionManager().registerObjectTopicParser(id, std::move(*shared)); },
-        Qt::AutoConnection);
-  };
+  ingest_deps.register_object_parser = makeQueuedObjectParserRegistrar(this, session_->sessionManager());
 
   session->host = std::make_unique<ToolboxRuntimeHost>(
       session_->sessionManager().dataEngine(), session_->sessionManager().objectStore(), *session->settings,
@@ -8242,6 +8569,17 @@ void MainWindow::launchToolbox(
   session->dp_host = std::make_unique<DataProcessorsRuntimeHost>(
       session_->sessionManager().dataProcessorService(), plugin_id.toStdString());
   session->dp_host->registerServices(*session->builder);
+
+  // Source promotion ("pj.source_promotion.v1"), bound per toolbox instance:
+  // the provider identity is THIS binding's stable manifest id (host-derived,
+  // unspoofable) and the ownership predicate is this instance's own ingest
+  // bookkeeping — a promotion can only ever target a dataset this plugin's
+  // ingest produced. `host` outlives promotion_host (see ~PanelSession), so
+  // the captured raw pointer stays valid for the predicate's whole life.
+  session->promotion_host = std::make_unique<SourcePromotionHost>(
+      *file_loader_, session_->sessionManager(), QString::fromStdString(it->id),
+      [host = session->host.get()](DatasetId dataset_id) { return host->hasIngestForDataset(dataset_id); });
+  session->promotion_host->registerServices(*session->builder);
 
   // 3. Create the toolbox instance and bind it to the assembled services.
   session->handle = std::make_shared<ToolboxHandle>(it->library.createHandle());

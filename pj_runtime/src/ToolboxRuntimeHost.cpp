@@ -131,6 +131,11 @@ void ToolboxRuntimeHost::postIngestFinished(
       Qt::QueuedConnection);
 }
 
+bool ToolboxRuntimeHost::hasIngestForDataset(DatasetId dataset_id) const {
+  const std::lock_guard lock(parser_ingest_mu_);
+  return ingest_progress_.find(dataset_id) != ingest_progress_.end();
+}
+
 void ToolboxRuntimeHost::requestStopActiveIngests() {
   std::lock_guard lock(parser_ingest_mu_);
   for (auto& [id, host] : parser_ingests_) {

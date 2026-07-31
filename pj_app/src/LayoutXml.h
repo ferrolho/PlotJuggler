@@ -130,6 +130,16 @@ struct DataSourceRef {
   QList<DataSourceDatasetRef> datasets;
 };
 
+// True when `ref` carries a provider <materialize> record (any of the three
+// materialize_* fields non-empty). This is the ONE predicate both halves of
+// the layout-restore classification key off — the import batch claims these
+// sources and the plain reload loop skips them — so it lives here, next to
+// the fields, where the two sides cannot diverge.
+[[nodiscard]] inline bool hasMaterializeRecord(const DataSourceRef& ref) {
+  return !ref.materialize_provider.isEmpty() || !ref.materialize_identity.isEmpty() ||
+         !ref.materialize_descriptor_json.isEmpty();
+}
+
 // CDATA sections cannot contain "]]>"; QDomDocument::createCDATASection
 // does not escape it. Splits the payload across adjacent CDATA sections
 // at each "]]>" boundary so QDomElement::text() concatenates them back
@@ -300,6 +310,13 @@ void resolveDatasetSourcePaths(QDomDocument& doc, const QDir& layout_dir);
 // pure XML pass: it performs no filesystem access and changes no schema.
 using DatasetPathRemapper = std::function<QString(const QString&)>;
 void remapDatasetSourcePaths(QDomDocument& doc, const DatasetPathRemapper& remap);
+
+// Rewrites each <previouslyLoaded_Datafiles>/<fileInfo> filename attribute
+// through `remap`, visiting exactly the elements extractDataSource yields
+// (non-empty filename, in document order) — the element-selection rule lives
+// once, next to the reader. The callback receives the SERIALIZED attribute
+// value; returning it unchanged is a no-op. Pure XML pass.
+void remapFileInfoFilenames(QDomDocument& doc, const DatasetPathRemapper& remap);
 
 // Removes every <curve> left without any usable key after rebindCurveKeys
 // (empty name and empty curve_x/curve_y). Two-pass so the live node list

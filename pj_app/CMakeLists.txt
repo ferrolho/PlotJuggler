@@ -29,6 +29,11 @@ add_library(pj_app_shell OBJECT
     src/LoadInput.h
     src/FileLoader.cpp
     src/FileLoader.h
+    src/SourcePromotionHost.cpp
+    src/SourcePromotionHost.h
+    src/HeadlessDescriptorProviderSession.cpp
+    src/HeadlessDescriptorProviderSession.h
+    src/ToolboxHostWiring.h
     src/PendingDisplayBinder.cpp
     src/PendingDisplayBinder.h
     src/TopicDemandController.cpp
@@ -41,6 +46,8 @@ add_library(pj_app_shell OBJECT
     src/DatasetMergeActions.h
     src/LayoutXml.cpp
     src/LayoutXml.h
+    src/LayoutImportBatch.cpp
+    src/LayoutImportBatch.h
     src/MainWindow.cpp
     src/MainWindow.h
     src/MainWindow.ui
@@ -329,6 +336,31 @@ if(PJ_BUILD_TESTS)
     add_pj_app_gui_test(main_window_history_test MainWindowHistoryTest
         tests/main_window_history_test.cpp)
 
+    # Layout-import batch restore (T6), one scenario per binary:
+    #   alive  — a materialize MISS import keeps the restore alive across the
+    #            catalog-empty guard; curves bind at the batch-gated drain.
+    #   policy — D5: a non-interactive restore opens zero dialogs; unresolved
+    #            intents are retained + diagnosed, never cleared.
+    #   cancel — cancel mid-import rolls back to the pre-layout workspace.
+    add_pj_app_gui_test(main_window_layout_import_alive_test MainWindowLayoutImportAliveTest
+        tests/main_window_layout_import_alive_test.cpp)
+    add_pj_app_gui_test(main_window_layout_import_policy_test MainWindowLayoutImportPolicyTest
+        tests/main_window_layout_import_policy_test.cpp)
+    add_pj_app_gui_test(main_window_layout_import_cancel_test MainWindowLayoutImportCancelTest
+        tests/main_window_layout_import_cancel_test.cpp)
+    #   lifecycle — Codex r1 F2/F3/F4/F6: explicit progressive policy on a
+    #              mixed automated restore, apply-failure diagnostics, full
+    #              supersession by a sync-path load, and automated plain-source
+    #              failure dialog suppression (with the interactive pin).
+    #              Stages the mock source plugin so plain replays load/fail
+    #              for real.
+    add_pj_app_gui_test(main_window_layout_import_lifecycle_test MainWindowLayoutImportLifecycleTest
+        tests/main_window_layout_import_lifecycle_test.cpp)
+    target_compile_definitions(main_window_layout_import_lifecycle_test PRIVATE
+        PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
+    )
+    add_dependencies(main_window_layout_import_lifecycle_test mock_file_source_plugin)
+
     # The left column's width belongs to the user: neither a window resize nor a
     # chart-area takeover may move the separator they dragged.
     add_pj_app_gui_test(main_window_panel_geometry_test MainWindowPanelGeometryTest
@@ -526,15 +558,19 @@ if(PJ_BUILD_TESTS)
         target_compile_options(dialog_probe_source_plugin PRIVATE ${PJ_WARNING_FLAGS})
     endif()
 
-    # End-to-end FileLoader pipeline test (same-file reload semantics + the
-    # worker-thread message-box marshal regression). Compiles FileLoader + its
-    # two helper TUs directly (FileLoader has no MainWindow dependency by design —
-    # see setFilePicker) and ingests through the SDK's mock_file_source_plugin
-    # (and the local msgbox_mock_source_plugin), staged into a temp extensions
-    # dir at runtime.
-    add_executable(file_loader_test
-        tests/file_loader_test.cpp
-        tests/file_loader_shutdown_progress_test.cpp
+    # Shared scaffolding for the standalone FileLoader-pipeline suites
+    # (file_loader_test, source_promotion_host_test,
+    # headless_descriptor_provider_session_test): the loader TUs compiled ONCE
+    # and reused by all three binaries (FileLoader has no MainWindow dependency
+    # by design — see setFilePicker). The one-binary-per-suite pattern stays;
+    # per-suite compile definitions (mock-plugin paths) live on each
+    # executable. The header-side twin is tests/support/loader_test_support.h.
+    add_library(pj_app_loader_testlib OBJECT
+        src/SourcePromotionHost.cpp
+        src/SourcePromotionHost.h
+        src/HeadlessDescriptorProviderSession.cpp
+        src/HeadlessDescriptorProviderSession.h
+        src/ToolboxHostWiring.h
         src/FileLoader.cpp
         src/FileLoader.h
         src/BrowserFileStore.cpp
@@ -547,12 +583,33 @@ if(PJ_BUILD_TESTS)
         src/FanoutConfig.cpp
         src/FanoutConfig.h
         # FileLoader's same-source match uses LayoutXml::isSamePath for full-path
-        # dataset identity; the standalone test target must link its definition.
+        # dataset identity; the standalone suites must link its definition.
         src/LayoutXml.cpp
         src/LayoutXml.h
     )
+    set_target_properties(pj_app_loader_testlib PROPERTIES AUTOMOC ON)
+    target_include_directories(pj_app_loader_testlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(pj_app_loader_testlib PUBLIC
+        pj_runtime
+        pj_widgets
+        pj_scene3d_widgets
+        pj_dialog_engine_qt
+        Qt6::Widgets
+        GTest::gtest
+    )
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(pj_app_loader_testlib PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+
+    # End-to-end FileLoader pipeline test (same-file reload semantics + the
+    # worker-thread message-box marshal regression). Ingests through the SDK's
+    # mock_file_source_plugin (and the local msgbox_mock_source_plugin), staged
+    # into a temp extensions dir at runtime.
+    add_executable(file_loader_test
+        tests/file_loader_test.cpp
+        tests/file_loader_shutdown_progress_test.cpp
+    )
     set_target_properties(file_loader_test PROPERTIES AUTOMOC ON)
-    target_include_directories(file_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(file_loader_test PRIVATE
         PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
         PJ_MSGBOX_MOCK_SOURCE_PLUGIN_PATH="$<TARGET_FILE:msgbox_mock_source_plugin>"
@@ -567,18 +624,68 @@ if(PJ_BUILD_TESTS)
         dialog_probe_source_plugin
         progress_shutdown_source_plugin
     )
-    target_link_libraries(file_loader_test PRIVATE
-        pj_runtime
-        pj_widgets
-        pj_scene3d_widgets
-        pj_dialog_engine_qt
-        Qt6::Widgets
-        GTest::gtest
-    )
+    target_link_libraries(file_loader_test PRIVATE pj_app_loader_testlib)
     if(DEFINED PJ_WARNING_FLAGS)
         target_compile_options(file_loader_test PRIVATE ${PJ_WARNING_FLAGS})
     endif()
     add_test(NAME FileLoaderTest COMMAND file_loader_test)
+
+    # Host side of the SDK's "pj.source_promotion.v1" service: drives the real
+    # FileLoader replace pipeline through the C ABI. Same standalone shape and
+    # scaffolding as file_loader_test above.
+    add_executable(source_promotion_host_test
+        tests/source_promotion_host_test.cpp
+    )
+    set_target_properties(source_promotion_host_test PROPERTIES AUTOMOC ON)
+    target_compile_definitions(source_promotion_host_test PRIVATE
+        PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
+    )
+    # $<TARGET_FILE:...> in a compile definition does not create a build-order
+    # dependency; the plugin must exist when the test runs.
+    add_dependencies(source_promotion_host_test mock_file_source_plugin)
+    target_link_libraries(source_promotion_host_test PRIVATE pj_app_loader_testlib)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(source_promotion_host_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME SourcePromotionHostTest COMMAND source_promotion_host_test)
+
+    # Headless per-batch owner of ONE descriptor-import provider toolbox
+    # instance (T5b): manifest-id resolution, bind, extension view, promotion
+    # service, queued-only callback marshal, and the quiescence teardown pin.
+    # Driven against a fake provider toolbox registered statically (no DSO);
+    # same standalone shape as source_promotion_host_test above.
+    add_executable(headless_descriptor_provider_session_test
+        tests/headless_descriptor_provider_session_test.cpp
+    )
+    set_target_properties(headless_descriptor_provider_session_test PROPERTIES AUTOMOC ON)
+    target_link_libraries(headless_descriptor_provider_session_test PRIVATE pj_app_loader_testlib)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(headless_descriptor_provider_session_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME HeadlessDescriptorProviderSessionTest COMMAND headless_descriptor_provider_session_test)
+
+    # The §6.2 rewrite-then-classify restore coordinator (T6): classify
+    # matrix, trust gate, guard-3 ceiling, provider-absent fallback,
+    # sequential job chaining, cancel/rollback. Driven against a
+    # descriptor-scripted fake provider toolbox (registerStaticToolbox) plus
+    # the real FileLoader + mock_file_source_plugin for stock cache-hit loads.
+    add_executable(layout_import_batch_test
+        tests/layout_import_batch_test.cpp
+        src/LayoutImportBatch.cpp
+        src/LayoutImportBatch.h
+    )
+    set_target_properties(layout_import_batch_test PROPERTIES AUTOMOC ON)
+    target_compile_definitions(layout_import_batch_test PRIVATE
+        PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
+    )
+    # $<TARGET_FILE:...> in a compile definition does not create a build-order
+    # dependency; the plugin must exist when the test runs.
+    add_dependencies(layout_import_batch_test mock_file_source_plugin)
+    target_link_libraries(layout_import_batch_test PRIVATE pj_app_loader_testlib)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(layout_import_batch_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME LayoutImportBatchTest COMMAND layout_import_batch_test)
 
     # Binds the Source Timeline widget to the runtime; the regression test pins that
     # the bars track data growth (samplesIngested), not just new catalog topics.

@@ -510,6 +510,28 @@ TEST_F(ToolboxRuntimeHostTest, RequestStopActiveIngestsSignalsCooperativeStop) {
   host_.reset();
 }
 
+// The source-promotion service's ownership authority: hasIngestForDataset
+// answers "did THIS host's plugin create a parser-ingest context for the
+// dataset" — and must keep answering true after terminal delivery AND after
+// release, because promotion happens once the download has finished (the
+// progress bookkeeping is retained until host teardown by design).
+TEST_F(ToolboxRuntimeHostTest, HasIngestForDatasetCoversLiveAndCompletedIngests) {
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(startHermeticIngest(PJ::ToolboxRuntimeHost::Callbacks{}, ingest));
+  const auto ds_id = static_cast<PJ::DatasetId>(ingest.source_id);
+  EXPECT_TRUE(host_->hasIngestForDataset(ds_id)) << "live ingest context";
+  EXPECT_FALSE(host_->hasIngestForDataset(ds_id + 1)) << "dataset without an ingest";
+
+  ingest.view->progressFinish();
+  QCoreApplication::processEvents();  // deliver the queued terminal
+  EXPECT_TRUE(host_->hasIngestForDataset(ds_id)) << "after terminal delivery";
+
+  ASSERT_TRUE(ingest.runtime->releaseParserIngest(ingest.source_id).has_value());
+  QCoreApplication::processEvents();
+  EXPECT_TRUE(host_->hasIngestForDataset(ds_id)) << "after release — promotion runs post-download";
+  host_.reset();  // context references test-body locals (catalog)
+}
+
 // progressFinish without a started sequence is the SDK finite-import pattern's
 // safe no-op — it must not emit an unpaired on_ingest_finished (which would
 // disturb the shell's started/finished bookkeeping for other imports). And the

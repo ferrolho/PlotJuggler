@@ -107,6 +107,13 @@ class ToolboxRuntimeHost {
   // into the builder used to bind the toolbox plugin.
   void registerServices(ServiceRegistryBuilder& registry);
 
+  // True when this host has (ever) created a parser-ingest context for
+  // `dataset_id` — deliberately including finished and released ingests: the
+  // source-promotion service asks AFTER a download completed, and the
+  // per-dataset progress bookkeeping is retained until host teardown (see
+  // ingest_progress_). Thread-safe.
+  [[nodiscard]] bool hasIngestForDataset(DatasetId dataset_id) const;
+
   // Flag-only cooperative stop for every live parser-ingest context — the
   // shell's "stop this import" affordance. Thread-safe. The plugin observes it
   // through is_stop_requested / progress_update returning false and ends the
@@ -140,8 +147,9 @@ class ToolboxRuntimeHost {
   // report_message/notify_data_changed, the plugin must be unbound and its
   // worker quiesced before this host is destroyed ("valid until ... host
   // teardown" in toolbox_protocol.h). Concurrent create+release of the SAME id
-  // is protocol-violating plugin behavior and out of contract.
-  std::mutex parser_ingest_mu_;
+  // is protocol-violating plugin behavior and out of contract. Mutable so the
+  // const hasIngestForDataset query can lock it.
+  mutable std::mutex parser_ingest_mu_;
   // One delegated-ingest session per toolbox-created dataset, keyed by the
   // data-source handle id (== DatasetId). Reuses the exact machinery file
   // loads use — catalog lookup, classifySchema, ObjectStore registration,
