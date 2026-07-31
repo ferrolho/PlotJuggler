@@ -195,8 +195,11 @@ ExtensionCatalogService::ExtensionCatalogService(
 
 #ifndef PJ_TARGET_WASM
   if (!QDir().mkpath(extensions_dir_)) {
-    qCWarning(lcCatalog) << "Failed to create extensions directory" << extensions_dir_
-                         << "- plugin loading will be a no-op until it exists.";
+    const QString message =
+        u"Failed to create extensions directory \"%1\" — plugin loading will be a no-op until it "
+        u"exists."_s.arg(extensions_dir_);
+    qCWarning(lcCatalog).noquote() << message;
+    reportDiagnostic(DiagnosticLevel::kError, message);
   }
   if (!QDir().mkpath(pending_dir)) {
     const QString message = u"Failed to create extension staging directory \"%1\""_s.arg(pending_dir);

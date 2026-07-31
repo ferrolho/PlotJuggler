@@ -39,14 +39,20 @@ void addScalarSamples(
   ASSERT_FALSE(changed_topics.empty());
 }
 
-TEST(AppSessionTest, CustomExtensionDirectoryReachesMarketplaceManager) {
+TEST(AppSessionTest, PluginDirOverrideDoesNotShiftMarketplaceManager) {
   QTemporaryDir dir;
   ASSERT_TRUE(dir.isValid());
 
   PJ::AppSession session(dir.path());
 
+  // The catalog reports the --plugin-dir override as its extensions dir — that
+  // is the top LOAD-priority tier in buildScanHierarchy.
   EXPECT_EQ(session.extensionCatalog().extensionsDir(), dir.path());
-  EXPECT_EQ(session.extensionCatalog().extensionManager().extensionsDir(), dir.path());
+  // The ExtensionManager, in contrast, stays anchored on the MANAGED marketplace
+  // dir regardless of any --plugin-dir override: the marketplace UI must keep
+  // tracking what it installs and manages. The two paths differ whenever
+  // --plugin-dir is provided.
+  EXPECT_NE(session.extensionCatalog().extensionManager().extensionsDir(), dir.path());
 }
 
 TEST(AppSessionTest, BuiltinPluginFoldersOrderedWithPluginDirOverride) {
