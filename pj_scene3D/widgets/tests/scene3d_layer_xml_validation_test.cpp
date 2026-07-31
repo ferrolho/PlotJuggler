@@ -265,6 +265,34 @@ TEST(Scene3DLayerXmlValidation, PosesInFrameRejectsMalformedPayloadTransactional
   expectRejectedWithoutMutation(layer, valid, observed, "invalid color", [](QDomDocument&, QDomElement& element) {
     element.setAttribute(u"override_color_value"_s, u"not-a-color"_s);
   });
+  expectRejectedWithoutMutation(
+      layer, valid, observed, "two owned trails", [](QDomDocument& payload_doc, QDomElement& element) {
+        element.appendChild(payload_doc.createElement(u"trail"_s));
+        element.appendChild(payload_doc.createElement(u"trail"_s));
+      });
+
+  // The one nested payload this layer owns. The browser build has no trail
+  // renderer and instead accepts-and-ignores this element so a desktop-saved
+  // layout still restores its poses (WasmPosesInFrameLayer::parseSettings), so
+  // the tag name and the single-child rule are a CROSS-PLATFORM contract, not a
+  // desktop detail. tests/wasm/scene3d_data.spec.js drives the browser half.
+  QDomDocument trail_doc;
+  QDomElement with_trail = trail_doc.importNode(valid, true).toElement();
+  trail_doc.appendChild(with_trail);
+  QDomElement trail = trail_doc.createElement(u"trail"_s);
+  trail.setAttribute(u"source_kind"_s, u"pose_topic"_s);
+  trail.setAttribute(u"past_color"_s, u"#123456"_s);
+  trail.setAttribute(u"thickness"_s, u"3"_s);
+  with_trail.appendChild(trail);
+  ASSERT_TRUE(layer.xmlLoadState(with_trail));
+  EXPECT_TRUE(layer.trailEnabled());
+  ASSERT_NE(layer.trail(), nullptr);
+  EXPECT_EQ(layer.trail()->pastColor().name(QColor::HexRgb), u"#123456"_s);
+  // Round-tripping must reproduce exactly one <trail>, or the browser's
+  // single-nested-child rule would start rejecting desktop layouts.
+  QDomDocument saved_doc;
+  const QDomElement saved = layer.xmlSaveState(saved_doc);
+  EXPECT_EQ(saved.elementsByTagName(u"trail"_s).count(), 1);
 }
 
 TEST(Scene3DLayerXmlValidation, VoxelGridRejectsUnknownStructureTransactionally) {

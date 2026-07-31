@@ -51,6 +51,29 @@ function reportCount(consoleMessages) {
   return consoleMessages.filter(message => message.includes('PJ_WASM_SCENE3D_FOUNDATION_SUMMARY')).length;
 }
 
+// One <trail> element exactly as a desktop build writes it (TrailLayer::
+// xmlSaveState) for a trail owned by a pose layer. The source-bound attributes
+// are deliberate: the browser has no trail renderer and must ignore the whole
+// element, not merely tolerate its tag name.
+const DESKTOP_POSE_TRAIL = '<trail source_kind="pose_topic" source_topic_name="/poses"'
+  + ' source_dataset_id="1" source_dataset_source="ros2_scene3d_order_real.mcap"'
+  + ' past_color="#1f77b4" future_color="#9ecae1" thickness="4"'
+  + ' past_visible="1" future_visible="1"/>';
+
+// Turn a browser-saved layout into the desktop-saved shape by nesting that
+// trail inside the pose layer's payload. QDom writes childless payloads
+// self-closed, but accept the paired spelling too so a serializer detail cannot
+// silently turn this into a no-op replacement.
+function withDesktopPoseTrail(xml) {
+  const selfClosing = /<poses_in_frame\b([^>]*?)\s*\/>/;
+  const paired = /<poses_in_frame\b([^>]*)><\/poses_in_frame>/;
+  const pattern = selfClosing.test(xml) ? selfClosing : paired;
+  expect(xml, 'browser layout has no <poses_in_frame> payload to nest a trail in').toMatch(pattern);
+  const desktopXml = xml.replace(pattern, `<poses_in_frame$1>${DESKTOP_POSE_TRAIL}</poses_in_frame>`);
+  expect(desktopXml).not.toBe(xml);
+  return desktopXml;
+}
+
 async function waitForData(page, consoleMessages, predicate, timeout = 30000) {
   let state;
   await expect.poll(async () => {
@@ -143,6 +166,50 @@ test('occupancy updates and voxel textures stay bounded and seekable', async ({ 
   expect(voxels.docks[0].data.voxels.max3d).toBeGreaterThanOrEqual(256);
   expect(voxels.docks[0].data.warnings).toEqual([]);
   expect(voxels.docks[0].readback.rgbSum).toBeGreaterThan(0);
+  expect(errors).toEqual([]);
+});
+
+test('a desktop-saved pose trail is ignored without costing the browser its poses', async ({ page }) => {
+  test.setTimeout(150000);
+  const consoleMessages = [];
+  const errors = [];
+  await page.addInitScript(() => { delete window.showOpenFilePicker; });
+  page.on('console', message => consoleMessages.push(message.text()));
+  page.on('pageerror', error => errors.push(String(error)));
+
+  const screen = await boot(page, consoleMessages);
+  await loadFixture(page, screen, consoleMessages, 'ros2_scene3d_order_real.mcap');
+  // Sorted rows: point, poses, TF, occupancy, second point.
+  await dropRows(page, screen, [212, 232, 252, 283, 302]);
+  const live = await waitForData(page, consoleMessages, data =>
+    data.points.live === 2 && data.poses.live === 1 && data.poses.arms === 768);
+
+  const downloaded = await downloadLayoutFromFileMenu(page, screen, consoleMessages);
+  const browserXml = downloaded.bytes.toString('utf8');
+  // The browser never writes a trail, so this payload can only reach it from a
+  // desktop session — which is exactly why nothing else covers the path.
+  expect(browserXml).not.toMatch(/<trail\b/);
+  const desktopXml = withDesktopPoseTrail(browserXml);
+  expect([...desktopXml.matchAll(/<trail\b/g)]).toHaveLength(1);
+
+  const layoutChooser = await openLayoutChooser(page);
+  await layoutChooser.setFiles({
+    name: 'scene3d-desktop-trail.pj4.xml',
+    mimeType: 'application/xml',
+    buffer: Buffer.from(desktopXml, 'utf8'),
+  });
+  await expect.poll(
+    () => consoleMessages.find(message => message.includes('PJ_WASM_LAYOUT_LOAD_OK name=scene3d-desktop-trail')) || '',
+    { timeout: 15000 },
+  ).toContain('scene3d-desktop-trail.pj4.xml');
+
+  // The identity check belongs INSIDE the predicate: a rejected pose payload
+  // would leave the pre-existing dock standing, and every count below would
+  // then pass against the dock the drops built rather than the replayed one.
+  const restored = await waitForData(page, consoleMessages, (data, state) =>
+    state.docks[0].identity !== live.docks[0].identity
+    && data.poses.live === 1 && data.poses.arms === 768);
+  expect(restored.docks[0].data.warnings).toEqual([]);
   expect(errors).toEqual([]);
 });
 

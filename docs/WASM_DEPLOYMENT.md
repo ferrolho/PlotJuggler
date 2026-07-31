@@ -130,7 +130,7 @@ PJ_WASM_PACKAGE_DIR="$PWD/../../build-wasm/deploy" npm run test:deployment
 ## Release size report and budgets
 
 The complete Release product is gated in all published representations. After
-creating the deterministic archive, reproduce the CI check with:
+creating the deterministic archive, reproduce the full release check with:
 
 ```bash
 source ./versions.env
@@ -144,21 +144,29 @@ npm --prefix tests/wasm run test:size
 The checker first verifies every packaged representation against the manifest,
 then enforces the identity, Brotli, gzip, and aggregate archive limits from
 `tests/wasm/size_budget.json`. A value exactly at its limit passes; one byte
-over fails. Its deterministic JSON also records total served assets, hashes,
+over fails.
+
+`--archive` is optional. Omit it — as `wasm-ci.yml` does, since only the release
+pipeline builds the deterministic archive — to gate just the delivered wasm
+representations; the archive limit is then reported with `"status": "skipped"`.
+A budget file must still *define* all four limits either way: it is the release
+contract, not a per-invocation switch. Its deterministic JSON also records total served assets, hashes,
 headroom/rationale, one-feature-off delivered-size measurements, and the
 largest retained Qt/application/third-party inputs. The measurement method,
 Release-versus-debug finding, and reproducible contributor audit ship with the
 wasm release-automation change (`docs/research/wasm_binary_size_audit.md`).
 
-`.github/workflows/wasm-ci.yml` is a manual (`workflow_dispatch`) check for the
-wasm platform — run it on demand from the Actions tab (or `gh workflow run
-"WASM CI" --ref <branch>`) when working on a wasm-relevant change or before
-merging one, since the wasm build is expensive and most PRs don't touch it. It
-builds the production configuration, packages it twice and diffs the outputs,
-runs this browser gate against the package, then builds the probe configuration
-and runs the functional browser suite. The complete release workflow
-(deterministic archive, size budget, tag publishing) ships with the wasm
-release-automation change.
+`.github/workflows/wasm-ci.yml` checks the wasm platform. It runs automatically
+on pull requests that touch paths able to affect the browser build, and can be
+started on demand from the Actions tab (or `gh workflow run "WASM CI" --ref
+<branch>`) — useful before cutting a release, or on a branch whose paths miss
+the filter. It is **not a required check**, so a red run does not block a merge:
+read it before merging wasm-relevant work. It builds the production
+configuration, packages it twice and diffs the outputs, runs this browser gate
+against the package, then builds the probe configuration, runs the functional
+browser suite, and gates the delivered wasm representations against the size
+budget. The complete release workflow (deterministic archive, archive-size
+limit, tag publishing) ships with the wasm release-automation change.
 
 All of this tooling is outside the native build graph. `PJ_QT_VERSION` and the
 existing desktop configure/install behavior are unchanged; the additional

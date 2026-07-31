@@ -19,13 +19,19 @@ const REQUIRED_LIMITS = [
   'wasm.gzip',
   'archive',
 ];
+// A budget must DEFINE every required limit — it is the release contract, not a
+// per-invocation switch. Only the archive limit may go unmeasured, because the
+// deterministic release archive is a release-pipeline artifact that the ordinary
+// browser CI never builds. Its evaluation is then reported as `skipped`, never
+// silently dropped, so a report can never be mistaken for a full release gate.
+const OPTIONAL_MEASUREMENTS = new Set(['archive']);
 
 function usage() {
   return `Usage: node scripts/check_wasm_size.mjs [options]
 
 Options:
   --package <dir>   Packaged deployment root (default: build-wasm/deploy-a)
-  --archive <file>  Deterministic release archive (required)
+  --archive <file>  Deterministic release archive; omit to skip the archive limit
   --budget <file>   Size budget definition (default: tests/wasm/size_budget.json)
   --output <file>   Structured report path (default: build-wasm/wasm-size-report.json)
   --help            Show this help
@@ -56,12 +62,10 @@ function parseArguments(argv) {
     options[argument.slice(2)] = value;
     index += 1;
   }
-  if (!options.archive) {
-    throw new Error(`--archive is required\n\n${usage()}`);
-  }
-
   for (const key of Object.keys(options)) {
-    options[key] = path.resolve(options[key]);
+    if (options[key]) {
+      options[key] = path.resolve(options[key]);
+    }
   }
   return options;
 }
@@ -113,7 +117,7 @@ function measurementFor(limitName, measurements) {
     case 'wasm.gzip':
       return measurements.wasm.gzip.bytes;
     case 'archive':
-      return measurements.archive.bytes;
+      return measurements.archive?.bytes;
     default:
       throw new Error(`Unknown size limit: ${limitName}`);
   }
@@ -141,6 +145,14 @@ export function evaluateBudgets(measurements, budget) {
       throw new Error(`Size budget ${name} must define positive maxBytes and a rationale`);
     }
     const actualBytes = measurementFor(name, measurements);
+    if (actualBytes === undefined && OPTIONAL_MEASUREMENTS.has(name)) {
+      evaluations[name] = {
+        maxBytes: definition.maxBytes,
+        status: 'skipped',
+        rationale: definition.rationale,
+      };
+      continue;
+    }
     if (!Number.isSafeInteger(actualBytes) || actualBytes <= 0) {
       throw new Error(`Size measurement ${name} must be a positive integer`);
     }
@@ -212,11 +224,6 @@ export async function createSizeReport({ packageRoot, archivePath, budget }) {
     servedAssets[encoding] = { bytes };
   }
 
-  const archiveContents = await readFile(archivePath);
-  const archiveStats = await stat(archivePath);
-  if (!archiveStats.isFile()) {
-    throw new Error(`Release archive is not a regular file: ${archivePath}`);
-  }
   const measurements = {
     wasm: {
       identity: { bytes: wasm.identity.bytes, sha256: wasm.identity.sha256 },
@@ -224,11 +231,18 @@ export async function createSizeReport({ packageRoot, archivePath, budget }) {
       gzip: { bytes: wasm.gzip.bytes, sha256: wasm.gzip.sha256 },
     },
     servedAssets,
-    archive: {
+  };
+  if (archivePath) {
+    const archiveStats = await stat(archivePath);
+    if (!archiveStats.isFile()) {
+      throw new Error(`Release archive is not a regular file: ${archivePath}`);
+    }
+    const archiveContents = await readFile(archivePath);
+    measurements.archive = {
       bytes: archiveContents.length,
       sha256: sha256(archiveContents),
-    },
-  };
+    };
+  }
   const { evaluations, failures } = evaluateBudgets(measurements, budget);
 
   return {
@@ -258,8 +272,12 @@ async function main() {
   if (failures.length > 0) {
     throw new Error(`WebAssembly size budget exceeded:\n${failures.join('\n')}`);
   }
+  const skipped = Object.entries(report.budgets)
+    .filter(([, evaluation]) => evaluation.status === 'skipped')
+    .map(([name]) => name);
+  const skippedNote = skipped.length > 0 ? ` (not measured: ${skipped.join(', ')})` : '';
   process.stdout.write(
-    `WebAssembly size budget passed for ${report.profile}; report: ${options.output}\n`,
+    `WebAssembly size budget passed for ${report.profile}${skippedNote}; report: ${options.output}\n`,
   );
 }
 

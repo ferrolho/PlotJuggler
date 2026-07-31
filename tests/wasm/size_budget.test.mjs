@@ -131,6 +131,64 @@ test('command exits successfully at the limit and nonzero on the first byte over
   assert.equal(JSON.parse(await readFile(reportPath, 'utf8')).status, 'fail');
 });
 
+test('skips only the archive limit when no release archive is measured', async t => {
+  const { packageRoot } = await fixture(t);
+  const report = await createSizeReport({ packageRoot, archivePath: '', budget: budget() });
+
+  assert.equal(report.report.status, 'pass');
+  assert.deepEqual(report.failures, []);
+  assert.equal(report.report.budgets.archive.status, 'skipped');
+  assert.equal(report.report.budgets.archive.maxBytes, 7);
+  assert.equal(report.report.measurements.archive, undefined);
+  // The delivered representations stay fully gated — skipping the archive must
+  // not weaken the limits the browser build can actually measure.
+  for (const name of ['wasm.identity', 'wasm.br', 'wasm.gzip']) {
+    assert.equal(report.report.budgets[name].status, 'pass');
+  }
+
+  const over = await createSizeReport({
+    packageRoot,
+    archivePath: '',
+    budget: budget({ 'wasm.br': 2 }),
+  });
+  assert.equal(over.report.status, 'fail');
+  assert.deepEqual(over.failures, ['wasm.br: 3 > 2 bytes']);
+});
+
+test('command runs without --archive and still enforces the wasm limits', async t => {
+  const { packageRoot } = await fixture(t);
+  const root = path.dirname(packageRoot);
+  const budgetPath = path.join(root, 'budget.json');
+  const reportPath = path.join(root, 'report.json');
+  const argumentsFor = () => [
+    SIZE_CHECKER,
+    '--package', packageRoot,
+    '--budget', budgetPath,
+    '--output', reportPath,
+  ];
+
+  await writeFile(budgetPath, JSON.stringify(budget()));
+  const withoutArchive = spawnSync(process.execPath, argumentsFor(), { encoding: 'utf8' });
+  assert.equal(withoutArchive.status, 0, withoutArchive.stderr);
+  assert.match(withoutArchive.stdout, /not measured: archive/);
+  assert.equal(JSON.parse(await readFile(reportPath, 'utf8')).budgets.archive.status, 'skipped');
+
+  await writeFile(budgetPath, JSON.stringify(budget({ 'wasm.gzip': 3 })));
+  const overLimit = spawnSync(process.execPath, argumentsFor(), { encoding: 'utf8' });
+  assert.equal(overLimit.status, 1);
+  assert.match(overLimit.stderr, /wasm\.gzip: 4 > 3 bytes/);
+});
+
+test('a budget that omits the archive limit is still rejected', async t => {
+  const { packageRoot } = await fixture(t);
+  const incomplete = budget();
+  delete incomplete.limits.archive;
+  await assert.rejects(
+    createSizeReport({ packageRoot, archivePath: '', budget: incomplete }),
+    /Size budget archive must define positive maxBytes and a rationale/,
+  );
+});
+
 test('rejects packaged bytes that do not match the deployment manifest', async t => {
   const paths = await fixture(t);
   await writeFile(path.join(paths.packageRoot, 'assets/app.wasm.br'), 'tampered');

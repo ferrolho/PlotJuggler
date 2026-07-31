@@ -12,8 +12,10 @@
 #      capability probe and functional browser suite run against the same
 #      source graph used by the packaged application.
 #
-# Cross-browser product coverage and size/performance release budgets remain
-# part of the release tranche.
+# The acceptance package is additionally gated against the delivered-size
+# limits in tests/wasm/size_budget.json. Cross-browser product coverage, the
+# deterministic release archive (and therefore the archive limit), and
+# performance budgets remain part of the release tranche.
 name: WASM CI
 
 on:
@@ -26,6 +28,10 @@ on:
       - '**/wasm/**'
       - 'tests/wasm/**'
       - 'cmake/PjWasm*'
+      # Packaging, serving and size-gate scripts: this job is their only
+      # consumer, and '**/wasm/**' does not match a file whose name — not
+      # directory — carries the wasm token.
+      - 'scripts/*wasm*'
       - '.github/workflows/wasm-ci.yml'
       - 'pj_app/**'
       - 'pj_widgets/**'
@@ -238,3 +244,25 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:6931/ || { echo "wasm server failed to start"; exit 1; }
           PJ_WASM_URL="http://127.0.0.1:6931/" PJ_WASM_BUILD_DIR=build-wasm-probe \
             npm --prefix tests/wasm run test
+
+      - name: Delivered-size budget (acceptance package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gate the identity/Brotli/gzip representations the browser actually
+          # transfers. Two deliberate imprecisions, both in the safe direction:
+          # this module carries the ingress probe (so a pass understates the
+          # product's headroom), and no deterministic release archive exists
+          # here (so the archive limit reports as skipped, not as passed).
+          node scripts/check_wasm_size.mjs \
+            --package build-wasm-probe/deploy \
+            --output build-wasm-probe/wasm-size-report.json
+          cat build-wasm-probe/wasm-size-report.json
+
+      - name: Upload size report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-size-report
+          path: build-wasm-probe/wasm-size-report.json
+          if-no-files-found: ignore
