@@ -53,6 +53,18 @@ fmt/*:header_only=True
 cpython/*:with_tkinter=False
 cpython/*:with_curses=False
 cpython/*:with_gdbm=False
+# Shared, not static, and not merely a preference: the stdlib's C extensions
+# (lib-dynload/*.so — math, zlib, _socket, …) carry no copy of the interpreter and
+# resolve Py* at dlopen time against the process. A static libpython leaves those
+# symbols out of pj_app's .dynsym, so EVERY such import dies with
+# "undefined symbol: PyFloat_Type". The static workaround (-rdynamic and friends)
+# cannot win: pj_app links --exclude-libs,ALL, which marks static-archive symbols
+# STV_HIDDEN, and ELF visibility only ever narrows. A shared libpython sidesteps
+# that flag by construction — --exclude-libs applies to static archive members
+# only — so the anti-interposition guard stays fully in force.
+# Dev caveat: a user LD_LIBRARY_PATH naming another libpython3.12.so.1.0 shadows
+# the Conan one. The AppImage is immune (AppRun.sh puts $APPDIR/usr/lib first).
+cpython/*:shared=True
 nanoarrow/*:with_ipc=True
 libarchive/*:shared=False
 # pj_scene2D needs FFmpeg for file video playback and packet-stream decode.

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #ifndef PJ_TARGET_WASM
+#include <cstring>
 #include <filesystem>
 #include <map>
 #endif
@@ -35,10 +36,14 @@
 #include "MainWindow.h"
 #include "Splashscreen.h"
 #include "WidgetTuner.h"
+#include "pj_datastore/data_processor.hpp"
+#include "pj_datastore/processor_detail.hpp"
 #include "pj_plotting/PlotWidgetBase.h"
 #include "pj_plotting/RasterTextEngine.h"
 #ifndef PJ_TARGET_WASM
 #include "pj_runtime/PluginRuntimeCatalog.h"
+#include "pj_scripting/filter_catalogue.h"
+#include "pj_scripting/python_engine.h"
 #endif
 #ifdef PJ_WITH_SCENE3D
 #include "pj_scene3d_widgets/scene_view_widget.h"  // --screenshot grabs the 3D view
@@ -56,6 +61,46 @@ namespace {
 // backward-cpp recommends exactly one such instance per program.
 #ifndef PJ_TARGET_WASM
 backward::SignalHandling g_crash_handler;
+
+// Boots the embedded Python backend the way a Data Processor does, inside the
+// packaged binary. Nothing else in any release flow ever launches the AppImage, so a
+// Python backend that cannot reach its own stdlib ships undetected — which is exactly
+// how the "undefined symbol: PyFloat_Type" report happened.
+int selftestPython() {
+  constexpr const char* kSource = R"PY(# pj-script: python
+import math
+
+class T:
+    id = "selftest"
+    name = "Selftest"
+    output = "double"
+    @staticmethod
+    def create(params):
+        return T()
+    def calculate(self, time, value, *args):
+        return math.sqrt(value)
+)PY";
+
+  const PJ::scripting::FilterCatalogue catalogue(PJ::scripting::makePythonEngine());
+  auto processor = catalogue.makeProcessorFromSource(kSource, "selftest", "{}");
+  if (!processor.has_value()) {
+    std::fprintf(stderr, "[selftest-python] FAILED: %s\n", processor.error().c_str());
+    return EXIT_FAILURE;
+  }
+  const auto out = (*processor)->calculateNextPoint(PJ::proc::Sample::scalar(0, PJ::VarValue{144.0}));
+  if (!out.has_value() || PJ::proc::detail::toDouble(out->value()) != 12.0) {
+    std::fprintf(stderr, "[selftest-python] FAILED: sqrt(144) did not yield 12\n");
+    return EXIT_FAILURE;
+  }
+  // Packaging must not hand the bundle back the full stdlib: silently regaining
+  // `os` is as much a regression as losing `math`.
+  if (catalogue.makeProcessorFromSource("# pj-script: python\nimport os\n", "selftest", "{}").has_value()) {
+    std::fprintf(stderr, "[selftest-python] FAILED: 'import os' was accepted\n");
+    return EXIT_FAILURE;
+  }
+  std::fprintf(stdout, "[selftest-python] OK\n");
+  return EXIT_SUCCESS;
+}
 
 int validatePlugins(const QString& plugin_dir, const QStringList& expected_specs) {
   if (expected_specs.isEmpty()) {
@@ -147,6 +192,18 @@ int validatePlugins(const QString& plugin_dir, const QStringList& expected_specs
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#ifndef PJ_TARGET_WASM
+  // Handled before any Q(Core)Application exists: the selftest needs nothing
+  // from Qt, while a QApplication would demand a platform plugin — and the
+  // packaged AppImage ships only xcb, useless on the display-less CI
+  // containers this flag exists for.
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--selftest-python") == 0) {
+      return selftestPython();
+    }
+  }
+#endif
+
   // Pin to Fusion (under our Style proxy) before constructing
   // QApplication so widgets that read the style at construction time
   // don't end up with the platform's native style (KDE Breeze, GNOME
@@ -234,6 +291,9 @@ int main(int argc, char* argv[]) {
   const QCommandLineOption expect_plugin_option(
       u"expect-plugin"_s, u"Expected plugin as id=version; repeat once per whitelisted plugin."_s, u"id=version"_s);
   parser.addOption(expect_plugin_option);
+  // Registered only so --help lists it; handled at the top of main().
+  parser.addOption(
+      QCommandLineOption(u"selftest-python"_s, u"Compile and run a Python Data Processor headlessly, then exit."_s));
 #endif
   const QCommandLineOption layout_option(
       u"layout"_s, u"Load a layout file on startup, reloading its data source(s)."_s, u"path"_s);

@@ -1,23 +1,34 @@
-# pj_scripting — Luau filter engine for Data Processors
+# pj_scripting — scripting engines for Data Processors
 
 The scripting substrate for PJ4 **Data Processors**. Filters are **self-describing
-`.luau` classes**: each declares its `id/name/description/version/output_kind` and a
-typed `parameters` schema, plus a `create()`/`calculate()` (and optional
+classes**: each declares its `id/name/description/version/output_kind` and a typed
+`parameters` schema, plus a `create()`/`calculate()` (and optional
 `calculate_batch`) implementation. The host reads that schema to (a) populate a
 filter **catalogue** and (b) **generate** the parameter-editor form at runtime — so
-changing a filter is a data edit, not a panel-code recompile. The engine is hidden
-behind a thin **`ScriptEngine`** seam (`include/pj_scripting/script_engine.h`,
-constructed via free fn `makeLuauEngine(BudgetLimits = {})`) so a future
-out-of-process Python backend is a drop-in. The binding is **hand-written Luau**
-(`src/luau_engine.cpp`) — Luau's API is C++ linkage, not `extern "C"`, so sol2 does
-not apply. The data-processor base (`PJ::proc::DataProcessor`, owned by `pj_datastore`)
-stays Qt-free **and Luau-free**: only `pj_scripting` links Luau.
-Depends on `pj_base` + `pj_datastore` (public) + Luau (private). Licensed MPL-2.0.
+changing a filter is a data edit, not a panel-code recompile.
+
+Two backends sit behind the **`ScriptEngine`** seam
+(`include/pj_scripting/script_engine.h`), selected by free fn:
+
+- **Luau** — `makeLuauEngine(BudgetLimits = {})`, `src/luau_engine.cpp`. The bundled
+  filter set and the default language. The binding is **hand-written**: Luau's API
+  is C++ linkage, not `extern "C"`, so sol2 does not apply.
+- **Python** — `makePythonEngine()`, `src/python_engine.cpp`. Embedded CPython via
+  pybind11, IN-PROCESS (not out-of-process). Reached from the Transform Editor's
+  `Lua | Python` switch; `DataProcessorService` routes to it by sniffing the
+  `# pj-script: python` header on the source. Imports are restricted — see below.
+
+The data-processor base (`PJ::proc::DataProcessor`, owned by `pj_datastore`) stays
+Qt-free, Luau-free **and Python-free**: only `pj_scripting` links either runtime.
+Depends on `pj_base` + `pj_datastore` (public) + Luau + CPython/pybind11 (private).
+Licensed MPL-2.0.
 
 ## Key headers
 
 - `script_engine.h` — the `ScriptEngine` seam + `FilterInstance` (one VM per
   instance) + `makeLuauEngine(BudgetLimits)`.
+- `python_engine.h` — `makePythonEngine()` and the Python filter-module contract
+  (a top-level class `T` with `id` and a static `create(params)`).
 - `filter_class.h` — the `FilterClass` schema + `ParamSpec`
   (`id/name/description/version/output_kind/parameters/source/origin`; `ParamType` ∈
   {number, integer, boolean, enum, string, text}). Drives the generated
@@ -46,6 +57,28 @@ Depends on `pj_base` + `pj_datastore` (public) + Luau (private). Licensed MPL-2.
   Each VM loads exactly ONE module, so `safeenv` stays on and stdlib imports keep
   the fast path. A "tripped" flag is checked by the host **even if the script
   `pcall`-swallows the error**, so a runaway can never silently survive.
+- **Python imports are an allowlist, and it is a guardrail — NOT a sandbox.**
+  `python_engine.cpp` hands each filter module a namespace whose `__builtins__` has
+  `__import__` swapped for a gate over `kAllowedImports` (`math`, `cmath`,
+  `statistics`); anything else is rejected as *"module 'X' is not available in Data
+  Processors"*, so the limit reads as policy rather than as breakage. Only the root
+  package is matched, and the gate governs **only what the filter source imports** —
+  an allowed module's own body runs under its own globals with unrestricted
+  builtins, which is why `statistics` still reaches `_statistics`, `random` and the
+  rest. What this does NOT do: CPython cannot be sandboxed from within (an
+  object-graph walk reaches past any namespace), `open` lives in builtins rather
+  than behind an import, and there is no memory cap or watchdog on the Python side.
+  Filter sources are trusted input. The Luau backend above is the hardened one.
+- **CPython is linked SHARED on every platform** (`conanfile.txt`
+  `cpython/*:shared=True`), and this is load-bearing, not a preference. The stdlib's
+  C extensions (`lib-dynload/*.so` — `math`, `zlib`, …) carry no copy of the
+  interpreter and resolve `Py*` at dlopen time against the process; a static
+  libpython leaves those symbols out of `pj_app`'s `.dynsym` and every such import
+  dies with `undefined symbol: PyFloat_Type`. `-rdynamic` cannot rescue it —
+  `pj_app` links `--exclude-libs,ALL`, which marks static-archive symbols
+  `STV_HIDDEN`, and ELF visibility only ever narrows. `pj_app`'s
+  `ExportedSymbolsGuard` test pins that flag in place; `--selftest-python` (run
+  against the packaged AppImage in CI) pins the runtime end.
 - **Time contract (precision-critical).** The script sees `t` = **seconds since
   session start**. The int64-ns session-start is subtracted on the absolute spine
   **before** the double cast (avoiding epoch-double quantization, ~256 ns at epoch

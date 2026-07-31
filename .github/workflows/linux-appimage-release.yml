@@ -231,6 +231,17 @@ jobs:
           echo "APPIMAGE=$appimage_path" >> "$GITHUB_ENV"
           echo "APPIMAGE_NAME=$(basename "$appimage_path")" >> "$GITHUB_ENV"
 
+      - name: Self-test the packaged Python backend
+        # The only step in any release flow that RUNS the AppImage. Everything else
+        # inspects it statically, which is why a Python backend that could not import
+        # its own stdlib shipped unnoticed. Covers the whole packaging contract at
+        # once: the bundled libpython resolves, PYTHONHOME points at the bundled
+        # stdlib, lib-dynload made it into the AppDir, and the import allowlist holds.
+        # No display or QT_QPA_PLATFORM needed: --selftest-python is handled
+        # before QApplication exists (see pj_app/src/main.cpp).
+        shell: bash
+        run: '"${APPIMAGE}" --selftest-python'
+
       - name: Trim Conan cache before saving
         if: always() && github.ref_type != 'tag' && steps.conan-cache.outputs.cache-hit != 'true'
         shell: bash

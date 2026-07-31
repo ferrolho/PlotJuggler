@@ -288,6 +288,27 @@ if(PJ_BUILD_TESTS)
     endif()
     add_test(NAME FileSelectionServiceTest COMMAND file_selection_service_test)
 
+    # Proves --exclude-libs,ALL (above) still keeps third-party static-archive
+    # symbols out of pj_app's dynamic symbol table. Needs a real ELF and binutils,
+    # so it is a script test rather than a gtest binary.
+    #
+    # `nm` is resolved HERE rather than inside the script so the "no binutils"
+    # case is decided once, visibly, at configure time: a bare toolchain gets a
+    # STATUS line saying the guard is off instead of either a mystery build
+    # failure or a test that silently passes without checking anything. Every CI
+    # image has binutils, so the guard always runs where it matters.
+    if(NOT WIN32 AND NOT APPLE AND NOT EMSCRIPTEN)
+        find_program(PJ_NM_EXECUTABLE nm)
+        if(PJ_NM_EXECUTABLE)
+            add_test(NAME ExportedSymbolsGuard COMMAND ${CMAKE_COMMAND}
+                -DTARGET=$<TARGET_FILE:pj_app>
+                -DNM=${PJ_NM_EXECUTABLE}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_exported_symbols.cmake)
+        else()
+            message(STATUS "pj_app: 'nm' not found — ExportedSymbolsGuard disabled (install binutils to enable it)")
+        endif()
+    endif()
+
     # A GUI test binary that drives the real MainWindow through a friend peer: it
     # links the whole shell (pj_app_shell) and compiles resources.qrc (AUTORCC) so
     # the window's icons resolve. One MainWindow per binary — its dtor leaks

@@ -280,6 +280,12 @@ esac
 #     "Failed to init CPython". AppRun overrides PYTHONHOME to <AppDir>/usr, so
 #     ship the stdlib at usr/lib/pythonX.Y. pj_scripting/CMakeLists.txt records
 #     the prefix in build/pj_python_home.txt.
+#
+#     Only the stdlib needs this explicit copy. libpython3.12.so.1.0 itself
+#     arrives on its own: the app declares it DT_NEEDED, so linuxdeploy pulls it
+#     in with the rest of the shared-library closure. Do not "simplify" the copy
+#     below by assuming linuxdeploy covers the stdlib too — those are plain data
+#     files that no ELF references, and dropping them breaks every Python filter.
 # ---------------------------------------------------------------------------
 PY_HOME_FILE="${BUILD}/pj_python_home.txt"
 if [[ -f "${PY_HOME_FILE}" ]]; then

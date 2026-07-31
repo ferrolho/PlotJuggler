@@ -11,9 +11,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "pj_base/sdk/platform.hpp"
@@ -48,6 +51,55 @@ void ensureInterpreter() {
     return true;
   }();
   (void)inited;
+}
+
+// The imports a filter script may reach. Data Processors compute over timeseries —
+// trigonometry, constants, basic statistics — so the filesystem, the network and
+// subprocesses are out of scope, and a script that reaches for them is told so
+// instead of receiving whatever error the module itself would have raised.
+//
+// NOT a security boundary. CPython cannot be sandboxed from within: an object-graph
+// walk reaches past any namespace we hand the script. This is a guardrail against
+// scope creep, and filter sources remain trusted input. (Contrast pj_scripting's Luau
+// backend, whose sandbox IS enforced — frozen stdlib, memory cap, instruction
+// watchdog. Note also that `open` stays reachable here: it lives in builtins, not
+// behind an import.)
+constexpr std::array<std::string_view, 3> kAllowedImports{"math", "cmath", "statistics"};
+
+// Only the root package is matched — "math.foo" is governed by the "math" entry, and
+// `from x import y` arrives here as an import of "x".
+bool importAllowed(std::string_view module) {
+  const std::string_view root = module.substr(0, module.find('.'));
+  return std::find(kAllowedImports.begin(), kAllowedImports.end(), root) != kAllowedImports.end();
+}
+
+// A module namespace whose __builtins__ is the real one with __import__ swapped for
+// the allowlist gate. Allowed modules still import their own dependencies freely:
+// their bodies execute under their own globals, which carry unrestricted builtins.
+py::dict makeFilterNamespace() {
+  py::dict gated = py::module_::import("builtins").attr("__dict__").attr("copy")();
+  py::object real_import = gated["__import__"];
+
+  std::string allowed;
+  for (const auto& name : kAllowedImports) {
+    allowed += (allowed.empty() ? "" : ", ");
+    allowed += name;
+  }
+
+  gated["__import__"] = py::cpp_function([real_import, allowed](py::args args, py::kwargs kwargs) {
+    if (args.empty()) {
+      throw py::import_error("__import__() requires a module name");
+    }
+    const auto name = py::cast<std::string>(py::str(args[0]));
+    if (!importAllowed(name)) {
+      throw py::import_error("module '" + name + "' is not available in Data Processors (allowed: " + allowed + ")");
+    }
+    return real_import(*args, **kwargs);
+  });
+
+  py::dict ns;
+  ns["__builtins__"] = gated;
+  return ns;
 }
 
 std::string attrString(const py::object& obj, const char* name, const std::string& fallback) {
@@ -183,7 +235,7 @@ class PythonEngine final : public ScriptEngine {
     ensureInterpreter();
     py::gil_scoped_acquire gil;
     try {
-      py::dict ns;
+      py::dict ns = makeFilterNamespace();
       py::exec(source, ns);
       if (!ns.contains("T")) {
         return PJ::unexpected("Python filter module must define a top-level class named 'T'");
@@ -216,7 +268,7 @@ class PythonEngine final : public ScriptEngine {
     ensureInterpreter();
     py::gil_scoped_acquire gil;
     try {
-      auto ns = std::make_shared<py::object>(py::dict());
+      auto ns = std::make_shared<py::object>(makeFilterNamespace());
       py::exec(klass.source, *ns);
       py::dict& nsd = reinterpret_cast<py::dict&>(*ns);
       if (!nsd.contains("T")) {

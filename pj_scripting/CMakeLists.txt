@@ -12,6 +12,22 @@
 find_package(Luau REQUIRED)
 find_package(nlohmann_json REQUIRED)
 if(NOT EMSCRIPTEN)
+  # Conan's cpython package ships a build module that runs its own bin/python3.12 to
+  # cross-check the version. That interpreter carries no RUNPATH, so with a shared
+  # libpython the loader hands it the SYSTEM libpython3.12.so.1.0 (a different patch
+  # level) and the check aborts the configure. Put the package's own lib dir on the
+  # search path first — only that one, so no other Conan library becomes visible to
+  # the tools CMake spawns.
+  if(UNIX AND DEFINED CONAN_RUNTIME_LIB_DIRS)
+    foreach(_dir IN LISTS CONAN_RUNTIME_LIB_DIRS)
+      file(GLOB _pj_libpython "${_dir}/libpython3*.so*")
+      if(_pj_libpython)
+        set(ENV{LD_LIBRARY_PATH} "${_dir}:$ENV{LD_LIBRARY_PATH}")
+        break()
+      endif()
+    endforeach()
+    unset(_pj_libpython)
+  endif()
   find_package(Python REQUIRED)    # conan-provided embedded CPython (cpython::embed)
   find_package(pybind11 REQUIRED)  # embedded CPython backend (python_engine.cpp)
 endif()
@@ -72,12 +88,13 @@ if(WIN32 AND _pj_python_home_is_conan)
   set(_pj_python_home_define "${_pj_python_home}/bin")
 endif()
 
-# Windows is a non-blocking portability tracker (PJ4 v1 is Linux-only). CPython's
-# Conan recipe disables the static MSVC build (>=3.10), so on Windows CPython is
-# linked shared and python_engine_test needs pythonXY.dll resolvable at launch,
-# else STATUS_DLL_NOT_FOUND (0xc0000135). Export the CPython runtime dir(s) so the
-# CI Test step can prepend them to PATH — mirrors pj_scene2D/core's FFmpeg bin-dir
-# export. Linux links CPython statically and needs none of this.
+# CPython is linked shared on every platform (conanfile.txt `cpython/*:shared=True`;
+# on Windows the recipe forces it anyway, having disabled the static MSVC build for
+# >=3.10). Windows has no RPATH, so python_engine_test needs pythonXY.dll resolvable
+# via PATH at launch, else STATUS_DLL_NOT_FOUND (0xc0000135). Export the CPython
+# runtime dir(s) so the CI Test step can prepend them — mirrors pj_scene2D/core's
+# FFmpeg bin-dir export. Linux needs none of this: Conan bakes a DT_RUNPATH into the
+# binaries, and the AppImage resolves via AppRun.sh's LD_LIBRARY_PATH.
 if(WIN32 AND _pj_python_home)
   file(WRITE "${CMAKE_BINARY_DIR}/pj_python_bin_dirs.txt" "${_pj_python_home}/bin\n${_pj_python_home}\n")
 endif()
@@ -127,7 +144,7 @@ target_link_libraries(pj_scripting
 if(NOT EMSCRIPTEN)
   target_link_libraries(pj_scripting PRIVATE
     pybind11::embed               # Python backend (embedded CPython) — python_engine.cpp only
-    cpython::embed                # static libpython for the embedded interpreter
+    cpython::embed                # libpython for the embedded interpreter
   )
 endif()
 
