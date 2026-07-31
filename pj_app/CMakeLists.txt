@@ -387,6 +387,13 @@ if(PJ_BUILD_TESTS)
     add_pj_app_gui_test(main_window_panel_geometry_test MainWindowPanelGeometryTest
         tests/main_window_panel_geometry_test.cpp)
 
+    # A toolbox panel with a download in flight folds into a background tab
+    # instead of being destroyed: the banner X, the folded tab's own close, the
+    # auto-fold on import start, layout-save exclusion, and completion-close
+    # suppression.
+    add_pj_app_gui_test(toolbox_panel_fold_test ToolboxPanelFoldTest
+        tests/toolbox_panel_fold_test.cpp)
+
     # Pure config-parsing logic (no GUI), compiled standalone so it's linkable
     # from a plain gtest binary. FanoutConfig.cpp is also part of pj_app itself.
     add_executable(fanout_config_test

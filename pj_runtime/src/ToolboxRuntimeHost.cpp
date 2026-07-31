@@ -136,6 +136,13 @@ bool ToolboxRuntimeHost::hasIngestForDataset(DatasetId dataset_id) const {
   return ingest_progress_.find(dataset_id) != ingest_progress_.end();
 }
 
+bool ToolboxRuntimeHost::hasActiveIngests() const {
+  const std::lock_guard lock(parser_ingest_mu_);
+  // parser_ingests_ holds only live contexts: entries appear on create and are
+  // erased on release, unlike the ingest_progress_ bookkeeping above.
+  return !parser_ingests_.empty();
+}
+
 void ToolboxRuntimeHost::requestStopActiveIngests() {
   std::lock_guard lock(parser_ingest_mu_);
   for (auto& [id, host] : parser_ingests_) {

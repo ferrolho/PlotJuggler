@@ -5345,7 +5345,7 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, Miss
   }
 
   restoreChromeAndPanels(doc, path);
-  commitRestoredLayout(doc);
+  commitRestoredLayout(doc, policy);
 }
 
 void MainWindow::restoreChromeAndPanels(const QDomDocument& doc, const QString& path) {
@@ -5784,13 +5784,17 @@ void MainWindow::onProgressiveLayoutDrained() {
   }
 
   progressive_layout_in_flight_ = false;
-  commitRestoredLayout(progressive_layout_doc_);
+  commitRestoredLayout(progressive_layout_doc_, policy);
   progressive_layout_doc_.clear();
   progressive_previous_workspace_.reset();
 }
 
-void MainWindow::commitRestoredLayout(const QDomDocument& doc) {
-  restorePinnedToolboxes(doc.documentElement());
+void MainWindow::commitRestoredLayout(const QDomDocument& doc, MissingCurvePolicy policy) {
+  // A kept busy panel (declined confirmation, or a non-interactive restore's
+  // unprompted retain) leaves the live pinned toolboxes in place; the rest of
+  // the layout has already been applied by here, so the undo baseline is
+  // reset either way.
+  static_cast<void>(restorePinnedToolboxes(doc.documentElement(), policy));
   resetUndoHistory();
 }
 
@@ -8051,7 +8055,8 @@ void MainWindow::applyActivePlotStyle(int style) {
 
 MainWindow::WrappedToolboxPanel MainWindow::wrapToolboxPanel(
     QWidget* content, const QString& title, const std::function<void()>& on_close,
-    const std::function<void()>& on_migrate) {
+    const std::function<void()>& on_migrate, std::function<bool()> has_work_in_flight,
+    const std::function<void()>& on_fold_busy) {
   auto* container = new QWidget;
   container->setObjectName(QStringLiteral("toolboxPanelContainer"));
   auto* column = new QVBoxLayout(container);
@@ -8159,7 +8164,22 @@ MainWindow::WrappedToolboxPanel MainWindow::wrapToolboxPanel(
   };
   tint_close(theme_->currentTheme());
   connect(this, &MainWindow::stylesheetChanged, close_button, tint_close);
-  connect(close_button, &QToolButton::clicked, this, [on_close]() { on_close(); });
+  // Rules 1-2: with work in flight the X folds the panel into a background tab
+  // (uncovering the chart area for the series the job is publishing) instead of
+  // tearing it down, which would cancel that job. The fold takes `on_fold_busy`
+  // — a host-chosen disposition (transient, kept out of layout save), because a
+  // user who pressed CLOSE chose a pin even less than an auto-fold did — not
+  // the migrate button's user-pin path.
+  connect(
+      close_button, &QToolButton::clicked, this,
+      [on_close, on_migrate, on_fold_busy, enter_pinned_chrome, has_work_in_flight = std::move(has_work_in_flight)]() {
+        if (has_work_in_flight && has_work_in_flight()) {
+          enter_pinned_chrome();
+          (on_fold_busy ? on_fold_busy : on_migrate)();
+          return;
+        }
+        on_close();
+      });
   row->addWidget(close_button);
 
   column->addWidget(banner);
@@ -8174,6 +8194,9 @@ bool MainWindow::presentPanel(QWidget* panel) {
   // A panel is already presented: dismiss it so launching a new toolbox/panel
   // replaces the open one instead of refusing.
   dismissTakeoverPanel();
+  // The incoming panel owns the takeover from here; whoever launches it
+  // registers its own fold.
+  takeover_fold_ = {};
 
   // The chart area (ui_->tabbedPlotWidget) lives as a direct child of a
   // QSplitter in MainWindow.ui. Swap the panel into the chart's splitter slot
@@ -8221,6 +8244,11 @@ bool MainWindow::presentPanel(QWidget* panel) {
 }
 
 QWidget* MainWindow::releaseCentralPanel() {
+  // The panel stops being the takeover here, whichever exit it takes, so its
+  // fold registration must not outlive this call. foldTakeoverPanelIfOwnedBy
+  // moves the closure out before invoking it, so this never destroys a
+  // std::function that is mid-execution.
+  takeover_fold_ = {};
   if (current_panel_ == nullptr) {
     return nullptr;
   }
@@ -8263,6 +8291,16 @@ void MainWindow::dismissTakeoverPanel() {
   if (current_panel_ == nullptr) {
     return;
   }
+  // Rule 2's other door: launching any other panel goes through here, and for a
+  // panel with a job in flight the teardown below is that job's kill switch.
+  // Fold instead. If the fold does not take (no registration, or the panel is
+  // already gone) fall through so the takeover is never left stuck on screen.
+  if (takeoverHasWorkInFlight()) {
+    foldTakeoverPanelIfOwnedBy(takeover_fold_.owner, /*transient=*/true);
+    if (current_panel_ == nullptr) {
+      return;
+    }
+  }
   // For a toolbox panel, close its PanelEngine first (same teardown as the
   // reject path) so its host/handle are released; restoreCentralArea() then
   // swaps the chart back and clears the panel state. Non-toolbox panels
@@ -8275,6 +8313,60 @@ void MainWindow::dismissTakeoverPanel() {
   if (previous_engine != nullptr) {
     previous_engine->deleteLater();
   }
+}
+
+void MainWindow::setTakeoverFold(
+    const void* owner, std::function<void(bool transient)> fold, std::function<bool()> has_work_in_flight) {
+  takeover_fold_ = {.owner = owner, .fold = std::move(fold), .has_work_in_flight = std::move(has_work_in_flight)};
+}
+
+bool MainWindow::takeoverHasWorkInFlight() const {
+  return takeover_fold_.has_work_in_flight && takeover_fold_.has_work_in_flight();
+}
+
+void MainWindow::foldTakeoverPanelIfOwnedBy(const void* owner, bool transient) {
+  if (current_panel_ == nullptr || owner == nullptr || takeover_fold_.owner != owner || !takeover_fold_.fold) {
+    return;
+  }
+  // Move the closure out first: folding reaches releaseCentralPanel(), which
+  // drops the registration and would otherwise destroy the very std::function
+  // running here.
+  const std::function<void(bool)> fold = std::move(takeover_fold_.fold);
+  takeover_fold_ = {};
+  fold(transient);
+}
+
+bool MainWindow::hostHasWorkInFlight(ToolboxRuntimeHost* host) const {
+  if (host_work_in_flight_) {
+    return host_work_in_flight_(host);
+  }
+  return host != nullptr && host->hasActiveIngests();
+}
+
+void MainWindow::stopHostWork(ToolboxRuntimeHost* host) {
+  if (stop_host_work_) {
+    stop_host_work_(host);
+    return;
+  }
+  if (host != nullptr) {
+    host->requestStopActiveIngests();
+  }
+}
+
+bool MainWindow::confirmCancelRunningJob(const QString& label) {
+  if (confirm_running_job_) {
+    return confirm_running_job_(label);
+  }
+  // No default button: closing here cancels a transfer the user may have been
+  // waiting on for minutes, so an accidental Enter must not do it. Esc /
+  // dismiss keeps downloading.
+  constexpr int kCancelAndClose = 0;
+  const int choice = MessageBox::question(
+      this, label.isEmpty() ? tr("Cancel download?") : label, tr("A download is in progress. Cancel it and close?"),
+      // "&&" so Qt renders a literal ampersand instead of eating it as a mnemonic.
+      {{tr("Cancel download && close"), MessageBox::kDestructiveRole},
+       {tr("Keep downloading"), MessageBox::kCancelRole}});
+  return choice == kCancelAndClose;
 }
 
 void MainWindow::openEmbeddedConsole() {
@@ -8328,6 +8420,12 @@ void MainWindow::launchToolbox(
       // the recursive call takes the normal build path.
       const QString pinned_name = ui_->tabbedPlotWidget->widgetTabName(pinned_it->container);
       ui_->tabbedPlotWidget->closeWidgetTab(pinned_it->container);
+      // A close the tab declined keeps the live instance, so relaunching would
+      // breach the one-instance-per-toolbox rule; the surviving registry entry
+      // (erased by a completed teardown) is the signal.
+      if (pinned_toolboxes_.contains(plugin_id)) {
+        return;
+      }
       launchToolbox(plugin_id, initial_config, ToolboxLaunchTarget::kPinnedTab, pinned_name);
       return;
     }
@@ -8506,6 +8604,11 @@ void MainWindow::launchToolbox(
     toolbox_active_imports_.insert(
         dataset, ToolboxIngestRef{owner, std::static_pointer_cast<PanelSession>(owner)->host.get()});
     toolbox_ingest_label_ = import_label;
+    // The panel that just started importing must stop covering the chart area:
+    // it publishes rows mid-batch and those series have to be reachable while
+    // the batch runs. Folding keeps the instance — and the download — alive.
+    // Ahead of the strip arbitration below, which is about presentation only.
+    foldTakeoverPanelIfOwnedBy(owner.get(), /*transient=*/true);
     if (file_loader_->isBusy()) {
       return;  // FileLoader wins the strip; the import still runs, just undisplayed
     }
@@ -8671,6 +8774,23 @@ void MainWindow::launchToolbox(
     }
     return QString::fromStdString(config_json);
   };
+  // Lifting the live panel out of the takeover and into a tab: shared by the
+  // migrate button, the banner X while work is in flight, and the auto-fold on
+  // ingest start. `transient` distinguishes a fold the host chose from a pin the
+  // user asked for.
+  auto migrate_to_tab = [this, engine, plugin_id, source, save_config, host = session->host.get()](bool transient) {
+    QWidget* released = releaseCentralPanel();
+    if (released == nullptr) {
+      return;
+    }
+    pinToolboxPanel(released, plugin_id, source, engine, save_config, host, transient);
+  };
+  // "This panel has work in flight" — the one predicate every teardown door
+  // consults. Domain-neutral: it asks the panel's own host whether it currently
+  // owns a live ingest context, not what the plugin is.
+  std::function<bool()> has_work_in_flight = [session]() {
+    return session->host != nullptr && session->host->hasActiveIngests();
+  };
   const WrappedToolboxPanel wrapped = wrapToolboxPanel(
       panel, source,
       /*on_close=*/
@@ -8679,18 +8799,15 @@ void MainWindow::launchToolbox(
         restoreCentralArea();
         engine->deleteLater();
       },
-      /*on_migrate=*/
-      [this, engine, plugin_id, source, save_config]() {
-        QWidget* released = releaseCentralPanel();
-        if (released == nullptr) {
-          return;
-        }
-        pinToolboxPanel(released, plugin_id, source, engine, save_config);
-      });
+      /*on_migrate=*/[migrate_to_tab]() { migrate_to_tab(/*transient=*/false); },
+      /*has_work_in_flight=*/has_work_in_flight,
+      /*on_fold_busy=*/[migrate_to_tab]() { migrate_to_tab(/*transient=*/true); });
 
   if (target == ToolboxLaunchTarget::kPinnedTab) {
     wrapped.enter_pinned_chrome();
-    pinToolboxPanel(wrapped.container, plugin_id, pin_tab_name.isEmpty() ? source : pin_tab_name, engine, save_config);
+    pinToolboxPanel(
+        wrapped.container, plugin_id, pin_tab_name.isEmpty() ? source : pin_tab_name, engine, save_config,
+        session->host.get(), /*transient=*/false);
     QTimer::singleShot(250, this, [this]() { syncPanelPreviewDisplay(); });
     return;
   }
@@ -8707,6 +8824,16 @@ void MainWindow::launchToolbox(
   // presentPanel() succeeded; remember the engine so launching another toolbox
   // (or any panel) tears this one down first instead of being refused.
   current_panel_engine_ = engine;
+  // Key the fold on the launch session's address — the identity the ingest
+  // callbacks above report as their owner — so only this panel's own import
+  // folds it.
+  setTakeoverFold(
+      static_cast<const void*>(session.get()),
+      [migrate_to_tab, enter_pinned_chrome = wrapped.enter_pinned_chrome](bool transient) {
+        enter_pinned_chrome();
+        migrate_to_tab(transient);
+      },
+      has_work_in_flight);
   // Apply the app's grid/curve-style/width to the panel's embedded PlotWidget once
   // the panel engine has built it (deferred: the plot is created on the first tick).
   QTimer::singleShot(250, this, [this]() { syncPanelPreviewDisplay(); });
@@ -8714,9 +8841,15 @@ void MainWindow::launchToolbox(
 
 void MainWindow::pinToolboxPanel(
     QWidget* container, const QString& plugin_id, const QString& title, PanelEngine* engine,
-    std::function<QString()> save_config) {
+    std::function<QString()> save_config, ToolboxRuntimeHost* host, bool transient) {
   pinned_toolboxes_.insert(
-      plugin_id, PinnedToolbox{.container = container, .engine = engine, .save_config = std::move(save_config)});
+      plugin_id, PinnedToolbox{
+                     .container = container,
+                     .engine = engine,
+                     .save_config = std::move(save_config),
+                     .host = host,
+                     .label = title,
+                     .transient = transient});
 
   // A plugin-initiated requestClose (e.g. the toolbox's own Close button)
   // must now close the TAB, funnelling into the same on_close teardown as
@@ -8725,11 +8858,10 @@ void MainWindow::pinToolboxPanel(
   // is idempotent, deleteLater coalesces, and the registry erase is a no-op
   // the second time.
   QPointer<QWidget> container_guard(container);
-  engine->onCloseRequested([this, container_guard](const std::string& /*reason*/) {
-    if (!container_guard.isNull()) {
-      ui_->tabbedPlotWidget->closeWidgetTab(container_guard);
-    }
-  });
+  if (engine != nullptr) {
+    engine->onCloseRequested(
+        [this, container_guard](const std::string& reason) { onPinnedPanelCloseRequested(container_guard, reason); });
+  }
 
   QPointer<PanelEngine> engine_guard(engine);
   ui_->tabbedPlotWidget->addWidgetTab(title, container, [this, plugin_id, engine_guard]() {
@@ -8743,6 +8875,38 @@ void MainWindow::pinToolboxPanel(
     }
     pinned_toolboxes_.remove(plugin_id);
   });
+
+  // Rules 3-4: an idle folded panel closes like any tab; one with a job in
+  // flight confirms first, because the teardown above cancels that job. The
+  // entry's own host is what makes the cancellation land on THIS panel and
+  // leave another folded import running.
+  ui_->tabbedPlotWidget->setWidgetTabPreClose(container, [this, plugin_id]() {
+    const auto it = pinned_toolboxes_.constFind(plugin_id);
+    if (it == pinned_toolboxes_.constEnd() || !hostHasWorkInFlight(it->host)) {
+      return true;
+    }
+    if (!confirmCancelRunningJob(it->label)) {
+      return false;
+    }
+    // The confirmation ran a modal event loop, so `it` may be stale: re-find
+    // the entry rather than stopping through a dangling host.
+    if (const auto confirmed = pinned_toolboxes_.constFind(plugin_id); confirmed != pinned_toolboxes_.constEnd()) {
+      stopHostWork(confirmed->host);
+    }
+    return true;
+  });
+}
+
+void MainWindow::onPinnedPanelCloseRequested(QWidget* container, const std::string& reason) {
+  // A pinned panel survives its own batch completion: the tab is the user's
+  // surface now and stays connected so another job can be queued into it. Only
+  // a user-driven request closes it.
+  if (reason == "import_complete") {
+    return;
+  }
+  if (container != nullptr) {
+    ui_->tabbedPlotWidget->closeWidgetTab(container);
+  }
 }
 
 QDomElement MainWindow::savePinnedToolboxes(QDomDocument& doc) const {
@@ -8754,6 +8918,12 @@ QDomElement MainWindow::savePinnedToolboxes(QDomDocument& doc) const {
   for (const QString& plugin_id : plugin_ids) {
     const auto toolbox_it = pinned_toolboxes_.constFind(plugin_id);
     if (toolbox_it == pinned_toolboxes_.constEnd() || toolbox_it->container.isNull()) {
+      continue;
+    }
+    // A background fold is the host uncovering the chart area for a running
+    // job, not a workspace the user arranged — persisting it would resurrect a
+    // panel they never pinned (and cannot resume the job it was doing).
+    if (toolbox_it->transient) {
       continue;
     }
     QDomElement element = doc.createElement(u"toolbox"_s);
@@ -8777,7 +8947,42 @@ QDomElement MainWindow::savePinnedToolboxes(QDomDocument& doc) const {
   return root;
 }
 
-void MainWindow::restorePinnedToolboxes(const QDomElement& root) {
+bool MainWindow::restorePinnedToolboxes(const QDomElement& root, MissingCurvePolicy policy) {
+  // Replacing the pinned set destroys every live pinned engine, and for a panel
+  // with a job in flight that teardown is the job's kill switch. Ask ONCE
+  // (naming one busy panel) before taking any of them down; declining leaves the
+  // live set — and the transfer — exactly as it was.
+  QString busy_label;
+  bool any_busy = false;
+  for (const auto& toolbox : std::as_const(pinned_toolboxes_)) {
+    if (hostHasWorkInFlight(toolbox.host)) {
+      any_busy = true;
+      busy_label = toolbox.label;
+      break;
+    }
+  }
+  if (any_busy) {
+    // D5's dialog-vs-diagnostic fork: a non-interactive restore (a batch
+    // drain can land minutes after the layout open, mid-anything) must never
+    // raise the confirmation modal. Its resolution is the same as a decline —
+    // the live panels and their jobs are retained, the layout's pinned set is
+    // not applied — reported through the diagnostic sink.
+    if (policy == MissingCurvePolicy::kRetainAndDiagnose) {
+      reportLayoutRestoreIssue(
+          policy, "pinned-toolbox-busy",
+          tr("Layout restore kept the current pinned panels: '%1' has a job still running.").arg(busy_label));
+      return false;
+    }
+    if (!confirmCancelRunningJob(busy_label)) {
+      return false;
+    }
+    for (const auto& toolbox : std::as_const(pinned_toolboxes_)) {
+      if (hostHasWorkInFlight(toolbox.host)) {
+        stopHostWork(toolbox.host);
+      }
+    }
+  }
+
   // The layout's pinned set REPLACES the live one — a layout saved without
   // pinned toolboxes restores to none.
   closeAllPinnedToolboxTabs();
@@ -8797,6 +9002,7 @@ void MainWindow::restorePinnedToolboxes(const QDomElement& root) {
         plugin_id, layout_xml::directCdataText(element), ToolboxLaunchTarget::kPinnedTab,
         element.attribute(u"tab_name"_s));
   }
+  return true;
 }
 
 void MainWindow::closeAllPinnedToolboxTabs() {
@@ -8805,7 +9011,10 @@ void MainWindow::closeAllPinnedToolboxTabs() {
   for (const PinnedToolbox& toolbox : pinned) {
     QWidget* container = toolbox.container.data();
     if (container != nullptr) {
-      ui_->tabbedPlotWidget->closeWidgetTab(container);
+      // Forced: shutdown and layout replacement are not refusable, and the
+      // pinned tab's own pre-close would otherwise raise a confirmation the
+      // callers here have already resolved (or, at shutdown, cannot honor).
+      ui_->tabbedPlotWidget->closeWidgetTabForced(container);
     }
     // Bulk closes (layout replace, shutdown) finish the teardown
     // SYNCHRONOUSLY instead of via the deferred deletes closeWidgetTab

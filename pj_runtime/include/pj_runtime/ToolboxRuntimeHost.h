@@ -114,6 +114,12 @@ class ToolboxRuntimeHost {
   // ingest_progress_). Thread-safe.
   [[nodiscard]] bool hasIngestForDataset(DatasetId dataset_id) const;
 
+  // True while this host owns at least one parser-ingest context created and not
+  // yet released — i.e. the panel driving this host has work in flight. Unlike
+  // hasIngestForDataset(), which stays true after release, this goes false again,
+  // so a panel does not read busy forever after its first import. Thread-safe.
+  [[nodiscard]] bool hasActiveIngests() const;
+
   // Flag-only cooperative stop for every live parser-ingest context — the
   // shell's "stop this import" affordance. Thread-safe. The plugin observes it
   // through is_stop_requested / progress_update returning false and ends the

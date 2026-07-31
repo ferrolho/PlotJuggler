@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
+#include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -429,7 +430,19 @@ void TabbedPlotWidget::focusWidgetTab(QWidget* content) {
 
 void TabbedPlotWidget::closeWidgetTab(QWidget* content) {
   if (const TabEntry* entry = findWidgetEntry(content)) {
-    onTabCloseRequested(entry->frame);
+    closeTab(entry->frame, /*honor_veto=*/true);
+  }
+}
+
+void TabbedPlotWidget::closeWidgetTabForced(QWidget* content) {
+  if (const TabEntry* entry = findWidgetEntry(content)) {
+    closeTab(entry->frame, /*honor_veto=*/false);
+  }
+}
+
+void TabbedPlotWidget::setWidgetTabPreClose(QWidget* content, std::function<bool()> pre_close) {
+  if (TabEntry* entry = findWidgetEntry(content)) {
+    entry->pre_close = std::move(pre_close);
   }
 }
 
@@ -490,9 +503,31 @@ void TabbedPlotWidget::onTabRenameRequested(PlotTabFrame* frame, const QString& 
 }
 
 void TabbedPlotWidget::onTabCloseRequested(PlotTabFrame* frame) {
+  closeTab(frame, /*honor_veto=*/true);
+}
+
+void TabbedPlotWidget::closeTab(PlotTabFrame* frame, bool honor_veto) {
   TabEntry* entry = findEntry(frame);
   if (entry == nullptr) {
     return;
+  }
+  // The veto is consulted before ANY side effect — including the last-plot-tab
+  // spawn below — so a declined close leaves the tab set exactly as it was.
+  if (honor_veto && entry->pre_close) {
+    const std::function<bool()> pre_close = entry->pre_close;
+    const QPointer<PlotTabFrame> frame_guard(frame);
+    if (!pre_close()) {
+      return;
+    }
+    // pre_close may have run a modal event loop: tabs_ can have been
+    // reallocated, and this very tab closed (deleting its frame) meanwhile.
+    if (frame_guard.isNull()) {
+      return;
+    }
+    entry = findEntry(frame);
+    if (entry == nullptr) {
+      return;
+    }
   }
   // Closing the last PLOT tab spawns a fresh one first: the workspace must
   // always serialize at least one <Tab> (xmlLoadState rejects an empty set),
@@ -513,6 +548,9 @@ void TabbedPlotWidget::onTabCloseRequested(PlotTabFrame* frame) {
   // through closeWidgetTab) finds it empty instead of running it twice.
   const std::function<void()> on_close = std::move(entry->on_close);
   entry->on_close = nullptr;
+  // Past the veto the close is committed, so a reentrant close of this tab must
+  // not put the question a second time.
+  entry->pre_close = nullptr;
   if (on_close) {
     on_close();
   }
@@ -560,16 +598,20 @@ TabbedPlotWidget::TabEntry* TabbedPlotWidget::findEntry(QWidget* content) {
   return nullptr;
 }
 
-const TabbedPlotWidget::TabEntry* TabbedPlotWidget::findWidgetEntry(QWidget* content) const {
+TabbedPlotWidget::TabEntry* TabbedPlotWidget::findWidgetEntry(QWidget* content) {
   if (content == nullptr) {
     return nullptr;
   }
-  for (const TabEntry& entry : tabs_) {
+  for (TabEntry& entry : tabs_) {
     if (entry.widget == content) {
       return &entry;
     }
   }
   return nullptr;
+}
+
+const TabbedPlotWidget::TabEntry* TabbedPlotWidget::findWidgetEntry(QWidget* content) const {
+  return const_cast<TabbedPlotWidget*>(this)->findWidgetEntry(content);
 }
 
 QWidget* TabbedPlotWidget::contentOf(const TabEntry& entry) {

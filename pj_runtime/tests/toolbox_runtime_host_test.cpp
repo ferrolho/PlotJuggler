@@ -56,20 +56,20 @@ class ToolboxRuntimeHostTest : public ::testing::Test {
     return metadata.has_value() ? metadata->total_row_count : 0;
   }
 
-  // Bring-up shared by the teardown-terminal tests: hermetic catalog deps, a
-  // host wired with `callbacks`, and one parser-ingest context — with its
-  // progress sequence STARTED unless start_progress is false (a test that
-  // needs the started callback QUEUED starts it from a worker thread via
-  // `view`). Out-param + void return so gtest ASSERTs abort the helper;
-  // callers wrap the call in ASSERT_NO_FATAL_FAILURE.
+  // Bring-up state the helpers below fill in; every helper takes it as an
+  // out-param and returns void so gtest ASSERTs abort the helper itself —
+  // callers wrap each call in ASSERT_NO_FATAL_FAILURE. It owns the catalog the
+  // host's ingest contexts point at, so it must outlive host_.
   struct StartedIngest {
     std::unique_ptr<PJ::test::HermeticCatalog> catalog;
+    std::optional<PJ::sdk::ToolboxHostView> toolbox;
     std::optional<PJ::ToolboxRuntimeHostView> runtime;
     std::optional<PJ::DataSourceRuntimeHostView> view;
     uint32_t source_id = 0;
   };
-  void startHermeticIngest(
-      PJ::ToolboxRuntimeHost::Callbacks callbacks, StartedIngest& out, bool start_progress = true) {
+  // Host bring-up only: hermetic catalog deps + a host wired with `callbacks`,
+  // with NO ingest context yet, so a caller can observe the pre-ingest state.
+  void buildHermeticHost(PJ::ToolboxRuntimeHost::Callbacks callbacks, StartedIngest& out) {
     QFileInfo plugin_file{QString::fromUtf8(PJ_RUNTIME_HOST_OBJECT_PARSER_PATH)};
     out.catalog = std::make_unique<PJ::test::HermeticCatalog>(plugin_file.absolutePath());
     PJ::ToolboxRuntimeHost::ParserIngestDeps deps;
@@ -79,17 +79,34 @@ class ToolboxRuntimeHostTest : public ::testing::Test {
     auto services = registered();
     auto toolbox_or = services.require<PJ::sdk::ToolboxHostService>();
     ASSERT_TRUE(toolbox_or.has_value());
+    out.toolbox.emplace(*toolbox_or);
     auto runtime_or = services.require<PJ::sdk::ToolboxRuntimeHostService>();
     ASSERT_TRUE(runtime_or.has_value());
     out.runtime.emplace(*runtime_or);
+  }
 
-    const auto source = *(*toolbox_or).createDataSource("cloud download");
+  // One dataset + its parser-ingest context on a host from buildHermeticHost.
+  void createIngestContext(StartedIngest& out) {
+    ASSERT_TRUE(out.toolbox.has_value());
+    const auto source = *out.toolbox->createDataSource("cloud download");
     out.source_id = source.id;
     PJ_data_source_runtime_host_t ingest_raw{};
     PJ_error_t error{};
     ASSERT_TRUE(
         out.runtime->raw().vtable->create_parser_ingest(out.runtime->raw().ctx, source.id, &ingest_raw, &error));
     out.view.emplace(ingest_raw);
+  }
+
+  // Bring-up shared by the teardown-terminal tests: hermetic catalog deps, a
+  // host wired with `callbacks`, and one parser-ingest context — with its
+  // progress sequence STARTED unless start_progress is false (a test that
+  // needs the started callback QUEUED starts it from a worker thread via
+  // `view`). Out-param + void return so gtest ASSERTs abort the helper;
+  // callers wrap the call in ASSERT_NO_FATAL_FAILURE.
+  void startHermeticIngest(
+      PJ::ToolboxRuntimeHost::Callbacks callbacks, StartedIngest& out, bool start_progress = true) {
+    ASSERT_NO_FATAL_FAILURE(buildHermeticHost(std::move(callbacks), out));
+    ASSERT_NO_FATAL_FAILURE(createIngestContext(out));
     if (start_progress) {
       ASSERT_TRUE(out.view->progressStart("import", 10, true).has_value());  // on-thread: started delivered directly
     }
@@ -529,6 +546,26 @@ TEST_F(ToolboxRuntimeHostTest, HasIngestForDatasetCoversLiveAndCompletedIngests)
   ASSERT_TRUE(ingest.runtime->releaseParserIngest(ingest.source_id).has_value());
   QCoreApplication::processEvents();
   EXPECT_TRUE(host_->hasIngestForDataset(ds_id)) << "after release — promotion runs post-download";
+  host_.reset();  // context references test-body locals (catalog)
+}
+
+// The fold predicate must be true only while an ingest is LIVE: unlike
+// hasIngestForDataset (which stays true after release so source promotion can
+// ask later), a released ingest must read idle or a panel would be busy forever
+// after its first import.
+TEST_F(ToolboxRuntimeHostTest, HasActiveIngestsTracksLiveContextsOnly) {
+  StartedIngest ingest;
+  ASSERT_NO_FATAL_FAILURE(buildHermeticHost(PJ::ToolboxRuntimeHost::Callbacks{}, ingest));
+  EXPECT_FALSE(host_->hasActiveIngests()) << "no context created yet";
+
+  ASSERT_NO_FATAL_FAILURE(createIngestContext(ingest));
+  EXPECT_TRUE(host_->hasActiveIngests()) << "live context";
+
+  ASSERT_TRUE(ingest.runtime->releaseParserIngest(ingest.source_id).has_value());
+  QCoreApplication::processEvents();
+  EXPECT_FALSE(host_->hasActiveIngests()) << "a released context is no longer work in flight";
+  EXPECT_TRUE(host_->hasIngestForDataset(static_cast<PJ::DatasetId>(ingest.source_id)))
+      << "retained per-dataset bookkeeping intact";
   host_.reset();  // context references test-body locals (catalog)
 }
 

@@ -163,6 +163,79 @@ TEST(TabbedWidgetTab, SerializerSkipsWidgetTabsAndLoadPreservesThem) {
   EXPECT_EQ(tabbed.tabCount(), 2);
 }
 
+// A pinned toolbox tab whose plugin has work in flight must be able to decline
+// its own close, so the host can ask "cancel the download and close?" first.
+TEST(TabbedWidgetTab, WidgetTabPreCloseCanVetoClose) {
+  PJ::TabbedPlotWidget tabbed;
+  auto* content = new QLabel(u"pinned"_s);
+  bool torn_down = false;
+  tabbed.addWidgetTab(u"Panel"_s, content, [&torn_down]() { torn_down = true; });
+  tabbed.setWidgetTabPreClose(content, []() { return false; });
+
+  tabbed.closeWidgetTab(content);
+
+  EXPECT_FALSE(torn_down);
+  // Declining leaves the tab set untouched — in particular the veto is
+  // consulted before the keep-one-plot-tab spawn, which would otherwise add a
+  // tab for a close that never happened.
+  EXPECT_EQ(tabbed.widgetTabName(content), u"Panel"_s);
+  EXPECT_EQ(tabbed.tabCount(), 2);
+  EXPECT_EQ(tabbed.dockerCount(), 1);
+
+  // The veto survives a declined attempt, so the next close asks again.
+  tabbed.closeWidgetTab(content);
+  EXPECT_FALSE(torn_down);
+  EXPECT_EQ(tabbed.tabCount(), 2);
+}
+
+// Shutdown and layout replacement must not be refusable.
+TEST(TabbedWidgetTab, ForcedCloseIgnoresVeto) {
+  PJ::TabbedPlotWidget tabbed;
+  auto* content = new QLabel(u"pinned"_s);
+  bool torn_down = false;
+  tabbed.addWidgetTab(u"Panel"_s, content, [&torn_down]() { torn_down = true; });
+  tabbed.setWidgetTabPreClose(content, []() { return false; });
+
+  tabbed.closeWidgetTabForced(content);
+
+  EXPECT_TRUE(torn_down);
+  EXPECT_EQ(tabbed.tabCount(), 1);
+}
+
+// Absent pre-close keeps the plain close behavior.
+TEST(TabbedWidgetTab, WidgetTabWithoutPreCloseClosesNormally) {
+  PJ::TabbedPlotWidget tabbed;
+  auto* content = new QLabel(u"pinned"_s);
+  bool torn_down = false;
+  tabbed.addWidgetTab(u"Panel"_s, content, [&torn_down]() { torn_down = true; });
+
+  tabbed.closeWidgetTab(content);
+
+  EXPECT_TRUE(torn_down);
+  EXPECT_EQ(tabbed.tabCount(), 1);
+}
+
+TEST(TabbedWidgetTab, PreCloseThatClosesTheTabItselfDoesNotTearDownTwice) {
+  PJ::TabbedPlotWidget tabbed;
+  QPointer<QLabel> content(new QLabel(u"pinned"_s));
+  int close_count = 0;
+  tabbed.addWidgetTab(u"Panel"_s, content, [&close_count]() { ++close_count; });
+  // Stands in for a confirmation that runs a modal event loop: the tab (and its
+  // frame) can be gone by the time the callback returns, and the accepted close
+  // must not run a second teardown on the freed entry.
+  tabbed.setWidgetTabPreClose(content, [&tabbed, content]() {
+    tabbed.closeWidgetTabForced(content);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    return true;
+  });
+
+  tabbed.closeWidgetTab(content);
+
+  EXPECT_EQ(close_count, 1);
+  EXPECT_EQ(tabbed.tabCount(), 1);
+  EXPECT_TRUE(content.isNull());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

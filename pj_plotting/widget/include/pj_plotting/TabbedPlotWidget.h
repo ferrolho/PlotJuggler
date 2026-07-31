@@ -65,9 +65,22 @@ class TabbedPlotWidget : public QWidget {
   void addWidgetTab(const QString& tab_name, QWidget* content, std::function<void()> on_close);
   // Selects the tab hosting `content` (added via addWidgetTab). No-op if absent.
   void focusWidgetTab(QWidget* content);
-  // Closes the tab hosting `content` exactly like its X button: runs its
-  // on_close, removes the tab, deletes the widget. No-op if absent.
+  // Closes the tab hosting `content` exactly like its X button: honours any
+  // setWidgetTabPreClose veto, then runs its on_close, removes the tab and
+  // deletes the widget. No-op if absent.
   void closeWidgetTab(QWidget* content);
+  // Gives a widget tab a veto over its own close: `pre_close` runs BEFORE any
+  // teardown and returning false abandons the close entirely (nothing is run,
+  // removed or deleted), which is how a pinned panel with work in flight asks
+  // the user to confirm first. Optional — a tab without one always closes.
+  // `pre_close` may run a modal event loop, and may itself close this or other
+  // tabs; doing so simply ends the close it was consulted for. Replaces any
+  // previously set callback; no-op if `content` is not a widget tab.
+  // closeWidgetTabForced() bypasses it — use that for shutdown and layout
+  // replacement, which must not be refusable.
+  void setWidgetTabPreClose(QWidget* content, std::function<bool()> pre_close);
+  // Like closeWidgetTab, but ignores any setWidgetTabPreClose veto.
+  void closeWidgetTabForced(QWidget* content);
   // Current strip label of the widget tab hosting `content` (empty if
   // absent) — the sole store of a user rename, so owners persisting the
   // tab must read it at save time.
@@ -153,6 +166,9 @@ class TabbedPlotWidget : public QWidget {
     PlotDocker* docker = nullptr;
     QWidget* widget = nullptr;
     std::function<void()> on_close;
+    // Widget tabs only (see setWidgetTabPreClose): consulted first on a
+    // vetoable close, and false there aborts it before anything is torn down.
+    std::function<bool()> pre_close;
     // The hosted widget's size policy at addWidgetTab time — restored when
     // its tab is current; hidden widget pages are set to Ignored so they
     // never inflate the QStackedWidget's union size hint.
@@ -163,7 +179,11 @@ class TabbedPlotWidget : public QWidget {
   TabEntry* findEntry(QWidget* content);
   // The entry hosting `content` as a WIDGET tab (nullptr for absent content
   // and for docker pages) — the shared predicate behind the widget-tab API.
+  TabEntry* findWidgetEntry(QWidget* content);
   [[nodiscard]] const TabEntry* findWidgetEntry(QWidget* content) const;
+  // The one close path for both tab kinds. With honor_veto, a widget tab's
+  // pre_close runs first and can abandon the close; plot tabs have none.
+  void closeTab(PlotTabFrame* frame, bool honor_veto);
   // The stack page a tab entry shows (its docker or hosted widget).
   static QWidget* contentOf(const TabEntry& entry);
   void updateSelectionStyle();
