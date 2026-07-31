@@ -205,5 +205,33 @@ TEST_F(ExtensionCatalogSeedTest, ConstructorStaticPluginsRegisterAndShadowSameId
   EXPECT_EQ(mock_count, 1);
 }
 
+// --plugin-dir mode: the CLI override reorders the LOAD scan hierarchy, but the
+// marketplace UI must keep tracking the plugins it INSTALLED (the marketplace
+// dir), not the override dir. A regression would swap the ExtensionManager's
+// root to the override dir, so an extension installed via the marketplace
+// disappears from installedExtensions() the moment --plugin-dir is used.
+//
+// The mocked v1 and v2 DSOs share the id "mock-data-source" but differ by
+// version, giving us a two-value discriminator on the same key: place v1 under
+// the marketplace dir (what the user "installed"), v2 under --plugin-dir (the
+// dev override), then read back the version the marketplace reports installed.
+// Marketplace-tracks-marketplace-dir ⇒ v1; regression to override-dir ⇒ v2.
+TEST_F(ExtensionCatalogSeedTest, OverrideModeExtensionManagerTracksMarketplaceDirNotOverrideDir) {
+  const QString installed_root = marketplace_.path() + "/" + kMockId;
+  placePlugin(installed_root, PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("ds"));  // v1 in marketplace
+  const QString override_root = override_.path() + "/" + kMockId;
+  placePlugin(override_root, PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH, pluginFileName("ds"));  // v2 under --plugin-dir
+
+  const auto service = makeOverrideModeService();
+
+  const QMap<QString, InstalledExtension> installed = service->extensionManager().installedExtensions();
+  const QString mock_id = QString::fromUtf8(kMockId);
+  ASSERT_TRUE(installed.contains(mock_id))
+      << "an extension installed under the marketplace dir must remain visible to the marketplace "
+         "even when --plugin-dir is used";
+  EXPECT_EQ(installed.value(mock_id).version, "1.0.0")
+      << "installedExtensions() must reflect the marketplace-managed copy, not the --plugin-dir override";
+}
+
 }  // namespace
 }  // namespace PJ

@@ -186,10 +186,12 @@ ExtensionCatalogService::ExtensionCatalogService(
   marketplace_dir_ = default_marketplace ? defaultExtensionsDir() : std::move(paths.marketplace_dir);
   extensions_dir_ = default_mode_ ? marketplace_dir_ : std::move(paths.install_dir);
   bundled_dir_ = paths.bundled_dir.isEmpty() ? bundledPluginsDir() : std::move(paths.bundled_dir);
-  // The staging dir must live with the managed dir it stages for; the platform
-  // default is used only when the managed dir itself is the platform default.
-  const QString pending_dir =
-      (default_mode_ && default_marketplace) ? defaultPendingDir() : extensions_dir_ + "/.pending";
+  // The staging dir must live with the MANAGED dir it stages for — i.e., the
+  // marketplace dir, never the --plugin-dir override. The platform default is
+  // used only when the marketplace dir itself is the platform default. Anchored
+  // to marketplace_dir_ (not extensions_dir_) so a --plugin-dir override leaves
+  // installs/staging on the real managed path.
+  const QString pending_dir = default_marketplace ? defaultPendingDir() : marketplace_dir_ + "/.pending";
 
 #ifndef PJ_TARGET_WASM
   if (!QDir().mkpath(extensions_dir_)) {
@@ -202,7 +204,12 @@ ExtensionCatalogService::ExtensionCatalogService(
     reportDiagnostic(DiagnosticLevel::kError, message);
   }
 
-  extension_manager_ = std::make_unique<ExtensionManager>(nullptr, extensions_dir_, pending_dir, sink_, this);
+  // The ExtensionManager tracks what the marketplace INSTALLS and MANAGES; that
+  // is always marketplace_dir_, independent of any --plugin-dir override (which
+  // only reorders the LOAD scan hierarchy via buildScanHierarchy). Passing
+  // extensions_dir_ here would make the marketplace UI look at the CLI override
+  // dir and lose sight of every plugin the user actually installed.
+  extension_manager_ = std::make_unique<ExtensionManager>(nullptr, marketplace_dir_, pending_dir, sink_, this);
 
   // Sync bundled plugins into the marketplace dir BEFORE the scan — the bundled
   // dir is never scanned, so the seed is the only route by which shipped
