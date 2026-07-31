@@ -147,26 +147,33 @@ Expected<HeadlessDescriptorProviderSession::Ptr> HeadlessDescriptorProviderSessi
 }
 
 HeadlessDescriptorProviderSession::~HeadlessDescriptorProviderSession() {
-  // (1) QUIESCENCE FIRST: cancel + join + destroy every import job while the
-  // plugin instance, its DSO, and every host it can call into are still
-  // alive. After this, no provider worker exists and (per the SDK's
-  // JoinableJob contract) no job callback can ever run again — which is the
-  // precondition ToolboxRuntimeHost's destructor demands and what makes the
-  // ~QObject purge of any still-queued terminal metacalls legal.
+  // (1) Cancel every import job, then FAIL THE PROMOTION INTAKE BEFORE
+  // JOINING. A provider worker may legally block its terminal on an ACCEPTED
+  // promotion's exactly-once result callback — the ABI has no way to cancel
+  // a promotion — so joining first can deadlock: joinAll waits on a terminal
+  // that waits on a callback only shutdown() can deliver. shutdown()
+  // (idempotent; phase 1 of the two-phase teardown, uniform with
+  // ~PanelSession — Codex r1 F5) closes the intake and fails every
+  // accepted-but-unfinished promotion (ok=false), which reaches plugin
+  // code — the instance/DSO is still alive here, exactly as its contract
+  // demands.
   cancelAll();
-  joinAll();
-  jobs_.clear();
-  // (2) Two-phase promotion teardown, uniform with ~PanelSession (Codex r1
-  // F5): shutdown() fails accepted-but-unfinished promotions, which reaches
-  // plugin code — the instance/DSO must still be alive; the host object
-  // itself survives until after the handle so any straggler hits the safe
-  // synchronous rejection (here the jobs-first join already guarantees
-  // quiescence, but the ordering stays identical on both paths).
   if (promotion_host_ != nullptr) {
     promotion_host_->shutdown();
   }
+  // (2) QUIESCENCE: join + destroy every import job while the plugin
+  // instance, its DSO, and every host it can call into are still alive.
+  // After this, no provider worker exists and (per the SDK's JoinableJob
+  // contract) no job callback can ever run again — which is the
+  // precondition ToolboxRuntimeHost's destructor demands and what makes the
+  // ~QObject purge of any still-queued terminal metacalls legal.
+  joinAll();
+  jobs_.clear();
   // (3) The plugin instance persists its state through the settings backend
   // in its destructor, so the handle dies while builder/hosts/settings live.
+  // The promotion-host OBJECT survives until after the handle: a straggler
+  // call into the raw service pointer during instance destroy hits
+  // shutdown()'s safe synchronous rejection, never a use-after-free.
   handle_.reset();
   promotion_host_.reset();
   // (4) Service views into the hosts, then the hosts, then the backend —

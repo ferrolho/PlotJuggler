@@ -20,6 +20,7 @@
 #include <QThread>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -85,6 +86,23 @@ FakeEventLog g_events;
 std::atomic<int> g_created{0};
 std::atomic<int> g_destroyed{0};
 std::atomic<bool> g_promotion_service_found{false};
+
+// Promotion-blocking instrumentation (the shutdown-before-join regression
+// test). `g_worker_promotes` switches the fake worker into a provider that
+// calls promote_to_file_source through the REGISTERED service and then
+// blocks its terminal on the promotion's exactly-once result callback —
+// cancelled or not, because the ABI has no way to cancel a promotion.
+std::atomic<bool> g_worker_promotes{false};
+PJ_service_t g_promotion_service{};  // captured at bind (GUI thread, before any worker starts)
+std::atomic<bool> g_promotion_accepted{false};
+std::atomic<bool> g_promotion_result_ok{true};
+std::binary_semaphore g_promotion_result_gate{0};
+
+void promotionResult(void* /*callback_ctx*/, bool ok, PJ_string_view_t /*message*/) noexcept {
+  g_promotion_result_ok.store(ok);
+  g_events.add(ok ? "promotion.result.ok" : "promotion.result.failed");
+  g_promotion_result_gate.release();
+}
 
 [[nodiscard]] int firstIndexOf(const std::vector<std::string>& log, const std::string& event) {
   const auto it = std::find(log.begin(), log.end(), event);
@@ -178,6 +196,38 @@ bool fakeStartImport(
   }
   job->worker = std::thread([job, on_dataset, on_terminal, callback_ctx] {
     job->start_gate.acquire();
+    if (g_worker_promotes.load()) {
+      // Models a provider whose worker CANNOT abandon an accepted promotion:
+      // the terminal blocks on the promotion's result callback, cancel or no
+      // cancel. The promotion is accepted through the real registered
+      // service; the test never settles it — only the host can.
+      const auto* vtable = static_cast<const PJ_source_promotion_host_vtable_t*>(g_promotion_service.vtable);
+      static const std::string identity = "fake:v1:sha256/aa";
+      static const std::string path = "/tmp/fake-artifact.mcap";
+      PJ_source_promotion_request_v1_t promotion_request{};
+      promotion_request.struct_size = sizeof(promotion_request);
+      promotion_request.dataset = PJ_data_source_handle_t{kFakeDatasetId};
+      promotion_request.source_identity = PJ_string_view_t{identity.data(), identity.size()};
+      promotion_request.local_path_utf8 = PJ_string_view_t{path.data(), path.size()};
+      promotion_request.loader_plugin_id = sv("fake-loader");
+      promotion_request.loader_config_json = sv("{}");
+      promotion_request.descriptor_json = sv(R"({"v":1})");
+      PJ_error_t error{};
+      if (vtable == nullptr || !vtable->promote_to_file_source(
+                                   g_promotion_service.ctx, &promotion_request, &promotionResult, nullptr, &error)) {
+        g_events.add("worker.promotion.rejected");
+        on_terminal(callback_ctx, PJ_DESCRIPTOR_IMPORT_FAILED, sv("promotion rejected"));
+        return;
+      }
+      g_events.add("worker.promotion.accepted");
+      g_promotion_accepted.store(true);
+      // THE BLOCKING EDGE UNDER TEST: an accepted promotion promises
+      // result_cb exactly once — wait for it before delivering the terminal.
+      g_promotion_result_gate.acquire();
+      g_events.add("worker.terminal.after-promotion");
+      on_terminal(callback_ctx, PJ_DESCRIPTOR_IMPORT_CANCELLED, sv("promotion settled at teardown"));
+      return;
+    }
     if (job->cancelled.load()) {
       g_events.add("worker.terminal.cancelled");
       on_terminal(callback_ctx, PJ_DESCRIPTOR_IMPORT_CANCELLED, sv("cancelled"));
@@ -249,6 +299,12 @@ bool fakeBind(void* ctx, PJ_service_registry_t registry, PJ_error_t* out_error) 
       registry.vtable != nullptr &&
       registry.vtable->get_service(registry.ctx, sv(PJ_SOURCE_PROMOTION_HOST_SERVICE_V1), 1, &service, &error);
   g_promotion_service_found.store(found && service.ctx != nullptr && service.vtable != nullptr);
+  if (g_promotion_service_found.load()) {
+    // Kept for the promote-and-block worker; bind runs on the GUI thread
+    // strictly before any worker exists, so no synchronization is needed
+    // beyond the thread-creation happens-before.
+    g_promotion_service = service;
+  }
   g_events.add("plugin.bind");
   return true;
 }
@@ -334,6 +390,10 @@ class HeadlessDescriptorProviderSessionTest : public ::testing::Test {
     g_created.store(0);
     g_destroyed.store(0);
     g_promotion_service_found.store(false);
+    g_worker_promotes.store(false);
+    g_promotion_service = PJ_service_t{};
+    g_promotion_accepted.store(false);
+    g_promotion_result_ok.store(true);
     g_instance = nullptr;
   }
 
@@ -399,6 +459,99 @@ TEST_F(HeadlessDescriptorProviderSessionTest, DestructionQuiescesJobsBeforeHosts
   flushQueuedEvents();
   EXPECT_EQ(dataset_calls.load(), 0);
   EXPECT_EQ(terminal_calls.load(), 0);
+}
+
+// Scenario 4b (the PROMOTION-SHUTDOWN DEADLOCK regression, found
+// independently by the stage-4 design consult and the stage-4 adversarial
+// review): a provider worker may legally block its terminal on an ACCEPTED
+// promotion's exactly-once result callback — the ABI has no way to cancel a
+// promotion. The destructor must therefore fail the promotion intake
+// (SourcePromotionHost::shutdown()) BEFORE joining the jobs; with the old
+// order (join first, shutdown after) teardown deadlocks: joinAll waits on a
+// terminal that waits on a callback only shutdown() can deliver. The
+// destructor runs on a helper thread with a 5 s bound so the pre-fix
+// deadlock FAILS the test instead of hanging the suite.
+TEST_F(HeadlessDescriptorProviderSessionTest, DestructionFailsAcceptedPromotionBeforeJoiningJobs) {
+  g_worker_promotes.store(true);
+  auto session = makeSession(kProviderId);
+  ASSERT_TRUE(session.has_value()) << session.error();
+  ASSERT_NE(g_promotion_service.ctx, nullptr);
+  ASSERT_NE(g_promotion_service.vtable, nullptr);
+
+  std::atomic<int> terminal_calls{0};
+  PJ::DescriptorImportStartRequest request;
+  request.descriptor_json = R"({"v":1})";
+  const auto status = (*session)->startImport(
+      request, nullptr, [&](PJ::DescriptorImportOutcome, std::string) { terminal_calls.fetch_add(1); });
+  ASSERT_TRUE(status) << status.error();
+
+  ASSERT_NE(g_instance, nullptr);
+  g_instance->releaseStart();
+  // Wait for ACCEPTANCE without pumping the event loop: the queued
+  // processPromotion metacall must stay undelivered so the promotion is
+  // still pending when the destructor runs — only shutdown() can settle it.
+  const auto acceptance_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (!g_promotion_accepted.load() && std::chrono::steady_clock::now() < acceptance_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(g_promotion_accepted.load()) << "the promotion must be ACCEPTED through the registered service";
+
+  // Destroy the session on a helper thread and BOUND the teardown.
+  std::atomic<bool> dtor_done{false};
+  std::thread dtor([&] {
+    session->reset();
+    dtor_done.store(true);
+  });
+  const auto bound = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!dtor_done.load() && std::chrono::steady_clock::now() < bound) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(dtor_done.load())
+      << "teardown DEADLOCKED: the destructor must shutdown() the promotion intake BEFORE joinAll";
+  if (!dtor_done.load()) {
+    // Red-run rescue so the failing run reports instead of hanging the
+    // suite: deliver the queued processPromotion (GUI thread) exactly once —
+    // the ownership gate fails the promotion (ok=false), the worker
+    // unblocks, the stuck join returns. Pump only ONCE: the worker's
+    // re-posted terminal metacall must die with the session QObject, not
+    // race its destruction on this thread.
+    QCoreApplication::processEvents();
+    while (!dtor_done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  dtor.join();
+
+  const auto log = g_events.snapshot();
+  const int idx_cancel = firstIndexOf(log, "job.cancel");
+  const int idx_result = firstIndexOf(log, "promotion.result.failed");
+  const int idx_terminal = firstIndexOf(log, "worker.terminal.after-promotion");
+  const int idx_join = firstIndexOf(log, "job.join.returned");
+  const int idx_job_destroy = firstIndexOf(log, "job.destroy");
+  const int idx_plugin_destroy = firstIndexOf(log, "plugin.destroy");
+  ASSERT_GE(idx_cancel, 0) << "the destructor must cancel the live job";
+  ASSERT_GE(idx_result, 0) << "shutdown() must FAIL (ok=false) the accepted-but-unfinished promotion";
+  ASSERT_GE(idx_terminal, 0) << "the failed promotion must unblock the worker's terminal";
+  ASSERT_GE(idx_join, 0);
+  ASSERT_GE(idx_job_destroy, 0);
+  ASSERT_GE(idx_plugin_destroy, 0);
+  EXPECT_FALSE(g_promotion_result_ok.load()) << "a teardown-settled promotion reports ok=false";
+  EXPECT_EQ(countOf(log, "promotion.result.failed") + countOf(log, "promotion.result.ok"), 1)
+      << "the result callback runs exactly once";
+  EXPECT_LT(idx_cancel, idx_result) << "cancel precedes the promotion-intake shutdown";
+  EXPECT_LT(idx_result, idx_join) << "THE FIX: the promotion fails BEFORE join, never after";
+  EXPECT_LT(idx_terminal, idx_join) << "join returns only after the unblocked terminal returned";
+  // The existing QUIESCENCE pin must survive the reorder: every job event
+  // still precedes the plugin instance's destruction.
+  EXPECT_LT(idx_join, idx_job_destroy) << "the job is joined before it is destroyed";
+  EXPECT_LT(idx_job_destroy, idx_plugin_destroy)
+      << "the worker must be fully quiesced BEFORE the handle/runtime hosts die";
+  EXPECT_EQ(g_destroyed.load(), 1);
+
+  // No user callback after destruction: the queued terminal metacall died
+  // with the session QObject.
+  flushQueuedEvents();
+  EXPECT_EQ(terminal_calls.load(), 0) << "no callback may fire after the destructor";
 }
 
 // Scenario 1: creation success — the session resolves the fake by STABLE
