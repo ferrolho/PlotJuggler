@@ -216,6 +216,25 @@ QByteArray pluginZipWithTwoDsos(const QString& ext_id, const QString& first_id, 
   });
 }
 
+// Scopes QCoreApplication::applicationVersion() for a single test — the value
+// is process-wide, so pinning it at the top of the test and restoring it in
+// the destructor keeps sibling tests independent. Used by the
+// hostCompatibility() coverage below.
+class ScopedApplicationVersion {
+ public:
+  explicit ScopedApplicationVersion(const QString& v) : previous_(QCoreApplication::applicationVersion()) {
+    QCoreApplication::setApplicationVersion(v);
+  }
+  ~ScopedApplicationVersion() {
+    QCoreApplication::setApplicationVersion(previous_);
+  }
+  ScopedApplicationVersion(const ScopedApplicationVersion&) = delete;
+  ScopedApplicationVersion& operator=(const ScopedApplicationVersion&) = delete;
+
+ private:
+  QString previous_;
+};
+
 // Builds an Extension whose download artifact for the current platform points to `url`.
 // Checksum is empty by default so DownloadManager skips SHA-256 verification.
 Extension makeExtension(const QString& id, const QString& version, const QUrl& url, const QString& checksum = {}) {
@@ -392,6 +411,99 @@ TEST_F(ExtensionManagerTest, InstallRejectsUnsupportedPlatform) {
   EXPECT_EQ(spy_error.first().at(0).toString(), "fft-toolbox");
   EXPECT_FALSE(spy_error.first().at(1).toString().isEmpty());
   EXPECT_EQ(spy_started.count(), 0) << "installStarted must not fire when the platform is unsupported";
+}
+
+// ---------------------------------------------------------------------------
+// hostCompatibility() — the primitive: platform match + host >= min version.
+// applicationVersion() is process-wide so each test scopes its own value via
+// the ScopedApplicationVersion RAII helper declared earlier in this file.
+// ---------------------------------------------------------------------------
+
+TEST_F(ExtensionManagerTest, HostCompatibilityAcceptsCurrentPlatformWithNoMinVersion) {
+  Extension ext = makeExtension("plugin-x", "1.0.0", server_.url());
+  ext.min_plotjuggler_version = "";  // advisory soft floor absent
+
+  const auto compat = mgr_->hostCompatibility(ext);
+  EXPECT_TRUE(compat.ok);
+  EXPECT_TRUE(compat.reason.isEmpty());
+}
+
+TEST_F(ExtensionManagerTest, HostCompatibilityRejectsPlatformNotListed) {
+  Extension ext;
+  ext.id = "plugin-x";
+  ext.name = "plugin-x";
+  ext.version = "1.0.0";
+  ext.platforms["nonexistent-platform"] = Platform{"http://example.com/dummy.zip", ""};
+
+  const auto compat = mgr_->hostCompatibility(ext);
+  EXPECT_FALSE(compat.ok);
+  EXPECT_FALSE(compat.reason.isEmpty()) << "reason must be non-empty when compatibility fails";
+}
+
+// A locally-sideloaded install (installFromLocalZip → row synthesized by
+// MarketplaceWindow::rebuildExtensionList) carries no registry-sourced fields,
+// so `platforms` is empty by design. Treating that as incompatible would
+// mislabel a working local install; empty-platforms must be read as "no
+// registry declaration" and pass the gate.
+TEST_F(ExtensionManagerTest, HostCompatibilityAcceptsEmptyPlatformsAsLocallyDeclared) {
+  Extension ext;
+  ext.id = "local-plugin";
+  ext.name = "local-plugin";
+  ext.version = "1.0.0";
+  // ext.platforms is deliberately left empty — this is what the synthesized
+  // local-only marketplace row carries.
+
+  const auto compat = mgr_->hostCompatibility(ext);
+  EXPECT_TRUE(compat.ok) << "an ext with an empty platforms map is a local install without registry metadata — "
+                            "the platform gate must not fire on it";
+  EXPECT_TRUE(compat.reason.isEmpty());
+}
+
+TEST_F(ExtensionManagerTest, HostCompatibilityRejectsHostBelowDeclaredMinimum) {
+  const ScopedApplicationVersion host{"3.9.0"};
+  Extension ext = makeExtension("plugin-x", "1.0.0", server_.url());
+  ext.min_plotjuggler_version = "4.0.0";
+
+  const auto compat = mgr_->hostCompatibility(ext);
+  EXPECT_FALSE(compat.ok);
+  EXPECT_TRUE(compat.reason.contains("4.0.0"))
+      << "reason must surface the required minimum: " << compat.reason.toStdString();
+}
+
+TEST_F(ExtensionManagerTest, HostCompatibilityAcceptsHostAtOrAboveDeclaredMinimum) {
+  const ScopedApplicationVersion host{"4.0.0"};
+  Extension ext = makeExtension("plugin-x", "1.0.0", server_.url());
+  ext.min_plotjuggler_version = "4.0.0";
+
+  EXPECT_TRUE(mgr_->hostCompatibility(ext).ok) << "host equal to min must be accepted";
+
+  const ScopedApplicationVersion host_newer{"4.5.1"};
+  EXPECT_TRUE(mgr_->hostCompatibility(ext).ok) << "host above min must be accepted";
+}
+
+// R1: install() must refuse an extension whose declared minimum host is newer
+// than the running build. Both installError AND installFinished(id, false)
+// must fire — callers that await installFinished would otherwise hang, and
+// callers subscribed to installError would miss the failure entirely if only
+// one of the two were emitted.
+TEST_F(ExtensionManagerTest, InstallRefusesWhenHostBelowMinPlotjugglerVersion) {
+  const ScopedApplicationVersion host{"3.9.0"};
+  Extension ext = makeExtension("plugin-x", "1.0.0", server_.url());
+  ext.min_plotjuggler_version = "4.0.0";
+
+  QSignalSpy started(mgr_, &ExtensionManager::installStarted);
+  QSignalSpy error(mgr_, &ExtensionManager::installError);
+  QSignalSpy finished(mgr_, &ExtensionManager::installFinished);
+
+  mgr_->install(ext);
+
+  EXPECT_EQ(started.count(), 0) << "installStarted must not fire when the host is below the plugin's minimum";
+  ASSERT_EQ(error.count(), 1);
+  EXPECT_EQ(error.first().at(0).toString(), "plugin-x");
+  EXPECT_TRUE(error.first().at(1).toString().contains("4.0.0"));
+  ASSERT_EQ(finished.count(), 1) << "installFinished must fire so callers awaiting it do not hang";
+  EXPECT_EQ(finished.first().at(0).toString(), "plugin-x");
+  EXPECT_FALSE(finished.first().at(1).toBool());
 }
 
 TEST_F(ExtensionManagerTest, InstallRejectsEmbeddedIdMismatch) {

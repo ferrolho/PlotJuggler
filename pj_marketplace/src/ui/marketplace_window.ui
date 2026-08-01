@@ -12,10 +12,57 @@
    <property name="rightMargin"><number>8</number></property>
    <property name="bottomMargin"><number>8</number></property>
 
-   <!-- Toolbar -->
+   <!-- Toolbar — single row: category filters (left) · search · action buttons (right).
+        Category toggles are additive: with all four checked (default) every registry
+        category is visible; with all four unchecked the table is empty. The user-facing
+        button labels differ from the registry "category" values, which live in
+        applyFilters(). filter_compatible_ / filter_installed_ are hidden for now — the
+        compatibility gate keeps running on filter_compatible_'s default-checked state. -->
    <item>
     <layout class="QHBoxLayout" name="toolbar_layout">
-     <property name="spacing"><number>8</number></property>
+     <property name="spacing"><number>6</number></property>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_data_loader_">
+       <property name="checked"><bool>true</bool></property>
+       <property name="text"><string>Data Sources</string></property>
+       <property name="toolTip"><string>Extensions that load data from files</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_data_streamer_">
+       <property name="checked"><bool>true</bool></property>
+       <property name="text"><string>Data Streamers</string></property>
+       <property name="toolTip"><string>Extensions that stream data continuously</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_parser_">
+       <property name="checked"><bool>true</bool></property>
+       <property name="text"><string>Parsers</string></property>
+       <property name="toolTip"><string>Extensions that decode byte blobs into fields</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_toolbox_">
+       <property name="checked"><bool>true</bool></property>
+       <property name="text"><string>Toolboxes</string></property>
+       <property name="toolTip"><string>Extensions that add a tool with its own GUI</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_compatible_">
+       <property name="visible"><bool>false</bool></property>
+       <property name="text"><string>Compatible only</string></property>
+       <property name="toolTip"><string>Show only plugins compatible with this PlotJuggler build (installed ones stay visible)</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="PJ::CheckButton" name="filter_installed_">
+       <property name="visible"><bool>false</bool></property>
+       <property name="text"><string>Installed only</string></property>
+       <property name="toolTip"><string>Show only extensions that are already installed</string></property>
+      </widget>
+     </item>
      <item>
       <widget class="PJ::Search" name="search_edit_">
        <property name="placeholder"><string>Search extensions...</string></property>
@@ -40,59 +87,6 @@
        <property name="toolTip"><string>Plugin settings — open Preferences ▸ Plugins</string></property>
        <property name="iconSize"><size><width>18</width><height>18</height></size></property>
        <property name="maximumSize"><size><width>30</width><height>16777215</height></size></property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-
-   <!-- Faceted filter row. Any number of toggles can be active at once: the four
-        category toggles OR among themselves (none checked means "any category"),
-        and "Installed" intersects that result. Right-aligned behind a spacer so the
-        row reads as a trailing control strip under the toolbar. Button labels are
-        the user-facing names only; the registry "category" values they map to live
-        in applyFilters() and deliberately differ from these labels. -->
-   <item>
-    <layout class="QHBoxLayout" name="filter_layout">
-     <property name="spacing"><number>6</number></property>
-     <item>
-      <widget class="QLabel" name="filter_label">
-       <property name="text"><string>Show:</string></property>
-      </widget>
-     </item>
-     <item>
-      <spacer name="filter_stretch">
-       <property name="orientation"><enum>Qt::Horizontal</enum></property>
-       <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
-      </spacer>
-     </item>
-     <item>
-      <widget class="PJ::CheckButton" name="filter_installed_">
-       <property name="text"><string>Installed</string></property>
-       <property name="toolTip"><string>Show only extensions that are already installed</string></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="PJ::CheckButton" name="filter_data_loader_">
-       <property name="text"><string>Data Source</string></property>
-       <property name="toolTip"><string>Extensions that load data from files</string></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="PJ::CheckButton" name="filter_data_streamer_">
-       <property name="text"><string>Data Streamer</string></property>
-       <property name="toolTip"><string>Extensions that stream data continuously</string></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="PJ::CheckButton" name="filter_parser_">
-       <property name="text"><string>Parsers</string></property>
-       <property name="toolTip"><string>Extensions that decode byte blobs into fields</string></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="PJ::CheckButton" name="filter_toolbox_">
-       <property name="text"><string>Toolboxes</string></property>
-       <property name="toolTip"><string>Extensions that add a tool with its own GUI</string></property>
       </widget>
      </item>
     </layout>

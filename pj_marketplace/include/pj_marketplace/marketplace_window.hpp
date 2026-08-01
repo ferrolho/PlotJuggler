@@ -198,6 +198,12 @@ class MarketplaceWindow : public Dialog {
   bool installations_changed_ = false;
   bool status_error_sticky_ = false;
   bool initial_snapshot_provided_ = false;
+  // Last user-chosen sort state on one of the sortable columns (Name, Category,
+  // Installed, Marketplace) — the header intercepts clicks on Description and
+  // reverts to this. Default: Category ascending, which via CategoryItem's
+  // compound comparator reads as "grouped by category, alphabetical within".
+  int last_sort_column_ = 1;  // kColCategory
+  Qt::SortOrder last_sort_order_ = Qt::AscendingOrder;
 };
 
 }  // namespace PJ

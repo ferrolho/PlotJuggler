@@ -1,6 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -283,6 +284,31 @@ void ExtensionManager::install(const Extension& ext) {
   doInstall(ext, /*staging=*/false);
 }
 
+ExtensionManager::HostCompatibility ExtensionManager::hostCompatibility(const Extension& ext) const {
+  // Platform: only enforced when the extension declares a `platforms` map at
+  // all. A locally-sideloaded row (installed via installFromLocalZip, then
+  // synthesized by MarketplaceWindow::rebuildExtensionList for the marketplace
+  // list) carries no registry-sourced fields — `platforms` is empty by design.
+  // Treating that as incompatible would mislabel a working local install as
+  // "Not available for this platform"; the caller-side sideloader has already
+  // validated the DSO loads on this build, so the check is meaningful only for
+  // registry entries with declared platforms.
+  const QString platform = PlatformUtils::currentPlatform();
+  if (!ext.platforms.isEmpty() && !ext.platforms.contains(platform)) {
+    return {false, tr("Not available for this platform (%1)").arg(platform)};
+  }
+  // Version: the host must be at least the declared minimum. The host version is
+  // QCoreApplication::applicationVersion() — the single source the app sets once
+  // at startup; there is no second/fallback path. An empty minimum imposes no
+  // floor.
+  const QString host = QCoreApplication::applicationVersion();
+  if (!ext.min_plotjuggler_version.isEmpty() &&
+      compareSemver(host.toStdString(), ext.min_plotjuggler_version.toStdString()) < 0) {
+    return {false, tr("Requires PlotJuggler %1 or newer (this build is %2)").arg(ext.min_plotjuggler_version, host)};
+  }
+  return {true, {}};
+}
+
 void ExtensionManager::installFromLocalZip(const QString& zip_path) {
   // Until the manifest is read there is no id to name, so failures raised before
   // that point are reported against the file name.
@@ -466,11 +492,13 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
     return;
   }
 
-  const QString platform = PlatformUtils::currentPlatform();
-  if (!ext.platforms.contains(platform)) {
-    emitInstallFailure(ext.id, QString("No artifact available for platform \"%1\"").arg(platform));
+  // Refuse an extension the host can't run: wrong platform or a host older than
+  // the plugin's declared minimum (R1). The reason is surfaced to the user.
+  if (const HostCompatibility compat = hostCompatibility(ext); !compat.ok) {
+    emitInstallFailure(ext.id, compat.reason);
     return;
   }
+  const QString platform = PlatformUtils::currentPlatform();
   const Platform& artifact = ext.platforms[platform];
 
   // Extraction goes into a hidden transaction directory on the same filesystem

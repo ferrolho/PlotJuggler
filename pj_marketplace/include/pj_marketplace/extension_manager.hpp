@@ -46,6 +46,19 @@ class ExtensionManager : public QObject {
   // Starts an async install for the current platform.
   void install(const Extension& ext);
 
+  // Host/plugin compatibility of a registry extension: the current platform must
+  // be listed in ext.platforms AND the host version must be >= its declared
+  // min_plotjuggler_version (an empty value imposes no floor). The host version is
+  // QCoreApplication::applicationVersion(), the single source the app sets at
+  // startup (tests set it the same way). `reason` is a human-readable explanation
+  // when !ok, for the footer / an install-button tooltip. install() refuses an
+  // incompatible extension (see doInstall).
+  struct HostCompatibility {
+    bool ok = true;
+    QString reason;
+  };
+  HostCompatibility hostCompatibility(const Extension& ext) const;
+
   // Asked by installFromLocalZip when the archive carries an id that is already
   // installed: return true to replace it, false to abort. Called synchronously on
   // the calling (GUI) thread, so an implementation may run a modal dialog.

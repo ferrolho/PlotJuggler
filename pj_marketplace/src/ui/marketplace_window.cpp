@@ -57,41 +57,69 @@ namespace {
 // Column order of the plugin table (see setupUi / rebuildTable).
 enum Column {
   kColName = 0,
+  kColCategory,            // the registry `category` value (data_loader, toolbox, …)
   kColInstalledVersion,    // the installed version, or "—" when not installed
   kColMarketplaceVersion,  // the registry version; highlighted when it's an update
   kColDescription,
   kColCount,
 };
 
+// Per-item string on the Category column carrying the row's plugin name, so
+// CategoryItem::operator< can break ties alphabetically WITHIN a category
+// (see the class comment). Stored via setData at row insertion time in
+// rebuildTable().
+constexpr int kCategoryNameKeyRole = Qt::UserRole + 2;
+
+// Sort compound for the Category column: primary key = category text,
+// secondary key = plugin name (case-insensitive). Grouping by category with an
+// alphabetical run inside each group is the PJ3-era default sort Davide asked
+// to restore. Applied uniformly for both ascending and descending — descending
+// flips both keys (reverse-category, then reverse-name within), which keeps
+// Category a single toggle rather than a stateful multi-dimension picker.
+class CategoryItem : public QTableWidgetItem {
+ public:
+  using QTableWidgetItem::QTableWidgetItem;
+  [[nodiscard]] bool operator<(const QTableWidgetItem& other) const override {
+    const int cat_cmp = QString::compare(text(), other.text(), Qt::CaseInsensitive);
+    if (cat_cmp != 0) {
+      return cat_cmp < 0;
+    }
+    return QString::compare(
+               data(kCategoryNameKeyRole).toString(), other.data(kCategoryNameKeyRole).toString(),
+               Qt::CaseInsensitive) < 0;
+  }
+};
+
 // Row-height floor: a comfortable minimum so rows read as clearly separated
 // even when their text is short.
 constexpr int kMinRowHeight = 44;
 
-// Per-item bool: true when the row is an available update (set in rebuildTable,
-// read by UpdateRowDelegate to paint the highlight).
-constexpr int kUpdateRole = Qt::UserRole + 1;
+// Per-item fill QColor for the Marketplace-version cell highlight, or an invalid
+// QColor for no highlight (set in rebuildTable, read by MarketplaceCellDelegate).
+// The colour differs by reason — Destructive pink for an available update,
+// Emphasis amber for an incompatible plugin.
+constexpr int kHighlightColorRole = Qt::UserRole + 1;
 
-// Paints updatable rows in the framework's Emphasis "update" tone. A delegate is
+// Paints the Marketplace-version cell in a per-item fill colour. A delegate is
 // required because the app-wide QSS rule `QTableView::item { background-color: … }`
 // unconditionally overrides any per-item setBackground(), so the highlight has to
 // be drawn here (the delegate owns the cell's paint) rather than via item brushes.
-class UpdateRowDelegate : public QStyledItemDelegate {
+class MarketplaceCellDelegate : public QStyledItemDelegate {
  public:
-  UpdateRowDelegate(QColor bg, QColor fg, QObject* parent)
-      : QStyledItemDelegate(parent), bg_(std::move(bg)), fg_(std::move(fg)) {}
+  MarketplaceCellDelegate(QColor fg, QObject* parent) : QStyledItemDelegate(parent), fg_(std::move(fg)) {}
 
   void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
-    const bool updatable = index.data(kUpdateRole).toBool();
+    const QColor fill = index.data(kHighlightColorRole).value<QColor>();
     const bool selected = (option.state & QStyle::State_Selected) != 0;
-    if (!updatable || selected) {
+    if (!fill.isValid() || selected) {
       QStyledItemDelegate::paint(painter, option, index);  // normal cells: let the QSS style paint
       return;
     }
-    // Updatable, unselected: fill the Emphasis background and draw the text
+    // Highlighted, unselected: fill the per-item background and draw the text
     // ourselves (calling the base would let the QSS repaint the cell backdrop
     // over our fill).
     painter->save();
-    painter->fillRect(option.rect, bg_);
+    painter->fillRect(option.rect, fill);
     painter->setPen(fg_);
     const QRect text_rect = option.rect.adjusted(6, 0, -6, 0);
     // Respect the item's own alignment (e.g. the centered version columns);
@@ -103,7 +131,6 @@ class UpdateRowDelegate : public QStyledItemDelegate {
   }
 
  private:
-  QColor bg_;
   QColor fg_;
 };
 
@@ -186,6 +213,22 @@ void MarketplaceWindow::setupUi() {
   ui_->update_all_btn_->setFixedWidth(90);
   ui_->update_all_btn_->setEnabled(false);
 
+  // Pin the toolbar-row pill height to the Install/Update button post-QSS
+  // rendered size so the strip reads as one row. QPushButton grows via the QSS
+  // `padding: ${space_comfortable}` which doesn't feed sizeHint on QStyleSheet
+  // widgets (padding without a border), so the actual height is only known
+  // after the first layout pass — deferred to the next event-loop tick.
+  QMetaObject::invokeMethod(
+      this,
+      [this]() {
+        const int actual_h = ui_->install_local_btn_->height();
+        for (CheckButton* pill :
+             {ui_->filter_data_loader_, ui_->filter_data_streamer_, ui_->filter_parser_, ui_->filter_toolbox_}) {
+          pill->setFixedHeight(actual_h);
+        }
+      },
+      Qt::QueuedConnection);
+
   // The marketplace doesn't link pj_app_core, so it can't pipe icons
   // through LoadSvg's recolor. Pick the theme-appropriate variant
   // directly from the resource bundle.
@@ -202,9 +245,12 @@ void MarketplaceWindow::setupUi() {
   // (#scroll_area_ rule binds it to ${dark_background}).
 
   connect(ui_->search_edit_, &Search::textChanged, this, &MarketplaceWindow::onSearchChanged);
+  // "Compatible" hides host-incompatible plugins and is ON by default (R2). Set
+  // it before wiring signals so this initial state emits no toggled/filter pass.
+  ui_->filter_compatible_->setChecked(true);
   for (CheckButton* toggle :
-       {ui_->filter_installed_, ui_->filter_data_loader_, ui_->filter_data_streamer_, ui_->filter_parser_,
-        ui_->filter_toolbox_}) {
+       {ui_->filter_compatible_, ui_->filter_installed_, ui_->filter_data_loader_, ui_->filter_data_streamer_,
+        ui_->filter_parser_, ui_->filter_toolbox_}) {
     connect(toggle, &CheckButton::toggled, this, &MarketplaceWindow::onFilterToggled);
   }
   connect(ui_->settings_btn_, &QPushButton::clicked, this, &MarketplaceWindow::pluginPreferencesRequested);
@@ -219,7 +265,7 @@ void MarketplaceWindow::setupUi() {
   // uninstall and enable/disable — live in the details footer, not in the cells.
   auto* table = ui_->plugin_table_;
   table->setColumnCount(kColCount);
-  table->setHorizontalHeaderLabels({tr("Name"), tr("Installed"), tr("Marketplace"), tr("Description")});
+  table->setHorizontalHeaderLabels({tr("Name"), tr("Category"), tr("Installed"), tr("Marketplace"), tr("Description")});
   table->verticalHeader()->setVisible(false);
   table->setEditTriggers(QAbstractItemView::NoEditTriggers);
   table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -229,26 +275,39 @@ void MarketplaceWindow::setupUi() {
   table->setShowGrid(true);
   table->setWordWrap(true);
   table->setAlternatingRowColors(true);
-  table->setSortingEnabled(false);
+  // Sorting is on so the header click reorders rows. We restrict click-to-sort
+  // to Name and Category — clicks on other columns are intercepted below and
+  // reset back to the previous Name/Category sort. rebuildTable() toggles
+  // sortingEnabled around the row insertion.
+  table->setSortingEnabled(true);
+  table->sortByColumn(kColCategory, Qt::AscendingOrder);
   table->verticalHeader()->setMinimumSectionSize(kMinRowHeight);
   auto* header = table->horizontalHeader();
   header->setSectionResizeMode(kColName, QHeaderView::ResizeToContents);
+  header->setSectionResizeMode(kColCategory, QHeaderView::ResizeToContents);
   header->setSectionResizeMode(kColInstalledVersion, QHeaderView::ResizeToContents);
   header->setSectionResizeMode(kColMarketplaceVersion, QHeaderView::ResizeToContents);
   header->setSectionResizeMode(kColDescription, QHeaderView::Stretch);
+  // Name, Category, Installed and Marketplace are sortable; a click on
+  // Description (long free-form text) is intercepted and reverts to the last
+  // valid sort state (default: Name ascending).
+  connect(header, &QHeaderView::sortIndicatorChanged, this, [this, header](int section, Qt::SortOrder order) {
+    if (section == kColName || section == kColCategory || section == kColInstalledVersion ||
+        section == kColMarketplaceVersion) {
+      last_sort_column_ = section;
+      last_sort_order_ = order;
+      return;
+    }
+    QSignalBlocker blocker(header);
+    ui_->plugin_table_->sortByColumn(last_sort_column_, last_sort_order_);
+  });
 
   // Delegate that lights up updatable rows in the "update" tone (the per-item
   // setBackground path is defeated by the app-wide QTableView::item QSS). The
-  // update tone is the palette's Destructive pink (${destructive_nominal}), the
-  // same pink the "Abort" button uses; painted at reduced alpha as a very subtle
-  // tint over the cell surface (there is no pastel-pink token — only the opacity
-  // drops, the base stays the palette token). Standard body ink reads cleanly.
-  {
-    const auto fw = theme::appTheme();
-    QColor subtle_pink = theme::destructive(theme::Destructive::Nominal, fw);
-    subtle_pink.setAlphaF(0.22);
-    table->setItemDelegate(new UpdateRowDelegate(subtle_pink, theme::text(fw), table));
-  }
+  // The per-item fill colour is set in rebuildTable (Destructive pink for an
+  // update, Emphasis amber for an incompatible plugin), painted at reduced
+  // alpha as a subtle tint. Standard body ink reads cleanly on either.
+  table->setItemDelegate(new MarketplaceCellDelegate(theme::text(theme::appTheme()), table));
 
   // Selecting a row updates the bottom "Details" footer with that plugin.
   connect(table, &QTableWidget::itemSelectionChanged, this, [this]() {
@@ -468,9 +527,24 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
 
   // Silence selection changes while tearing down + repopulating (setRowCount(0)
   // clears the selection); the deliberate selectRow() at the end fires exactly
-  // one itemSelectionChanged that refreshes the footer.
+  // one itemSelectionChanged that refreshes the footer. Also switch sorting off
+  // while inserting rows — otherwise QTableWidget would resort after each row
+  // (O(n²) inserts, and the intermediate order breaks the row-index bookkeeping
+  // above).
   table->blockSignals(true);
+  const bool sorting_was_enabled = table->isSortingEnabled();
+  table->setSortingEnabled(false);
   table->setRowCount(0);
+
+  // Marketplace-cell highlight fills (subtle tints over the cell surface): the
+  // Destructive pink for an available update, the Emphasis amber for an
+  // incompatible plugin — the same amber the footer's incompatibility notice
+  // uses.
+  const auto fw = theme::appTheme();
+  QColor update_fill = theme::destructive(theme::Destructive::Nominal, fw);
+  update_fill.setAlphaF(0.22);
+  QColor incompatible_fill = theme::interaction(theme::Variant::Emphasis, theme::State::Nominal, fw);
+  incompatible_fill.setAlphaF(0.22);
 
   const auto installed = ext_mgr_->installedExtensions();
   for (const Extension& ext : filtered_) {
@@ -479,12 +553,23 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
 
     const bool is_installed = installed.contains(ext.id);
     const bool has_update = ext_mgr_->hasUpdate(ext);
+    const auto compat = ext_mgr_->hostCompatibility(ext);
 
-    // Name, with the full description as tooltip.
+    // Name, with the full description as tooltip. Plain QTableWidgetItem — the
+    // Name column sorts by case-insensitive text.
     auto* name_item = new QTableWidgetItem(ext.name);
     name_item->setToolTip(ext.description);
     name_item->setData(Qt::UserRole, ext.id);
     table->setItem(row, kColName, name_item);
+
+    // Category — the registry `category` value verbatim (data_loader,
+    // data_stream, message_parser, toolbox). CategoryItem breaks category ties
+    // alphabetically by the plugin name it stores in kCategoryNameKeyRole, so
+    // the default sort reads as "grouped by category, alphabetical within".
+    auto* category_item = new CategoryItem(ext.category);
+    category_item->setToolTip(ext.category);
+    category_item->setData(kCategoryNameKeyRole, ext.name);
+    table->setItem(row, kColCategory, category_item);
 
     // Installed version (an em dash when not installed), centered.
     auto* installed_item = new QTableWidgetItem(is_installed ? installed[ext.id].version : u"\u2014"_s);
@@ -492,13 +577,17 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     table->setItem(row, kColInstalledVersion, installed_item);
 
     // Marketplace (registry) version \u2014 the version an update would move to. Only
-    // THIS cell is flagged for the update highlight (UpdateRowDelegate paints it),
-    // so an available update shows as a pink Marketplace-version cell, not a
-    // whole-row tint.
+    // THIS cell is highlighted (MarketplaceCellDelegate paints it), not the whole
+    // row. Incompatible wins over update: an incompatible plugin's cell is
+    // amber (matching the footer notice) even when it also has an update;
+    // otherwise an available update paints it pink.
     auto* market_item = new QTableWidgetItem(ext.version);
     market_item->setTextAlignment(Qt::AlignCenter);
-    market_item->setData(kUpdateRole, has_update);
-    if (has_update) {
+    if (!compat.ok) {
+      market_item->setData(kHighlightColorRole, incompatible_fill);
+      market_item->setToolTip(compat.reason);
+    } else if (has_update) {
+      market_item->setData(kHighlightColorRole, update_fill);
       market_item->setToolTip(tr("Update available: v%1").arg(ext.version));
     }
     table->setItem(row, kColMarketplaceVersion, market_item);
@@ -507,6 +596,15 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     auto* desc_item = new QTableWidgetItem(ext.description);
     desc_item->setToolTip(ext.description);
     table->setItem(row, kColDescription, desc_item);
+  }
+
+  // Re-enable sorting AFTER all rows are populated and sort by the last
+  // user-chosen Name/Category column so the visible order is deterministic
+  // across rebuilds. resizeRowsToContents follows so heights match the sorted
+  // rows.
+  if (sorting_was_enabled) {
+    table->setSortingEnabled(true);
+    table->sortByColumn(last_sort_column_, last_sort_order_);
   }
 
   table->resizeRowsToContents();
@@ -540,9 +638,13 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
   // filtered subset shown — so the button's reach matches its action. A staged
   // update keeps its old installed version until restart (hasUpdate stays true),
   // so exclude already-pending extensions to avoid re-staging what is queued.
+  // Incompatible updates are excluded: their new version needs a newer host, so
+  // install() would reject them — Update All must not appear to offer what it
+  // can't do (it disables entirely when every pending update is incompatible).
   bool any_updatable = false;
   for (const Extension& ext : extensions_) {
-    if (ext_mgr_->hasUpdate(ext) && !ext_mgr_->hasPendingInstall(ext.id) && !ext_mgr_->hasPendingUninstall(ext.id)) {
+    if (ext_mgr_->hasUpdate(ext) && ext_mgr_->hostCompatibility(ext).ok && !ext_mgr_->hasPendingInstall(ext.id) &&
+        !ext_mgr_->hasPendingUninstall(ext.id)) {
       any_updatable = true;
       break;
     }
@@ -596,6 +698,29 @@ void MarketplaceWindow::updateDetailFooter() {
   }
 
   QString html;
+
+  // When the selected plugin is incompatible with this host, lead the footer with
+  // a prominent notice carrying the reason, in the palette's Emphasis (amber)
+  // tone — the same amber the Marketplace-version cell uses. Emphasis is a fill
+  // family (no legible text ink), so tint the notice's background rather than its
+  // text and keep the standard body ink on top. When the plugin is ALSO outdated
+  // (an installed version with a newer — but incompatible — registry version), the
+  // notice states both facts: the update exists but is blocked, and why (R6).
+  if (const auto compat = ext_mgr_->hostCompatibility(*ext); !compat.ok) {
+    QColor tint = theme::interaction(theme::Variant::Emphasis, theme::State::Nominal, theme::appTheme());
+    tint.setAlphaF(0.30);
+    const QString message =
+        ext_mgr_->hasUpdate(*ext)
+            ? tr("⚠ Update to v%1 available, but blocked — %2").arg(esc(ext->version), esc(compat.reason))
+            : tr("⚠ Incompatible — %1").arg(esc(compat.reason));
+    html +=
+        u"<p style='margin:0 0 6px 0; padding:3px 6px; font-weight:700; "
+        u"background-color:rgba(%1,%2,%3,%4);'>%5</p>"_s.arg(tint.red())
+            .arg(tint.green())
+            .arg(tint.blue())
+            .arg(tint.alphaF())
+            .arg(message);
+  }
 
   // Metadata line (publisher/author • category • license • requires PJ •
   // installed).
@@ -688,6 +813,16 @@ void MarketplaceWindow::updateDetailFooter() {
     action->setText(tr("Install"));
     action->setObjectName("extButtonInstall");
     connect(action, &QPushButton::clicked, this, [this, ext_id]() { onActionButtonClicked(ext_id); });
+  }
+  // An incompatible plugin can't be installed/updated: disable the actionable
+  // primary button (Install/Update — the state badges are already disabled) and
+  // surface the reason on hover. install() would refuse it anyway; this stops the
+  // click before it starts.
+  if (action->isEnabled()) {
+    if (const auto compat = ext_mgr_->hostCompatibility(*ext); !compat.ok) {
+      action->setEnabled(false);
+      action->setToolTip(compat.reason);
+    }
   }
   ui_->detail_buttons_layout->addWidget(action);
 
@@ -804,15 +939,23 @@ void MarketplaceWindow::applyFilters() {
     active_categories << u"toolbox"_s;
   }
   const bool installed_only = ui_->filter_installed_->isChecked();
+  // R2: hide plugins incompatible with this host (on by default). R2a: never hide
+  // one that's already installed — even incompatible/outdated/disabled — so the
+  // user can always see and manage what they have.
+  const bool compatible_only = ui_->filter_compatible_->isChecked();
 
   filtered_.clear();
   for (const auto& ext : extensions_) {
-    // Categories are a single facet: any number may be active and they widen the
-    // result (OR). "Installed" is a separate facet and narrows it (AND).
-    if (!active_categories.isEmpty() && !active_categories.contains(ext.category)) {
+    // Category checkboxes are additive: only extensions whose category is
+    // currently checked are shown. With all four checked (the default) every
+    // registry category is visible; with all four unchecked nothing is shown.
+    if (!active_categories.contains(ext.category)) {
       continue;
     }
     if (installed_only && !ext_mgr_->isInstalled(ext.id)) {
+      continue;
+    }
+    if (compatible_only && !ext_mgr_->hostCompatibility(ext).ok && !ext_mgr_->isInstalled(ext.id)) {
       continue;
     }
     if (!search.isEmpty()) {
@@ -1038,7 +1181,10 @@ void MarketplaceWindow::onUpdateAllClicked() {
   // hasUpdate() stays true) but re-queuing it would just re-download and
   // re-stage the same payload.
   for (const auto& ext : extensions_) {
-    if (ext_mgr_->hasUpdate(ext) && !ext_mgr_->hasPendingInstall(ext.id) && !ext_mgr_->hasPendingUninstall(ext.id)) {
+    // Skip incompatible updates — install() would reject them (see the enable
+    // guard in rebuildTable, which keeps the button in step with this queue).
+    if (ext_mgr_->hasUpdate(ext) && ext_mgr_->hostCompatibility(ext).ok && !ext_mgr_->hasPendingInstall(ext.id) &&
+        !ext_mgr_->hasPendingUninstall(ext.id)) {
       update_queue_.append(ext);
     }
   }
