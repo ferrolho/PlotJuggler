@@ -494,20 +494,29 @@ void LayoutImportBatch::startNextJob() {
         planned.descriptor_utf8.constData(), static_cast<std::size_t>(planned.descriptor_utf8.size()));
     request.flags = PJ_DESCRIPTOR_IMPORT_START_FLAG_NONE;
     request.max_transfer_bytes = max_transfer_bytes_;
-    const auto status = session->startImport(
-        request, [this](DatasetId dataset_id) { produced_datasets_.push_back(dataset_id); },
+    const auto started = session->startImport(
+        request,
+        [this](DatasetId dataset_id) {
+          // The T7 correlation surface, alongside the rollback-ledger append:
+          // sequential v1 runs at most one job, so the announcement is
+          // unambiguously the active job's.
+          active_import_dataset_ = dataset_id;
+          produced_datasets_.push_back(dataset_id);
+        },
         [this, index](DescriptorImportOutcome outcome, std::string message) {
           onJobTerminal(index, outcome, QString::fromStdString(message));
         });
-    if (!status) {
-      setResult(index, SourceOutcome::kFailed, QString::fromStdString(status.error()));
+    if (!started) {
+      setResult(index, SourceOutcome::kFailed, QString::fromStdString(started.error()));
       emitDiagnostic(
           DiagnosticLevel::kWarning, "layout-import-job-start-failed",
           tr("Import of layout source '%1' could not start: %2")
-              .arg(planned.effective_path, QString::fromStdString(status.error())));
+              .arg(planned.effective_path, QString::fromStdString(started.error())));
       continue;
     }
     job_active_ = true;
+    active_job_session_ = session;
+    active_job_id_ = *started;
     return;
   }
 }
@@ -515,6 +524,12 @@ void LayoutImportBatch::startNextJob() {
 void LayoutImportBatch::onJobTerminal(
     std::size_t planned_index, DescriptorImportOutcome outcome, const QString& message) {
   job_active_ = false;
+  // Clear the T7 correlation BEFORE the startNextJob() chain below: the next
+  // job must never inherit its predecessor's announced dataset or cancel
+  // address.
+  active_job_session_ = nullptr;
+  active_job_id_ = 0;
+  active_import_dataset_.reset();
   const QString& effective_path = planned_[planned_index].effective_path;
   switch (outcome) {
     case DescriptorImportOutcome::kSucceededPromoted:
@@ -604,6 +619,17 @@ void LayoutImportBatch::onLoadFinished(quint64 ticket, LoadOutcome outcome, cons
       break;
   }
   maybeFinish();
+}
+
+void LayoutImportBatch::cancelActiveImportJob() {
+  // D3 keep-partial: forward to the session's per-job cancel and nothing
+  // else. The job's kCancelled terminal arrives through the normal queued
+  // path (onJobTerminal records the outcome and chains the next job) —
+  // deliberately none of cancel()'s rollback machinery runs.
+  if (!job_active_ || active_job_session_ == nullptr) {
+    return;
+  }
+  active_job_session_->cancelJob(active_job_id_);
 }
 
 void LayoutImportBatch::cancel() {

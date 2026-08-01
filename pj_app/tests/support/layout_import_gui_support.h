@@ -2,8 +2,8 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
-// Shared scaffolding for the three MainWindow layout-import GUI test
-// binaries (alive / policy / cancel): the friend test peer, the
+// Shared scaffolding for the MainWindow layout-import GUI test binaries
+// (alive / policy / cancel / lifecycle / binder): the friend test peer, the
 // source-bound layout-file builder, the diagnostic recorder, and the common
 // main() macro. The descriptor-scripted fake provider itself is the shared
 // tests/support/fake_import_provider.h. One MainWindow per binary (its dtor
@@ -17,9 +17,13 @@
 #include <QDomElement>
 #include <QFile>
 #include <QObject>
+#include <QProgressBar>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QToolButton>
+#include <functional>
+#include <utility>
 
 #include "LayoutImportBatch.h"
 #include "LayoutXml.h"
@@ -30,6 +34,7 @@
 #include "pj_plotting/PlotWidget.h"
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/ExtensionCatalogService.h"
+#include "pj_widgets/IngestProgressWidget.h"
 
 namespace PJ {
 
@@ -83,6 +88,107 @@ class MainWindowLayoutImportTestPeer {
     int count = 0;
     window.forEachPlot([&count](PlotWidget* plot) { count += static_cast<int>(plot->curveList().size()); });
     return count;
+  }
+
+  // --- T7 binder surfaces: strip displayed ownership + batch observation ---
+
+  using StripOwnerKind = MainWindow::IngestStripOwnerKind;
+  [[nodiscard]] static StripOwnerKind stripOwnerKind(const MainWindow& window) {
+    return window.ingest_strip_owner_kind_;
+  }
+  [[nodiscard]] static DatasetId stripOwnerDataset(const MainWindow& window) {
+    return window.ingest_strip_owner_dataset_;
+  }
+  // "Engaged" = shown, or the anti-flash show delay is pending. These binaries
+  // never show() the window, so the widget's isVisible() is always false; the
+  // explicit hidden flag plus the timer is the observable pair.
+  [[nodiscard]] static bool stripEngaged(const MainWindow& window) {
+    return window.ingest_show_timer_->isActive() || !window.ingest_progress_->isHidden();
+  }
+  // The strip's caption rides the bar's format string (IngestProgressWidget
+  // has no title getter, deliberately); ingest owners never set counter text,
+  // so the format IS the displayed title here.
+  [[nodiscard]] static QString stripTitle(const MainWindow& window) {
+    const auto* bar = stripBar(window);
+    return bar == nullptr ? QString() : bar->format();
+  }
+  [[nodiscard]] static int stripProgressMaximum(const MainWindow& window) {
+    const auto* bar = stripBar(window);
+    return bar == nullptr ? -1 : bar->maximum();
+  }
+  [[nodiscard]] static int stripProgressValue(const MainWindow& window) {
+    const auto* bar = stripBar(window);
+    return bar == nullptr ? -1 : bar->value();
+  }
+  [[nodiscard]] static int batchObserverCount(const MainWindow& window) {
+    return static_cast<int>(window.layout_batch_ingest_conns_.size());
+  }
+  // The real GUI stop control (never the routed slot directly).
+  [[nodiscard]] static bool clickStripStop(MainWindow& window) {
+    auto* stop = window.ingest_progress_->findChild<QToolButton*>(QStringLiteral("ingestPrimaryButton"));
+    if (stop == nullptr) {
+      return false;
+    }
+    stop->click();
+    return true;
+  }
+  // Test-only hygiene: a driven endIngest with no batch active reaches no
+  // production handler (real ends route through the interactive host
+  // callbacks or the batch observers), so a scenario's last driven end can
+  // leave a stale displayed owner behind — and a show timer that fired during
+  // pumping leaves the widget active (or a timer still pending) into the next
+  // scenario. Reset the whole strip surface — owner fields, both timers, the
+  // widget's active state — in TearDown so the scenarios stay
+  // order-independent. Unconditional-safe there: no active ingests remain.
+  static void resetStripState(MainWindow& window) {
+    window.ingest_strip_owner_kind_ = MainWindow::IngestStripOwnerKind::kNone;
+    window.ingest_strip_owner_dataset_ = 0;
+    window.ingest_show_timer_->stop();
+    window.ingest_hide_timer_->stop();
+    window.ingest_progress_->setActive(false);
+  }
+
+  // --- D9 scaffolding: the takeover-fold and pinned-panel seams (the same
+  // private surfaces ToolboxPanelFoldTest drives, re-exposed here so the
+  // binder suite can prove a headless batch job never reaches them). ---
+
+  [[nodiscard]] static bool presentPanel(MainWindow& window, QWidget* panel) {
+    return window.presentPanel(panel);
+  }
+  static void setTakeoverFold(
+      MainWindow& window, const void* owner, std::function<void(bool)> fold, std::function<bool()> busy) {
+    window.setTakeoverFold(owner, std::move(fold), std::move(busy));
+  }
+  [[nodiscard]] static bool takeoverPanelPresent(const MainWindow& window) {
+    return window.current_panel_ != nullptr;
+  }
+  static QWidget* releaseCentralPanel(MainWindow& window) {
+    return window.releaseCentralPanel();
+  }
+  static void pinToolboxPanel(
+      MainWindow& window, QWidget* container, const QString& plugin_id, const QString& title,
+      ToolboxRuntimeHost* host) {
+    window.pinToolboxPanel(
+        container, plugin_id, title, /*engine=*/nullptr, []() { return QStringLiteral("{}"); }, host,
+        /*transient=*/false);
+  }
+  [[nodiscard]] static bool isPinned(const MainWindow& window, const QString& plugin_id) {
+    return window.pinned_toolboxes_.contains(plugin_id);
+  }
+  static void closeAllPinnedToolboxTabs(MainWindow& window) {
+    window.closeAllPinnedToolboxTabs();
+  }
+  static void setHostSeams(
+      MainWindow& window, std::function<bool(QString)> confirm, std::function<bool(ToolboxRuntimeHost*)> busy,
+      std::function<void(ToolboxRuntimeHost*)> stop) {
+    window.confirm_running_job_ = std::move(confirm);
+    window.host_work_in_flight_ = std::move(busy);
+    window.stop_host_work_ = std::move(stop);
+  }
+
+ private:
+  [[nodiscard]] static const QProgressBar* stripBar(const MainWindow& window) {
+    return window.ingest_progress_->findChild<QProgressBar*>(QStringLiteral("ingestProgressBar"));
   }
 };
 

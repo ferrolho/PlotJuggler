@@ -704,6 +704,66 @@ TEST_F(HeadlessDescriptorProviderSessionTest, QueuedTerminalIsPurgedAfterCancelJ
   EXPECT_EQ(terminal_calls.load(), 0) << "no callback may fire after the destructor";
 }
 
+// Scenario 7 (T7 per-job cancel): startImport returns a DISTINCT JobId per
+// job, and cancelJob(id) cancels ONLY that job — its kCancelled terminal
+// still arrives through the normal queued marshal while the other job stays
+// live — returning without blocking (no join). An unknown or an
+// already-concluded id is a safe no-op.
+TEST_F(HeadlessDescriptorProviderSessionTest, StartImportReturnsDistinctJobIdsAndCancelJobTargetsOnlyThatJob) {
+  auto session = makeSession(kProviderId);
+  ASSERT_TRUE(session.has_value()) << session.error();
+
+  int first_terminals = 0;
+  int second_terminals = 0;
+  auto first_outcome = PJ::DescriptorImportOutcome::kFailed;
+  auto second_outcome = PJ::DescriptorImportOutcome::kFailed;
+  PJ::DescriptorImportStartRequest request;
+  request.descriptor_json = R"({"v":1})";
+  const auto first = (*session)->startImport(request, nullptr, [&](PJ::DescriptorImportOutcome outcome, std::string) {
+    first_outcome = outcome;
+    ++first_terminals;
+  });
+  ASSERT_TRUE(first) << first.error();
+  const auto second = (*session)->startImport(request, nullptr, [&](PJ::DescriptorImportOutcome outcome, std::string) {
+    second_outcome = outcome;
+    ++second_terminals;
+  });
+  ASSERT_TRUE(second) << second.error();
+  EXPECT_NE(*first, *second) << "every started job must get a distinct JobId";
+  EXPECT_EQ((*session)->activeJobCount(), 2u);
+
+  // Cancel ONLY the first job (both workers still blocked on their start
+  // gates). Nonblocking: no join may happen on this thread, and nothing may
+  // deliver inline (queued-only marshal).
+  (*session)->cancelJob(*first);
+  const auto log = g_events.snapshot();
+  EXPECT_EQ(countOf(log, "job.cancel"), 1);
+  EXPECT_EQ(countOf(log, "job.join.returned"), 0) << "cancelJob must not join";
+  EXPECT_EQ(first_terminals, 0) << "provider-thread callbacks must be queued, never delivered inline";
+
+  ASSERT_TRUE(pumpUntil([&]() { return first_terminals > 0; }));
+  EXPECT_EQ(first_outcome, PJ::DescriptorImportOutcome::kCancelled);
+  EXPECT_EQ(second_terminals, 0) << "the untargeted job must be unaffected";
+  EXPECT_EQ((*session)->activeJobCount(), 1u);
+
+  // No-op safety: the concluded id (its registry entry is gone) and a
+  // never-issued id both do nothing.
+  (*session)->cancelJob(*first);
+  (*session)->cancelJob(*first + *second + 1000);
+  flushQueuedEvents();
+  EXPECT_EQ(countOf(g_events.snapshot(), "job.cancel"), 1);
+  EXPECT_EQ(second_terminals, 0);
+  EXPECT_EQ((*session)->activeJobCount(), 1u);
+
+  // The surviving job drains normally.
+  ASSERT_NE(g_instance, nullptr);
+  g_instance->releaseStart();  // last_job == the second job
+  ASSERT_TRUE(pumpUntil([&]() { return second_terminals > 0; }));
+  EXPECT_EQ(second_outcome, PJ::DescriptorImportOutcome::kSucceededEagerOnly);
+  EXPECT_EQ((*session)->activeJobCount(), 0u);
+  session->reset();
+}
+
 // Scenario 6: DSO-pin proxy. With a static vtable there is no dlopen to pin,
 // so this can only assert HANDLE-LIFETIME ordering: the plugin instance is
 // destroyed exactly once, and only after every job event — i.e. the handle

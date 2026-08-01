@@ -1636,20 +1636,30 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   connect(ingest_hide_timer_, &QTimer::timeout, this, [this]() {
     // Only hide once nothing is still producing into the strip: a file load may
     // have started, or a toolbox import may have re-adopted it, since the linger
-    // began.
+    // began. Hiding retires the displayed owner (e.g. a drained file load's).
     if (!session_->sessionManager().hasActiveIngests() && !file_loader_->isBusy()) {
       ingest_progress_->setActive(false);
+      ingest_strip_owner_kind_ = IngestStripOwnerKind::kNone;
+      ingest_strip_owner_dataset_ = 0;
     }
   });
   connect(ingest_progress_, &IngestProgressWidget::actionRequested, this, [this](IngestProgressWidget::Action) {
     // Stop pressed → ask what to do with the in-progress load. The worker keeps
     // loading (and the bar keeps updating) while this modal dialog is up.
     if (!file_loader_->isBusy()) {
-      // No file load to stop. If toolbox bulk imports are running, route the
-      // stop to every live importing host (a closed panel's entry fails the
-      // owner lock and is skipped): flag-only cooperative cancel, no
-      // keep/discard dialog — toolbox imports keep what already landed (the
-      // ABI has no host-side rollback), so there is no second choice to offer.
+      // No file load to stop: Stop routes by DISPLAYED owner (D8). The layout
+      // batch's job takes the nonblocking keep-partial per-job cancel (D3) —
+      // that job concludes kCancelled, the batch CONTINUES with its next
+      // source, nothing is rolled back; NEVER batch->cancel() and never a
+      // faked ToolboxIngestRef for a headless job.
+      if (ingest_strip_owner_kind_ == IngestStripOwnerKind::kLayoutBatch && layoutImportBatchActive()) {
+        layout_import_batch_->cancelActiveImportJob();
+        return;  // the strip hands off when the job's ingest ends
+      }
+      // Interactive toolbox imports keep the pre-D8 route: stop every live
+      // importing host (a closed panel's entry fails the owner lock and is
+      // skipped) — flag-only cooperative cancel, no keep/discard dialog, and
+      // inherently batch-free (the batch never registers a ToolboxIngestRef).
       if (session_->sessionManager().hasActiveIngests()) {
         stopAllToolboxImports();
         return;  // strip hides when on_ingest_finished drains the import set
@@ -1717,6 +1727,10 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   connect(
       file_loader_.get(), &FileLoader::ingestStarted, this,
       [this](const QString& title, int index, int total, bool /*determinate*/) {
+        // File loads always win the strip (D8: displayed ownership tracks it,
+        // even over a currently displayed toolbox/batch ingest).
+        ingest_strip_owner_kind_ = IngestStripOwnerKind::kFile;
+        ingest_strip_owner_dataset_ = 0;
         ingest_progress_->setTitle(title);
         ingest_progress_->setCounterText(total > 1 ? u"%1/%2"_s.arg(index).arg(total) : QString());
         ingest_progress_->setRange(0, 0);  // busy until the first determinate progress tick
@@ -1733,12 +1747,15 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     ingest_progress_->setValue(current);
   });
   connect(file_loader_.get(), &FileLoader::queueDrained, this, [this]() {
-    // A toolbox bulk import that started while this file load owned the strip
-    // takes it over now instead of the strip hiding on a still-running import.
-    if (session_->sessionManager().hasActiveIngests()) {
-      adoptToolboxIngestStrip();
+    // A toolbox/batch ingest that started while this file load owned the strip
+    // takes it over now (D8 survivor pick — its own label and progress, never
+    // a stale finished import's) instead of the strip hiding on a
+    // still-running import.
+    if (displaySurvivingIngestOnStrip(0)) {
       return;
     }
+    ingest_strip_owner_kind_ = IngestStripOwnerKind::kNone;
+    ingest_strip_owner_dataset_ = 0;
     ingest_show_timer_->stop();
     ingest_hide_timer_->start();
   });
@@ -2023,6 +2040,11 @@ void MainWindow::onPlaceholderTopicDropped(
 }
 
 MainWindow::~MainWindow() {
+  // Dtor-without-closeEvent path (same precedent as closeAllPinnedToolboxTabs
+  // below): a still-running batch's host teardown fires on_ingest_finished ->
+  // endIngest -> the still-connected observer, so the D1 teardown must run
+  // FIRST — structurally, not by the member-declaration-order accident.
+  teardownLayoutBatchObservation();
   // Pinned toolboxes hold plugin sessions (ToolboxRuntimeHost writing into
   // the AppSession's DataEngine). Tear them down synchronously while the
   // session, tab strip, and engines are all still alive — a deferred
@@ -4256,11 +4278,77 @@ void MainWindow::stopAllToolboxImports() {
 }
 
 void MainWindow::adoptToolboxIngestStrip() {
-  toolbox_strip_adopted_ = true;
+  ingest_strip_owner_kind_ = IngestStripOwnerKind::kInteractiveToolbox;
+  ingest_strip_owner_dataset_ = toolbox_ingest_dataset_;
   ingest_progress_->setTitle(toolbox_ingest_label_);
   ingest_progress_->setCounterText({});
   ingest_progress_->setRange(0, 0);  // busy until the first determinate tick
   ingest_show_timer_->start(kIngestStripShowDelayMs);
+}
+
+void MainWindow::setIngestStripProgress(quint64 current, quint64 total) {
+  // Counts may be bytes far beyond int range — track progress as permille of
+  // total rather than raw counts. total 0 keeps the busy/indeterminate bar.
+  if (total == 0) {
+    ingest_progress_->setRange(0, 0);
+  } else {
+    ingest_progress_->setRange(0, kIngestProgressResolution);
+    ingest_progress_->setValue(static_cast<int>(std::min(current, total) * kIngestProgressResolution / total));
+  }
+}
+
+bool MainWindow::displaySurvivingIngestOnStrip(DatasetId exclude) {
+  const auto& active = session_->sessionManager().activeIngests();
+  const auto eligible = [&](DatasetId id) { return id != 0 && id != exclude && active.count(id) != 0; };
+  // Interactive survivors outrank the batch job's ingest; among them, prefer
+  // the last-started one (today's re-adopt identity) and fall back to the
+  // lowest surviving id (see the arbitration rule at the owner state).
+  DatasetId pick = 0;
+  IngestStripOwnerKind kind = IngestStripOwnerKind::kInteractiveToolbox;
+  if (eligible(toolbox_ingest_dataset_) && toolbox_ingest_dataset_ != layout_batch_strip_dataset_) {
+    pick = toolbox_ingest_dataset_;
+  } else {
+    for (const auto& entry : active) {
+      if (entry.first == exclude || entry.first == layout_batch_strip_dataset_) {
+        continue;
+      }
+      if (pick == 0 || entry.first < pick) {
+        pick = entry.first;
+      }
+    }
+  }
+  if (pick == 0 && eligible(layout_batch_strip_dataset_)) {
+    pick = layout_batch_strip_dataset_;
+    kind = IngestStripOwnerKind::kLayoutBatch;
+  }
+  if (pick == 0) {
+    return false;
+  }
+  const SessionManager::ActiveIngest& entry = active.at(pick);
+  ingest_strip_owner_kind_ = kind;
+  ingest_strip_owner_dataset_ = pick;
+  ingest_progress_->setTitle(entry.label);
+  ingest_progress_->setCounterText({});
+  setIngestStripProgress(entry.current, entry.total);
+  return true;
+}
+
+void MainWindow::releaseIngestStripOwner(DatasetId ended) {
+  const bool displayed = (ingest_strip_owner_kind_ == IngestStripOwnerKind::kInteractiveToolbox ||
+                          ingest_strip_owner_kind_ == IngestStripOwnerKind::kLayoutBatch) &&
+                         ingest_strip_owner_dataset_ == ended;
+  if (!displayed) {
+    return;  // the strip shows someone else — nothing to hand over
+  }
+  if (displaySurvivingIngestOnStrip(ended)) {
+    return;
+  }
+  ingest_strip_owner_kind_ = IngestStripOwnerKind::kNone;
+  ingest_strip_owner_dataset_ = 0;
+  if (!file_loader_->isBusy()) {
+    ingest_show_timer_->stop();
+    ingest_hide_timer_->start();
+  }
 }
 
 void MainWindow::onRebuildToolboxMenu() {
@@ -4506,6 +4594,10 @@ void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity
         supersedeActiveRestore();
         if (batch_result == LayoutImportBatch::StartResult::kRunning) {
           layout_import_batch_ = std::move(batch);
+          // D1: the ingest-lifecycle observation exists exactly while a
+          // handed-over batch does (the supersede above tore down any
+          // predecessor's observers first).
+          installLayoutBatchObservers();
         }
         // Load each pending file. Distinct files append as separate datasets
         // (FileLoader replaces in place only on a basename match), so the full
@@ -5724,8 +5816,8 @@ void MainWindow::onProgressiveLayoutDrained() {
   const MissingCurvePolicy policy = progressive_missing_curve_policy_;
   // B3 / D5 retention channel: the kRetainAndDiagnose arm keeps the
   // itemsAdded connection alive past the drain so retained intents can still
-  // bind when their data arrives later (T7 drives this); every other arm
-  // tears it down here as before.
+  // bind when their data arrives later (main_window_layout_import_binder_test
+  // pins this mid-import); every other arm tears it down here as before.
   if (policy != MissingCurvePolicy::kRetainAndDiagnose) {
     QObject::disconnect(pending_items_added_conn_);
     pending_items_added_conn_ = {};
@@ -5802,9 +5894,79 @@ bool MainWindow::layoutImportBatchActive() const {
   return layout_import_batch_ != nullptr && layout_import_batch_->isActive();
 }
 
+void MainWindow::installLayoutBatchObservers() {
+  // D1: MainWindow owns the observation, batch-scoped. Events for the batch
+  // job's announced dataset (exact equality with activeImportDataset(); the
+  // supported delivery order — D2 — guarantees the correlation is installed
+  // before that dataset's began reaches the GUI thread) display under
+  // kLayoutBatch ownership. Every OTHER began/progress is a concurrent
+  // interactive ingest and rides the same arbitration generically — in
+  // production its own host callbacks produce the identical result, so the
+  // double handling is idempotent.
+  SessionManager& manager = session_->sessionManager();
+  layout_batch_ingest_conns_.push_back(connect(
+      &manager, &SessionManager::ingestBegan, this, [this](DatasetId dataset, const QString& label, quint64 /*total*/) {
+        const bool is_batch = layoutImportBatchActive() && layout_import_batch_->activeImportDataset() == dataset;
+        if (is_batch) {
+          layout_batch_strip_dataset_ = dataset;
+        }
+        if (file_loader_->isBusy()) {
+          return;  // file loads always win the strip; the drain re-adopts
+        }
+        if (is_batch && ingest_strip_owner_kind_ == IngestStripOwnerKind::kInteractiveToolbox) {
+          return;  // the background batch never displaces the user's import
+        }
+        ingest_strip_owner_kind_ =
+            is_batch ? IngestStripOwnerKind::kLayoutBatch : IngestStripOwnerKind::kInteractiveToolbox;
+        ingest_strip_owner_dataset_ = dataset;
+        ingest_progress_->setTitle(label);
+        ingest_progress_->setCounterText({});
+        ingest_progress_->setRange(0, 0);  // busy until the first determinate tick
+        ingest_show_timer_->start(kIngestStripShowDelayMs);
+      }));
+  layout_batch_ingest_conns_.push_back(connect(
+      &manager, &SessionManager::ingestProgressed, this, [this](DatasetId dataset, quint64 current, quint64 total) {
+        if (file_loader_->isBusy() || !session_->sessionManager().hasActiveIngests()) {
+          return;
+        }
+        if (ingest_strip_owner_kind_ != IngestStripOwnerKind::kInteractiveToolbox &&
+            ingest_strip_owner_kind_ != IngestStripOwnerKind::kLayoutBatch && !displaySurvivingIngestOnStrip(0)) {
+          return;  // the strip was free but nothing eligible survives
+        }
+        if (ingest_strip_owner_dataset_ != dataset) {
+          return;  // another producer owns the display; its ticks drive the bar
+        }
+        setIngestStripProgress(current, total);
+      }));
+  layout_batch_ingest_conns_.push_back(connect(&manager, &SessionManager::ingestEnded, this, [this](DatasetId dataset) {
+    if (dataset == layout_batch_strip_dataset_) {
+      layout_batch_strip_dataset_ = 0;
+    }
+    releaseIngestStripOwner(dataset);
+  }));
+}
+
+void MainWindow::teardownLayoutBatchObservation() {
+  // D1 ordering: observers off and any batch-owned display released BEFORE
+  // the batch object dies, so no lifecycle event (or strip Stop click) can
+  // reach a dangling batch. The batch's SessionManager entry may outlive this
+  // by a moment (its producer's teardown ends it); it is excluded from the
+  // survivor pick here and, no longer classified as the batch's, behaves as a
+  // plain ingest until its end arrives.
+  for (const QMetaObject::Connection& conn : layout_batch_ingest_conns_) {
+    QObject::disconnect(conn);
+  }
+  layout_batch_ingest_conns_.clear();
+  layout_batch_strip_dataset_ = 0;
+  if (ingest_strip_owner_kind_ == IngestStripOwnerKind::kLayoutBatch) {
+    releaseIngestStripOwner(ingest_strip_owner_dataset_);
+  }
+}
+
 void MainWindow::resetLayoutImportBatch() {
   // A still-running batch takes the destructor's HARD shutdown (children
   // cancelled+joined, no rollback) — this path replaces or retires it.
+  teardownLayoutBatchObservation();
   layout_import_batch_.reset();
   batch_workspace_checkpoint_.reset();
   if (!progressive_layout_in_flight_) {
@@ -5869,9 +6031,11 @@ void MainWindow::maybeSettleProgressiveRestore() {
   onProgressiveLayoutDrained();
   // The batch is retired here — its policy already lives in
   // progressive_missing_curve_policy_, so nothing at (or after) the drain
-  // reads it. The D5 retention channel (pending_items_added_conn_)
+  // reads it. Observation teardown first (D1: observers/ownership never
+  // outlive the batch). The D5 retention channel (pending_items_added_conn_)
   // deliberately survives a kRetainAndDiagnose drain; a plain
   // layout_import_batch_.reset() leaves it untouched.
+  teardownLayoutBatchObservation();
   layout_import_batch_.reset();
   batch_workspace_checkpoint_.reset();
 }
@@ -8604,6 +8768,7 @@ void MainWindow::launchToolbox(
     toolbox_active_imports_.insert(
         dataset, ToolboxIngestRef{owner, std::static_pointer_cast<PanelSession>(owner)->host.get()});
     toolbox_ingest_label_ = import_label;
+    toolbox_ingest_dataset_ = dataset;
     // The panel that just started importing must stop covering the chart area:
     // it publishes rows mid-batch and those series have to be reachable while
     // the batch runs. Folding keeps the instance — and the download — alive.
@@ -8630,31 +8795,30 @@ void MainWindow::launchToolbox(
     if (file_loader_->isBusy() || !session_->sessionManager().hasActiveIngests()) {
       return;
     }
-    if (!toolbox_strip_adopted_) {
+    if (ingest_strip_owner_kind_ != IngestStripOwnerKind::kInteractiveToolbox &&
+        ingest_strip_owner_kind_ != IngestStripOwnerKind::kLayoutBatch) {
       adoptToolboxIngestStrip();  // the file load that owned the strip has drained
     }
-    // Counts may be bytes far beyond int range — track progress as permille of
-    // total rather than raw counts. total 0 keeps the busy/indeterminate bar.
-    if (total == 0) {
-      ingest_progress_->setRange(0, 0);
-    } else {
-      ingest_progress_->setRange(0, kIngestProgressResolution);
-      ingest_progress_->setValue(static_cast<int>(std::min(current, total) * kIngestProgressResolution / total));
+    if (ingest_strip_owner_dataset_ != dataset) {
+      return;  // another producer owns the display (D8); its ticks drive the bar
     }
+    setIngestStripProgress(current, total);
   };
   callbacks.on_ingest_finished = [this](DatasetId dataset) {
     // Lifecycle first (so a notify_data_changed fired during teardown already
     // sees the dataset as no-longer-growing), then drop the stop-routing ref.
     session_->sessionManager().endIngest(dataset);
     toolbox_active_imports_.remove(dataset);
-    if (session_->sessionManager().hasActiveIngests()) {
-      return;
+    if (toolbox_ingest_dataset_ == dataset) {
+      // The last-started identity is gone; survivor picks fall back to the
+      // lowest surviving id.
+      toolbox_ingest_dataset_ = 0;
+      toolbox_ingest_label_.clear();
     }
-    toolbox_strip_adopted_ = false;
-    if (!file_loader_->isBusy()) {
-      ingest_show_timer_->stop();
-      ingest_hide_timer_->start();
-    }
+    // D8: a displayed import that ends hands the strip to a survivor (its own
+    // label/progress) or runs the linger-hide; an undisplayed one changes
+    // nothing on screen.
+    releaseIngestStripOwner(dataset);
   };
 
   // Parser-ingest deps: the plugin catalog for ensureParserBinding lookups and

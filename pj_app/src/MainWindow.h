@@ -346,10 +346,31 @@ class MainWindow : public QMainWindow {
   // tracks whatever the catalog currently has loaded.
   void onRebuildToolboxMenu();
 
-  // Point the title-bar progress strip at the current toolbox bulk import
-  // (title from toolbox_ingest_label_, busy bar, delayed show). Callers gate on
-  // FileLoader being idle — the strip has one owner at a time and file loads win.
+  // Point the title-bar progress strip at the last-started interactive toolbox
+  // import (title from toolbox_ingest_label_, busy bar, delayed show) and take
+  // displayed ownership for it. Callers gate on FileLoader being idle — the
+  // strip has one owner at a time and file loads win.
   void adoptToolboxIngestStrip();
+
+  // Permille progress on the strip (counts may be bytes far beyond int range);
+  // total 0 keeps the busy/indeterminate bar.
+  void setIngestStripProgress(quint64 current, quint64 total);
+
+  // D8 survivor pick + display: hands the strip to the eligible active ingest
+  // per the arbitration rule at ingest_strip_owner_kind_, skipping `exclude`
+  // (a dataset that is ending/ineligible; 0 = none) and restoring the
+  // survivor's recorded label/progress. Returns false when no eligible ingest
+  // survives (the caller decides between linger-hide and leaving the strip to
+  // a file load). Precondition: callers invoke this only while the strip is
+  // already engaged (shown, or its show delay pending) — it never (re)starts
+  // the show timer.
+  bool displaySurvivingIngestOnStrip(DatasetId exclude);
+
+  // The strip's displayed ingest ended (or became ineligible): switch to a
+  // survivor, or clear ownership and start the linger-hide (skipped while a
+  // file load is about to own the widget). No-op when `ended` is not the
+  // displayed dataset.
+  void releaseIngestStripOwner(DatasetId ended);
 
   // Flag-only cooperative cancel of every live toolbox bulk import: dedups by
   // host, skips entries whose owning panel has closed (dead weak owner), and
@@ -727,11 +748,22 @@ class MainWindow : public QMainWindow {
   // the restore alive").
   [[nodiscard]] bool restoreHasPendingAsyncWork(bool reload_requested) const;
   // The progressive-drain gate: proceeds only when NO registered restore
-  // waiter is still pending (FileLoader's queue, the batch, and — later —
-  // whatever T7 registers). A cancelled batch instead unwinds the
-  // progressive state: its rollback already restored the pre-layout
-  // workspace.
+  // waiter is still pending (FileLoader's queue and the batch — the batch's
+  // waiter is also what holds the drain open for T7's mid-import binding;
+  // the binder work registers nothing of its own here). A cancelled batch
+  // instead unwinds the progressive state: its rollback already restored
+  // the pre-layout workspace.
   void maybeSettleProgressiveRestore();
+  // D1: batch-scoped observation of SessionManager's ingest lifecycle —
+  // connects the three signals at the batch HANDOVER (and only then; plain
+  // layouts never install them). The batch job's announced dataset displays
+  // under kLayoutBatch ownership; every other began/progress rides the same
+  // arbitration as a concurrent interactive ingest.
+  void installLayoutBatchObservers();
+  // Disconnects the observers and releases a batch-owned strip display. MUST
+  // run BEFORE every layout_import_batch_.reset()/destruction (D1 ordering:
+  // no lifecycle event or Stop click may reach a dangling batch).
+  void teardownLayoutBatchObservation();
   // Drops the current batch (graceful if finished; HARD shutdown — children
   // cancelled+joined, no rollback — if still running). Also ends the D5
   // retention channel a kRetainAndDiagnose drain left alive (see
@@ -1190,17 +1222,44 @@ class MainWindow : public QMainWindow {
   // pairing holds). `owner` weak-guards the PanelSession whose
   // ToolboxRuntimeHost runs the import — a closed panel can never be
   // stop-routed into freed memory; `host` is dereferenced only after the owner
-  // check succeeds. `toolbox_strip_adopted_` says the strip currently shows a
-  // toolbox import; one that started while a file load owned the strip
-  // re-adopts it (via `toolbox_ingest_label_`, last-started wins) once the
-  // file queue drains.
+  // check succeeds. `toolbox_ingest_label_`/`toolbox_ingest_dataset_` name the
+  // last-STARTED interactive import — the identity a fresh strip adopt (or a
+  // re-adopt once the file queue drains) shows; cleared when that import ends.
   struct ToolboxIngestRef {
     std::weak_ptr<void> owner;
     PJ::ToolboxRuntimeHost* host = nullptr;
   };
   QHash<PJ::DatasetId, ToolboxIngestRef> toolbox_active_imports_;
   QString toolbox_ingest_label_;
-  bool toolbox_strip_adopted_ = false;
+  DatasetId toolbox_ingest_dataset_ = 0;
+
+  // D8: the strip's DISPLAYED OWNER — whose title/progress the widget shows,
+  // so Stop routes to exactly that producer and an ending producer hands the
+  // strip over instead of leaving stale text. The arbitration rule
+  // (deterministic):
+  //   * a file load always wins while FileLoader is busy (unchanged);
+  //   * a newly BEGUN toolbox ingest takes the strip (last-started wins,
+  //     unchanged), EXCEPT the layout batch's ingest never displaces a
+  //     displayed interactive one — a background restore must not steal the
+  //     strip from the user's own import;
+  //   * when the displayed ingest ends (or its batch dies), the strip
+  //     switches to a surviving eligible ingest with its recorded
+  //     label/progress — the last-started interactive if still active, else
+  //     the lowest surviving interactive DatasetId (engine ids are monotonic,
+  //     so lowest = first-created), else the batch job's; with no survivor
+  //     the normal linger-hide runs.
+  enum class IngestStripOwnerKind { kNone, kFile, kInteractiveToolbox, kLayoutBatch };
+  IngestStripOwnerKind ingest_strip_owner_kind_ = IngestStripOwnerKind::kNone;
+  DatasetId ingest_strip_owner_dataset_ = 0;  ///< set for the two ingest kinds only
+
+  // T7 batch observation (D1): connections to the three SessionManager ingest
+  // lifecycle signals, installed ONLY while a handed-over batch lives and torn
+  // down (with ownership release) strictly before the batch is destroyed.
+  // `layout_batch_strip_dataset_` is the batch job's begun-and-not-ended
+  // ingest (0 = none), recorded by exact equality with the batch's announced
+  // activeImportDataset() — the classification key the arbitration uses.
+  std::vector<QMetaObject::Connection> layout_batch_ingest_conns_;
+  DatasetId layout_batch_strip_dataset_ = 0;
   // Help ▸ Installed Extensions — informational, rebuilt on aboutToShow.
   QMenu* installed_extensions_menu_ = nullptr;
   // Local-panel header bands (grey "Curve Width" / "Curve Style" labels).
@@ -1233,15 +1292,17 @@ class MainWindow : public QMainWindow {
   bool progressive_layout_in_flight_ = false;
   // The progressive binder's itemsAdded retry channel. Torn down with the
   // restore on every arm EXCEPT a kRetainAndDiagnose drain, which leaves it
-  // alive as D5's retention channel (retained intents can still bind when
-  // their data arrives later; T7 drives this) until the next restore or
-  // resetLayoutImportBatch supersedes it.
+  // alive as D5's retention channel (retained intents bind when their data
+  // arrives later — main_window_layout_import_binder_test pins this
+  // mid-import) until the next restore or resetLayoutImportBatch supersedes
+  // it.
   QMetaObject::Connection pending_items_added_conn_;
   // One reason the progressive drain must keep waiting, plus the connection
   // that re-runs the gate when that reason may have cleared. The gate
   // (maybeSettleProgressiveRestore) proceeds only once no waiter is pending;
   // FileLoader registers isBusy() on queueDrained, the batch registers
-  // !isFinished() on finished, and T7 rides the same surface.
+  // !isFinished() on finished — and that batch waiter doubles as the drain
+  // signal for the T7 mid-import binding (no third waiter exists).
   struct RestoreWaiter {
     std::function<bool()> pending;
     QMetaObject::Connection conn;

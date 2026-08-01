@@ -30,8 +30,8 @@ class ToolboxRuntimeHost;
 
 // Headless per-batch owner of ONE descriptor-import provider toolbox
 // instance — MainWindow::launchToolbox minus the UI half (no dialog, no
-// PanelEngine, no QWidget). The future LayoutImportBatch (T6) owns exactly
-// one of these per import batch and is this class's sole intended consumer.
+// PanelEngine, no QWidget). LayoutImportBatch (T6) owns exactly one of
+// these per import batch and is this class's sole intended consumer.
 //
 // create() finds the provider toolbox by its STABLE MANIFEST ID in the
 // plugin catalog, assembles the SAME host-service set the interactive path
@@ -56,12 +56,13 @@ class ToolboxRuntimeHost;
 // has been destroyed (the view itself holds no keep-alive).
 //
 // Threading: the session is a QObject that must be created and destroyed on
-// the GUI thread; create()/queryDescriptor()/startImport()/cancelAll()/
-// joinAll() are GUI-thread-only ([main-thread] slots on the provider side,
-// and the job registry is deliberately unsynchronized). Both startImport
-// callbacks are marshalled QUEUED-ONLY onto the GUI thread — provider
-// job-callback threads only post, never run host code (the project-wide
-// marshal rule shared with the promotion/runtime-host callbacks).
+// the GUI thread; create()/queryDescriptor()/startImport()/cancelJob()/
+// cancelAll()/joinAll() are GUI-thread-only ([main-thread] slots on the
+// provider side, and the job registry is deliberately unsynchronized). Both
+// startImport callbacks are marshalled QUEUED-ONLY onto the GUI thread —
+// provider job-callback threads only post, never run host code (the
+// project-wide marshal rule shared with the promotion/runtime-host
+// callbacks).
 //
 // QUIESCENCE GUARANTEE (the absorbed PR-A follow-up): the concurrent
 // dtor-vs-worker race on ToolboxRuntimeHost is out of contract — the plugin
@@ -87,6 +88,11 @@ class HeadlessDescriptorProviderSession : public QObject {
  public:
   using Ptr = std::unique_ptr<HeadlessDescriptorProviderSession>;
 
+  // Session-unique identity of one started import job — the cancelJob()
+  // address, valid until that job's terminal concludes it. Never reused
+  // within a session.
+  using JobId = quint64;
+
   // Builds a fully-bound session for `provider_manifest_id` from the pieces
   // MainWindow::launchToolbox uses. All references must outlive the session.
   // `diagnostics` receives the plugin's report_message stream (level +
@@ -109,16 +115,24 @@ class HeadlessDescriptorProviderSession : public QObject {
   [[nodiscard]] Expected<DescriptorQueryResult> queryDescriptor(std::string_view descriptor_json) const;
 
   // [main-thread] Starts one import through the provider's start_import and
-  // keeps the returned job in the session-owned registry. On success,
-  // `on_dataset` fires zero-or-one time and `on_terminal` exactly once,
-  // both QUEUED onto the GUI thread (never inline, never on a provider
-  // thread), in provider order. The job is concluded (removed from the
-  // registry and destroyed) before `on_terminal` runs, so the callback may
-  // re-enter startImport freely. On an error return, neither callback will
-  // ever be invoked. Either callback may be null.
-  [[nodiscard]] Status startImport(
+  // keeps the returned job in the session-owned registry, returning the
+  // job's JobId (the cancelJob() address). On success, `on_dataset` fires
+  // zero-or-one time and `on_terminal` exactly once, both QUEUED onto the
+  // GUI thread (never inline, never on a provider thread), in provider
+  // order. The job is concluded (removed from the registry and destroyed)
+  // before `on_terminal` runs, so the callback may re-enter startImport
+  // freely. On an error return, neither callback will ever be invoked.
+  // Either callback may be null.
+  [[nodiscard]] Expected<JobId> startImport(
       const DescriptorImportStartRequest& request, std::function<void(DatasetId)> on_dataset,
       std::function<void(DescriptorImportOutcome, std::string)> on_terminal);
+
+  // [main-thread] Best-effort, non-blocking cancel of ONE live job (its
+  // JoinableJob::cancel passthrough — no join): the job's terminal still
+  // arrives through the normal queued marshal, as kCancelled for a
+  // well-behaved provider. An unknown or already-concluded id is a safe
+  // no-op.
+  void cancelJob(JobId job_id);
 
   // [main-thread] Best-effort, non-blocking cancel of every live job. Safe
   // to call at any time, including with no jobs live.
@@ -153,7 +167,7 @@ class HeadlessDescriptorProviderSession : public QObject {
   // GUI thread: remove `job_id` from the registry and destroy it (destroy =
   // cancel+join; never a self-join here — the provider's terminal already
   // returned when the queued continuation that calls this runs).
-  void concludeJob(quint64 job_id);
+  void concludeJob(JobId job_id);
 
   SessionManager& session_;
   CatalogModel& catalog_;
@@ -178,9 +192,10 @@ class HeadlessDescriptorProviderSession : public QObject {
   // Borrowed (extension pointer + plugin ctx); valid while handle_ lives.
   DescriptorImportProviderView view_;
 
-  // GUI-thread only (startImport / queued continuations / teardown).
-  quint64 next_job_id_ = 0;
-  std::map<quint64, JoinableJob> jobs_;
+  // GUI-thread only (startImport / cancelJob / queued continuations /
+  // teardown).
+  JobId next_job_id_ = 0;
+  std::map<JobId, JoinableJob> jobs_;
 };
 
 }  // namespace PJ

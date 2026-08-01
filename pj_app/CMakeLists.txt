@@ -381,6 +381,19 @@ if(PJ_BUILD_TESTS)
         PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
     )
     add_dependencies(main_window_layout_import_lifecycle_test mock_file_source_plugin)
+    #   binder — T7 (D2/D4/D6/D8/D9): the ingest strip's displayed ownership +
+    #            batch-scoped SessionManager observation, the batch job's
+    #            keep-partial Stop route, #498 coexistence (no panel folds
+    #            from headless jobs; busy pinned panels survive the batch
+    #            drain), and the D6 real-surface legs — mid-import curve
+    #            binding, on_dataset/ingestBegan ordering, and the real
+    #            promotion transaction (mock source plugin staged for it).
+    add_pj_app_gui_test(main_window_layout_import_binder_test MainWindowLayoutImportBinderTest
+        tests/main_window_layout_import_binder_test.cpp)
+    target_compile_definitions(main_window_layout_import_binder_test PRIVATE
+        PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
+    )
+    add_dependencies(main_window_layout_import_binder_test mock_file_source_plugin)
 
     # The left column's width belongs to the user: neither a window resize nor a
     # chart-area takeover may move the separator they dragged.

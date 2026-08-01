@@ -611,6 +611,135 @@ TEST_F(LayoutImportBatchTest, FinishedIsEmittedExactlyOnceAndOnlyViaTheEventLoop
 }
 
 // ---------------------------------------------------------------------------
+// T7 correlation + per-job cancel: activeImportDataset() mirrors the ACTIVE
+// job's zero-or-one dataset announcement, and cancelActiveImportJob() is the
+// keep-partial per-job stop (D3) — never the batch cancel/rollback path.
+// ---------------------------------------------------------------------------
+
+TEST_F(LayoutImportBatchTest, ActiveImportDatasetTracksTheRunningJobsAnnouncedId) {
+  const QString first_path = data_dir_.filePath(u"first.mock"_s);
+  const QString second_path = data_dir_.filePath(u"second.mock"_s);
+  QDomDocument doc = makeLayoutDoc({
+      SourceSpec{
+          u"/saved/first.mock"_s, makeDescriptor(u"first"_s, u"trusted"_s, first_path, 0, u"announce-then-block"_s)},
+      SourceSpec{u"/saved/second.mock"_s, makeDescriptor(u"second"_s, u"trusted"_s, second_path, 0, u"block"_s)},
+  });
+
+  PJ::LayoutImportBatch& batch = prepareBatch(doc, /*interactive=*/false);
+  EXPECT_FALSE(batch.activeImportDataset().has_value()) << "no job started yet";
+  ASSERT_EQ(batch.start(), StartResult::kRunning);
+
+  // The first job announces its dataset and then HOLDS on the resume gate:
+  // the correlation must expose exactly that id while the job still runs.
+  ASSERT_TRUE(pumpUntil([&batch]() { return batch.activeImportDataset().has_value(); }));
+  EXPECT_EQ(*batch.activeImportDataset(), 101u);
+  EXPECT_FALSE(batch.isFinished());
+  EXPECT_EQ(g_log.snapshot(), (std::vector<std::string>{"first"})) << "the second job must not have started";
+
+  // The terminal clears the correlation BEFORE the startNextJob() chain:
+  // once the (blocked, announces-nothing-yet) second job is up, the surface
+  // must be empty again — never the first job's stale id.
+  ASSERT_NE(g_instance, nullptr);
+  g_instance->releaseResume();
+  ASSERT_TRUE(pumpUntil([]() { return g_log.snapshot().size() == 2u; }));
+  EXPECT_EQ(g_log.snapshot(), (std::vector<std::string>{"first", "second"}));
+  EXPECT_FALSE(batch.activeImportDataset().has_value())
+      << "the first job's id must be cleared at its terminal, before the next job starts";
+  EXPECT_FALSE(batch.isFinished());
+
+  g_instance->releaseStart();  // let the second job run to its terminal
+  ASSERT_TRUE(pumpUntil([&batch]() { return batch.isFinished(); }));
+  EXPECT_FALSE(batch.activeImportDataset().has_value());
+  ASSERT_EQ(batch.result().sources.size(), 2);
+  EXPECT_EQ(batch.result().sources[0].outcome, Outcome::kResolvedImported);
+  EXPECT_EQ(batch.result().sources[1].outcome, Outcome::kResolvedImported);
+}
+
+TEST_F(LayoutImportBatchTest, FailModeJobLeavesActiveImportDatasetEmptyEndToEnd) {
+  // D5: a job that never announces a dataset (race-loss/failure) leaves the
+  // correlation empty for its WHOLE life — no event will ever match it.
+  const QString miss_path = data_dir_.filePath(u"missing.mock"_s);
+  QDomDocument doc = makeLayoutDoc({
+      SourceSpec{u"/saved/a.mock"_s, makeDescriptor(u"s1"_s, u"trusted"_s, miss_path, 0, u"fail"_s)},
+  });
+
+  PJ::LayoutImportBatch& batch = prepareBatch(doc, /*interactive=*/false);
+  EXPECT_FALSE(batch.activeImportDataset().has_value());
+  ASSERT_EQ(batch.start(), StartResult::kRunning);
+  ASSERT_TRUE(pumpUntil([&batch]() {
+    EXPECT_FALSE(batch.activeImportDataset().has_value()) << "a zero-on_dataset job must never populate the surface";
+    return batch.isFinished();
+  }));
+  flushQueuedEvents();
+
+  EXPECT_FALSE(batch.activeImportDataset().has_value());
+  ASSERT_EQ(batch.result().sources.size(), 1);
+  EXPECT_EQ(batch.result().sources[0].outcome, Outcome::kFailed);
+  EXPECT_EQ(finished_count_, 1) << "the degraded job must still conclude the batch normally";
+}
+
+TEST_F(LayoutImportBatchTest, CancelActiveImportJobKeepsPartialAndContinues) {
+  const QString first_path = data_dir_.filePath(u"first.mock"_s);
+  const QString second_path = data_dir_.filePath(u"second.mock"_s);
+  const QString third_path = data_dir_.filePath(u"third.mock"_s);
+  QDomDocument doc = makeLayoutDoc({
+      SourceSpec{u"/saved/first.mock"_s, makeDescriptor(u"first"_s, u"trusted"_s, first_path)},
+      SourceSpec{u"/saved/second.mock"_s, makeDescriptor(u"second"_s, u"trusted"_s, second_path, 0, u"block"_s)},
+      SourceSpec{u"/saved/third.mock"_s, makeDescriptor(u"third"_s, u"trusted"_s, third_path)},
+  });
+
+  PJ::LayoutImportBatch& batch = prepareBatch(doc, /*interactive=*/false);
+  ASSERT_EQ(batch.start(), StartResult::kRunning);
+  // The first job resolves (its dataset 101 enters the ledger); the second
+  // starts and sits blocked on its start gate.
+  ASSERT_TRUE(pumpUntil([&batch]() { return batch.result().sources[0].outcome == Outcome::kResolvedImported; }));
+  ASSERT_EQ(g_log.snapshot(), (std::vector<std::string>{"first", "second"}));
+  ASSERT_FALSE(batch.isFinished());
+
+  // D3 keep-partial: ONLY the active job dies; the batch continues to the
+  // third job, and nothing the earlier jobs produced is rolled back.
+  batch.cancelActiveImportJob();
+  ASSERT_TRUE(pumpUntil([&batch]() { return batch.isFinished(); }));
+  flushQueuedEvents();
+
+  EXPECT_EQ(g_log.snapshot(), (std::vector<std::string>{"first", "second", "third"}))
+      << "the batch must continue past the cancelled job";
+  ASSERT_EQ(batch.result().sources.size(), 3);
+  EXPECT_EQ(batch.result().sources[0].outcome, Outcome::kResolvedImported);
+  EXPECT_EQ(batch.result().sources[1].outcome, Outcome::kCancelled);
+  EXPECT_EQ(batch.result().sources[2].outcome, Outcome::kResolvedImported);
+  EXPECT_FALSE(batch.result().cancelled) << "a per-job cancel is not a batch cancel";
+  EXPECT_TRUE(removed_.empty()) << "keep-partial: earlier produced datasets must survive";
+  EXPECT_EQ(restore_calls_, 0) << "keep-partial: no workspace rollback";
+  EXPECT_GE(diagnosticCount("layout-import-cancelled"), 1);
+  EXPECT_EQ(finished_count_, 1);
+}
+
+TEST_F(LayoutImportBatchTest, CancelActiveImportJobWithNoActiveJobIsANoOp) {
+  const QString miss_path = data_dir_.filePath(u"missing.mock"_s);
+  QDomDocument doc = makeLayoutDoc({
+      SourceSpec{u"/saved/a.mock"_s, makeDescriptor(u"s1"_s, u"trusted"_s, miss_path)},
+  });
+
+  PJ::LayoutImportBatch& batch = prepareBatch(doc, /*interactive=*/false);
+  // Before start(): nothing to cancel, nothing may change.
+  batch.cancelActiveImportJob();
+  EXPECT_FALSE(batch.isFinished());
+  EXPECT_TRUE(batch.hasPendingWork());
+
+  ASSERT_TRUE(runToFinish(batch));
+  ASSERT_EQ(batch.result().sources.size(), 1);
+  EXPECT_EQ(batch.result().sources[0].outcome, Outcome::kResolvedImported);
+
+  // After the batch finished: still a no-op (no new terminal, no signal).
+  batch.cancelActiveImportJob();
+  flushQueuedEvents();
+  EXPECT_EQ(finished_count_, 1);
+  EXPECT_EQ(batch.result().sources[0].outcome, Outcome::kResolvedImported);
+  EXPECT_EQ(diagnosticCount("layout-import-cancelled"), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Codex r1 F1: provider provenance + the is_materialized verdict are
 // authoritative for classification.
 // ---------------------------------------------------------------------------

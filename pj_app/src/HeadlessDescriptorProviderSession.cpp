@@ -68,8 +68,10 @@ Expected<HeadlessDescriptorProviderSession::Ptr> HeadlessDescriptorProviderSessi
   // MainWindow-owned surfaces this session has no business reaching:
   // 3D-scene TF bridging (transform_service_), playback focus/seeding
   // (AppSession::focusPlaybackOnDatasets / seedPlaybackFromSession), and the
-  // Custom Series panel rows. The batch owner (T6) decides what presentation
-  // to drive once the import concludes.
+  // Custom Series panel rows. MainWindow (the batch owner) supplies that
+  // presentation from outside: its batch-scoped SessionManager observers
+  // (installLayoutBatchObservers) drive the title-bar ingest strip
+  // mid-import, and the progressive-restore drain settles the rest.
   callbacks.on_data_changed = [self](std::vector<DatasetId> ingested_datasets) {
     self->catalog_.rebuildFromDatastore();
     for (const DatasetId id : ingested_datasets) {
@@ -189,10 +191,10 @@ Expected<DescriptorQueryResult> HeadlessDescriptorProviderSession::queryDescript
   return view_.queryDescriptor(descriptor_json);
 }
 
-Status HeadlessDescriptorProviderSession::startImport(
+Expected<HeadlessDescriptorProviderSession::JobId> HeadlessDescriptorProviderSession::startImport(
     const DescriptorImportStartRequest& request, std::function<void(DatasetId)> on_dataset,
     std::function<void(DescriptorImportOutcome, std::string)> on_terminal) {
-  const quint64 job_id = ++next_job_id_;
+  const JobId job_id = ++next_job_id_;
 
   // Queued-only marshal (the locked project rule): the provider's
   // job-callback thread only POSTS; host-side code runs exclusively on the
@@ -227,7 +229,15 @@ Status HeadlessDescriptorProviderSession::startImport(
     return unexpected(std::move(job).error());
   }
   jobs_.emplace(job_id, std::move(*job));
-  return okStatus();
+  return job_id;
+}
+
+void HeadlessDescriptorProviderSession::cancelJob(JobId job_id) {
+  const auto it = jobs_.find(job_id);
+  if (it == jobs_.end()) {
+    return;  // unknown or already concluded — per-job cancel is best-effort
+  }
+  it->second.cancel();
 }
 
 void HeadlessDescriptorProviderSession::cancelAll() {
@@ -242,7 +252,7 @@ void HeadlessDescriptorProviderSession::joinAll() {
   }
 }
 
-void HeadlessDescriptorProviderSession::concludeJob(quint64 job_id) {
+void HeadlessDescriptorProviderSession::concludeJob(JobId job_id) {
   const auto it = jobs_.find(job_id);
   if (it == jobs_.end()) {
     return;  // defensive: no live path reaches here — teardown purges pending continuations

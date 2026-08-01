@@ -17,9 +17,11 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "FileLoader.h"
+#include "HeadlessDescriptorProviderSession.h"
 #include "LayoutXml.h"
 #include "pj_base/diagnostic_sink.hpp"
 #include "pj_base/sdk/descriptor_import.hpp"
@@ -30,7 +32,6 @@ namespace PJ {
 
 class CatalogModel;
 class ExtensionCatalogService;
-class HeadlessDescriptorProviderSession;
 class SessionManager;
 
 // Owner of ONE layout-restore import transaction (spec §6.2): for every
@@ -164,6 +165,13 @@ class LayoutImportBatch : public QObject {
   // call repeatedly; a batch that never started concludes immediately.
   void cancel();
 
+  // Nonblocking, keep-partial cancel of ONLY the active import job (D3): the
+  // job concludes kCancelled through its normal terminal and the batch
+  // CONTINUES with the next child — no rollback, every dataset produced so
+  // far stays. No-op when no import job is active. cancel() above remains
+  // the whole-batch rollback path.
+  void cancelActiveImportJob();
+
   [[nodiscard]] bool isFinished() const noexcept {
     return state_ == State::kFinished;
   }
@@ -175,6 +183,14 @@ class LayoutImportBatch : public QObject {
   }
   [[nodiscard]] const BatchResult& result() const noexcept {
     return result_;
+  }
+
+  // The dataset the ACTIVE import job announced (the T7 correlation
+  // surface): empty while no job runs, before the job's zero-or-one
+  // on_dataset arrives, and for jobs that never announce one. Cleared at
+  // that job's terminal, strictly before the next job starts.
+  [[nodiscard]] std::optional<DatasetId> activeImportDataset() const noexcept {
+    return active_import_dataset_;
   }
 
  signals:
@@ -308,6 +324,13 @@ class LayoutImportBatch : public QObject {
   std::vector<std::size_t> job_queue_;           ///< planned_ indices awaiting an import job
   std::size_t job_cursor_ = 0;                   ///< next job_queue_ entry to start
   bool job_active_ = false;
+  // The active import job's cancel address on its owning session, and the
+  // dataset its on_dataset announced (if any) — the T7 correlation state.
+  // Set as the job starts/announces; all cleared together at its terminal,
+  // before the startNextJob() chain (sequential v1: at most one job runs).
+  HeadlessDescriptorProviderSession* active_job_session_ = nullptr;
+  HeadlessDescriptorProviderSession::JobId active_job_id_ = 0;
+  std::optional<DatasetId> active_import_dataset_;
   // The exact-restore closure from begin_workspace_checkpoint (empty until
   // start() reaches the checkpoint, or when the hook is unset).
   std::function<bool()> rollback_workspace_;
