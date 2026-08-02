@@ -488,22 +488,14 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
     // sequence: getTopicStorage() does NOT lock (engine.hpp's threading
     // contract), so a returned pointer is only valid while the lock is held —
     // and this runs on the plugin poll thread while the GUI thread may be
-    // mutating the engine (a dataset removal frees TopicStorage). Two engines
-    // lock deferred-then-std::lock, the same deadlock-free order the
-    // direct-write sibling uses (WriteCore::ensureTopic via lockWriteEngines),
-    // so the two paths can never invert against each other. The engine mutex is
-    // recursive, so createTopic re-acquiring inside is fine.
+    // mutating the engine (a dataset removal frees TopicStorage). lockEnginePair
+    // is the SAME helper the direct-write sibling locks through
+    // (WriteCore::ensureTopic via lockWriteEngines), so the two paths can never
+    // invert against each other. The engine mutex is recursive, so createTopic
+    // re-acquiring inside is fine.
     TopicId topic_id = 0;
     {
-      std::unique_lock<std::recursive_mutex> primary_lock;
-      std::unique_lock<std::recursive_mutex> secondary_lock;
-      if (self->secondary_data_engine_ != nullptr) {
-        primary_lock = self->engine_.lockEngineDeferred();
-        secondary_lock = self->secondary_data_engine_->lockEngineDeferred();
-        std::lock(primary_lock, secondary_lock);
-      } else {
-        primary_lock = self->engine_.lockEngine();
-      }
+      const EngineLockPair engine_locks = lockEnginePair(self->engine_, self->secondary_data_engine_);
 
       auto existing_ids = self->engine_.listTopics(self->dataset_id_);
       std::sort(existing_ids.begin(), existing_ids.end());

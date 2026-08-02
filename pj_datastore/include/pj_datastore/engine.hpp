@@ -326,4 +326,30 @@ class DataEngine {
   std::unique_ptr<Impl> impl_;
 };
 
+/// Guard pair returned by lockEnginePair(). `primary` is always engaged;
+/// `secondary` stays empty when no secondary engine was supplied.
+struct EngineLockPair {
+  std::unique_lock<std::recursive_mutex> primary;
+  std::unique_lock<std::recursive_mutex> secondary;
+};
+
+/// Lock one or two engines together, deadlock-free, per lockEngineDeferred()'s
+/// contract: a single recursive lockEngine() when `secondary` is null, otherwise
+/// a deferred guard on each locked with std::lock(), so this can never invert
+/// order against another two-engine locker (flushTo, the write-host replay).
+/// Both ingest routes that mint/mirror topics go through here — the direct-write
+/// one (plugin_data_host's lockWriteEngines, wrapping this) and the parser
+/// binding one (DataSourceRuntimeHost::cbEnsureParserBinding) — so the two paths
+/// cannot drift out of lock order. The mutex is recursive, so the engine methods
+/// called underneath may re-acquire it.
+[[nodiscard]] inline EngineLockPair lockEnginePair(DataEngine& primary, DataEngine* secondary) {
+  if (secondary == nullptr) {
+    return {primary.lockEngine(), {}};
+  }
+  auto primary_lock = primary.lockEngineDeferred();
+  auto secondary_lock = secondary->lockEngineDeferred();
+  std::lock(primary_lock, secondary_lock);
+  return {std::move(primary_lock), std::move(secondary_lock)};
+}
+
 }  // namespace PJ

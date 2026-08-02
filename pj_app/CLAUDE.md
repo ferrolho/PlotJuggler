@@ -37,6 +37,26 @@ Per root CLAUDE.md: **prefer `.ui` files** over programmatic widget construction
 
 `pj_app` has no `docs/` folder by design — the shell's intent is "wire the services to the widgets," and the wiring is best read directly from `MainWindow.cpp` and `main.cpp`.
 
+## Canonical layout import (cloud sessions)
+
+A `.pj4.xml` layout can embed a durable source descriptor, so opening it
+re-creates an exact cloud session — instantly from a local cache artifact when
+present, otherwise by re-downloading through the MCAP Cloud connector plugin
+while plots grow. The PJ4-side pieces are `LayoutImportBatch`,
+`HeadlessDescriptorProviderSession`, `SourcePromotionHost`, the
+rewrite-then-classify layout load path (`MainWindow` + `LayoutXml`), and the
+growing-import binder (`MainWindow` over `SessionManager`'s ingest signals).
+
+The feature spans three repos, so its as-built reference lives outside this one:
+**`~/ws_plotjuggler/mcap_server/docs/layout-import-architecture.md`** (repo
+`pj-mcap-server`, a sibling checkout) — cross-repo component map, runtime flows,
+and the invariant list I-1…I-16. **Read it before changing any of the components
+above**: several invariants are host-side (delivery order, teardown orders,
+strict in-place promotion, strip displayed-owner arbitration) and are not
+derivable from PJ4 alone. The operations guide — what a shared layout embeds,
+the trust bootstrap, cache purge, the headless flow and its diagnostic ids — is
+`docs/layout-sharing-runbook.md` in that same repo.
+
 ## Browser persistence boundary
 
 Native builds retain their normal `QSettings` behavior. WASM redirects ordinary

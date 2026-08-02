@@ -74,6 +74,28 @@ using PJ::sdk::FieldHandle;
 using PJ::sdk::SourceWriteHostView;
 using PJ::sdk::TopicHandle;
 
+// Committed rows for `topic_id` on `engine`.
+[[nodiscard]] uint64_t rowCount(PJ::DataEngine& engine, PJ::TopicId topic_id) {
+  PJ::DataReader reader(engine);
+  const auto meta = reader.getMetadata(topic_id);
+  return meta.has_value() ? meta->total_row_count : 0;
+}
+
+// Every engine topic under `dataset_id` whose descriptor carries `name`.
+// createTopic mints a fresh TopicId per call with NO name dedup, so a
+// non-idempotent rebind shows up here as a duplicate topic.
+[[nodiscard]] std::size_t countTopicsNamed(
+    const PJ::DataEngine& engine, PJ::DatasetId dataset_id, const std::string& name) {
+  std::size_t count = 0;
+  for (const PJ::TopicId topic_id : engine.listTopics(dataset_id)) {
+    const auto* storage = engine.getTopicStorage(topic_id);
+    if (storage != nullptr && storage->descriptor().name == name) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 // Two lockstep engines + a DataSourceRuntimeHost wired for streaming
 // pause/resume, exercising the SOURCE-LEVEL scalar write path
 // (SourceWriteHostService) — the path a plugin like data_stream_dummy uses
@@ -109,12 +131,6 @@ class StreamEngineSwapTest : public ::testing::Test {
     auto writer_or = services.require<PJ::sdk::SourceWriteHostService>();
     EXPECT_TRUE(writer_or.has_value()) << writer_or.error();
     return writer_or.has_value() ? *writer_or : SourceWriteHostView{};
-  }
-
-  [[nodiscard]] static uint64_t rowCount(PJ::DataEngine& engine, PJ::TopicId topic_id) {
-    PJ::DataReader reader(engine);
-    const auto meta = reader.getMetadata(topic_id);
-    return meta.has_value() ? meta->total_row_count : 0;
   }
 
   PJ::ExtensionCatalogService catalog_{QString{}};
@@ -298,20 +314,6 @@ TEST_F(StreamParserSwapTest, CachedParserFieldHandleResolvesAfterPauseSwap) {
   host_->flushPending();
 }
 
-// Every engine topic under `dataset_id` whose descriptor carries `name`.
-// createTopic mints a fresh TopicId per call with NO name dedup, so a
-// non-idempotent rebind shows up here as a duplicate topic.
-std::size_t countTopicsNamed(const PJ::DataEngine& engine, PJ::DatasetId dataset_id, const std::string& name) {
-  std::size_t count = 0;
-  for (const PJ::TopicId topic_id : engine.listTopics(dataset_id)) {
-    const auto* storage = engine.getTopicStorage(topic_id);
-    if (storage != nullptr && storage->descriptor().name == name) {
-      ++count;
-    }
-  }
-  return count;
-}
-
 // A demand-driven source unsubscribes and later RE-subscribes a topic; the
 // plugin calls ensure_parser_binding again with the identical request (its own
 // binding cache was dropped with the subscription). The host must hand back
@@ -361,6 +363,76 @@ TEST_F(StreamParserSwapTest, RetypedRebindMintsFreshBinding) {
   auto second = runtime().ensureParserBinding(retyped);
   ASSERT_TRUE(second.has_value()) << second.error();
   EXPECT_NE(second->id, first->id) << "a retyped topic must get a fresh binding";
+}
+
+// The offline pin for the delegated-ingest TopicId-stability contract.
+//
+// SessionManager::beginRefill keeps a reloading source's TopicIds REGISTERED so
+// the refill writes back into the same ids and every curve key survives. That
+// only holds if binding a name the dataset ALREADY carries resolves to the
+// existing topic instead of minting a new one — which the direct-write API
+// (WriteCore::ensureTopic) and the object route have always done, and which
+// this scalar parser-binding path did NOT do until the fix this test pins.
+//
+// The gap was invisible to every other offline test because the test/mock
+// loaders write through the direct-write API (which reuses by name); only a
+// REAL delegated-ingest loader (data_load_mcap — i.e. every cloud promotion)
+// took the broken path, so the bug surfaced first in the live layout-import
+// E2E. Pre-fix this fails on the first assertion: the bind mints a second
+// same-named topic and the dataset carries two.
+TEST_F(StreamParserSwapTest, ParserBindingReusesTheDatasetsExistingSameNamedTopic) {
+  // A topic the dataset already carries — the shape a refill/reload presents.
+  auto existing_or = primary_engine_.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/reused"});
+  ASSERT_TRUE(existing_or.has_value()) << existing_or.error();
+  const PJ::TopicId existing_id = *existing_or;
+
+  auto binding_or = runtime().ensureParserBinding(
+      PJ::ParserBindingRequest{
+          .topic_name = "/reused",
+          .parser_encoding = "streaming_caching",
+          .type_name = "streaming/cached_scalar",
+          .schema = PJ::Span<const uint8_t>{},
+          .parser_config_json = "{}",
+      });
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  // No duplicate minted, and the id the refill contract depends on is intact.
+  ASSERT_EQ(countTopicsNamed(primary_engine_, dataset_id_, "/reused"), 1U)
+      << "binding minted a duplicate same-named topic";
+  EXPECT_EQ(primary_engine_.listTopics(dataset_id_).front(), existing_id);
+
+  // And the binding actually writes into that same topic.
+  ASSERT_TRUE(pushFloat(*binding_or, 1000, 1.0F).has_value());
+  host_->flushPending();
+  EXPECT_GT(rowCount(primary_engine_, existing_id), 0U) << "rows landed somewhere other than the reused topic";
+}
+
+// The same reuse path seen from the streaming pause/resume lockstep: the mirror
+// stays idempotent — an id the secondary already holds is not re-created — and
+// the two engines keep matching ids.
+TEST_F(StreamParserSwapTest, ParserBindingReuseKeepsTheSecondaryEngineMirrorIdempotent) {
+  // Both engines already carry the topic under the same id — the post-refill
+  // state a rebind lands in. (SetUp already pinned the two datasets' ids.)
+  auto primary_or = primary_engine_.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/mirrored"});
+  ASSERT_TRUE(primary_or.has_value()) << primary_or.error();
+  auto secondary_or = secondary_engine_.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/mirrored"}, *primary_or);
+  ASSERT_TRUE(secondary_or.has_value()) << secondary_or.error();
+
+  auto binding_or = runtime().ensureParserBinding(
+      PJ::ParserBindingRequest{
+          .topic_name = "/mirrored",
+          .parser_encoding = "streaming_caching",
+          .type_name = "streaming/cached_scalar",
+          .schema = PJ::Span<const uint8_t>{},
+          .parser_config_json = "{}",
+      });
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  ASSERT_EQ(countTopicsNamed(primary_engine_, dataset_id_, "/mirrored"), 1U)
+      << "binding minted a duplicate same-named topic on the primary";
+  ASSERT_EQ(countTopicsNamed(secondary_engine_, dataset_id_, "/mirrored"), 1U)
+      << "the mirror re-created an id the secondary already held";
+  EXPECT_EQ(primary_engine_.listTopics(dataset_id_).front(), secondary_engine_.listTopics(dataset_id_).front());
 }
 
 }  // namespace

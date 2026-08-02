@@ -219,24 +219,15 @@ void flattenColumnsImpl(
 }  // namespace
 
 // Engine lock(s) for a write-host operation (driven by the worker while the GUI
-// reads). With a staging engine (the pause/resume copy) armed, lock BOTH via
+// reads). The shared PJ::lockEnginePair (engine.hpp) in this file's vocabulary:
+// with a staging engine (the pause/resume copy) armed it locks BOTH via
 // std::lock so the worker's write-then-replay can't invert order against flushTo
 // (which also std::lock()s both); otherwise a single recursive lock. Recursive so
 // the locked methods underneath — and ensureField() nested in appendRecord() —
-// re-acquire.
-struct WriteEngineLocks {
-  std::unique_lock<std::recursive_mutex> live;
-  std::unique_lock<std::recursive_mutex> staging;  // empty unless a staging engine is armed
-};
-
-[[nodiscard]] inline WriteEngineLocks lockWriteEngines(DataEngine& live, DataEngine* staging) {
-  if (staging == nullptr) {
-    return {live.lockEngine(), {}};
-  }
-  auto live_lock = live.lockEngineDeferred();
-  auto staging_lock = staging->lockEngineDeferred();
-  std::lock(live_lock, staging_lock);
-  return {std::move(live_lock), std::move(staging_lock)};
+// re-acquire. The parser-binding ingest route locks through the same helper, so
+// the two write paths can never drift out of lock order.
+[[nodiscard]] inline EngineLockPair lockWriteEngines(DataEngine& live, DataEngine* staging) {
+  return lockEnginePair(live, staging);
 }
 
 struct WriteCore {
