@@ -44,6 +44,10 @@ add_library(pj_app_shell OBJECT
     src/SourceTimelineController.h
     src/DatasetMergeActions.cpp
     src/DatasetMergeActions.h
+    src/DiagnosticDump.cpp
+    src/DiagnosticDump.h
+    src/LayoutExitWatch.cpp
+    src/LayoutExitWatch.h
     src/LayoutXml.cpp
     src/LayoutXml.h
     src/LayoutImportBatch.cpp
@@ -394,6 +398,33 @@ if(PJ_BUILD_TESTS)
         PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
     )
     add_dependencies(main_window_layout_import_binder_test mock_file_source_plugin)
+
+    #   settle — stage-5 E5: layoutRestoreSettled fires exactly once per load
+    #            terminal (open-failure false + dump composition, plain sync
+    #            true, batch true only at batch finish — never mid-import).
+    add_pj_app_gui_test(main_window_layout_settle_test MainWindowLayoutSettleTest
+        tests/main_window_layout_settle_test.cpp)
+    #   e2e    — stage-5 E1(a): the LIVE cross-repo gui-test — real MainWindow,
+    #            REAL plugin DSOs (mcap-cloud + mcap-loader + ros-parser) from
+    #            $MCAP_CLOUD_E2E_EXTENSIONS, live server at $MCAP_CLOUD_E2E_URL,
+    #            frozen descriptor vectors from $MCAP_CLOUD_E2E_VECTORS. SKIPs
+    #            cleanly (all five scenarios) when that env is absent; the
+    #            e2e-layout-import.sh harness provides it and treats SKIP as
+    #            failure (smoke's pattern).
+    add_pj_app_gui_test(main_window_layout_import_e2e_test MainWindowLayoutImportE2ETest
+        tests/main_window_layout_import_e2e_test.cpp)
+    #   exit   — LayoutExitWatch (the --exit-after-layout exit-code decision):
+    #            load-failed/success/timeout mapping, decide-once latching,
+    #            and the parked-batch teardown staying crash-free.
+    add_pj_app_gui_test(main_window_layout_exit_test MainWindowLayoutExitTest
+        tests/main_window_layout_exit_test.cpp)
+
+    # --dump-diagnostics collector (stage-5 E2): full-run accumulation from the
+    # queued bridge (incl. pre-attach records), the stable five-field JSON
+    # shape, and no truncation at the DiagnosticHistory ring cap. No MainWindow
+    # is constructed; the target links the shell for DiagnosticDump + the
+    # bridge and supplies its own QCoreApplication main.
+    add_pj_app_gui_test(diagnostic_dump_test DiagnosticDumpTest tests/diagnostic_dump_test.cpp)
 
     # The left column's width belongs to the user: neither a window resize nor a
     # chart-area takeover may move the separator they dragged.

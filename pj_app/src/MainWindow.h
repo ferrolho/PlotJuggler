@@ -164,6 +164,13 @@ class MainWindow : public QMainWindow {
   // emit through the same pipeline plugins use.
   [[nodiscard]] DiagnosticSink diagnosticSink() const;
 
+  // The Qt-side bridge every in-process diagnostic re-emits through (queued).
+  // Exposed for additional subscribers — the --dump-diagnostics collector —
+  // beside the DiagnosticHistory bell service; never a mutation surface.
+  [[nodiscard]] QtDiagnosticBridge* diagnosticBridge() const {
+    return diagnostic_bridge_;
+  }
+
   // Shows a transient bottom-right toast. The message may contain rich text
   // (an `<a href>` opens in the system browser). Lazily creates the toast
   // manager on first use.
@@ -251,6 +258,17 @@ class MainWindow : public QMainWindow {
   // Fires after qApp's stylesheet is applied; subwidgets refresh
   // palette-tinted icons via their onStylesheetChanged slots.
   void stylesheetChanged(QString theme);
+
+  // The settlement boundary of a loadLayoutFromPath restore (the
+  // --exit-after-layout observation channel): emitted exactly once per layout
+  // load that reaches a terminal outcome. `success` is true only when the
+  // layout COMMITTED (the sync apply leg's tail, or the progressive drain
+  // after every restore waiter cleared and the import batch finished — so a
+  // quit on this signal can never tear down a still-active batch); false on
+  // an open/parse/apply failure, a user cancel, or a cancelled import batch.
+  // A progressive restore superseded by a newer load never settles — the
+  // superseding load emits its own settlement instead.
+  void layoutRestoreSettled(bool success);
 
   // Fires when any chrome metric changes. Bundled so consumers always
   // recompute layout from a consistent snapshot:

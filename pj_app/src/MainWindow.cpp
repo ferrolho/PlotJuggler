@@ -4415,10 +4415,13 @@ void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity
   // kAutomated (--layout) run must never open a modal (Codex r2-3).
   const MissingCurvePolicy restore_policy =
       interactive ? MissingCurvePolicy::kPrompt : MissingCurvePolicy::kRetainAndDiagnose;
-  // 1. Open + parse
+  // 1. Open + parse. Every terminal outcome of this load — these entry
+  // failures, the user cancels below, and both restore legs' ends — emits
+  // layoutRestoreSettled exactly once (the --exit-after-layout boundary).
   QFile file(path);
   if (!file.open(QIODevice::ReadOnly)) {
     reportLayoutRestoreIssue(restore_policy, "layout-open-failed", tr("Cannot open '%1' for reading.").arg(path));
+    emit layoutRestoreSettled(false);
     return;
   }
   QDomDocument doc;
@@ -4431,6 +4434,7 @@ void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity
             .arg(path, parse_result.errorMessage)
             .arg(parse_result.errorLine)
             .arg(parse_result.errorColumn));
+    emit layoutRestoreSettled(false);
     return;
   }
   file.close();
@@ -4564,6 +4568,7 @@ void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity
              {tr("Load Layout only"), MessageBox::kNeutralRole},
              {tr("Cancel"), MessageBox::kCancelRole}});
         if (choice == kCancel || choice < 0) {
+          emit layoutRestoreSettled(false);
           return;  // Cancel or dialog dismissed → abort the layout load.
         }
         do_reload = (choice == kReloadOriginal);
@@ -4582,6 +4587,7 @@ void MainWindow::loadLayoutFromPath(const QString& path, LayoutLoadInteractivity
             // nothing was enqueued or captured on this path (pinned by the
             // batch tests), so returning here leaves any in-flight OLD
             // restore draining untouched — base-equivalent semantics.
+            emit layoutRestoreSettled(false);
             return;
           }
         }
@@ -5408,6 +5414,7 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, Miss
     // is a NO-OP — an in-flight previous restore keeps draining.
     reportLayoutRestoreIssue(
         policy, "layout-apply-no-data", tr("No data is loaded. Open a data source before applying this layout."));
+    emit layoutRestoreSettled(false);
     return;
   }
   // COMMIT POINT: the workspace is about to be replaced — supersede any
@@ -5420,6 +5427,7 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, Miss
   // output topic is in the catalog. Panel/chrome restores below stay layout-only.
   switch (restoreWorkspaceState(doc, policy)) {
     case RestoreResult::kCancelled:
+      emit layoutRestoreSettled(false);
       return;  // user aborted at the missing-curve prompt
     case RestoreResult::kFailed:
       // If step 2 already reloaded a data source AND apply failed, the world is left
@@ -5431,6 +5439,7 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, Miss
       reportLayoutRestoreIssue(
           policy, "layout-apply-failed",
           tr("Layout was parsed but could not be applied. If a data source was reloaded, it is still loaded."));
+      emit layoutRestoreSettled(false);
       return;
     case RestoreResult::kApplied:
       break;
@@ -5438,6 +5447,7 @@ void MainWindow::applyRestoredLayout(QDomDocument doc, const QString& path, Miss
 
   restoreChromeAndPanels(doc, path);
   commitRestoredLayout(doc, policy);
+  emit layoutRestoreSettled(true);
 }
 
 void MainWindow::restoreChromeAndPanels(const QDomDocument& doc, const QString& path) {
@@ -5537,6 +5547,7 @@ void MainWindow::beginProgressiveLayoutRestore(QDomDocument doc, const QString& 
     // kRetainAndDiagnose (non-interactive) restore never opens the modal.
     reportLayoutRestoreIssue(
         policy, "layout-progressive-apply-failed", tr("Layout was parsed but could not be applied."));
+    emit layoutRestoreSettled(false);
     return;
   }
 
@@ -5832,6 +5843,7 @@ void MainWindow::onProgressiveLayoutDrained() {
         rolled_back ? tr("A saved data processor could not be restored; the previous workspace was restored.")
                     : tr("A saved data processor could not be restored, and the previous workspace could not be fully "
                          "restored against the reloaded data. The partial layout was kept as the new undo baseline."));
+    emit layoutRestoreSettled(false);
     return;
   }
 
@@ -5847,6 +5859,7 @@ void MainWindow::onProgressiveLayoutDrained() {
         rolled_back ? tr("A saved scene element was invalid; the previous workspace was restored.")
                     : tr("A saved scene element was invalid, and the previous workspace could not be fully restored "
                          "against the reloaded data. The partial layout was kept as the new undo baseline."));
+    emit layoutRestoreSettled(false);
     return;
   }
 
@@ -5872,6 +5885,7 @@ void MainWindow::onProgressiveLayoutDrained() {
   // One owner for every unresolved-state teardown decision (binder intents,
   // blocking scene pends, the scene-pend clear), switching on the policy.
   if (!finalizeUnresolvedRestoreState(policy)) {
+    emit layoutRestoreSettled(false);
     return;  // user cancelled at the missing-curve prompt
   }
 
@@ -5879,6 +5893,11 @@ void MainWindow::onProgressiveLayoutDrained() {
   commitRestoredLayout(progressive_layout_doc_, policy);
   progressive_layout_doc_.clear();
   progressive_previous_workspace_.reset();
+  // Settlement AFTER the commit: every waiter cleared (the caller's gate) and
+  // the batch — if any — is finished (its waiter required exactly that), so a
+  // subscriber quitting here can never tear down a still-active batch. The
+  // caller retires the finished batch synchronously right after this returns.
+  emit layoutRestoreSettled(true);
 }
 
 void MainWindow::commitRestoredLayout(const QDomDocument& doc, MissingCurvePolicy policy) {
@@ -6025,6 +6044,7 @@ void MainWindow::maybeSettleProgressiveRestore() {
     emitDiagnostic(
         DiagnosticLevel::kInfo, "Layout", "layout-import-cancelled",
         tr("Layout import was cancelled; the previous workspace was restored."));
+    emit layoutRestoreSettled(false);
     return;
   }
   clearRestoreWaiters();

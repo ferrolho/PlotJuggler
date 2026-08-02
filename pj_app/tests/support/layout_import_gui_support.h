@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <QAction>
 #include <QApplication>
 #include <QDomDocument>
 #include <QDomElement>
@@ -148,6 +149,25 @@ class MainWindowLayoutImportTestPeer {
     window.ingest_progress_->setActive(false);
   }
 
+  // --- Stage-5 live-E2E surfaces: the literal GUI menu actions (E6 automates
+  // the real QActions, never the slots directly), the dataset-removal shell
+  // route (the warm leg must unload first — findAlreadyLoaded resolves by
+  // provenance and would short-circuit the reload), and the direct save entry
+  // for re-save assertions that already proved the modal once. ---
+
+  [[nodiscard]] static QAction* saveLayoutAction(MainWindow& window) {
+    return window.action_save_layout_;
+  }
+  [[nodiscard]] static QAction* loadLayoutAction(MainWindow& window) {
+    return window.action_load_layout_;
+  }
+  static void removeDatasetData(MainWindow& window, DatasetId dataset_id) {
+    window.removeDatasetData(dataset_id);
+  }
+  static void saveLayoutToPath(MainWindow& window, const QString& path, bool include_data_source) {
+    window.saveLayoutToPath(path, include_data_source);
+  }
+
   // --- D9 scaffolding: the takeover-fold and pinned-panel seams (the same
   // private surfaces ToolboxPanelFoldTest drives, re-exposed here so the
   // binder suite can prove a headless batch job never reaches them). ---
@@ -253,6 +273,37 @@ using pj_fake_import::kProviderId;
   file_info.appendChild(materialize);
   wrapper.appendChild(file_info);
   root.appendChild(wrapper);
+  return doc;
+}
+
+// A generic-binding layout with one curve on `curve_topic`: no data sources,
+// no <materialize> — the plain SYNC-apply shape (binds against loaded data).
+[[nodiscard]] inline QDomDocument buildGenericCurveLayoutDoc(const QString& curve_topic) {
+  QDomDocument doc;
+  QDomElement root = doc.createElement(QStringLiteral("root"));
+  root.setAttribute(QStringLiteral("pj4_version"), QStringLiteral("4"));
+  root.setAttribute(QStringLiteral("binding"), QStringLiteral("generic"));
+  doc.appendChild(root);
+  QDomElement tabbed = doc.createElement(QStringLiteral("tabbed_widget"));
+  tabbed.setAttribute(QStringLiteral("parent"), QStringLiteral("main_window"));
+  QDomElement tab = doc.createElement(QStringLiteral("Tab"));
+  tab.setAttribute(QStringLiteral("id"), QStringLiteral("t1"));
+  tab.setAttribute(QStringLiteral("containers"), QStringLiteral("1"));
+  QDomElement container = doc.createElement(QStringLiteral("Container"));
+  QDomElement dock_area = doc.createElement(QStringLiteral("DockArea"));
+  dock_area.setAttribute(QStringLiteral("id"), QStringLiteral("a1"));
+  dock_area.setAttribute(QStringLiteral("name"), QStringLiteral("View"));
+  QDomElement plot = doc.createElement(QStringLiteral("plot"));
+  plot.setAttribute(QStringLiteral("id"), QStringLiteral("plot1"));
+  plot.setAttribute(QStringLiteral("mode"), QStringLiteral("TimeSeries"));
+  QDomElement curve = doc.createElement(QStringLiteral("curve"));
+  curve.setAttribute(QStringLiteral("topic"), curve_topic);
+  plot.appendChild(curve);
+  dock_area.appendChild(plot);
+  container.appendChild(dock_area);
+  tab.appendChild(container);
+  tabbed.appendChild(tab);
+  root.appendChild(tabbed);
   return doc;
 }
 

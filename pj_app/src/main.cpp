@@ -21,8 +21,10 @@
 #include <cstdio>
 #include <cstdlib>
 #ifndef PJ_TARGET_WASM
+#include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #endif
 #include <memory>
@@ -32,7 +34,13 @@
 
 #include "BrowserPersistence.h"
 #include "DebugMode.h"
+#ifndef PJ_TARGET_WASM
+#include "DiagnosticDump.h"
+#endif
 #include "KeySequence.h"
+#ifndef PJ_TARGET_WASM
+#include "LayoutExitWatch.h"
+#endif
 #include "MainWindow.h"
 #include "Splashscreen.h"
 #include "WidgetTuner.h"
@@ -332,11 +340,58 @@ int main(int argc, char* argv[]) {
   const QCommandLineOption screenshot_delay_option(
       u"screenshot-delay"_s, u"ms to wait before the screenshot grab (default 7000)."_s, u"ms"_s, u"7000"_s);
   parser.addOption(screenshot_delay_option);
+#ifndef PJ_TARGET_WASM
+  // Headless acceptance flags (the layout-import E2E observation channel):
+  // --dump-diagnostics serializes the WHOLE run's diagnostics (never the
+  // 200-record bell ring) and --exit-after-layout turns the restore
+  // settlement boundary into a failure-aware process exit code.
+  const QCommandLineOption dump_diagnostics_option(
+      u"dump-diagnostics"_s,
+      u"Write every diagnostic reported during this run to a JSON file on exit (full run, never truncated)."_s,
+      u"json-path"_s);
+  parser.addOption(dump_diagnostics_option);
+  const QCommandLineOption exit_after_layout_option(
+      u"exit-after-layout"_s,
+      QStringLiteral(
+          "With --layout: quit when the layout restore settles. Exit codes: 0 = restore committed, "
+          "1 = layout load failed, 2 = timed out (see --exit-after-layout-timeout); usage errors exit 64."));
+  parser.addOption(exit_after_layout_option);
+  const QCommandLineOption exit_after_layout_timeout_option(
+      u"exit-after-layout-timeout"_s,
+      u"Seconds --exit-after-layout waits for settlement before exiting with code 2 (default 300)."_s, u"seconds"_s,
+      u"300"_s);
+  parser.addOption(exit_after_layout_timeout_option);
+#endif
   parser.process(app);
 
 #ifndef PJ_TARGET_WASM
   if (parser.isSet(validate_plugins_option)) {
     return validatePlugins(parser.value(validate_plugins_option), parser.values(expect_plugin_option));
+  }
+
+  // --exit-after-layout is meaningless without a layout to settle: fail fast
+  // (a headless harness must never sit in an unobserved GUI session). Usage
+  // errors exit 64 (EX_USAGE, the sysexits convention) so scripts can always
+  // distinguish them from the run's own codes (1 = load failed, 2 = timeout).
+  constexpr int kExitUsage = 64;
+  int exit_after_layout_timeout_s = 0;
+  if (parser.isSet(exit_after_layout_option)) {
+    if (!parser.isSet(layout_option)) {
+      std::fprintf(stderr, "[exit-after-layout] --exit-after-layout requires --layout\n");
+      return kExitUsage;
+    }
+    bool timeout_ok = false;
+    exit_after_layout_timeout_s = parser.value(exit_after_layout_timeout_option).toInt(&timeout_ok);
+    // Upper bound: the deadline rides QTimer, whose interval is int
+    // milliseconds — a seconds value whose milliseconds would overflow int
+    // must be a loud usage error, never a silent wrap.
+    if (!timeout_ok || exit_after_layout_timeout_s <= 0 ||
+        exit_after_layout_timeout_s > std::numeric_limits<int>::max() / 1000) {
+      std::fprintf(
+          stderr, "[exit-after-layout] invalid --exit-after-layout-timeout value: %s\n",
+          qPrintable(parser.value(exit_after_layout_timeout_option)));
+      return kExitUsage;
+    }
   }
 #endif
 
@@ -377,6 +432,27 @@ int main(int argc, char* argv[]) {
   }
 
   PJ::MainWindow window(parser.value(plugin_dir_option));
+
+#ifndef PJ_TARGET_WASM
+  // --dump-diagnostics: attached IMMEDIATELY after MainWindow construction,
+  // before ANYTHING can pump the loop — the splash wait and --test-data below
+  // both processEvents(), which would deliver the queued construction-time
+  // bridge re-emits (e.g. plugin-load failures) to zero subscribers and lose
+  // them for good. Serialized on aboutToQuit, which fires on EVERY event-loop
+  // exit — including QCoreApplication::exit(nonzero) — so failure paths get
+  // the file too.
+  if (parser.isSet(dump_diagnostics_option)) {
+    auto* dump = new PJ::DiagnosticDump(parser.value(dump_diagnostics_option), &window);
+    dump->attachTo(window.diagnosticBridge());
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, dump, [dump]() {
+      if (dump->write()) {
+        std::printf("[dump-diagnostics] wrote %d record(s): %s\n", dump->size(), qPrintable(dump->outputPath()));
+      } else {
+        std::fprintf(stderr, "[dump-diagnostics] write FAILED: %s\n", qPrintable(dump->outputPath()));
+      }
+    });
+  }
+#endif
 
   // App-wide gesture watcher. Observes key presses without consuming them and
   // calls the entry point when the fixed sequence completes.
@@ -428,6 +504,33 @@ int main(int argc, char* argv[]) {
     const QString layout_path = parser.value(layout_option);
     QTimer::singleShot(0, &window, [&window, layout_path]() { window.loadLayoutAtStartup(layout_path); });
   }
+
+#ifndef PJ_TARGET_WASM
+  // --exit-after-layout: quit at the restore settlement boundary with a
+  // failure-aware exit code (0 committed / 1 load failed / 2 timeout — the
+  // LayoutExitWatch constants). Settlement is emitted only after the import
+  // batch finished and every restore waiter cleared, so this quit can never
+  // tear down a mid-flight import. Composes with --screenshot: whichever
+  // quit fires first wins (the screenshot timer stays an unconditional
+  // watchdog reporting 0 — it is never the success oracle; use THIS flag's
+  // exit code for that).
+  if (parser.isSet(exit_after_layout_option)) {
+    const int timeout_s = exit_after_layout_timeout_s;
+    new PJ::LayoutExitWatch(
+        window, std::chrono::seconds(timeout_s),
+        [timeout_s](int code) {
+          if (code == PJ::LayoutExitWatch::kExitCodeSuccess) {
+            std::printf("[exit-after-layout] layout restore settled: success\n");
+          } else if (code == PJ::LayoutExitWatch::kExitCodeLoadFailed) {
+            std::fprintf(stderr, "[exit-after-layout] layout load FAILED\n");
+          } else {
+            std::fprintf(stderr, "[exit-after-layout] TIMED OUT after %d s without settlement\n", timeout_s);
+          }
+          QCoreApplication::exit(code);
+        },
+        &window);
+  }
+#endif
 
   // One-shot GitHub release check, opt-out via Preferences (default on) and
   // skipped for headless --screenshot runs. Deferred to the running event loop

@@ -411,4 +411,84 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, EmbeddedTimestampRegressionKeepsSc
   EXPECT_EQ(object_store_.entryCount(*object_topic), embedded_stamps.size());
 }
 
+// The offline pin for the delegated-ingest TopicId-stability contract.
+//
+// SessionManager::beginRefill keeps a reloading source's TopicIds REGISTERED so
+// the refill writes back into the same ids and every curve key survives. That
+// only holds if binding a name the dataset ALREADY carries resolves to the
+// existing topic instead of minting a new one — which the direct-write API
+// (WriteCore::ensureTopic) and the object route have always done, and which
+// this scalar parser-binding path did NOT do until the fix this test pins.
+//
+// The gap was invisible to every other offline test because the test/mock
+// loaders write through the direct-write API (which reuses by name); only a
+// REAL delegated-ingest loader (data_load_mcap — i.e. every cloud promotion)
+// took the broken path, so the bug surfaced first in the live layout-import
+// E2E. Pre-fix this fails on the first assertion: the bind mints a second
+// same-named topic and listTopics() returns 2.
+TEST_F(DataSourceRuntimeHostObjectIngestTest, ParserBindingReusesTheDatasetsExistingSameNamedTopic) {
+  // A topic the dataset already carries — the shape a refill/reload presents.
+  auto existing_or = engine_.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/reused"});
+  ASSERT_TRUE(existing_or.has_value()) << existing_or.error();
+  const PJ::TopicId existing_id = *existing_or;
+
+  auto binding_or = bindTopic("/reused", "mock/scalar");
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  // No duplicate minted, and the id the refill contract depends on is intact.
+  auto topics = engine_.listTopics(dataset_id_);
+  ASSERT_EQ(topics.size(), 1U) << "binding minted a duplicate same-named topic";
+  EXPECT_EQ(topics.front(), existing_id);
+
+  // And the binding actually writes into that same topic.
+  (void)pushPayload(*binding_or, 1000, std::vector<uint8_t>{0x10, 0x20});
+  host_->flushAll();
+  PJ::DataReader reader(engine_);
+  const auto metadata = reader.getMetadata(existing_id);
+  ASSERT_TRUE(metadata.has_value());
+  EXPECT_GT(metadata->total_row_count, 0U) << "rows landed somewhere other than the reused topic";
+}
+
+// The same reuse path with a secondary engine bound (the streaming pause/resume
+// lockstep): the mirror stays idempotent — an id the secondary already holds is
+// not re-created — and the two engines keep matching ids.
+TEST_F(DataSourceRuntimeHostObjectIngestTest, ParserBindingReuseKeepsTheSecondaryEngineMirrorIdempotent) {
+  PJ::DataEngine secondary;
+  auto secondary_dataset_or =
+      secondary.createDataset(PJ::DatasetDescriptor{.source_name = "test", .time_domain_id = 0});
+  ASSERT_TRUE(secondary_dataset_or.has_value()) << secondary_dataset_or.error();
+  ASSERT_EQ(static_cast<PJ::DatasetId>(*secondary_dataset_or), dataset_id_) << "fixture assumption: ids start aligned";
+
+  // Both engines already carry the topic under the same id — the post-refill
+  // state a rebind lands in.
+  auto primary_or = engine_.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/mirrored"});
+  ASSERT_TRUE(primary_or.has_value()) << primary_or.error();
+  auto secondary_or = secondary.createTopic(dataset_id_, PJ::TopicDescriptor{.name = "/mirrored"}, *primary_or);
+  ASSERT_TRUE(secondary_or.has_value()) << secondary_or.error();
+
+  PJ::ServiceRegistryBuilder builder;
+  PJ::DataSourceRuntimeHost host(
+      engine_, catalog_, dataset_id_, source_handle_, object_store_, "runtime_host_test_source",
+      /*parser_registrar=*/nullptr, /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/&secondary,
+      /*library_keepalive=*/nullptr);
+  host.registerServices(builder);
+  PJ::sdk::ServiceRegistry services(builder.view());
+  auto runtime_or = services.require<PJ::sdk::DataSourceRuntimeHostService>();
+  ASSERT_TRUE(runtime_or.has_value()) << runtime_or.error();
+
+  auto binding_or = runtime_or->ensureParserBinding(
+      PJ::ParserBindingRequest{
+          .topic_name = "/mirrored",
+          .parser_encoding = "runtime_host_object",
+          .type_name = "mock/scalar",
+          .schema = PJ::Span<const uint8_t>{},
+          .parser_config_json = "{}",
+      });
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  ASSERT_EQ(engine_.listTopics(dataset_id_).size(), 1U);
+  ASSERT_EQ(secondary.listTopics(dataset_id_).size(), 1U) << "the mirror re-created an id the secondary already held";
+  EXPECT_EQ(engine_.listTopics(dataset_id_).front(), secondary.listTopics(dataset_id_).front());
+}
+
 }  // namespace

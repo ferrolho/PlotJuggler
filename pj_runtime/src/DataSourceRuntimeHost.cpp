@@ -7,6 +7,7 @@
 
 #include <QLoggingCategory>
 #include <QString>
+#include <algorithm>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -473,29 +474,78 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
       return self->fail(out_error, ("no parser found for encoding '" + std::string(encoding) + "'").c_str());
     }
 
-    auto topic_or = self->engine_.createTopic(self->dataset_id_, TopicDescriptor{.name = std::string(topic_name)});
-    if (!topic_or.has_value()) {
-      return self->fail(
-          out_error, ("failed to create topic '" + std::string(topic_name) + "': " + topic_or.error()).c_str());
-    }
-    const PJ_topic_handle_t topic_handle{static_cast<uint32_t>(*topic_or)};
+    // Reuse the dataset's existing same-named scalar topic before minting a new
+    // one — the transactional-refill contract (SessionManager::beginRefill keeps
+    // TopicIds REGISTERED precisely so a same-source reload / import promotion
+    // writes back into the same ids and every curve key survives) depends on it.
+    // The direct-write API (WriteCore::ensureTopic) and the object route below
+    // (ObjectStore::findTopic) already reuse by name; this scalar parser-binding
+    // path was the one asymmetric spot that always createTopic'd — which
+    // renumbered every TopicId on a delegated-ingest reload (data_load_mcap et
+    // al.) and silently dropped every bound curve at the replace boundary
+    // (caught live by the layout-import E2E's promotion leg).
+    // Scan + create + mirror run under the engine lock(s), held across the whole
+    // sequence: getTopicStorage() does NOT lock (engine.hpp's threading
+    // contract), so a returned pointer is only valid while the lock is held —
+    // and this runs on the plugin poll thread while the GUI thread may be
+    // mutating the engine (a dataset removal frees TopicStorage). Two engines
+    // lock deferred-then-std::lock, the same deadlock-free order the
+    // direct-write sibling uses (WriteCore::ensureTopic via lockWriteEngines),
+    // so the two paths can never invert against each other. The engine mutex is
+    // recursive, so createTopic re-acquiring inside is fine.
+    TopicId topic_id = 0;
+    {
+      std::unique_lock<std::recursive_mutex> primary_lock;
+      std::unique_lock<std::recursive_mutex> secondary_lock;
+      if (self->secondary_data_engine_ != nullptr) {
+        primary_lock = self->engine_.lockEngineDeferred();
+        secondary_lock = self->secondary_data_engine_->lockEngineDeferred();
+        std::lock(primary_lock, secondary_lock);
+      } else {
+        primary_lock = self->engine_.lockEngine();
+      }
 
-    // Lockstep-mirror into the secondary engine with the SAME TopicId. The two
-    // engines' TopicId counters drift whenever the primary gets topics the
-    // secondary doesn't (e.g. a file loaded between streams), so we force the
-    // secondary topic id to match the primary's instead of relying on the
-    // counters staying in step. A later push uses one id against whichever
-    // engine is the active target, so the ids MUST match.
-    if (self->secondary_data_engine_ != nullptr) {
-      auto mirrored = self->secondary_data_engine_->createTopic(
-          self->dataset_id_, TopicDescriptor{.name = std::string(topic_name)}, *topic_or);
-      if (!mirrored.has_value()) {
-        return self->fail(
-            out_error,
-            ("failed to mirror topic '" + std::string(topic_name) + "' into secondary engine: " + mirrored.error())
-                .c_str());
+      auto existing_ids = self->engine_.listTopics(self->dataset_id_);
+      std::sort(existing_ids.begin(), existing_ids.end());
+      for (const TopicId tid : existing_ids) {
+        const auto* storage = self->engine_.getTopicStorage(tid);
+        if (storage != nullptr && storage->descriptor().name == topic_name) {
+          topic_id = tid;
+          break;
+        }
+      }
+      if (topic_id == 0) {
+        auto topic_or = self->engine_.createTopic(self->dataset_id_, TopicDescriptor{.name = std::string(topic_name)});
+        if (!topic_or.has_value()) {
+          return self->fail(
+              out_error, ("failed to create topic '" + std::string(topic_name) + "': " + topic_or.error()).c_str());
+        }
+        topic_id = *topic_or;
+      }
+
+      // Lockstep-mirror into the secondary engine with the SAME TopicId. The two
+      // engines' TopicId counters drift whenever the primary gets topics the
+      // secondary doesn't (e.g. a file loaded between streams), so we force the
+      // secondary topic id to match the primary's instead of relying on the
+      // counters staying in step. A later push uses one id against whichever
+      // engine is the active target, so the ids MUST match. (On the reuse path
+      // the secondary may already hold the id; mirror only when absent — the
+      // same idempotent retry the direct-write mirror applies. Like that
+      // sibling, the skip is name-blind: an id already present is assumed
+      // mirrored rather than re-checked by name.)
+      if (self->secondary_data_engine_ != nullptr &&
+          self->secondary_data_engine_->getTopicStorage(topic_id) == nullptr) {
+        auto mirrored = self->secondary_data_engine_->createTopic(
+            self->dataset_id_, TopicDescriptor{.name = std::string(topic_name)}, topic_id);
+        if (!mirrored.has_value()) {
+          return self->fail(
+              out_error,
+              ("failed to mirror topic '" + std::string(topic_name) + "' into secondary engine: " + mirrored.error())
+                  .c_str());
+        }
       }
     }
+    const PJ_topic_handle_t topic_handle{static_cast<uint32_t>(topic_id)};
 
     auto write_host = std::make_unique<DatastoreParserWriteHost>(self->engine_, topic_handle);
     // Same lockstep wiring as the source-level write host (see the runtime
