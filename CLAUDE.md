@@ -61,6 +61,7 @@ When adding files, use the owning module rather than creating new top-level fold
 - `3rdparty/`: vendored source dependencies added via CMake `add_subdirectory`. Conan/system dependencies do not belong here.
 - `thirdparty/`: GPLv2/shareware license + source-offer compliance artifacts (`thirdparty/retro/`) shipped alongside the separately-licensed `pj-raster-helper`; distinct from `3rdparty/` (CMake-vendored sources). The root `CMakeLists.txt` installs these next to the helper binary.
 - Top-level `raster_helper/` (the standalone GPL-2.0 `pj-raster-helper` executable that links vendored doomgeneric — PlotJuggler links none of it) and `raster_ipc/` (its header-only, Qt-free MPL-2.0 IPC contract, consumed by `pj_widgets`) are intentional non-`pj_` helper folders, not PJ modules, and are exempt from the no-new-top-level-folders rule.
+- Packaging recipes live in one flat folder per artifact format, also exempt from that rule: `appimage/` (AppImage), `deb/` (Debian/Ubuntu package), `installer/` (Windows installer). They contain no compiled code — each holds the scripts, templates and metadata that repackage an already-built tree. A `.deb` recipe belongs in `deb/`, deliberately **not** `debian/`, which by convention marks a debhelper source package this repo is not.
 
 ## Documentation
 

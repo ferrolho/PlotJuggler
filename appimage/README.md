@@ -5,6 +5,16 @@ Builds a single relocatable `PlotJuggler-<version>-<arch>.AppImage` bundling the
 The default app version, Qt version, and AppImage arch come from repo-root
 `versions.env`; release builds may override `PJ_VERSION` with the tag.
 
+The `build/AppDir` this produces is also the payload of the Debian package — see
+[`deb/README.md`](../deb/README.md). Anything added to the AppDir ships in both
+artifacts, so check that side too when changing what gets bundled.
+
+`smoke_test.sh` runs the finished AppImage on a machine that did not build it
+(`--selftest-python` + a GUI startup under Xvfb) — release CI runs it in the
+same clean containers as `deb/smoke_test.sh`, right after it, so the runtime
+libraries come from the `.deb`'s `Depends`. See the header comment for
+standalone use.
+
 ## Build
 
 ```bash

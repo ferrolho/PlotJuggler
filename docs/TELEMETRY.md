@@ -11,7 +11,7 @@ mechanism PlotJuggler 3 used, hardened for privacy.
 | `user_id` | `3f2c…` (SHA-256) | Salted hash of the OS machine id — counts unique machines; cannot be reversed or linked to other applications. |
 | `os` / `os_version` | `ubuntu` / `24.04` | Platform-support decisions. |
 | `version` | `4.0.1` | Adoption per release. |
-| `installation` | `appimage` | Package-channel share (`source`, `appimage`, `windows`). |
+| `installation` | `appimage` | Package-channel share (`source`, `appimage`, `deb`, `windows`). |
 | `arch` | `x86_64` | Whether arm64 builds are worth shipping. |
 | `display_server` | `wayland` | Linux only: Wayland vs X11 session share. |
 
@@ -30,4 +30,4 @@ ever sent). Headless `--screenshot` runs never send the ping.
 `pj_runtime`'s `TelemetryPing` (payload + transport); wired in
 `pj_app/src/main.cpp` behind the `Preferences::send_anonymous_stats` setting. The packaging channel comes from
 the `PJ_INSTALLATION` CMake cache variable (default `source`; release CI
-stamps `appimage` / `windows`).
+stamps `appimage` / `deb` / `windows`).

@@ -1,0 +1,17 @@
+Package: @PACKAGE@
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: PlotJuggler <noreply@plotjuggler.io>
+Installed-Size: @INSTALLED_SIZE@
+Depends: @DEPENDS@
+Section: science
+Priority: optional
+Homepage: https://plotjuggler.io
+Description: Visualize timeseries like a pro
+ PlotJuggler is a fast, feature-rich application to visualize and analyze
+ timeseries data — robotics logs, telemetry, CSV, MCAP, ROS bags, Parquet and
+ more — with plots, 2D image/scene views and a 3D robotics viewer.
+ .
+ This package bundles its own Qt 6 runtime and third-party dependencies under
+ /opt/plotjuggler4, so it does not use (or interfere with) the Qt packages
+ installed on the system.

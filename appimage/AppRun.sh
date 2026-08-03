@@ -15,8 +15,19 @@ set -e
 HERE="$(dirname "$(readlink -f "${0}")")"
 APPDIR="${APPDIR:-${HERE}}"
 
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
-export QT_PLUGIN_PATH="${APPDIR}/usr/plugins:${QT_PLUGIN_PATH:-}"
+# Join with ':' only when the variable is already set: an unconditional
+# "${new}:${old:-}" leaves a trailing colon when $old is empty, and the loader
+# reads an empty search-path entry as the current working directory.
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH}"
+else
+  export LD_LIBRARY_PATH="${APPDIR}/usr/lib"
+fi
+if [[ -n "${QT_PLUGIN_PATH:-}" ]]; then
+  export QT_PLUGIN_PATH="${APPDIR}/usr/plugins:${QT_PLUGIN_PATH}"
+else
+  export QT_PLUGIN_PATH="${APPDIR}/usr/plugins"
+fi
 export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
 # Embedded CPython (Python Data Processors) must find its stdlib at startup. The

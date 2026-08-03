@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# /usr/bin/plotjuggler4 — launcher for the packaged PlotJuggler 4.
+#
+# The Debian counterpart of the AppImage's AppRun: it reproduces the same
+# runtime environment with the AppDir root replaced by the install prefix.
+# Everything the app needs lives under that prefix; only this wrapper, the
+# desktop file and the icon are installed into the system tree.
+#
+# Generated from deb/plotjuggler4.wrapper.in by deb/build_deb.sh.
+set -e
+
+PJ_PREFIX="@PJ_PREFIX@"
+
+# Prepend rather than assign, but only when the variable is already set: an
+# unconditional "${new}:${old}" leaves a trailing colon when $old is empty, and
+# the loader reads a trailing colon as the current working directory — which
+# would sit ahead of the bundled closure in the search order.
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH="${PJ_PREFIX}/lib:${LD_LIBRARY_PATH}"
+else
+  LD_LIBRARY_PATH="${PJ_PREFIX}/lib"
+fi
+export LD_LIBRARY_PATH
+
+# Redundant with bin/qt.conf (Prefix = ../), kept because it is what actually
+# rescues a run where qt.conf is missing or ignored.
+if [ -n "${QT_PLUGIN_PATH:-}" ]; then
+  QT_PLUGIN_PATH="${PJ_PREFIX}/plugins:${QT_PLUGIN_PATH}"
+else
+  QT_PLUGIN_PATH="${PJ_PREFIX}/plugins"
+fi
+export QT_PLUGIN_PATH
+
+# The embedded CPython (Python Data Processors) has the BUILD host's Conan
+# prefix baked in, which exists on no user machine, so it cannot find its own
+# stdlib. Point it at the bundled copy under ${PJ_PREFIX}/lib/pythonX.Y.
+# python_engine.cpp only sets PYTHONHOME when unset, so this wins — and a
+# user-provided PYTHONHOME still wins over this.
+[ -n "${PYTHONHOME:-}" ] || export PYTHONHOME="${PJ_PREFIX}"
+
+# Mosaico's bundled gRPC (Arrow Flight client) has its default CA-roots path
+# compiled to a build-sandbox path that does not exist at runtime, so TLS dials
+# fail with "pem_root_certs cannot be nullptr". First match wins; honor any
+# pre-set override.
+if [ -z "${GRPC_DEFAULT_SSL_ROOTS_FILE_PATH:-}" ]; then
+  for _ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    if [ -f "${_ca}" ]; then
+      export GRPC_DEFAULT_SSL_ROOTS_FILE_PATH="${_ca}"
+      break
+    fi
+  done
+fi
+
+# An IBus input-context module loaded from a system or older Qt segfaults under
+# the bundled Qt 6.11 (the same reason run.sh unsets it for dev runs).
+unset QT_IM_MODULE
+
+exec "${PJ_PREFIX}/bin/plotjuggler4" "$@"

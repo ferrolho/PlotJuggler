@@ -1,0 +1,46 @@
+PlotJuggler 4
+Upstream-Contact: https://github.com/PlotJuggler/PJ4
+Source: https://github.com/PlotJuggler/PJ4
+
+PlotJuggler 4
+-------------
+
+Copyright (c) PlotJuggler contributors.
+
+Licensed under the Mozilla Public License, Version 2.0 (MPL-2.0). You may
+obtain a copy of the license at https://mozilla.org/MPL/2.0/ or at
+/usr/share/common-licenses/MPL-2.0.
+
+The plotjuggler_sdk component (pj_base, pj_plugins) is licensed under the
+Apache License, Version 2.0 (/usr/share/common-licenses/Apache-2.0).
+
+Bundled third-party software
+----------------------------
+
+This package bundles its own copies of Qt 6 and other third-party libraries
+under /opt/plotjuggler4/lib so that it runs independently of the Qt version
+installed on the system.
+
+Copyright and license texts for the bundled system libraries (harvested from
+the distribution packages they were deployed from at build time) are shipped
+under /opt/plotjuggler4/share/doc/<package>/.
+
+Qt 6 is used under the GNU Lesser General Public License, version 3
+(/usr/share/common-licenses/LGPL-3); FFmpeg is built with an LGPL-only feature
+set and used under the LGPL, version 2.1 or later
+(/usr/share/common-licenses/LGPL-2.1). Their license texts are not duplicated
+inside /opt. The remaining bundled libraries come from the project's pinned
+Conan dependency set (assimp, draco, luau, cpython, and others) under their
+respective permissive or LGPL licenses.
+
+Corresponding sources for the LGPL components: the exact versions and build
+configuration are pinned in the PlotJuggler 4 repository (versions.env,
+conanfile.txt, conan.lock, recipes/), from which each component's unmodified
+upstream source release can be retrieved; the sources are also available on
+written request via https://github.com/PlotJuggler/PJ4/issues. The bundled Qt
+and FFmpeg shared libraries under /opt/plotjuggler4/lib can be replaced with
+user-built compatible versions, satisfying the LGPL relinking requirement.
+
+Bundled plugins under /opt/plotjuggler4/lib/plotjuggler/plugins are published
+separately by the PlotJuggler project and carry their own license metadata in
+each plugin's manifest.json.
