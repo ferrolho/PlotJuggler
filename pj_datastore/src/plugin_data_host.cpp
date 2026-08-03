@@ -342,7 +342,25 @@ struct WriteCore {
 
   [[nodiscard]] bool createDataSource(std::string_view name, DataSourceHandle* out_source) {
     auto engine_locks = lockWriteEngines(engine, secondary_engine);
-    auto id_or = engine.createDataset(DatasetDescriptor{.source_name = std::string(name), .time_domain_id = 0});
+    // Each plugin-created source gets its OWN time domain, exactly as the app's
+    // own file/stream loaders do. The per-source display offset lives on the
+    // domain, so a dataset left on the default domain (id 0) can never carry
+    // one — its Source Timeline bar would draw but refuse every drag.
+    auto td_or = engine.createTimeDomain(std::string(name));
+    if (!td_or.has_value()) {
+      setError(td_or.error());
+      return false;
+    }
+    // Same-id mirror per the two-engine lockstep invariant above, done before
+    // the dataset exists so a failed mirror leaves nothing half-created.
+    if (secondary_engine != nullptr) {
+      auto mirror_or = secondary_engine->createTimeDomain(std::string(name), *td_or);
+      if (!mirror_or.has_value()) {
+        setError(fmt::format("secondary mirror createTimeDomain failed: {}", mirror_or.error()));
+        return false;
+      }
+    }
+    auto id_or = engine.createDataset(DatasetDescriptor{.source_name = std::string(name), .time_domain_id = *td_or});
     if (!id_or.has_value()) {
       setError(id_or.error());
       return false;

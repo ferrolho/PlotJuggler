@@ -181,6 +181,7 @@ if(PJ_BUILD_TESTS)
     tests/clear_dataset_test.cpp
     tests/plugin_data_host_object_test.cpp
     tests/plugin_data_host_object_read_test.cpp
+    tests/plugin_host_dataset_test.cpp
     tests/streaming_mirror_test.cpp
     tests/sample_test.cpp
     tests/data_processor_test.cpp
