@@ -88,8 +88,10 @@ class ToolboxPanelFoldTestPeer {
     window.pinToolboxPanel(container, plugin_id, title, /*engine=*/nullptr, std::move(save_config), host, transient);
   }
 
-  static void emitPinnedCloseRequest(MainWindow& window, QWidget* container, const std::string& reason) {
-    window.onPinnedPanelCloseRequested(container, reason);
+  /// Returns whether the engine may tear itself down (false = the host declined
+  /// and the panel must keep exchanging widget data).
+  [[nodiscard]] static bool emitPinnedCloseRequest(MainWindow& window, QWidget* container, const std::string& reason) {
+    return window.onPinnedPanelCloseRequested(container, reason);
   }
 
   [[nodiscard]] static bool isPinned(const MainWindow& window, const QString& plugin_id) {
@@ -242,8 +244,9 @@ class ToolboxPanelFoldTest : public ::testing::Test {
     PJ::ToolboxPanelFoldTestPeer::dismissTakeoverPanel(mainWindow());
   }
 
-  void emitCloseRequest(const std::string& reason) {
-    PJ::ToolboxPanelFoldTestPeer::emitPinnedCloseRequest(mainWindow(), container_.data(), reason);
+  /// Returns whether the host let the engine tear itself down.
+  bool emitCloseRequest(const std::string& reason) {
+    return PJ::ToolboxPanelFoldTestPeer::emitPinnedCloseRequest(mainWindow(), container_.data(), reason);
   }
 
   void setWorkInFlight(bool busy) {
@@ -421,7 +424,9 @@ TEST_F(ToolboxPanelFoldTest, BackgroundFoldIsExcludedFromLayoutSave) {
 TEST_F(ToolboxPanelFoldTest, CompletionCloseRequestIsIgnoredWhilePinned) {
   pinPanel();
 
-  emitCloseRequest("import_complete");
+  // Declining is what keeps the engine alive: a torn-down engine stops ticking
+  // and rejects the plugin, leaving the still-visible tab an inert shell.
+  EXPECT_FALSE(emitCloseRequest("import_complete"));
 
   EXPECT_FALSE(engineClosed());
 }
@@ -430,7 +435,7 @@ TEST_F(ToolboxPanelFoldTest, CompletionCloseRequestIsIgnoredWhilePinned) {
 TEST_F(ToolboxPanelFoldTest, UserCloseRequestStillClosesPinnedPanel) {
   pinPanel();
 
-  emitCloseRequest("user_back");
+  EXPECT_TRUE(emitCloseRequest("user_back"));
 
   EXPECT_TRUE(engineClosed());
 }

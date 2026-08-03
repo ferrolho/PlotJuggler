@@ -297,6 +297,7 @@ TEST_F(PanelEngineTest, RequestCloseFiresCallback) {
   engine.onCloseRequested([&](std::string reason) {
     captured_reason = std::move(reason);
     fired = true;
+    return true;
   });
 
   QWidget* panel = engine.openPanel();
@@ -311,6 +312,44 @@ TEST_F(PanelEngineTest, RequestCloseFiresCallback) {
 
   EXPECT_TRUE(fired);
   EXPECT_EQ(captured_reason, "import_complete");
+
+  delete panel;
+}
+
+// A host that keeps the panel alive past its own batch completion (a pinned tab
+// ignoring "import_complete") declines the close, and the session MUST keep
+// running. Regression: the engine used to tear itself down regardless of the
+// callback, so the kept-open tab stayed on screen as an inert shell — no ticks,
+// no widget-data exchange, every click silently dropped, unrecoverable without
+// reopening the plugin.
+TEST_F(PanelEngineTest, DeclinedCloseKeepsTheSessionRunning) {
+  PJ::PanelEngine engine(
+      makeMockHandle(), {/*tick_interval_ms=*/10, /*enable_diff=*/true, /*catalog_key_resolver=*/{}});
+  int close_requests = 0;
+  engine.onCloseRequested([&](std::string /*reason*/) {
+    ++close_requests;
+    return false;  // the owner keeps this panel open
+  });
+
+  QWidget* panel = engine.openPanel();
+  ASSERT_NE(panel, nullptr);
+  panel->show();
+
+  mockPanelState().close_on_next_tick = true;
+  mockPanelState().close_reason = "import_complete";
+  pumpEventLoop(50);
+  ASSERT_GT(close_requests, 0) << "the plugin never asked to close; test is not exercising the path";
+
+  // The engine must still be ticking AND still applying plugin widget data.
+  const int ticks_after_decline = engine.stats().tick_count;
+  mockPanelState().close_on_next_tick = false;
+  mockPanelState().label = "StillAlive";
+  pumpEventLoop(100);
+
+  EXPECT_GT(engine.stats().tick_count, ticks_after_decline) << "engine stopped ticking after a declined close";
+  auto* label = panel->findChild<QLabel*>("labelHello");
+  ASSERT_NE(label, nullptr);
+  EXPECT_EQ(label->text().toStdString(), "StillAlive") << "widget data stopped flowing after a declined close";
 
   delete panel;
 }
@@ -342,6 +381,7 @@ TEST_F(PanelEngineTest, ButtonBoxRejectClosesPanel) {
   engine.onCloseRequested([&](std::string reason) {
     captured_reason = std::move(reason);
     fired = true;
+    return true;
   });
 
   QWidget* panel = engine.openPanel();

@@ -8943,6 +8943,7 @@ void MainWindow::launchToolbox(
     (void)session;
     restoreCentralArea();
     engine->deleteLater();
+    return true;  // the takeover is gone; let the engine tear itself down
   });
 
   // 6. Wrap the panel in the canonical Banner header (title left, migrate +
@@ -9043,8 +9044,9 @@ void MainWindow::pinToolboxPanel(
   // the second time.
   QPointer<QWidget> container_guard(container);
   if (engine != nullptr) {
-    engine->onCloseRequested(
-        [this, container_guard](const std::string& reason) { onPinnedPanelCloseRequested(container_guard, reason); });
+    engine->onCloseRequested([this, container_guard](const std::string& reason) {
+      return onPinnedPanelCloseRequested(container_guard, reason);
+    });
   }
 
   QPointer<PanelEngine> engine_guard(engine);
@@ -9081,16 +9083,22 @@ void MainWindow::pinToolboxPanel(
   });
 }
 
-void MainWindow::onPinnedPanelCloseRequested(QWidget* container, const std::string& reason) {
+bool MainWindow::onPinnedPanelCloseRequested(QWidget* container, const std::string& reason) {
   // A pinned panel survives its own batch completion: the tab is the user's
   // surface now and stays connected so another job can be queued into it. Only
   // a user-driven request closes it.
+  //
+  // Returning false is load-bearing, not cosmetic: the engine tears itself down
+  // unless the owner declines, and a torn-down engine stops ticking and rejects
+  // the plugin while the tab stays on screen — an inert panel whose every click
+  // is silently dropped, unrecoverable without reopening the plugin.
   if (reason == "import_complete") {
-    return;
+    return false;
   }
   if (container != nullptr) {
     ui_->tabbedPlotWidget->closeWidgetTab(container);
   }
+  return true;
 }
 
 QDomElement MainWindow::savePinnedToolboxes(QDomDocument& doc) const {

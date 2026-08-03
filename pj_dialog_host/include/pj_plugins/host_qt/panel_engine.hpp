@@ -54,7 +54,7 @@ struct PanelEngineConfig {
 ///   * No required QDialogButtonBox — the plugin draws its own button row.
 ///   * Close is plugin-initiated via WidgetData::requestClose("<reason>");
 ///     the engine forwards the reason via the callback set with
-///     onCloseRequested() and then tears down the panel.
+///     onCloseRequested(); that callback decides whether the panel is torn down.
 ///   * While the panel root is hidden (e.g. pinned into a non-current
 ///     central tab) ticks are throttled to 1/10 rate — the plugin's periodic
 ///     logic keeps advancing, the UI poll+diff mostly pauses — and a
@@ -62,7 +62,7 @@ struct PanelEngineConfig {
 ///
 /// Typical usage from pj_app:
 ///   auto* engine = new PJ::PanelEngine(std::move(dialog_handle), {}, this);
-///   engine->onCloseRequested([this](std::string reason) { restoreCentralArea(); });
+///   engine->onCloseRequested([this](std::string reason) { restoreCentralArea(); return true; });
 ///   QWidget* widget = engine->openPanel();
 ///   if (widget == nullptr) { ... handle error ... }
 ///   mainWindow->presentPanel(widget);  // takes ownership; engine keeps a weak ref
@@ -93,9 +93,16 @@ class PanelEngine : public QObject {
   void close();
 
   /// Set the callback fired when the plugin emits requestClose("<reason>").
-  /// The string carries the plugin-provided reason. After the callback runs,
-  /// PanelEngine calls close() on itself.
-  void onCloseRequested(std::function<void(std::string /*reason*/)> cb);
+  /// The string carries the plugin-provided reason.
+  ///
+  /// The callback OWNS the decision: return true to let PanelEngine tear itself
+  /// down (stop ticking, reject the plugin), false to keep the session running.
+  /// Declining matters for a panel the host keeps alive across its own batch
+  /// completion — a pinned tab that ignores "import_complete" must keep
+  /// exchanging widget data, or it is left on screen as an inert shell whose
+  /// every click is dropped. With no callback installed the engine closes, which
+  /// is the takeover default.
+  void onCloseRequested(std::function<bool(std::string /*reason*/)> cb);
 
   /// Statistics from the current panel session (zeroed on each openPanel).
   struct Stats {

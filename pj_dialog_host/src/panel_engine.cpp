@@ -53,7 +53,7 @@ struct PanelEngine::Impl {
   // (the file-picker check) read THIS instead of paying a fresh widget_data()
   // build + parse per forwarded event — at drag rates that build is the cost.
   WidgetDataView prev_view{std::string_view{}};
-  std::function<void(std::string)> close_cb;
+  std::function<bool(std::string)> close_cb;
   std::function<void()> request_owner_close;  // bound to PanelEngine::close in openPanel
   Stats stats;
   bool closed = false;
@@ -87,10 +87,11 @@ struct PanelEngine::Impl {
     ++stats.event_count;
     if (handle.sendEvent(name, event_json)) {
       if (auto reason = applyAndDiff(); reason.has_value()) {
-        if (close_cb) {
-          close_cb(*reason);
-        }
-        if (request_owner_close) {
+        // The owner decides: a host that keeps this panel alive past its own
+        // batch completion (a pinned tab ignoring "import_complete") declines,
+        // and the session must keep running rather than become an inert shell.
+        const bool proceed = !close_cb || close_cb(*reason);
+        if (proceed && request_owner_close) {
           request_owner_close();
         }
       }
@@ -110,10 +111,8 @@ struct PanelEngine::Impl {
     ++stats.tick_count;
     (void)handle.tick();
     if (auto reason = applyAndDiff(); reason.has_value()) {
-      if (close_cb) {
-        close_cb(*reason);
-      }
-      if (request_owner_close) {
+      const bool proceed = !close_cb || close_cb(*reason);
+      if (proceed && request_owner_close) {
         request_owner_close();
       }
     }
@@ -416,10 +415,10 @@ QWidget* PanelEngine::openPanel() {
     auto forward = [this](const std::string& widget, const std::string& ev) {
       if (impl_->handle.sendEvent(widget, ev)) {
         if (auto reason = impl_->applyAndDiff(); reason.has_value()) {
-          if (impl_->close_cb) {
-            impl_->close_cb(*reason);
+          const bool proceed = !impl_->close_cb || impl_->close_cb(*reason);
+          if (proceed) {
+            this->close();
           }
-          this->close();
         }
         impl_->restartTickTimerAfterEvent();
       }
@@ -472,10 +471,10 @@ QWidget* PanelEngine::openPanel() {
       if (impl_->closed) {
         return;
       }
-      if (impl_->close_cb) {
-        impl_->close_cb("closed by user");
+      const bool proceed = !impl_->close_cb || impl_->close_cb("closed by user");
+      if (proceed) {
+        this->close();
       }
-      this->close();
     };
     QObject::connect(button_box, &QDialogButtonBox::rejected, this, on_close);
     QObject::connect(button_box, &QDialogButtonBox::accepted, this, on_close);
@@ -493,10 +492,10 @@ QWidget* PanelEngine::openPanel() {
         ++impl_->stats.event_count;
         if (impl_->handle.sendEvent(name, event_json)) {
           if (auto reason = impl_->applyAndDiff(); reason.has_value()) {
-            if (impl_->close_cb) {
-              impl_->close_cb(*reason);
+            const bool proceed = !impl_->close_cb || impl_->close_cb(*reason);
+            if (proceed) {
+              this->close();
             }
-            this->close();
           }
           impl_->restartTickTimerAfterEvent();
         }
@@ -557,7 +556,7 @@ void PanelEngine::close() {
   impl_->handle.reject();
 }
 
-void PanelEngine::onCloseRequested(std::function<void(std::string)> cb) {
+void PanelEngine::onCloseRequested(std::function<bool(std::string)> cb) {
   impl_->close_cb = std::move(cb);
 }
 

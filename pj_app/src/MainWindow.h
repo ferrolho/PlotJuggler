@@ -1107,7 +1107,11 @@ class MainWindow : public QMainWindow {
   // plugin's own string; "import_complete" is ignored because a folded panel is
   // the user's surface once pinned and outlives its own batch (another job can
   // be queued into it). Every other reason closes the tab.
-  void onPinnedPanelCloseRequested(QWidget* container, const std::string& reason);
+  //
+  // Returns whether PanelEngine may tear itself down: false for the ignored
+  // reason, so the kept-open tab keeps exchanging widget data instead of
+  // becoming an inert shell.
+  [[nodiscard]] bool onPinnedPanelCloseRequested(QWidget* container, const std::string& reason);
 
   // Layout persistence of pinned toolbox tabs (NOT part of the undo
   // snapshot; see TabbedPlotWidget::xmlSaveState). savePinnedToolboxes emits
