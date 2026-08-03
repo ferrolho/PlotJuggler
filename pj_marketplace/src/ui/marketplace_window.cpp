@@ -592,9 +592,10 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     }
     table->setItem(row, kColMarketplaceVersion, market_item);
 
-    // Description: full text, wraps within the stretched column.
+    // Description: full text, wraps within the stretched column. No tooltip —
+    // the cell already renders the whole string, so a tooltip repeating it
+    // adds nothing and covers the row on hover.
     auto* desc_item = new QTableWidgetItem(ext.description);
-    desc_item->setToolTip(ext.description);
     table->setItem(row, kColDescription, desc_item);
   }
 
