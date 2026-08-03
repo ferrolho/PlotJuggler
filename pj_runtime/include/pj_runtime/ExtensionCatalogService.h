@@ -165,6 +165,38 @@ class ExtensionCatalogService : public QObject {
   // shown to the user for reference.
   [[nodiscard]] QStringList builtinPluginFolders() const;
 
+  // Empty if the host would accept this plugin at load time; otherwise a
+  // human-readable reason it would be rejected. The seed uses this to decide
+  // whether an installed copy above the bundled version can survive: a
+  // non-empty reason triggers the rescue path (overwrite with the bundled
+  // build, compatible by construction).
+  //
+  // Two gates:
+  //   - ABI: `abi_major` (baked into the manifest at build time by the SDK's
+  //     CMake helper) must equal the host's `PJ_ABI_VERSION`. A zero
+  //     `abi_major` means the manifest predates the field; treat it as
+  //     "unknown → assume compatible" (the load path's own abi symbol check
+  //     will catch a real mismatch there).
+  //   - `min_plotjuggler_version`: the host must be at least the declared
+  //     minimum. An empty value is no floor.
+  //
+  // The reason string mirrors ExtensionManager::hostCompatibility's wording
+  // so seed diagnostics and marketplace UI say the same thing.
+  //
+  // Static + descriptor-taking so the seed can call it without an
+  // ExtensionCatalogService instance and tests can drive it with any host
+  // version, not only QCoreApplication::applicationVersion().
+  [[nodiscard]] static QString descriptorIncompatReason(
+      const PluginDescriptor& descriptor, const QString& host_version);
+
+  // Convenience predicate — a descriptor is compatible when its incompat
+  // reason is empty. Delegates to descriptorIncompatReason so a future third
+  // gate cannot drift between the two paths.
+  [[nodiscard]] static bool descriptorIsCompatibleWithHost(
+      const PluginDescriptor& descriptor, const QString& host_version) {
+    return descriptorIncompatReason(descriptor, host_version).isEmpty();
+  }
+
  signals:
   // Emitted after reload() changes the loaded plugin set.
   void catalogChanged();

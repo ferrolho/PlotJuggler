@@ -18,7 +18,9 @@
 #include <string>
 
 #include "mock_data_source_vtable.h"
+#include "pj_base/plugin_data_api.h"
 #include "pj_marketplace/extension_manager.hpp"
+#include "pj_plugins/host/plugin_catalog.hpp"
 #include "pj_runtime/ExtensionCatalogService.h"
 #include "plugin_test_utils.h"
 
@@ -231,6 +233,60 @@ TEST_F(ExtensionCatalogSeedTest, OverrideModeExtensionManagerTracksMarketplaceDi
          "even when --plugin-dir is used";
   EXPECT_EQ(installed.value(mock_id).version, "1.0.0")
       << "installedExtensions() must reflect the marketplace-managed copy, not the --plugin-dir override";
+}
+
+// -----------------------------------------------------------------------------
+// Host-compatibility helpers used by the seed's rescue path
+// -----------------------------------------------------------------------------
+
+// The seed uses descriptorIsCompatibleWithHost() to decide whether an installed
+// copy above the bundled version can survive: when the answer is false, the
+// bundled build overwrites it (rescue). These tests pin the compat semantics
+// the seed relies on — end-to-end coverage of the rescue itself needs a mock
+// DSO that declares incompatible metadata, which requires an SDK-side test
+// asset; the follow-up lands separately.
+
+PluginDescriptor makeDescriptor(uint32_t abi_major, std::string min_pj) {
+  PluginDescriptor d;
+  d.id = "any-id";
+  d.name = "Any";
+  d.version = "1.0.0";
+  d.abi_major = abi_major;
+  d.min_plotjuggler_version = std::move(min_pj);
+  return d;
+}
+
+TEST(ExtensionCatalogCompatTest, MatchingAbiAndEmptyMinIsCompatible) {
+  const auto d = makeDescriptor(PJ_ABI_VERSION, "");
+  EXPECT_TRUE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.999.0"));
+  EXPECT_TRUE(ExtensionCatalogService::descriptorIncompatReason(d, "3.999.0").isEmpty());
+}
+
+TEST(ExtensionCatalogCompatTest, ZeroAbiIsAssumedCompatible) {
+  // A manifest predating the abi_major field decodes as 0 — the seed defers to
+  // the load path's own abi symbol check instead of falsely marking it incompat.
+  const auto d = makeDescriptor(0, "");
+  EXPECT_TRUE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.999.0"));
+}
+
+TEST(ExtensionCatalogCompatTest, MismatchedAbiIsIncompatible) {
+  const auto d = makeDescriptor(PJ_ABI_VERSION + 1, "");
+  EXPECT_FALSE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.999.0"));
+  const QString reason = ExtensionCatalogService::descriptorIncompatReason(d, "3.999.0");
+  EXPECT_TRUE(reason.contains("ABI")) << reason.toStdString();
+}
+
+TEST(ExtensionCatalogCompatTest, HostBelowMinIsIncompatible) {
+  const auto d = makeDescriptor(PJ_ABI_VERSION, "999.0.0");
+  EXPECT_FALSE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.999.0"));
+  const QString reason = ExtensionCatalogService::descriptorIncompatReason(d, "3.999.0");
+  EXPECT_TRUE(reason.contains("999.0.0")) << reason.toStdString();
+}
+
+TEST(ExtensionCatalogCompatTest, HostAtOrAboveMinIsCompatible) {
+  const auto d = makeDescriptor(PJ_ABI_VERSION, "3.0.0");
+  EXPECT_TRUE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.999.0"));
+  EXPECT_TRUE(ExtensionCatalogService::descriptorIsCompatibleWithHost(d, "3.0.0"));
 }
 
 }  // namespace

@@ -23,6 +23,7 @@
 #include "pj_marketplace/platform_utils.hpp"
 #include "pj_marketplace/version_compare.hpp"
 #endif
+#include "pj_base/plugin_data_api.h"
 #include "pj_plugins/host/plugin_catalog.hpp"
 using namespace Qt::StringLiterals;
 
@@ -143,10 +144,15 @@ bool sameDsoSignature(const std::filesystem::path& installed_dso, const std::fil
   return !ec && installed_time == bundled_time;
 }
 
-// Manifest version of the copy of `id` installed under dir, or nullopt when the
-// folder is absent or holds no loadable plugin with that id (a gutted or
+// Manifest descriptor of the copy of `id` installed under dir, or nullopt when
+// the folder is absent or holds no loadable plugin with that id (a gutted or
 // half-written copy) — both mean "reseed".
-std::optional<std::string> installedPluginVersion(const std::filesystem::path& dir, const std::string& id) {
+//
+// Returns the full descriptor rather than just the version, because the seed's
+// compat check needs abi_major and min_plotjuggler_version too — a stale
+// installed copy that would be rejected at load time gets replaced with the
+// bundled build, which is compatible by construction.
+std::optional<PluginDescriptor> installedPluginDescriptor(const std::filesystem::path& dir, const std::string& id) {
   std::error_code ec;
   if (!std::filesystem::exists(dir, ec)) {
     return std::nullopt;
@@ -157,11 +163,12 @@ std::optional<std::string> installedPluginVersion(const std::filesystem::path& d
   }
   for (const PluginDescriptor& descriptor : scan->plugins) {
     if (descriptor.id == id) {
-      return descriptor.version;
+      return descriptor;
     }
   }
   return std::nullopt;
 }
+
 }  // namespace
 
 ExtensionCatalogService::ExtensionCatalogService(QString extensions_dir, QObject* parent)
@@ -392,9 +399,38 @@ void ExtensionCatalogService::seedBundledPlugins() {
     // unreadable -> copy; older -> refresh; same-or-newer -> untouched (a
     // marketplace update above the bundled version is never downgraded, and an
     // equal version never refreshes — ship a change by bumping the version).
-    const std::optional<std::string> installed = installedPluginVersion(dst, descriptor.id);
-    if (installed && compareSemver(descriptor.version, *installed) <= 0) {
-      continue;
+    //
+    // Exception to "never downgrade": an installed copy above the bundled
+    // version that the current host would reject at load time (ABI drift or
+    // min_plotjuggler_version too high). Leaving it in place gives the user a
+    // dead "installed" that never loads and no bundled fallback (the bundled
+    // dir is never scanned as a load path). Rescue by refreshing to the bundled
+    // build — compatible by construction, since it ships with this host.
+    const std::optional<PluginDescriptor> installed = installedPluginDescriptor(dst, descriptor.id);
+    bool rescue_incompat = false;
+    QString rescue_reason;
+    if (installed && compareSemver(descriptor.version, installed->version) <= 0) {
+      const QString host = QCoreApplication::applicationVersion();
+      const QString installed_reason = ExtensionCatalogService::descriptorIncompatReason(*installed, host);
+      if (installed_reason.isEmpty()) {
+        continue;  // Installed is compatible — user's marketplace update wins.
+      }
+      // Second preflight: only rescue if the bundled build is itself
+      // compatible. Downstream repackagers or an out-of-tree build with a
+      // stale share dir could ship a mismatched bundled; overwriting a broken
+      // installed with an equally-broken bundled destroys the user's
+      // marketplace history for no gain.
+      const QString bundled_reason = ExtensionCatalogService::descriptorIncompatReason(descriptor, host);
+      if (!bundled_reason.isEmpty()) {
+        reportDiagnostic(
+            DiagnosticLevel::kError,
+            u"Both bundled and installed \"%1\" are incompatible with this host — leaving the installed "
+            u"copy alone (bundled: %2; installed: %3)"_s.arg(id, bundled_reason, installed_reason),
+            id);
+        continue;
+      }
+      rescue_incompat = true;
+      rescue_reason = installed_reason;
     }
 
     // Stage the new payload, then swap it into place. Any failure keeps (or
@@ -420,10 +456,11 @@ void ExtensionCatalogService::seedBundledPlugins() {
     if (step_ec) {
       std::error_code cleanup_ec;
       std::filesystem::remove_all(stage_new, cleanup_ec);
+      const QString context = rescue_incompat ? u" (attempted rescue of an incompatible installed copy)"_s : QString{};
       reportDiagnostic(
           DiagnosticLevel::kWarning,
-          u"Failed to seed bundled plugin \"%1\" into \"%2\": %3"_s.arg(
-              id, QString::fromStdString(dst.string()), QString::fromStdString(step_ec.message())),
+          u"Failed to seed bundled plugin \"%1\" into \"%2\"%3: %4"_s.arg(
+              id, QString::fromStdString(dst.string()), context, QString::fromStdString(step_ec.message())),
           id);
       continue;
     }
@@ -437,10 +474,17 @@ void ExtensionCatalogService::seedBundledPlugins() {
     }
 
     if (installed) {
-      const QString message = u"Refreshed bundled plugin \"%1\" %2 -> %3"_s.arg(
-          id, QString::fromStdString(*installed), QString::fromStdString(descriptor.version));
-      qCInfo(lcCatalog) << message;
-      reportDiagnostic(DiagnosticLevel::kInfo, message, id);
+      if (rescue_incompat) {
+        const QString message = u"Restored bundled plugin \"%1\" %2 — installed %3 was incompatible: %4"_s.arg(
+            id, QString::fromStdString(descriptor.version), QString::fromStdString(installed->version), rescue_reason);
+        qCWarning(lcCatalog) << message;
+        reportDiagnostic(DiagnosticLevel::kWarning, message, id);
+      } else {
+        const QString message = u"Refreshed bundled plugin \"%1\" %2 -> %3"_s.arg(
+            id, QString::fromStdString(installed->version), QString::fromStdString(descriptor.version));
+        qCInfo(lcCatalog) << message;
+        reportDiagnostic(DiagnosticLevel::kInfo, message, id);
+      }
     } else {
       qCInfo(lcCatalog) << "Seeded bundled plugin" << id << "into" << QString::fromStdString(dst.string());
     }
@@ -554,6 +598,25 @@ void ExtensionCatalogService::reportDiagnostic(DiagnosticLevel level, const QStr
           message.toStdString(),
           std::chrono::system_clock::now(),
       });
+}
+
+QString ExtensionCatalogService::descriptorIncompatReason(
+    const PluginDescriptor& descriptor, const QString& host_version) {
+#ifdef PJ_TARGET_WASM
+  (void)descriptor;
+  (void)host_version;
+  return {};
+#else
+  if (descriptor.abi_major != 0 && descriptor.abi_major != PJ_ABI_VERSION) {
+    return u"plugin ABI %1 does not match host ABI %2"_s.arg(descriptor.abi_major).arg(PJ_ABI_VERSION);
+  }
+  if (!descriptor.min_plotjuggler_version.empty() &&
+      compareSemver(host_version.toStdString(), descriptor.min_plotjuggler_version) < 0) {
+    return u"requires PlotJuggler %1 or newer, this build is %2"_s.arg(
+        QString::fromStdString(descriptor.min_plotjuggler_version), host_version);
+  }
+  return {};
+#endif
 }
 
 }  // namespace PJ
