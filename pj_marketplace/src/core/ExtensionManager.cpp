@@ -385,7 +385,7 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
         fail(ext_id, QString("Extension \"%1\" is already installed").arg(ext_id));
         return;
       }
-      if (!replace_confirmation_(ext_id, installed_[ext_id].version, discovered.record.version)) {
+      if (!replace_confirmation_(ext_id, installedVersion(ext_id), discovered.record.version)) {
         fail(ext_id, QString("Replacing \"%1\" was cancelled").arg(ext_id));
         return;
       }
@@ -689,8 +689,7 @@ void ExtensionManager::uninstall(const QString& extension_id) {
   // "downgrade to bundled"): allow the uninstall here, and the seed restores the
   // bundled version on the next launch. This is the backend guard mirroring the UI.
   if (isBundled(extension_id)) {
-    if (compareSemver(installed_[extension_id].version.toStdString(), bundledVersion(extension_id).toStdString()) <=
-        0) {
+    if (compareSemver(installedVersion(extension_id).toStdString(), bundledVersion(extension_id).toStdString()) <= 0) {
       emitUninstallFailure(
           extension_id,
           QString("Extension \"%1\" ships with the application and cannot be uninstalled").arg(extension_id));
@@ -738,7 +737,7 @@ void ExtensionManager::downgradeToBundled(const QString& extension_id) {
         extension_id, QString("Extension \"%1\" does not ship with the application").arg(extension_id));
     return;
   }
-  if (compareSemver(installed_[extension_id].version.toStdString(), bundledVersion(extension_id).toStdString()) <= 0) {
+  if (compareSemver(installedVersion(extension_id).toStdString(), bundledVersion(extension_id).toStdString()) <= 0) {
     emitUninstallFailure(extension_id, QString("Extension \"%1\" is already at its bundled version").arg(extension_id));
     return;
   }
@@ -769,7 +768,7 @@ void ExtensionManager::update(const Extension& ext) {
   if (hasNewerInstalledVersion(ext)) {
     emitInstallFailure(
         ext.id, QString("Installed version \"%1\" is newer than registry version \"%2\"; downgrade is not allowed")
-                    .arg(installed_[ext.id].version, ext.version));
+                    .arg(installedVersion(ext.id), ext.version));
     return;
   }
 
@@ -1008,12 +1007,25 @@ bool ExtensionManager::hasPendingUninstall(const QString& id) const {
   return QFile::exists(extRoot(extensions_dir_, id) + "/" + kPendingUninstallMarker);
 }
 
+QString ExtensionManager::installedVersion(const QString& id) const {
+  const auto it = installed_.constFind(id);
+  if (it == installed_.constEnd()) {
+    return {};
+  }
+  const QString& scanned = it->version;
+  const QString bundled = bundledVersion(id);
+  if (bundled.isEmpty()) {
+    return scanned;
+  }
+  return compareSemver(bundled.toStdString(), scanned.toStdString()) > 0 ? bundled : scanned;
+}
+
 bool ExtensionManager::hasNewerInstalledVersion(const Extension& ext) const {
   if (!installed_.contains(ext.id)) {
     return false;
   }
 
-  return compareSemver(installed_[ext.id].version.toStdString(), ext.version.toStdString()) > 0;
+  return compareSemver(installedVersion(ext.id).toStdString(), ext.version.toStdString()) > 0;
 }
 
 bool ExtensionManager::hasUpdate(const Extension& ext) const {
@@ -1021,7 +1033,7 @@ bool ExtensionManager::hasUpdate(const Extension& ext) const {
     return false;
   }
 
-  return compareSemver(ext.version.toStdString(), installed_[ext.id].version.toStdString()) > 0;
+  return compareSemver(ext.version.toStdString(), installedVersion(ext.id).toStdString()) > 0;
 }
 
 QMap<QString, InstalledExtension> ExtensionManager::installedExtensions() const {

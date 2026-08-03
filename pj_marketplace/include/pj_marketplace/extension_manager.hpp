@@ -178,6 +178,26 @@ class ExtensionManager : public QObject {
   // Returns true when an installed directory is marked for restart cleanup.
   bool hasPendingUninstall(const QString& id) const;
 
+  // The version of `id` actually on disk. Prefer this over reading
+  // `installedExtensions()[id].version` directly — the scan snapshot can be
+  // stale in a specific window that this helper compensates for.
+  //
+  // The window: the startup seed refreshes a core plugin whose bundled copy is
+  // newer, but it has to read the installed version first to make that call —
+  // and that read opens the DSO. glibc then answers every later dlopen of the
+  // same path from that first-loaded image (plugin DSOs export STB_GNU_UNIQUE
+  // symbols, so dlclose never unloads them), so no rescan in this process can
+  // observe the version the seed just promoted; only a restart can. Since the
+  // seed guarantees the managed dir never ends up older than the bundled set,
+  // the higher of the two (scanned, bundled) is the truth.
+  //
+  // The bundled versions are supplied by the host at seed time via
+  // setBundledVersions() — that is where the write side lives.
+  //
+  // Empty when `id` is not installed. Falls back to the scanned version alone
+  // when no bundled set was provided (standalone app / --plugin-dir run).
+  QString installedVersion(const QString& id) const;
+
   // Returns true when the installed version is newer than the registry version.
   bool hasNewerInstalledVersion(const Extension& ext) const;
 

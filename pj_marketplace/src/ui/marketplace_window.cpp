@@ -571,8 +571,10 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     category_item->setData(kCategoryNameKeyRole, ext.name);
     table->setItem(row, kColCategory, category_item);
 
-    // Installed version (an em dash when not installed), centered.
-    auto* installed_item = new QTableWidgetItem(is_installed ? installed[ext.id].version : u"\u2014"_s);
+    // Installed version (an em dash when not installed), centered. Asked of the
+    // manager rather than read off the snapshot: a core plugin the startup seed
+    // refreshed cannot be re-scanned to its new version within this process.
+    auto* installed_item = new QTableWidgetItem(is_installed ? ext_mgr_->installedVersion(ext.id) : u"\u2014"_s);
     installed_item->setTextAlignment(Qt::AlignCenter);
     table->setItem(row, kColInstalledVersion, installed_item);
 
@@ -685,7 +687,9 @@ void MarketplaceWindow::updateDetailFooter() {
   }
 
   const auto installed = ext_mgr_->installedExtensions();
-  const QString installed_version = installed.contains(ext->id) ? installed[ext->id].version : QString{};
+  // Empty when not installed; see installedVersion for why the
+  // snapshot's own version can lag a seed-refreshed core plugin.
+  const QString installed_version = ext_mgr_->installedVersion(ext->id);
   const auto esc = [](const QString& s) { return s.toHtmlEscaped(); };
 
   // Title (plugin name) — a real header-row label so the enable toggle can sit
@@ -1084,8 +1088,7 @@ QString MarketplaceWindow::installedStatusText(const QString& id, bool from_file
   // fresh registry install. Replacing an installed id is staged instead and
   // reports through installPendingRestart, which owns the restart wording.
   if (from_file) {
-    const auto installed = ext_mgr_->installedExtensions();
-    const QString version = installed.contains(id) ? installed[id].version : QString();
+    const QString version = ext_mgr_->installedVersion(id);
     return version.isEmpty() ? QString("Installed %1 from file").arg(id)
                              : QString("Installed %1 v%2 from file").arg(id, version);
   }

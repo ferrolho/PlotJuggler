@@ -979,6 +979,81 @@ TEST_F(ExtensionManagerTest, HasNewerInstalledVersionReturnsTrueWhenLocalVersion
   EXPECT_FALSE(mgr_->hasUpdate(ext_v1));
 }
 
+// installedVersion() is the single source of truth for what's on disk. Three
+// branches — id absent, no bundled set (falls back to scanned), and bundled
+// higher than scanned (the seed-refreshed core-plugin case that motivates
+// the helper — see the header comment for the STB_GNU_UNIQUE / NODELETE trap).
+
+TEST_F(ExtensionManagerTest, InstalledVersionIsEmptyForUnknownId) {
+  EXPECT_TRUE(mgr_->installedVersion("never-installed").isEmpty());
+}
+
+TEST_F(ExtensionManagerTest, InstalledVersionFallsBackToScannedWithNoBundledSet) {
+  server_.setBody(dummyPluginZip("mock-data-source", "1.0.0"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "1.0.0");
+}
+
+// The seed-refresh case: bundled_versions_ carries a higher version than the
+// scanner observed because the scanner's dlopen was poisoned by NODELETE.
+// installedVersion() has to report the bundled version — it is what is really
+// on disk after the seed's promote.
+TEST_F(ExtensionManagerTest, InstalledVersionReportsBundledWhenNewerThanScanned) {
+  server_.setBody(dummyPluginZip("mock-data-source", "1.0.0"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  QMap<QString, QString> bundled;
+  bundled.insert("mock-data-source", "2.0.0");
+  mgr_->setBundledVersions(bundled);
+
+  EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "2.0.0");
+}
+
+// When the marketplace-installed copy is newer than the bundled one (the user
+// upgraded), scanned wins — the seed is not going to overwrite a user's newer
+// install, so scanned is what is on disk.
+TEST_F(ExtensionManagerTest, InstalledVersionKeepsScannedWhenBundledIsOlder) {
+  server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
+  const Extension ext = makeExtension("mock-data-source", "2.0.0", server_.url());
+
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy));
+
+  QMap<QString, QString> bundled;
+  bundled.insert("mock-data-source", "1.0.0");
+  mgr_->setBundledVersions(bundled);
+
+  EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "2.0.0");
+}
+
+// The consequence that motivates the whole change: hasUpdate stops offering an
+// update when bundled >= registry, even if the scanner still sees the pre-seed
+// version.
+TEST_F(ExtensionManagerTest, HasUpdateIsFalseWhenBundledMatchesRegistry) {
+  server_.setBody(dummyPluginZip("mock-data-source", "1.0.0"));
+  const Extension registry_v2 = makeExtension("mock-data-source", "2.0.0", server_.url());
+
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(spy));
+
+  QMap<QString, QString> bundled;
+  bundled.insert("mock-data-source", "2.0.0");
+  mgr_->setBundledVersions(bundled);
+
+  EXPECT_FALSE(mgr_->hasUpdate(registry_v2));
+}
+
 // Returns false when the registry version is older than the installed one (downgrade scenario).
 TEST_F(ExtensionManagerTest, HasUpdateReturnsFalseForOlderVersion) {
   server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
