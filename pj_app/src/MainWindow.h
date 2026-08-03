@@ -69,6 +69,7 @@ class DockWidget;
 class FileLoader;
 class IDataWidget;
 class LayoutImportBatch;
+class MarketplaceWindow;
 class PanelEngine;
 class PlotDocker;
 class PlotWidget;
@@ -1419,6 +1420,18 @@ class MainWindow : public QMainWindow {
   PanelEngine* current_panel_engine_ = nullptr;
   int panel_layout_index_ = -1;
   QWidget* panel_parent_ = nullptr;
+  // The marketplace controller while its panel holds the central area, so a
+  // second open request re-activates it instead of building a second one (the
+  // title-bar Update button and the File menu both route to onOpenMarketplace).
+  // Cleared by the controller's own destruction, whichever exit the panel takes.
+  //
+  // Paired with `marketplace_container_` — the guard has to distinguish
+  // "marketplace IS the central panel" from "marketplace was migrated to a tab
+  // and some other panel now sits centrally": both leave `marketplace_panel_`
+  // non-null, but only the first should re-activate. `current_panel_ ==
+  // marketplace_container_` is the exact test.
+  QPointer<MarketplaceWindow> marketplace_panel_;
+  QPointer<QWidget> marketplace_container_;
 
   // A toolbox pinned into the central tab strip via the banner's
   // "migrate to tab" button. `container` is the tab content (banner +

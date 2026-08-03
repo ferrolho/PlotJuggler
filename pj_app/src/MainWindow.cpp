@@ -2548,6 +2548,22 @@ void MainWindow::wasmProbeSupersedeBrowserReplayPicker() {
 void MainWindow::onOpenMarketplace() {
 #ifndef PJ_TARGET_WASM
   auto& catalog = session_->extensionCatalog();
+
+  // Both the File menu and the title-bar Update button land here, so a request
+  // can arrive while the panel is already up. Re-activating beats rebuilding:
+  // the user keeps their scroll position and filter, and the registry is not
+  // re-read for nothing.
+  //
+  // The guard fires only when the marketplace IS the central panel — comparing
+  // against its own container. Panels migrated into a tab keep the controller
+  // alive but leave the central area free (or occupied by an unrelated toolbox);
+  // there a fresh central-area instance is the right answer, and this guard
+  // stays out of the way.
+  if (!marketplace_panel_.isNull() && current_panel_ == marketplace_container_.data() && current_panel_ != nullptr) {
+    marketplace_panel_->activateEmbedded();
+    return;
+  }
+
   // Embed the marketplace in the central area (like a toolbox), not a modal
   // window. The MarketplaceWindow is a hidden controller: it owns the UI and
   // receives its child-widget signals; its content widget is lifted into a
@@ -2569,8 +2585,11 @@ void MainWindow::onOpenMarketplace() {
   });
 
   // Reload the plugin catalog if anything was installed/uninstalled while open.
-  const auto reload_if_changed = [this, mkt]() {
-    if (mkt->installationsChanged()) {
+  // Guarded because the controller's lifetime is tied to the container below: on
+  // the migrate exit this runs when the tab closes, by which point the container
+  // may already have taken the controller with it.
+  const auto reload_if_changed = [this, mkt = QPointer<MarketplaceWindow>(mkt)]() {
+    if (!mkt.isNull() && mkt->installationsChanged()) {
       session_->extensionCatalog().reload();
     }
   };
@@ -2578,28 +2597,41 @@ void MainWindow::onOpenMarketplace() {
   const WrappedToolboxPanel wrapped = wrapToolboxPanel(
       content, tr("Marketplace"),
       /*on_close=*/
-      [this, mkt, reload_if_changed]() {
+      [this, reload_if_changed]() {
         reload_if_changed();
         restoreCentralArea();
-        mkt->deleteLater();
       },
       /*on_migrate=*/
-      [this, mkt, reload_if_changed]() {
+      [this, reload_if_changed]() {
         QWidget* released = releaseCentralPanel();
         if (released == nullptr) {
           return;
         }
-        ui_->tabbedPlotWidget->addWidgetTab(tr("Marketplace"), released, [mkt, reload_if_changed]() {
-          reload_if_changed();
-          mkt->deleteLater();
-        });
+        ui_->tabbedPlotWidget->addWidgetTab(
+            tr("Marketplace"), released, [reload_if_changed]() { reload_if_changed(); });
       });
+
+  // The container owns every widget the controller's ui_ points at, so the
+  // controller must not outlive it. Closing and migrating are not the only exits:
+  // presentPanel() dismisses whatever panel is already up, which deletes the
+  // container without running either callback. A controller left behind stays
+  // connected to the shared ExtensionManager's install/uninstall signals, and the
+  // next one to fire writes through ui_ into freed widgets.
+  //
+  // Passing the controller as the context object makes Qt drop the connection when
+  // the controller dies, so the migrate exit (where the container survives inside
+  // a tab) cannot fire this against a stale pointer.
+  connect(wrapped.container, &QObject::destroyed, mkt, &QObject::deleteLater);
 
   if (!presentPanel(wrapped.container)) {
     wrapped.container->deleteLater();
-    mkt->deleteLater();
     return;
   }
+  // QPointer, so the re-activation guard above sees empty slots again as soon
+  // as the controller (and its container) go — no explicit clearing on any of
+  // the exit paths.
+  marketplace_panel_ = mkt;
+  marketplace_container_ = wrapped.container;
   mkt->activateEmbedded();
 #endif
 }
