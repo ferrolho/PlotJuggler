@@ -466,29 +466,45 @@ class TimelineBackgroundItem : public QGraphicsItem {
     return {};  // decorative; never hit-tested
   }
 
-  void paint(QPainter* painter, const QStyleOptionGraphicsItem* /*option*/, QWidget* widget) override {
+  void paint(QPainter* painter, const QStyleOptionGraphicsItem* option, QWidget* widget) override {
     const TimelineColors col = timelineColors();
+    // Everything below is bounded by the exposed slice rather than the item's full
+    // width. The item spans the union of every source, so its width scales with how
+    // far apart they sit on the clock, not with what is on screen. drawHatch() costs
+    // one antialiased line per kHatchSpacing of rect WIDTH, so painting the whole
+    // item is ~126k lines per repaint for two sources ~56 years apart, against ~123
+    // for the visible strip.
+    const QRectF visible = (option != nullptr && !option->exposedRect.isEmpty()) ? option->exposedRect : boundingRect();
+
     // 1) Solid theme background under everything (white in light theme).
-    painter->fillRect(boundingRect(), col.bg);
+    painter->fillRect(visible, col.bg);
 
     // 2) Hatch the empty area (outside the data span) with the shared app hatch
     // (PJ::drawHatch). Phased to this item's GLOBAL origin so its diagonal lines line
     // up with every other widget that paints the hatch (the Mosaico RangeSlider, ...)
     // — all are windows into one continuous hatch layer. Mapping item(0,0) through the
-    // painter's world transform and the viewport widget gives that global origin.
+    // painter's world transform and the viewport widget gives that global origin. The
+    // phase is derived from that global origin, so clipping a hatch rect to `visible`
+    // shifts no line: the grid stays continuous across widgets.
     const QPointF hatch_origin =
         widget != nullptr ? widget->mapToGlobal(painter->worldTransform().map(QPointF(0, 0))) : QPointF(0, 0);
     const QColor hatch_ink = appHatchColor();
+    const auto hatch = [&](const QRectF& area) {
+      const QRectF clipped = area.intersected(visible);
+      if (!clipped.isEmpty()) {
+        PJ::drawHatch(*painter, clipped, hatch_origin, hatch_ink);
+      }
+    };
     if (data_max_ns_ <= data_min_ns_) {
-      PJ::drawHatch(*painter, QRectF(0, 0, width_, height_), hatch_origin, hatch_ink);
+      hatch(QRectF(0, 0, width_, height_));
     } else {
       const double x_lo = TimelineScene::nsToPx(data_min_ns_, viewport_);
       const double x_hi = TimelineScene::nsToPx(data_max_ns_, viewport_);
       if (x_lo > 0.0) {
-        PJ::drawHatch(*painter, QRectF(0, 0, x_lo, height_), hatch_origin, hatch_ink);
+        hatch(QRectF(0, 0, x_lo, height_));
       }
       if (x_hi < width_) {
-        PJ::drawHatch(*painter, QRectF(x_hi, 0, width_ - x_hi, height_), hatch_origin, hatch_ink);
+        hatch(QRectF(x_hi, 0, width_ - x_hi, height_));
       }
     }
 

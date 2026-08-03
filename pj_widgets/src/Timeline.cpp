@@ -894,6 +894,16 @@ void Timeline::fitToContents() {
   // Request a fit on the next rebuild; rebuild() honors it only when auto-zoom is
   // on and there is data (the empty timeline always fits the playback range).
   fit_pending_ = true;
+  // Re-pad the scene around the CURRENT content. computeBufferedExtent() only ever
+  // GROWS the extent on an offset-only update, which is right for a drag (small,
+  // and the scene must not resize under the cursor) but wrong for the callers of
+  // this function: an alignment moves sources by the whole inter-source gap, then
+  // collapses the content. Without a reset the scene keeps the width of the
+  // pre-alignment spread, so scene_w = (that huge span) x (the zoom just fitted to
+  // the small content) — and the full-scene-width ruler and background items grow
+  // past what Qt will render, leaving a timeline that draws its bars but loses its
+  // ruler, gridlines and hatch.
+  extent_needs_reset_ = true;
   rebuild();
 }
 
