@@ -1185,6 +1185,14 @@ void MarketplaceWindow::onUpdateAllClicked() {
   // hasUpdate() stays true) but re-queuing it would just re-download and
   // re-stage the same payload.
   for (const auto& ext : extensions_) {
+    // Skip an update already in flight or queued by an individual click: the
+    // one currently downloading (active_install_id_) has not staged yet, so
+    // hasPendingInstall() is still false — re-queuing it would dispatch update()
+    // a second time once it stages and be rejected with "already staged". This
+    // mirrors the dedup in onActionButtonClicked.
+    if (ext.id == active_install_id_ || pending_clicks_.contains(ext.id)) {
+      continue;
+    }
     // Skip incompatible updates — install() would reject them (see the enable
     // guard in rebuildTable, which keeps the button in step with this queue).
     if (ext_mgr_->hasUpdate(ext) && ext_mgr_->hostCompatibility(ext).ok && !ext_mgr_->hasPendingInstall(ext.id) &&
