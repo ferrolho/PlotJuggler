@@ -824,22 +824,23 @@ DataSourceRuntimeHost::MessageBoxHandler makePluginMessageBoxHandler(
 }  // namespace
 
 // Default ingest policies the app applies to every DataSourceRuntimeHost it
-// builds: scalars eager, objects lazy (decoded on pull). The heaviest and/or
-// scalar-less payloads are PURE-LAZY — their bytes are re-fetched from the
-// source on every read instead of pinned in RAM at ingest:
-//   * Point clouds / compressed point clouds: huge per-frame; pure-lazy also
-//     defers the Draco/Cloudini transcode to the render path.
-//   * Video frames: keeps each file-backed bitstream NON-resident.
-//   * Images / depth images: a raw (uncompressed) Image frame is hundreds of KB
-//     and a recording holds thousands; retaining them all dominated peak RSS
-//     (~4 GB on the quadruped dataset). The 2D image/depth docks pull via
-//     ObjectStore::latestAt, which resolves the deferred fetch transparently —
-//     exactly how point clouds already render lazily.
-//   * Occupancy grids / voxel grids: a metric map or dense 3D grid is large per
-//     frame; the scene docks pull them via ObjectStore::latestAt, so pure-lazy
-//     keeps them non-resident like point clouds.
-//   * SceneEntities (markers) / ImageAnnotations: carry no scalar fields, so an
-//     eager-scalar parse would fail; pure-lazy is the only correct mode.
+// builds: scalars eager, objects lazy (decoded on pull). Under the default
+// kLazyObjectsEagerScalars the payload bytes are fetched ONCE at ingest so the
+// parser's scalar route can emit its slim timeseries (header stamp, frame_id,
+// counts), then dropped from RAM; object pulls re-fetch from the source, so
+// large blobs (clouds, images, grids) stay NON-resident either way and peak
+// RSS is unaffected. The price is one extra read of those messages at load
+// time — accepted so every header-bearing object topic (point clouds, images,
+// depth images, occupancy/voxel grids) exposes its header/timestamp series in
+// the curve tree, not only a 3D/2D object.
+// PURE-LAZY (bytes never fetched at ingest, no scalar series at all) is kept
+// only where even that one ingest-time read buys nothing worth plotting:
+//   * Video frames: reading every file-backed bitstream at load is a
+//     full-file pass for a couple of metadata columns; the video dock pulls
+//     frames on demand instead.
+//   * SceneEntities (markers) / ImageAnnotations: no meaningful scalar
+//     fields; their parsers return empty/slim rows purely so ingest survives
+//     under non-pure-lazy policies.
 // TF (kFrameTransforms) intentionally stays eager: its payload is tiny and its
 // scalar fields are useful. Static so the pre-dialog scratch session and the
 // per-fanout loop iterations stay in lockstep, and so it is unit-testable
@@ -848,12 +849,6 @@ void FileLoader::applyDefaultIngestPolicies(PJ::sdk::ObjectIngestPolicyResolver&
   using PJ::sdk::BuiltinObjectType;
   using PJ::sdk::ObjectIngestPolicy;
   resolver.setDefault(ObjectIngestPolicy::kLazyObjectsEagerScalars);
-  resolver.setForType(BuiltinObjectType::kPointCloud, ObjectIngestPolicy::kPureLazy);
-  resolver.setForType(BuiltinObjectType::kCompressedPointCloud, ObjectIngestPolicy::kPureLazy);
-  resolver.setForType(BuiltinObjectType::kImage, ObjectIngestPolicy::kPureLazy);
-  resolver.setForType(BuiltinObjectType::kDepthImage, ObjectIngestPolicy::kPureLazy);
-  resolver.setForType(BuiltinObjectType::kOccupancyGrid, ObjectIngestPolicy::kPureLazy);
-  resolver.setForType(BuiltinObjectType::kVoxelGrid, ObjectIngestPolicy::kPureLazy);
   resolver.setForType(BuiltinObjectType::kSceneEntities, ObjectIngestPolicy::kPureLazy);
   resolver.setForType(BuiltinObjectType::kImageAnnotations, ObjectIngestPolicy::kPureLazy);
   resolver.setForType(BuiltinObjectType::kVideoFrame, ObjectIngestPolicy::kPureLazy);
