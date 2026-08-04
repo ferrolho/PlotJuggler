@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QVector>
 #include <functional>
@@ -120,7 +121,7 @@ class SourcePromotionHost : public QObject {
   // GUI thread: deliver the result exactly once (no-op when already fired).
   void finishPromotion(const std::shared_ptr<Promotion>& promotion, bool ok, const QString& message);
 
-  FileLoader& loader_;
+  QPointer<FileLoader> loader_;
   SessionManager& session_;
   const QString provider_id_;
   const std::function<bool(DatasetId)> owns_dataset_;

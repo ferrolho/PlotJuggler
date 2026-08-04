@@ -2058,7 +2058,14 @@ MainWindow::~MainWindow() {
   // closures' remaining PanelSession refs while the engine is still alive.
   delete current_panel_engine_;
   current_panel_engine_ = nullptr;
-  current_panel_ = nullptr;
+  // Destroy the wrapper container widget that holds closures capturing
+  // shared_ptr<PanelSession>. The session must die synchronously before member
+  // destruction, while file_loader_ is still alive (needed by
+  // SourcePromotionHost::shutdown). releaseCentralPanel reparents the widget
+  // and nulls current_panel_; we delete immediately instead of deferring.
+  if (current_panel_ != nullptr) {
+    delete releaseCentralPanel();
+  }
   // Break the widget-owned pointers to services before session_ destroys
   // the engine — guarantees no late signal dereferences a dead pointer.
   ui_->timelineWidget->setPlaybackEngine(nullptr);

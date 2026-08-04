@@ -38,7 +38,7 @@ SourcePromotionHost::SourcePromotionHost(
     FileLoader& loader, SessionManager& session, QString provider_id, std::function<bool(DatasetId)> owns_dataset,
     QObject* parent)
     : QObject(parent),
-      loader_(loader),
+      loader_(&loader),
       session_(session),
       provider_id_(std::move(provider_id)),
       owns_dataset_(std::move(owns_dataset)),
@@ -52,7 +52,7 @@ SourcePromotionHost::SourcePromotionHost(
   // loader lives there too) and filter by ticket, so unrelated loads pass
   // through untouched.
   connect(
-      &loader_, &FileLoader::loadCommitting, this,
+      loader_.data(), &FileLoader::loadCommitting, this,
       [this](quint64 ticket, const QVector<DatasetId>& produced, const QString&, const QString&) {
         const auto it = by_ticket_.find(ticket);
         if (it == by_ticket_.end()) {
@@ -78,7 +78,7 @@ SourcePromotionHost::SourcePromotionHost(
                                 });
         promotion->record_attached = true;
       });
-  connect(&loader_, &FileLoader::fileLoadFailed, this, [this](const QString& path, const QString& reason) {
+  connect(loader_.data(), &FileLoader::fileLoadFailed, this, [this](const QString& path, const QString& reason) {
     // Terminal loadFinished carries no reason; this legacy signal does.
     // It fires synchronously inside the failing path: either while OUR
     // loadFileTicketed call is still on the stack (issuing_ — the ticket
@@ -89,13 +89,16 @@ SourcePromotionHost::SourcePromotionHost(
       issuing_->failure_reason = reason;
       return;
     }
-    const auto it = by_ticket_.find(loader_.currentLoadTicket());
+    if (loader_.isNull()) {
+      return;  // loader was destroyed
+    }
+    const auto it = by_ticket_.find(loader_->currentLoadTicket());
     if (it != by_ticket_.end() && FileLoader::sameSourceIdentity(path, it->second->local_path)) {
       it->second->failure_reason = reason;
     }
   });
   connect(
-      &loader_, &FileLoader::loadFinished, this,
+      loader_.data(), &FileLoader::loadFinished, this,
       [this](quint64 ticket, LoadOutcome outcome, const QString&, DatasetId, const QVector<DatasetId>&) {
         const auto it = by_ticket_.find(ticket);
         if (it == by_ticket_.end()) {
@@ -122,18 +125,6 @@ SourcePromotionHost::~SourcePromotionHost() {
 }
 
 void SourcePromotionHost::shutdown() {
-  // Stop observing the loader FIRST: a promotion load that outlives this host
-  // completes as an ordinary strict replace with no record attach — that is
-  // deliberate (the replaced data is still valid; only the promotion
-  // transaction is reported failed below), and the disconnect guarantees its
-  // later loadFinished cannot re-fire anything.
-  QObject::disconnect(&loader_, nullptr, this, nullptr);
-  // Fail every accepted-but-unfinished promotion while the plugin instance /
-  // DSO behind result_cb is still alive (the owners run shutdown() BEFORE
-  // releasing the plugin handle). New arrivals are rejected synchronously
-  // from here on (shutting_down_) — and keep being rejected safely for as
-  // long as the object lives, which is what lets the owners destroy the
-  // host only AFTER the plugin's workers are joined.
   std::vector<std::shared_ptr<Promotion>> unfinished;
   {
     const std::lock_guard lock(mu_);
@@ -149,6 +140,21 @@ void SourcePromotionHost::shutdown() {
     }
     pending_.clear();
   }
+  // Stop observing the loader: a promotion load that outlives this host
+  // completes as an ordinary strict replace with no record attach — that is
+  // deliberate (the replaced data is still valid; only the promotion
+  // transaction is reported failed below), and the disconnect guarantees its
+  // later loadFinished cannot re-fire anything. Guard the dereference in case
+  // the loader was destroyed.
+  if (!loader_.isNull()) {
+    QObject::disconnect(loader_.data(), nullptr, this, nullptr);
+  }
+  // Fail every accepted-but-unfinished promotion while the plugin instance /
+  // DSO behind result_cb is still alive (the owners run shutdown() BEFORE
+  // releasing the plugin handle). New arrivals are rejected synchronously
+  // from here on (shutting_down_) — and keep being rejected safely for as
+  // long as the object lives, which is what lets the owners destroy the
+  // host only AFTER the plugin's workers are joined.
   by_ticket_.clear();
   constexpr const char* kMessage = "the promotion host is shutting down";
   for (const auto& promotion : unfinished) {
@@ -274,8 +280,14 @@ void SourcePromotionHost::processPromotion(quint64 promotion_id) {
   // would misroute its reason here.
   issuing_ = promotion;
   LoadRequestId ticket = 0;
+  // Guard against loader being destroyed before this queued call runs.
+  if (loader_.isNull()) {
+    issuing_.reset();
+    finishPromotion(promotion, false, tr("the file loader was destroyed"));
+    return;
+  }
   try {
-    ticket = loader_.loadFileTicketed(LoadInput::fromNativePath(promotion->local_path), nullptr, hints);
+    ticket = loader_->loadFileTicketed(LoadInput::fromNativePath(promotion->local_path), nullptr, hints);
   } catch (...) {
     issuing_.reset();
     throw;
