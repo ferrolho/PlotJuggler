@@ -13,6 +13,7 @@
 #include <QRandomGenerator>
 #include <QRectF>
 #include <QSettings>
+#include <QSize>
 #include <QStringList>
 #include <QSvgRenderer>
 #include <Qt>
@@ -55,11 +56,7 @@ QPixmap getFunnySplashscreen() {
   }
   settings.setValue(u"previousFunnyMemesList"_s, recent);
 
-  // Cap oversized memes so a large/high-res image doesn't dominate the screen;
-  // smaller ones are left untouched (never upscaled).
-  constexpr int kMaxMemeWidth = 600;
-  const QPixmap pixmap(memes_dir.filePath(chosen));
-  return pixmap.width() > kMaxMemeWidth ? pixmap.scaledToWidth(kMaxMemeWidth, Qt::SmoothTransformation) : pixmap;
+  return capMemeToSplashBox(QPixmap(memes_dir.filePath(chosen)));
 }
 
 // The pool of subtitles for the "serious" splashscreen; one is picked at random
@@ -175,6 +172,13 @@ QPixmap makeSeriousSplashscreen() {
 }
 
 }  // namespace
+
+QPixmap capMemeToSplashBox(const QPixmap& pixmap) {
+  if (pixmap.width() <= kMaxMemeExtent && pixmap.height() <= kMaxMemeExtent) {
+    return pixmap;
+  }
+  return pixmap.scaled(QSize(kMaxMemeExtent, kMaxMemeExtent), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+}
 
 QPixmap makeStartupSplash() {
   QSettings settings;

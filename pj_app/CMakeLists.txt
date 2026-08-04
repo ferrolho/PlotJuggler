@@ -292,6 +292,26 @@ if(PJ_BUILD_TESTS)
     endif()
     add_test(NAME FileSelectionServiceTest COMMAND file_selection_service_test)
 
+    # Guards the meme splash pool against its two silent failure modes: a meme
+    # present in resources/memes/ but absent from resources.qrc is invisible at
+    # runtime (rcc has no globbing), and an oversized meme must be bounded on
+    # both axes, not just width. Compiles resources.qrc so the test inspects the
+    # real shipped pool, and is handed the source directory to compare against.
+    add_executable(splash_meme_pool_test
+        tests/splash_meme_pool_test.cpp
+        src/Splashscreen.cpp
+        src/Splashscreen.h
+        ${CMAKE_SOURCE_DIR}/resources/resources.qrc)
+    set_target_properties(splash_meme_pool_test PROPERTIES AUTORCC ON)
+    target_include_directories(splash_meme_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(splash_meme_pool_test PRIVATE
+        PJ_MEMES_SOURCE_DIR="${CMAKE_SOURCE_DIR}/resources/memes")
+    target_link_libraries(splash_meme_pool_test PRIVATE pj_widgets Qt6::Widgets Qt6::Svg GTest::gtest)
+    if(DEFINED PJ_WARNING_FLAGS)
+        target_compile_options(splash_meme_pool_test PRIVATE ${PJ_WARNING_FLAGS})
+    endif()
+    add_test(NAME SplashMemePoolTest COMMAND splash_meme_pool_test)
+
     # Proves --exclude-libs,ALL (above) still keeps third-party static-archive
     # symbols out of pj_app's dynamic symbol table. Needs a real ELF and binutils,
     # so it is a script test rather than a gtest binary.
