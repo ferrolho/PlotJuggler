@@ -981,12 +981,21 @@ void MarketplaceWindow::applyFilters() {
   // user can always see and manage what they have.
   const bool compatible_only = ui_->filter_compatible_->isChecked();
 
+  // The categories the four toggles can represent. A plugin whose category is
+  // one of these obeys its toggle; a plugin whose category falls outside this
+  // set (empty, or an unmodeled/future value) has no toggle to govern it.
+  static const QStringList kToggleableCategories = {
+      u"data_loader"_s, u"data_stream"_s, u"message_parser"_s, u"toolbox"_s};
+
   filtered_.clear();
   for (const auto& ext : extensions_) {
-    // Category checkboxes are additive: only extensions whose category is
-    // currently checked are shown. With all four checked (the default) every
-    // registry category is visible; with all four unchecked nothing is shown.
-    if (!active_categories.contains(ext.category)) {
+    // Category checkboxes are additive: a toggleable category is shown only
+    // while its toggle is checked (all four checked = every such category
+    // visible; all four unchecked = none). A category outside the toggleable
+    // set is never hidden here — it belongs to no toggle, so filtering it out
+    // would make it permanently unreachable (a registry plugin with no category
+    // could never be found to install, an installed one never uninstalled).
+    if (kToggleableCategories.contains(ext.category) && !active_categories.contains(ext.category)) {
       continue;
     }
     if (installed_only && !ext_mgr_->isInstalled(ext.id)) {
