@@ -30,6 +30,8 @@
 
 namespace PJ {
 
+class ResidentPayloadPool;  // pj_datastore/resident_payload_pool.hpp
+
 struct ObjectTopicId {
   uint32_t id = 0;
 
@@ -166,6 +168,15 @@ class ObjectStore {
   // already owns (chunk cache, mmap, hand-off between stores).
   Status pushLazy(ObjectTopicId id, Timestamp timestamp, LazyCallback fetch);
 
+  // pushLazy plus an ingest-time seed: `seed` (bytes the pushing host already
+  // holds — the producer's synchronous "hot path") is admitted to the store's
+  // ResidentPayloadPool so reads serve it with NO fetch until the pool's byte
+  // budget evicts it; after that the entry behaves exactly like pushLazy(fetch).
+  // Degrades to plain pushLazy when no pool is configured, the seed is empty,
+  // or the pool rejects it (zero capacity / larger than the whole budget).
+  // `fetch` must re-produce bytes identical to `seed`.
+  Status pushLazyWithSeed(ObjectTopicId id, Timestamp timestamp, sdk::PayloadView seed, LazyCallback fetch);
+
   // --- Read ---
 
   std::optional<ResolvedObjectEntry> latestAt(ObjectTopicId id, Timestamp timestamp) const;
@@ -224,6 +235,14 @@ class ObjectStore {
   void setRetentionBudget(ObjectTopicId id, RetentionBudget budget);
   RetentionBudget retentionBudget(ObjectTopicId id) const;
   size_t memoryUsage(ObjectTopicId id) const;
+
+  // Pool consulted by pushLazyWithSeed. Set once during wiring, BEFORE any
+  // pushes (plain member, not synchronized against concurrent pushes). Share
+  // one pool app-wide so every store's seeds compete for a single byte budget;
+  // seeded entries moved between stores (flushTo / replaceDatasetFrom) keep
+  // their slots regardless of the destination's pool. Null (default) disables
+  // seeding. Seeded bytes are pool-accounted and NOT included in memoryUsage().
+  void setResidentPayloadPool(std::shared_ptr<ResidentPayloadPool> pool);
 
   // --- Explicit eviction ---
 
@@ -339,6 +358,10 @@ class ObjectStore {
   ObjectSeries* findSeries(ObjectTopicId id);
   const ObjectSeries* findSeries(ObjectTopicId id) const;
 
+  // Shared body of pushLazy / pushLazyWithSeed once the payload variant is
+  // decided (plain closure vs slot + fallback).
+  Status pushLazyEntry(ObjectTopicId id, Timestamp timestamp, ObjectEntryPayload payload);
+
   // Erase a topic from topics_. Caller must already hold store_mutex_ (used by
   // removeTopic under its own lock and by replaceDatasetFrom under the dual lock).
   void eraseTopicLocked(ObjectTopicId id);
@@ -358,12 +381,22 @@ class ObjectStore {
   // vector being cleared.
   static void clearEntriesLocked(ObjectSeries& series);
 
-  static ResolvedObjectEntry resolveEntry(const ObjectEntry& entry);
+  // Resolve an entry SNAPSHOT (a cheap copy of the payload variant — refcount
+  // bumps only) taken under the series lock; called with that lock RELEASED so
+  // a slow lazy fetch never blocks same-series writers. `served_from_resident`
+  // (optional) reports a seeded-slot hit, letting latestAt skip warm-cache
+  // population — a resident hit is already cheap and caching it would create a
+  // second anchor owner outside the pool's budget.
+  static ResolvedObjectEntry resolveEntry(const ObjectEntry& entry, bool* served_from_resident = nullptr);
 
   // Drop the oldest entry: the warm cache (if it holds it) + owned-payload memory
   // accounting live here; the triple pop delegates to OrderedEntries::evictFront.
   void evictFront(ObjectSeries& series);
   void applyRetention(ObjectSeries& series, Timestamp newest_ts);
+
+  // See setResidentPayloadPool. Read without synchronization on the push path;
+  // wiring must complete before ingest starts.
+  std::shared_ptr<ResidentPayloadPool> resident_pool_;
 
   mutable std::shared_mutex store_mutex_;
   // topics_ is the ordered source of truth: listTopics/replaceDatasetFrom/flushTo

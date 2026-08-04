@@ -124,6 +124,7 @@ add_library(pj_datastore STATIC
   src/sequential_uid.cpp
   src/ordered_entries.cpp
   src/object_store.cpp
+  src/resident_payload_pool.cpp
   # Data-processor execution substrate (the DataProcessor base + ProcessorSisoAdapter
   # that runs a processor as a DerivedEngine node — moved here from the retired pj_proc
   # module; lives WITH the ISISOTransform interface it adapts to).
@@ -177,6 +178,7 @@ if(PJ_BUILD_TESTS)
     tests/merge_test.cpp
     tests/ordered_entries_test.cpp
     tests/object_store_test.cpp
+    tests/resident_payload_pool_test.cpp
     tests/object_merge_test.cpp
     tests/clear_dataset_test.cpp
     tests/plugin_data_host_object_test.cpp

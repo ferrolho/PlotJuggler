@@ -22,6 +22,7 @@
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/query.hpp"
 #include "pj_datastore/reader.hpp"
+#include "pj_datastore/resident_payload_pool.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
 #include "pj_runtime/DataSourceRuntimeHost.h"
 #include "pj_runtime/ExtensionCatalogService.h"
@@ -163,6 +164,38 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessageLazyObjectsEagerScalars
   // Object entries hold the same deferred-fetch closure kPureLazy uses, so
   // each pull re-invokes the fetcher instead of replaying resident bytes.
   EXPECT_EQ(fetch_calls->load(), 2);
+}
+
+TEST_F(DataSourceRuntimeHostObjectIngestTest, LazyObjectsEagerScalarsSeedServesPullsWithoutRefetch) {
+  // With a ResidentPayloadPool wired, the ingest-time fetch (the producer's hot
+  // path) seeds the entry, so object pulls read those bytes with NO re-fetch —
+  // until the pool evicts the seed, after which the re-fetch fallback serves.
+  auto pool = std::make_shared<PJ::ResidentPayloadPool>(64ULL * 1024 * 1024);
+  object_store_.setResidentPayloadPool(pool);
+  host_->policyResolver().setDefault(PJ::sdk::ObjectIngestPolicy::kLazyObjectsEagerScalars);
+
+  auto binding_or = bindTopic("/camera/image", "mock/image");
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  const std::vector<uint8_t> payload{0x10, 0x20, 0x30, 0x40};
+  auto fetch_calls = pushPayload(*binding_or, 123, payload);
+  EXPECT_EQ(fetch_calls->load(), 1);
+
+  host_->flushAll();
+  auto object_topic = object_store_.findTopic(dataset_id_, "/camera/image");
+  ASSERT_TRUE(object_topic.has_value());
+
+  auto entry = object_store_.latestAt(*object_topic, 123);
+  ASSERT_TRUE(entry.has_value());
+  EXPECT_EQ(std::vector<uint8_t>(entry->payload.bytes.begin(), entry->payload.bytes.end()), payload);
+  EXPECT_EQ(fetch_calls->load(), 1) << "resident seed must serve the pull without re-invoking the fetcher";
+  EXPECT_GE(pool->stats().resident_hits, 1U);
+
+  pool->trim();
+  auto after_eviction = object_store_.latestAt(*object_topic, 123);
+  ASSERT_TRUE(after_eviction.has_value());
+  EXPECT_EQ(std::vector<uint8_t>(after_eviction->payload.bytes.begin(), after_eviction->payload.bytes.end()), payload);
+  EXPECT_EQ(fetch_calls->load(), 2) << "an evicted seed degrades to the re-fetch fallback";
 }
 
 TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessagePureLazyDefersFetchAndDoesNotCommitScalars) {

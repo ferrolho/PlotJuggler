@@ -36,6 +36,24 @@ using SharedBuffer = std::shared_ptr<const std::vector<uint8_t>>;
 /// Invoked on every read; bytes are not counted against the retention budget.
 using LazyCallback = std::function<sdk::PayloadView()>;
 
+class ResidentSlot;  // pj_datastore/resident_payload_pool.hpp
+
+/// Lazy payload: the fetcher, optionally seeded (`seed != nullptr`) with an
+/// evictable resident copy of its ingest-time bytes. Seeded reads serve from
+/// the slot while the ResidentPayloadPool keeps it resident (no fetch), then
+/// degrade permanently to `fetch` — which must re-produce identical bytes —
+/// once the pool's byte budget rolls over. Resident bytes are pool-accounted,
+/// never counted against the series' retention budget (which governs whole
+/// entries, not their residency).
+struct LazyPayload {
+  LazyCallback fetch;
+  std::shared_ptr<ResidentSlot> seed;
+};
+
+/// Eager owned bytes, or a (possibly seeded) lazy resolver; resolveEntry
+/// discriminates via std::get_if.
+using ObjectEntryPayload = std::variant<SharedBuffer, LazyPayload>;
+
 struct ObjectEntry {
   Timestamp timestamp = 0;
   SequentialUID sequential_uid;
@@ -47,8 +65,7 @@ struct ObjectEntry {
   // add this delta to land them on the shifted clock. Consumers that key off the
   // store `timestamp` ignore it. Accumulates across chained merges.
   Timestamp payload_stamp_shift = 0;
-  // Eager owned bytes or a lazy resolver; resolveEntry discriminates via std::get_if.
-  std::variant<SharedBuffer, LazyCallback> payload;
+  ObjectEntryPayload payload;
 };
 
 /// Invariant-enforcing owner of a series' ordered entries. Holds three arrays

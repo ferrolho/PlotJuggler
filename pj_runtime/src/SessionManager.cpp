@@ -45,7 +45,18 @@ QString SessionManager::normalizedSourcePath(const QString& path) {
   return QDir::cleanPath(canonical.isEmpty() ? info.absoluteFilePath() : canonical);
 }
 
+// Session-wide cap on ingest-seeded resident object payloads. Large enough to
+// cover the live-edge window a scene chases during a progressive load; small
+// against the app's overall footprint.
+constexpr size_t kResidentPayloadPoolBytes = 256ULL * 1024 * 1024;
+
 SessionManager::SessionManager(QObject* parent) : QObject(parent) {
+  // Bounded resident window for ingest-seeded object payloads: live-edge object
+  // pulls during/after a file load read the bytes the ingest already fetched,
+  // instead of re-fetching (for MCAP: re-decompressing a chunk) from the source.
+  resident_payload_pool_ = std::make_shared<ResidentPayloadPool>(kResidentPayloadPoolBytes);
+  object_store_.setResidentPayloadPool(resident_payload_pool_);
+
   // data_engine_ is already alive (member init precedes the ctor body), so the
   // processor service can bind its DerivedEngine to it.
   processor_service_ = std::make_unique<DataProcessorService>(*this);

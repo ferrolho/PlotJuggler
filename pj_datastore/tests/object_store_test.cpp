@@ -9,9 +9,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1615,6 +1617,41 @@ TEST(ObjectStoreIndexTest, ClearThenReregister) {
   EXPECT_EQ(store.entryCount(*id_new), 1u);
   EXPECT_EQ(store.latestAt(*id_new, 400)->payload.bytes[0], 0x33);
   EXPECT_EQ(store.findTopic(1, "topic/x")->id, id_new->id);
+}
+
+// Regression: a slow lazy resolve must NOT hold the series lock — a concurrent
+// push to the same series has to complete while the resolve is in flight.
+// Pre-fix this deadlocks: the resolve held the shared series lock, the push
+// blocked on the exclusive lock, and the resolve waited for the push forever
+// (bounded here by wait_for so a regression fails instead of hanging the suite).
+TEST(ObjectStoreLockScopeTest, SlowResolveDoesNotBlockSameSeriesPush) {
+  ObjectStore store;
+  const auto id = registerTestTopic(store);
+
+  std::mutex sync_mutex;
+  std::condition_variable cv;
+  bool push_done = false;
+
+  LazyCallback blocking_fetch = [&]() -> sdk::PayloadView {
+    std::unique_lock lock(sync_mutex);
+    cv.wait_for(lock, std::chrono::seconds(5), [&] { return push_done; });
+    EXPECT_TRUE(push_done) << "push did not complete while resolve was in flight";
+    return sdk::makePayloadView(makePayload(8));
+  };
+  ASSERT_TRUE(store.pushLazy(id, 10, std::move(blocking_fetch)));
+
+  std::thread resolver([&] { (void)store.latestAt(id, 10); });
+  std::thread pusher([&] {
+    ASSERT_TRUE(store.pushLazy(id, 20, []() -> sdk::PayloadView { return sdk::makePayloadView(makePayload(8)); }));
+    {
+      std::lock_guard lock(sync_mutex);
+      push_done = true;
+    }
+    cv.notify_all();
+  });
+  pusher.join();
+  resolver.join();
+  EXPECT_EQ(store.entryCount(id), 2U);
 }
 
 }  // namespace

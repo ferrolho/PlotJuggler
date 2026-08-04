@@ -127,6 +127,28 @@ contribute to `memoryUsage()` because the store retains the callable, not the
 fetched bytes. The callable runs on every `at()` read; `latestAt()` repeats of the
 same sample are served from a warm cache without re-invoking it (see Read Paths).
 
+`pushLazyWithSeed(id, timestamp, seed, fetch)` is `pushLazy` plus an ingest-time
+seed: the pushing host already holds the payload bytes (its policy fetched them
+synchronously inside the producer's push — the "hot path"), so instead of
+dropping them it admits the `PayloadView` into the store's
+**ResidentPayloadPool** (`setResidentPayloadPool`, one shared pool per app
+session). Reads serve the resident bytes with no fetch until the pool's
+byte-bounded FIFO evicts the seed; the entry then degrades permanently to the
+`fetch` fallback — plain `pushLazy` behavior. Consumers chasing the ingest live
+edge (a 3D dock rendering during a progressive file load) therefore never
+re-fetch what the import just produced, while total residency stays bounded by
+the pool capacity. Seeded bytes are pool-accounted, NOT part of the series'
+`memoryUsage()`; entry destruction (retention, topic removal, clear) retires
+the seed's pool charge, and entries moved across stores (`flushTo`,
+`replaceDatasetFrom`) keep their slots. With no pool configured, an empty seed,
+or a pool rejection (zero capacity, payload larger than the whole budget), the
+push degrades to plain `pushLazy` up front. A resident-slot hit is deliberately
+NOT memoized into the `latestAt` warm cache: it is already cheap, and caching
+it would hold a second anchor owner outside the pool's budget. Accounting
+charges `payload.bytes.size()`; a zero-copy anchored seed may pin a larger
+upstream allocation (e.g. the producer's decompressed chunk) until eviction,
+so the budget bounds logical payload bytes, not anchor-backed RSS.
+
 Both write paths apply the topic retention budget after the new entry is
 inserted.
 
@@ -287,10 +309,22 @@ contract. `OrderedEntries` is not itself locked; the caller holds the series loc
 across every call to it.
 
 The warm cache (above) has its own small per-series mutex, distinct from the
-series shared mutex. `latestAt` holds the series mutex only in shared mode and
-never holds the cache mutex across `resolveEntry()` (a lazy fetch), so a slow
-decode on a miss cannot block other readers of the series. A lazy fetcher is
-always invoked outside every store lock.
+series shared mutex. Resolution is **snapshot-then-resolve**: `latestAt`/`at`
+copy the target entry (cheap — the payload variant copies as refcount bumps /
+a closure copy) under the series shared lock, RELEASE that lock, and only then
+invoke `resolveEntry()`. A slow lazy fetch (file re-read + decompress) therefore
+never blocks writers pushing to the same series, and never holds the cache
+mutex. Only the global store shared lock stays held across the resolve — it
+keeps the series object alive and conflicts only with registration-level
+exclusive operations, never with pushes. An entry evicted mid-resolve is
+harmless (the snapshot owns its captures); the warm cache may then briefly
+memoize that already-evicted payload, bounded at one per topic, until the next
+differing read replaces it.
+
+The ResidentPayloadPool has its own mutex, taken briefly by seed admission and
+by slot retirement (which entry destruction may trigger under store locks —
+store→pool nesting only; pool code never takes store locks). Payload anchors of
+evicted seeds are always released outside the pool mutex.
 
 ### Deferred: off-thread prefetch
 

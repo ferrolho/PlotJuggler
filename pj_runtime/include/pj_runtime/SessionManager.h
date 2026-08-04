@@ -20,6 +20,7 @@
 #include "pj_datastore/engine.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/reader.hpp"
+#include "pj_datastore/resident_payload_pool.hpp"
 #include "pj_plugins/host/message_parser_handle.hpp"
 #include "pj_runtime/CurveColorRegistry.h"
 #include "pj_runtime/Time.h"
@@ -76,6 +77,13 @@ class SessionManager : public QObject {
   }
   [[nodiscard]] ObjectStore& objectStore() noexcept {
     return object_store_;
+  }
+
+  // The session-wide budget for ingest-seeded object payload residency (see
+  // ResidentPayloadPool). One pool for the whole session so every dataset's
+  // seeds compete for a single byte cap; exposed for diagnostics and tests.
+  [[nodiscard]] const std::shared_ptr<ResidentPayloadPool>& residentPayloadPool() const noexcept {
+    return resident_payload_pool_;
   }
 
   // Session-scoped memory of each curve's assigned color, so a curve keeps its
@@ -536,6 +544,7 @@ class SessionManager : public QObject {
 
   DataEngine data_engine_;
   ObjectStore object_store_;
+  std::shared_ptr<ResidentPayloadPool> resident_payload_pool_;
   CurveColorRegistry curve_color_registry_;
   // "Use time offset" frame state. Neutral default (off); the app shell drives
   // the user-facing default (on, PJ3 parity) through setUseTimeOffset.

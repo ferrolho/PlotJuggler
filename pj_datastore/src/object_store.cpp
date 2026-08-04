@@ -7,7 +7,10 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include "pj_datastore/resident_payload_pool.hpp"
 
 namespace PJ {
 
@@ -116,6 +119,18 @@ Status ObjectStore::pushOwned(ObjectTopicId id, Timestamp timestamp, std::vector
 }
 
 Status ObjectStore::pushLazy(ObjectTopicId id, Timestamp timestamp, LazyCallback fetch) {
+  return pushLazyEntry(id, timestamp, ObjectEntryPayload{LazyPayload{std::move(fetch), nullptr}});
+}
+
+Status ObjectStore::pushLazyWithSeed(ObjectTopicId id, Timestamp timestamp, sdk::PayloadView seed, LazyCallback fetch) {
+  std::shared_ptr<ResidentSlot> slot;
+  if (resident_pool_ != nullptr) {
+    slot = resident_pool_->admit(std::move(seed));
+  }
+  return pushLazyEntry(id, timestamp, ObjectEntryPayload{LazyPayload{std::move(fetch), std::move(slot)}});
+}
+
+Status ObjectStore::pushLazyEntry(ObjectTopicId id, Timestamp timestamp, ObjectEntryPayload payload) {
   std::shared_lock store_lock(store_mutex_);
   auto* series = findSeries(id);
   if (series == nullptr) {
@@ -126,7 +141,7 @@ Status ObjectStore::pushLazy(ObjectTopicId id, Timestamp timestamp, LazyCallback
   ObjectEntry entry;
   entry.timestamp = timestamp;
   entry.sequential_uid = SequentialUID::getNext();
-  entry.payload = std::move(fetch);
+  entry.payload = std::move(payload);
   const auto push_order = series->ordered.push(std::move(entry));
 
   if (push_order == OrderedEntries::PushOrder::kOutOfOrderInsert) {
@@ -138,6 +153,10 @@ Status ObjectStore::pushLazy(ObjectTopicId id, Timestamp timestamp, LazyCallback
   return {};
 }
 
+void ObjectStore::setResidentPayloadPool(std::shared_ptr<ResidentPayloadPool> pool) {
+  resident_pool_ = std::move(pool);
+}
+
 // --- Read ---
 
 std::optional<ResolvedObjectEntry> ObjectStore::latestAt(ObjectTopicId id, Timestamp timestamp) const {
@@ -147,28 +166,42 @@ std::optional<ResolvedObjectEntry> ObjectStore::latestAt(ObjectTopicId id, Times
     return std::nullopt;
   }
 
-  std::shared_lock lock(series->mutex);
-  const auto idx = series->ordered.indexAtOrBefore(timestamp);
-  if (!idx.has_value()) {
-    return std::nullopt;
-  }
-  const ObjectEntry& entry = series->ordered.entryAt(*idx);
-
-  // Warm cache: a ~60 Hz reader landing on the same sample as last time is served
-  // without re-invoking the (possibly decompressing/file-backed) lazy fetcher.
-  // Keyed by sequential_uid, which is never reused, so a hit is always the exact
-  // same entry. The lock is released before resolveEntry() so a slow decode on a
-  // miss never blocks concurrent readers of this series.
+  // Snapshot the entry under the series lock, then RELEASE it before resolving:
+  // a slow lazy fetch (file re-read + decompress) must never block writers
+  // pushing to this series. The snapshot is cheap — the payload variant copies
+  // as refcount bumps / a closure copy. store_lock stays held so the series
+  // object itself cannot be destroyed. An entry evicted mid-resolve is harmless:
+  // the snapshot owns every capture it needs.
+  ObjectEntry snapshot;
   {
-    std::lock_guard cache_guard(series->cache_mutex);
-    if (series->cached_latest && series->cached_latest->sequential_uid == entry.sequential_uid) {
-      return *series->cached_latest;
+    std::shared_lock lock(series->mutex);
+    const auto idx = series->ordered.indexAtOrBefore(timestamp);
+    if (!idx.has_value()) {
+      return std::nullopt;
     }
+    const ObjectEntry& entry = series->ordered.entryAt(*idx);
+
+    // Warm cache: a ~60 Hz reader landing on the same sample as last time is
+    // served without re-invoking the (possibly decompressing/file-backed) lazy
+    // fetcher. Keyed by sequential_uid, which is never reused, so a hit is
+    // always the exact same entry.
+    {
+      std::lock_guard cache_guard(series->cache_mutex);
+      if (series->cached_latest && series->cached_latest->sequential_uid == entry.sequential_uid) {
+        return *series->cached_latest;
+      }
+    }
+    snapshot = entry;
   }
-  ResolvedObjectEntry resolved = resolveEntry(entry);
+
+  bool served_from_resident = false;
+  ResolvedObjectEntry resolved = resolveEntry(snapshot, &served_from_resident);
   // Don't memoize a failed/empty resolve — let the next read retry instead of
-  // latching the failure.
-  if (!resolved.payload.bytes.empty()) {
+  // latching the failure. A resident-slot hit is not memoized either: it is
+  // already cheap, and caching it would hold a second anchor owner outside the
+  // ResidentPayloadPool's byte budget. (Once the slot is evicted the fallback
+  // resolve lands here and is cached like any lazy entry.)
+  if (!resolved.payload.bytes.empty() && !served_from_resident) {
     std::lock_guard cache_guard(series->cache_mutex);
     series->cached_latest = resolved;
   }
@@ -182,12 +215,18 @@ std::optional<ResolvedObjectEntry> ObjectStore::at(ObjectTopicId id, size_t inde
     return std::nullopt;
   }
 
-  std::shared_lock lock(series->mutex);
-  const ObjectEntry* entry = series->ordered.atIndex(index);
-  if (entry == nullptr) {
-    return std::nullopt;
+  // Snapshot-then-resolve, same as latestAt: the series lock must not be held
+  // across a slow lazy fetch.
+  ObjectEntry snapshot;
+  {
+    std::shared_lock lock(series->mutex);
+    const ObjectEntry* entry = series->ordered.atIndex(index);
+    if (entry == nullptr) {
+      return std::nullopt;
+    }
+    snapshot = *entry;
   }
-  return resolveEntry(*entry);
+  return resolveEntry(snapshot);
 }
 
 std::optional<ResolvedObjectEntry> ObjectStore::at(ObjectTopicId id, SequentialUID sequential_uid) const {
@@ -201,12 +240,16 @@ std::optional<ResolvedObjectEntry> ObjectStore::at(ObjectTopicId id, SequentialU
     return std::nullopt;
   }
 
-  std::shared_lock lock(series->mutex);
-  const ObjectEntry* entry = series->ordered.atUid(sequential_uid);
-  if (entry == nullptr) {
-    return std::nullopt;
+  ObjectEntry snapshot;
+  {
+    std::shared_lock lock(series->mutex);
+    const ObjectEntry* entry = series->ordered.atUid(sequential_uid);
+    if (entry == nullptr) {
+      return std::nullopt;
+    }
+    snapshot = *entry;
   }
-  return resolveEntry(*entry);
+  return resolveEntry(snapshot);
 }
 
 std::optional<size_t> ObjectStore::indexAt(ObjectTopicId id, Timestamp timestamp) const {
@@ -853,11 +896,14 @@ const ObjectStore::ObjectSeries* ObjectStore::findSeries(ObjectTopicId id) const
   return it != series_index_.end() ? it->second : nullptr;
 }
 
-ResolvedObjectEntry ObjectStore::resolveEntry(const ObjectEntry& entry) {
+ResolvedObjectEntry ObjectStore::resolveEntry(const ObjectEntry& entry, bool* served_from_resident) {
   ResolvedObjectEntry resolved;
   resolved.timestamp = entry.timestamp;
   resolved.sequential_uid = entry.sequential_uid;
   resolved.payload_stamp_shift = entry.payload_stamp_shift;
+  if (served_from_resident != nullptr) {
+    *served_from_resident = false;
+  }
 
   if (const auto* owned = std::get_if<SharedBuffer>(&entry.payload)) {
     // Span the vector, anchor on the same shared_ptr — refcount bump, no copy.
@@ -868,10 +914,22 @@ ResolvedObjectEntry ObjectStore::resolveEntry(const ObjectEntry& entry) {
           sdk::BufferAnchor{*owned},
       };
     }
-  } else if (const auto* lazy = std::get_if<LazyCallback>(&entry.payload)) {
+  } else if (const auto* lazy = std::get_if<LazyPayload>(&entry.payload)) {
+    // Seeded: resident bytes while the pool keeps them; the fetcher after.
+    if (lazy->seed != nullptr) {
+      if (auto resident = lazy->seed->load()) {
+        resolved.payload = std::move(*resident);
+        if (served_from_resident != nullptr) {
+          *served_from_resident = true;
+        }
+        return resolved;
+      }
+    }
     // Forward the closure's PayloadView verbatim. The anchor stays opaque (no
     // cast), so producers can back it with arrow::Buffer, mmap, or a C-ABI anchor.
-    resolved.payload = (*lazy)();
+    if (lazy->fetch) {
+      resolved.payload = lazy->fetch();
+    }
   }
 
   return resolved;
