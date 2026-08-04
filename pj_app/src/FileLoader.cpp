@@ -305,6 +305,7 @@ QString normalizeExtension(const QString& path) {
   return suffix.isEmpty() ? QString() : u"."_s + suffix.toLower();
 }
 
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
 void logSuccessfulLoad(
     const DataEngine& engine, const CatalogModel& catalog, const QString& source_identity, const QString& plugin_name,
     const std::vector<DatasetId>& dataset_ids) {
@@ -366,6 +367,7 @@ void logSuccessfulLoad(
                                  << u"scalar_series=%1"_s.arg(scalar_series.join(u","_s))
                                  << u"series_samples=%1"_s.arg(series_samples.join(u","_s));
 }
+#endif
 #if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
 void probeObjectDecoding(SessionManager& session, ObjectStore& object_store, DatasetId dataset_id) {
   for (const ObjectTopicId topic_id : object_store.listTopics(dataset_id)) {
@@ -2003,7 +2005,9 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   emitLoadFinished(
       ticket, stopped ? LoadOutcome::kCancelled : LoadOutcome::kLoaded, source_identity, fanout_primary_id,
       QVector<DatasetId>(fanout_loaded_ids.begin(), fanout_loaded_ids.end()));
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
   logSuccessfulLoad(engine, catalog_, source_identity, source_name, fanout_loaded_ids);
+#endif
   emit fileLoaded(source_identity, QString(), source_name, QString::fromStdString(captured_config), source_manifest_id);
   co_return;  // fanout completed; process the next queued request
 }
@@ -2336,7 +2340,9 @@ void FileLoader::finishLoadOnGui(bool fully_loaded) {
   // file whose data is EARLIER than any prior dataset must reframe every plot to the
   // new origin. No-op when "Use time offset" is off.
   session_.refreshDatasetTimeReference(dataset_id);
+#ifdef PJ_WASM_ENABLE_INGRESS_PROBE
   logSuccessfulLoad(session_.dataEngine(), catalog_, path, source_name, {dataset_id});
+#endif
   ctx_.reset();  // drop the handle/host before notifying — the load is complete
 #if defined(PJ_WASM_ENABLE_INGRESS_PROBE) && (defined(PJ_WASM_WITH_ROS_PLUGIN) || defined(PJ_WASM_WITH_PROTOBUF_PLUGIN))
   // Exercise the same cold-fetch + parser path used later by the accelerated
