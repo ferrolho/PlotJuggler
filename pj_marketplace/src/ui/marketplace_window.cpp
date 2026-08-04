@@ -90,6 +90,26 @@ class CategoryItem : public QTableWidgetItem {
   }
 };
 
+// Sort item for the two version columns (Installed / Marketplace). Plain
+// QTableWidgetItem sorts its display text lexicographically, which orders
+// "10.0.0" before "9.0.0"; compareSemver gives the numeric ordering the columns
+// need. The em-dash placeholder for a not-installed row (empty semver) sorts
+// below every real version.
+class VersionItem : public QTableWidgetItem {
+ public:
+  using QTableWidgetItem::QTableWidgetItem;
+  [[nodiscard]] bool operator<(const QTableWidgetItem& other) const override {
+    return compareSemver(semver(text()), semver(other.text())) < 0;
+  }
+
+ private:
+  // Maps the em-dash placeholder to an empty string, which compareSemver treats
+  // as numeric zero — so uncategorized/not-installed rows land at the bottom.
+  static std::string semver(const QString& display) {
+    return display == u"—"_s ? std::string{} : display.toStdString();
+  }
+};
+
 // Row-height floor: a comfortable minimum so rows read as clearly separated
 // even when their text is short.
 constexpr int kMinRowHeight = 44;
@@ -574,7 +594,7 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     // Installed version (an em dash when not installed), centered. Asked of the
     // manager rather than read off the snapshot: a core plugin the startup seed
     // refreshed cannot be re-scanned to its new version within this process.
-    auto* installed_item = new QTableWidgetItem(is_installed ? ext_mgr_->installedVersion(ext.id) : u"\u2014"_s);
+    auto* installed_item = new VersionItem(is_installed ? ext_mgr_->installedVersion(ext.id) : u"\u2014"_s);
     installed_item->setTextAlignment(Qt::AlignCenter);
     table->setItem(row, kColInstalledVersion, installed_item);
 
@@ -583,7 +603,7 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
     // row. Incompatible wins over update: an incompatible plugin's cell is
     // amber (matching the footer notice) even when it also has an update;
     // otherwise an available update paints it pink.
-    auto* market_item = new QTableWidgetItem(ext.version);
+    auto* market_item = new VersionItem(ext.version);
     market_item->setTextAlignment(Qt::AlignCenter);
     if (!compat.ok) {
       market_item->setData(kHighlightColorRole, incompatible_fill);
