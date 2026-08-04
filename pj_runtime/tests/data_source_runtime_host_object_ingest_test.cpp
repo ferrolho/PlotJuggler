@@ -145,6 +145,8 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessageLazyObjectsEagerScalars
 
   const std::vector<uint8_t> payload{0x10, 0x20, 0x30, 0x40};
   auto fetch_calls = pushPayload(*binding_or, 123, payload);
+  // Exactly one ingest-time fetch feeds the scalar parse; the bytes are then
+  // dropped, not pinned in the store entry.
   EXPECT_EQ(fetch_calls->load(), 1);
 
   host_->flushAll();
@@ -158,10 +160,9 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessageLazyObjectsEagerScalars
   ASSERT_TRUE(entry.has_value());
   ASSERT_NE(entry->payload.anchor, nullptr);
   EXPECT_EQ(std::vector<uint8_t>(entry->payload.bytes.begin(), entry->payload.bytes.end()), payload);
-  // The captured-payload closure replays the same PayloadView on every read
-  // (it holds onto the upstream anchor) rather than re-invoking the fetcher.
-  // So latestAt does NOT trigger an additional fetch.
-  EXPECT_EQ(fetch_calls->load(), 1);
+  // Object entries hold the same deferred-fetch closure kPureLazy uses, so
+  // each pull re-invokes the fetcher instead of replaying resident bytes.
+  EXPECT_EQ(fetch_calls->load(), 2);
 }
 
 TEST_F(DataSourceRuntimeHostObjectIngestTest, PushMessagePureLazyDefersFetchAndDoesNotCommitScalars) {

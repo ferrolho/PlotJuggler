@@ -51,13 +51,13 @@ std::vector<uint8_t> copyPayloadBytes(const PJ_payload_t& payload) {
   return bytes;
 }
 
-// Idempotent lazy closure that replays the same PayloadView on every read.
-// Anchor-bearing payload: captures the anchor so the buffer lives for the
-// ObjectStore entry's lifetime (zero copy). Null anchor (transient buffer):
-// copies the bytes into a shared_ptr<vector> that serves as its own anchor.
-std::function<sdk::PayloadView()> makeCapturedPayloadClosure(
-    const PJ_payload_t& payload, std::shared_ptr<void> library_keepalive) {
-  if (payload.anchor.release == nullptr) {
+// Idempotent resident closure (kEager only) that replays the same PayloadView
+// on every read. `anchor` is the payload's already-wrapped upstream anchor:
+// non-null, the closure inherits it so the buffer lives for the ObjectStore
+// entry's lifetime (zero copy); null (transient buffer), the bytes are copied
+// into a shared_ptr<vector> that serves as its own anchor.
+std::function<sdk::PayloadView()> makeCapturedPayloadClosure(const PJ_payload_t& payload, sdk::BufferAnchor anchor) {
+  if (anchor == nullptr) {
     auto bytes = std::make_shared<const std::vector<uint8_t>>(copyPayloadBytes(payload));
     return [bytes]() -> sdk::PayloadView {
       return sdk::PayloadView{
@@ -66,7 +66,6 @@ std::function<sdk::PayloadView()> makeCapturedPayloadClosure(
       };
     };
   }
-  auto anchor = detail::wrapPayloadAnchor(payload.anchor, std::move(library_keepalive));
   const uint8_t* data = payload.data;
   uint64_t size = payload.size;
   return [anchor = std::move(anchor), data, size]() -> sdk::PayloadView {
@@ -119,8 +118,9 @@ struct LazyFetchContext {
 
 // Deferred lazy closure: re-invokes the fetcher on every read, wrapping each
 // invocation's anchor in a per-call shared_ptr so a returned PayloadView can
-// outlive the call without holding the fetcher. For kPureLazy sources, where
-// holding bytes until read time costs more than re-fetching.
+// outlive the call without holding the fetcher. Keeps object bytes
+// non-resident — used by kPureLazy, and by kLazyObjectsEagerScalars once the
+// ingest-time scalar parse is done with them.
 std::function<sdk::PayloadView()> makeLazyFetchClosure(
     std::shared_ptr<FetcherOwner> owner, std::shared_ptr<std::mutex> fetch_mutex, LazyFetchContext context) {
   // The DSO keepalive lives inside `owner` (FetcherOwner), so it is the single
@@ -731,10 +731,10 @@ bool DataSourceRuntimeHost::cbPushMessage(
       return false;
     }
 
-    // Build the captured-payload closure FIRST, so the anchor lifetime binds
-    // to the closure rather than this scope (no PayloadAnchorGuard needed): on
-    // any abort below, dropping `captured_closure` releases the anchor cleanly.
-    auto captured_closure = makeCapturedPayloadClosure(payload, self->library_keepalive_);
+    // Wrap the payload anchor FIRST, so every exit below — including the
+    // failure paths — releases the plugin's buffer exactly once. Only the
+    // kEager store path extends its lifetime, by handing it to the closure.
+    auto payload_anchor = detail::wrapPayloadAnchor(payload.anchor, self->library_keepalive_);
 
     if (payload.data == nullptr && payload.size > 0) {
       return self->fail(out_error, "message data fetcher returned null data");
@@ -743,16 +743,22 @@ bool DataSourceRuntimeHost::cbPushMessage(
       return self->fail(out_error, status.error().c_str());
     }
 
-    // Always-lazy doctrine: object entries land as lazy closures capturing the
-    // upstream anchor, so store reads replay the same PayloadView (zero-copy
-    // when anchor-bearing). Eager and kLazyObjectsEagerScalars collapse here —
-    // the parser already ran and we hold the bytes, so no kPureLazy re-fetch.
-    if (is_object_topic) {
-      if (auto status = self->object_store_target_.load()->pushLazy(
-              *binding.object_topic_id, timestamp_ns, std::move(captured_closure));
-          !status) {
-        return self->fail(out_error, ("ObjectStore.pushLazy failed: " + status.error()).c_str());
-      }
+    if (!is_object_topic) {
+      return true;
+    }
+    // kLazyObjectsEagerScalars: the bytes were fetched only to feed the scalar
+    // parse. Store the same re-fetch closure kPureLazy uses and drop the
+    // payload on return, honoring the protocol's "bytes dropped after
+    // parseScalars" contract — large blobs stay non-resident.
+    if (policy == sdk::ObjectIngestPolicy::kLazyObjectsEagerScalars) {
+      return push_lazy_object();
+    }
+    // kEager: the entry stays resident — the closure inherits the anchor
+    // (zero copy), so store reads replay this exact PayloadView, no re-fetch.
+    if (auto status = self->object_store_target_.load()->pushLazy(
+            *binding.object_topic_id, timestamp_ns, makeCapturedPayloadClosure(payload, std::move(payload_anchor)));
+        !status) {
+      return self->fail(out_error, ("ObjectStore.pushLazy failed: " + status.error()).c_str());
     }
     return true;
   } catch (...) {

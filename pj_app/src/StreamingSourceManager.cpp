@@ -349,6 +349,10 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
         session_manager_.registerObjectTopicParser(id, std::move(parser));
       },
       secondary_object_store_.get(), secondary_data_engine_.get(), std::move(library_keepalive));
+  // Streaming has no persistent file to re-read: a lazy policy's re-fetch
+  // closure would re-invoke each message's fetcher on every pull, so keep
+  // object bytes resident (kEager) instead of the resolver's lazy default.
+  session->runtime_host->policyResolver().setDefault(sdk::ObjectIngestPolicy::kEager);
 #ifdef PJ_TARGET_WASM
   // Browser RobotDescription handlers are object-only. Defer their payloads
   // until RobotModel requests one instead of invoking the absent scalar path.
