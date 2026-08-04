@@ -1,12 +1,14 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkRequest>
 
 #include "pj_marketplace/registry_manager.hpp"
+#include "pj_marketplace/version_compare.hpp"
 
 namespace PJ {
 
@@ -114,6 +116,10 @@ bool RegistryManager::parseJson(const QByteArray& data) {
   }
 
   QList<Extension> parsed;
+  // Maps an already-seen id to its slot in `parsed`, so a duplicate id in the
+  // registry collapses to a single row instead of a phantom second one. The
+  // higher version wins — a repeated id keeps the newest artifact.
+  QHash<QString, int> index_by_id;
 
   for (const QJsonValue& value : root["extensions"].toArray()) {
     if (!value.isObject()) {
@@ -171,7 +177,15 @@ bool RegistryManager::parseJson(const QByteArray& data) {
       ext.changelog.insert(it.key(), it.value().toString());
     }
 
-    parsed.append(ext);
+    // Deduplicate by id: keep only the highest-versioned entry for a given id
+    // so a duplicate never produces a second, unreachable table row.
+    const auto existing = index_by_id.constFind(ext.id);
+    if (existing == index_by_id.cend()) {
+      index_by_id.insert(ext.id, static_cast<int>(parsed.size()));
+      parsed.append(ext);
+    } else if (compareSemver(ext.version.toStdString(), parsed[*existing].version.toStdString()) > 0) {
+      parsed[*existing] = ext;
+    }
   }
 
   extensions_ = std::move(parsed);

@@ -493,6 +493,33 @@ TEST_F(RegistryManagerTest, ExtensionsEmptyAfterParseError) {
   EXPECT_TRUE(mgr.extensions().isEmpty());
 }
 
+// [2] A duplicate id collapses to a single entry, keeping the highest version —
+// otherwise the marketplace shows a phantom second row that can never be
+// selected (the footer always resolves an id to its first match).
+TEST_F(RegistryManagerTest, DeduplicatesByIdKeepingHighestVersion) {
+  RegistryManager mgr;
+  QSignalSpy spy_finished(&mgr, &RegistryManager::fetchFinished);
+
+  // The newer version is listed FIRST to prove the winner is chosen by semver,
+  // not by array order, and that "1.10.0" beats "1.9.0" (not a string compare).
+  server_->setResponseBody(R"({"extensions":[
+    {"id":"dup","name":"Dup","version":"1.10.0","description":"new"},
+    {"id":"dup","name":"Dup","version":"1.9.0","description":"old"},
+    {"id":"other","name":"Other","version":"1.0.0"}
+  ]})");
+  mgr.fetchRegistry(server_->url());
+  ASSERT_TRUE(spy_finished.wait(3000));
+
+  const QList<Extension> exts = mgr.extensions();
+  ASSERT_EQ(exts.size(), 2);
+
+  const Extension& dup = exts.at(0);
+  EXPECT_EQ(dup.id, "dup");
+  EXPECT_EQ(dup.version, "1.10.0");
+  EXPECT_EQ(dup.description, "new");
+  EXPECT_EQ(exts.at(1).id, "other");
+}
+
 }  // namespace
 }  // namespace PJ
 
