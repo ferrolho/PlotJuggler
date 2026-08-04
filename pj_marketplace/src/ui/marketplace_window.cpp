@@ -672,7 +672,13 @@ void MarketplaceWindow::rebuildTable(bool preserve_scroll) {
       break;
     }
   }
-  ui_->update_all_btn_->setEnabled(any_updatable && update_queue_.isEmpty());
+  // Stay disabled while anything is in flight, not just while the queue is
+  // non-empty: processInstallQueue() pops the last item before its install
+  // finishes, so update_queue_ empties while active_install_id_ is still
+  // downloading (not yet staged, so it still counts as updatable). Without the
+  // active_install_id_ check the button would re-enable mid-batch and a click
+  // would re-dispatch the in-flight update.
+  ui_->update_all_btn_->setEnabled(any_updatable && update_queue_.isEmpty() && active_install_id_.isEmpty());
 
   if (preserve_scroll) {
     QTimer::singleShot(
