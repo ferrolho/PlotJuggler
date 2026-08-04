@@ -97,7 +97,11 @@ class TopicStorage {
   /// Inline column layout (non-empty for schema_id==0 topics after the first writer is created).
   [[nodiscard]] const std::vector<ColumnDescriptor>& columnDescriptors() const noexcept;
 
-  /// Compute aggregated metadata for current retained chunks.
+  /// Aggregated metadata for current retained chunks. O(1) on the hot path: a
+  /// cached aggregate is merged incrementally on append and rebuilt lazily
+  /// (from per-chunk stats only — column buffers are never re-walked) after a
+  /// destructive mutation. Progressive loads call this per topic on every
+  /// ingest tick, so it must not scan chunk contents.
   [[nodiscard]] TopicMetadata metadata() const;
 
   /// Access topic descriptor.
@@ -150,12 +154,37 @@ class TopicStorage {
   // DataEngine::flushTo needs to move sealed_chunks_ between TopicStorage
   // instances of different engines without copying. Friending it lets the
   // transfer happen entirely inside DataEngine without exposing the move
-  // primitive on the public TopicStorage API.
+  // primitive on the public TopicStorage API. Every friend site that touches
+  // sealed_chunks_ directly MUST call invalidateChunkAggregate() on the
+  // storages it mutated.
   friend class DataEngine;
+
+  /// Drop the cached chunk aggregate; the next metadata()/timeMin()/timeMax()
+  /// rebuilds it from per-chunk stats. For mutations that bypass
+  /// appendSealedChunk (friend moves, eviction, clear).
+  void invalidateChunkAggregate() const noexcept {
+    chunk_agg_valid_ = false;
+  }
+
+  /// Rebuild the cached aggregate from per-chunk stats when invalid. Stats-only
+  /// scan — never walks column buffers (their encoded size is memoized in
+  /// ChunkStats::encoded_byte_size at append time).
+  void ensureChunkAggregate() const noexcept;
 
   TopicId topic_id_;
   TopicDescriptor descriptor_;
   std::deque<TopicChunk> sealed_chunks_;
+
+  // Cached aggregate over sealed_chunks_ (raw extrema — the retention-floor
+  // clamp is applied at read time, so a rising floor never invalidates it).
+  // Guarded by the engine lock like everything else here; mutable because the
+  // metadata read paths are const.
+  mutable bool chunk_agg_valid_ = false;
+  mutable Timestamp chunk_agg_t_min_ = 0;
+  mutable Timestamp chunk_agg_t_max_ = 0;
+  mutable uint64_t chunk_agg_row_count_ = 0;
+  mutable uint64_t chunk_agg_byte_size_ = 0;
+
   std::vector<ColumnDescriptor> column_descriptors_;  // for schema_id==0 topics
   uint32_t max_observed_array_length_ = 0;
   uint32_t truncated_sample_count_ = 0;

@@ -53,6 +53,11 @@ struct ChunkStats {
   Timestamp t_max = std::numeric_limits<Timestamp>::min();
   /// Number of rows in chunk.
   uint32_t row_count = 0;
+  /// Approximate encoded bytes of the sealed chunk (timestamps + column
+  /// buffers + validity bitmaps). Memoized by TopicStorage::appendSealedChunk
+  /// (0 until then) so metadata scans never re-walk column buffers; travels
+  /// with the chunk across flushTo/detach moves.
+  uint64_t encoded_byte_size = 0;
   /// Per-column statistics aligned to schema columns.
   std::vector<ColumnStats> column_stats;
 };

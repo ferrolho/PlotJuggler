@@ -460,6 +460,7 @@ void DataEngine::reattachDatasetChunks(DatasetId dataset_id, DatasetChunkSnapsho
       continue;  // defensive: a prior topic vanished (should not happen)
     }
     storage->sealed_chunks_ = std::move(topic_snapshot.chunks);
+    storage->invalidateChunkAggregate();
     storage->column_descriptors_ = std::move(topic_snapshot.column_descriptors);
     storage->retention_floor_ = topic_snapshot.retention_floor;
     storage->max_observed_array_length_ = topic_snapshot.max_observed_array_length;
@@ -536,11 +537,13 @@ void DataEngine::adoptChunksFrom(TopicStorage& dst, TopicStorage& src) {
   // Appends — callers that need replace semantics clear dst first.
   std::deque<TopicChunk> drained = std::move(src.sealed_chunks_);
   src.sealed_chunks_.clear();  // post-move state: deque is valid but empty.
+  src.invalidateChunkAggregate();
   const TopicId dst_id = dst.topicId();
   for (auto& chunk : drained) {
     chunk.topic_id = dst_id;
     dst.sealed_chunks_.push_back(std::move(chunk));
   }
+  dst.invalidateChunkAggregate();
 }
 
 Expected<DatasetReplaceResult> DataEngine::replaceDatasetFrom(

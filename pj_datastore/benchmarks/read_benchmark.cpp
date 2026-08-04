@@ -15,6 +15,7 @@
 #include "pj_datastore/chunk.hpp"
 #include "pj_datastore/column_buffer.hpp"
 #include "pj_datastore/query.hpp"
+#include "pj_datastore/topic_storage.hpp"
 
 namespace PJ {
 namespace {
@@ -507,6 +508,38 @@ void BM_Deque_ReadString(benchmark::State& state) {
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kPointCount);
 }
+
+// ---------------------------------------------------------------------------
+// TopicStorage::metadata() — the progressive-load hot call: the app reads it
+// for every visible topic on every ingest tick, so its cost across a growing
+// chunk deque is what this measures. Parameter = retained chunk count.
+// ---------------------------------------------------------------------------
+
+void BM_TopicMetadata(benchmark::State& state) {
+  const auto chunk_count = static_cast<std::size_t>(state.range(0));
+  TopicStorage storage(/*topic_id=*/1, TopicDescriptor{.name = "bench", .schema_id = 1});
+  std::vector<ColumnDescriptor> cols = {makeDescriptor(PrimitiveType::kFloat64, "value")};
+  for (std::size_t c = 0; c < chunk_count; ++c) {
+    TopicChunkBuilder builder(/*topic_id=*/1, /*schema_id=*/1, cols, kChunkSize);
+    for (uint32_t i = 0; i < kChunkSize; ++i) {
+      builder.beginRow(static_cast<Timestamp>(c * kChunkSize + i));
+      builder.set(0, static_cast<double>(i));
+      builder.finishRow();
+    }
+    if (!storage.appendSealedChunk(builder.seal())) {
+      state.SkipWithError("appendSealedChunk failed");
+      return;
+    }
+  }
+
+  for (auto _ : state) {
+    TopicMetadata meta = storage.metadata();
+    benchmark::DoNotOptimize(meta);
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+}
+
+BENCHMARK(BM_TopicMetadata)->Arg(100)->Arg(1000)->Arg(5000);
 
 BENCHMARK(BM_Deque_ReadFloat);
 BENCHMARK(BM_Deque_ReadInt64);

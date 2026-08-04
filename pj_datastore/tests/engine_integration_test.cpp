@@ -1729,5 +1729,102 @@ TEST(EngineIntegrationTest, LatestNumericAndStringAtAreNullAware) {
   EXPECT_FALSE(s_on_numeric->has_value());
 }
 
+// ===========================================================================
+// TopicMetadata aggregate coherence
+//
+// metadata() serves from a cached aggregate: merged incrementally on append,
+// rebuilt lazily after destructive mutations (evict/clear/friend moves). The
+// oracle: a detach+reattach roundtrip forces a from-scratch rebuild, so its
+// result must equal the incrementally-built one bit for bit — any divergence
+// between the two maintenance paths fails here.
+// ===========================================================================
+
+TEST(EngineIntegrationTest, TopicMetadataAggregateCoherence) {
+  DataEngine engine;
+  auto dataset_id_or = engine.createDataset(DatasetDescriptor{.source_name = "meta_coherence", .time_domain_id = 0});
+  ASSERT_TRUE(dataset_id_or.has_value()) << dataset_id_or.error();
+  const DatasetId dataset_id = *dataset_id_or;
+
+  DataWriter writer = engine.createWriter();
+  auto handle_or = writer.registerScalarSeries(dataset_id, "signal", NumericType::kFloat64);
+  ASSERT_TRUE(handle_or.has_value()) << handle_or.error();
+  const ScalarSeriesHandle handle = *handle_or;
+  DataReader reader = engine.createReader();
+
+  // Batch 1: 3000 in-order rows -> builds the aggregate on first read.
+  for (std::size_t i = 0; i < 3000; ++i) {
+    writer.appendScalar(handle, static_cast<Timestamp>(i) * 1000, static_cast<double>(i));
+  }
+  engine.commitChunks(writer.flushAll());
+  auto m1 = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(m1.has_value());
+  EXPECT_EQ(m1->total_row_count, 3000U);
+  EXPECT_EQ(m1->time_range_min, 0);
+  EXPECT_EQ(m1->time_range_max, 2999000);
+  EXPECT_GT(m1->total_byte_size, 0U);
+
+  // Batch 2: later rows PLUS an out-of-order older-than-min chunk. The
+  // incremental merge must widen both extrema and grow rows/bytes.
+  for (std::size_t i = 3000; i < 4000; ++i) {
+    writer.appendScalar(handle, static_cast<Timestamp>(i) * 1000, static_cast<double>(i));
+  }
+  writer.appendScalar(handle, -5000, 1.0);
+  engine.commitChunks(writer.flushAll());
+  auto m2 = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(m2.has_value());
+  EXPECT_EQ(m2->total_row_count, 4001U);
+  EXPECT_EQ(m2->time_range_min, -5000);
+  EXPECT_EQ(m2->time_range_max, 3999000);
+  EXPECT_GT(m2->total_byte_size, m1->total_byte_size);
+
+  // Oracle: detach forces empty, reattach forces a from-scratch rebuild that
+  // must reproduce the incrementally-maintained aggregate exactly.
+  auto snapshot = engine.detachDatasetChunks(dataset_id);
+  auto detached = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(detached.has_value());
+  EXPECT_EQ(detached->total_row_count, 0U);
+  EXPECT_EQ(detached->total_byte_size, 0U);
+  engine.reattachDatasetChunks(dataset_id, std::move(snapshot));
+  auto m3 = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(m3.has_value());
+  EXPECT_EQ(m3->total_row_count, m2->total_row_count);
+  EXPECT_EQ(m3->total_byte_size, m2->total_byte_size);
+  EXPECT_EQ(m3->time_range_min, m2->time_range_min);
+  EXPECT_EQ(m3->time_range_max, m2->time_range_max);
+
+  // Replacing reload runs the adoptChunksFrom friend path into the SAME
+  // topic id: a stale aggregate would still report the pre-replace 4001-row
+  // values here.
+  DataEngine staged;
+  auto staged_ds_or = staged.createDataset(DatasetDescriptor{.source_name = "meta_coherence", .time_domain_id = 0});
+  ASSERT_TRUE(staged_ds_or.has_value());
+  DataWriter staged_writer = staged.createWriter();
+  auto staged_handle_or = staged_writer.registerScalarSeries(*staged_ds_or, "signal", NumericType::kFloat64);
+  ASSERT_TRUE(staged_handle_or.has_value());
+  for (std::size_t i = 0; i < 3000; ++i) {
+    staged_writer.appendScalar(*staged_handle_or, static_cast<Timestamp>(i) * 1000, static_cast<double>(i));
+  }
+  staged.commitChunks(staged_writer.flushAll());
+  ASSERT_TRUE(engine.replaceDatasetFrom(staged, *staged_ds_or, dataset_id));
+  auto replaced = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(replaced.has_value());
+  EXPECT_EQ(replaced->total_row_count, 3000U);
+  EXPECT_EQ(replaced->time_range_min, 0);
+  EXPECT_EQ(replaced->time_range_max, 2999000);
+  EXPECT_GT(replaced->total_byte_size, 0U);
+  EXPECT_LT(replaced->total_byte_size, m2->total_byte_size);
+
+  // Retention eviction invalidates and rebuilds. Multiple chunks exist
+  // (3000 rows > max_chunk_rows), so a 500 ms window drops whole older
+  // chunks: rows/bytes shrink, the minimum rises to the cutoff.
+  engine.enforceRetention(500000, dataset_id);
+  auto evicted = reader.getMetadata(handle.topic_id);
+  ASSERT_TRUE(evicted.has_value());
+  EXPECT_LT(evicted->total_row_count, replaced->total_row_count);
+  EXPECT_LT(evicted->total_byte_size, replaced->total_byte_size);
+  EXPECT_GT(evicted->time_range_min, replaced->time_range_min);
+  EXPECT_EQ(evicted->time_range_max, replaced->time_range_max);
+}
+
 }  // namespace
 }  // namespace PJ

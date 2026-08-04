@@ -11,6 +11,42 @@
 
 #include "pj_base/expected.hpp"
 
+namespace {
+
+// Approximate encoded bytes of one sealed chunk: timestamp buffer + every
+// column's encoded payload + validity bitmaps. Walked ONCE per chunk (memoized
+// into ChunkStats::encoded_byte_size at append) — never on the metadata path.
+uint64_t encodedChunkByteSize(const PJ::TopicChunk& chunk) {
+  uint64_t bytes = chunk.timestamps.size() * sizeof(PJ::Timestamp);
+  for (const auto& col : chunk.columns) {
+    std::visit(
+        [&](const auto& v) {
+          using T = std::decay_t<decltype(v)>;
+          if constexpr (std::is_same_v<T, PJ::RawBuffer>) {
+            bytes += v.size();
+          } else if constexpr (std::is_same_v<T, PJ::encoding::DictionaryEncoded>) {
+            bytes += v.indices.size();
+            for (const auto& s : v.dictionary) {
+              bytes += s.size();
+            }
+          } else if constexpr (std::is_same_v<T, PJ::encoding::PackedBools>) {
+            bytes += v.bits.size();
+          } else if constexpr (std::is_same_v<T, PJ::encoding::ConstantEncoded>) {
+            bytes += v.value_size;
+          } else if constexpr (std::is_same_v<T, PJ::encoding::FrameOfReferenceEncoded>) {
+            bytes += v.offsets.size();
+          }
+        },
+        col.data);
+    if (col.validity_bitmap) {
+      bytes += col.validity_bitmap->sizeBytes();
+    }
+  }
+  return bytes;
+}
+
+}  // namespace
+
 namespace PJ {
 
 TopicStorage::TopicStorage(TopicId topic_id, TopicDescriptor descriptor)
@@ -21,6 +57,19 @@ PJ::Status TopicStorage::appendSealedChunk(TopicChunk chunk) {
   // out-of-order ingest means a chunk's time range may overlap earlier ones —
   // queries merge across overlapping chunks instead of assuming disjoint
   // ranges, so nothing is rejected (rejecting silently lost late data).
+  if (chunk.stats.encoded_byte_size == 0) {
+    chunk.stats.encoded_byte_size = encodedChunkByteSize(chunk);
+  }
+
+  // The append fast path folds the new chunk into the cached aggregate in
+  // O(1); extrema only widen, so no rescan is ever needed here.
+  if (chunk_agg_valid_) {
+    chunk_agg_t_min_ = std::min(chunk_agg_t_min_, chunk.stats.t_min);
+    chunk_agg_t_max_ = std::max(chunk_agg_t_max_, chunk.stats.t_max);
+    chunk_agg_row_count_ += chunk.stats.row_count;
+    chunk_agg_byte_size_ += chunk.stats.encoded_byte_size;
+  }
+
   sealed_chunks_.push_back(std::move(chunk));
   return PJ::okStatus();
 }
@@ -35,6 +84,7 @@ void TopicStorage::evictBefore(Timestamp t_keep_min) {
 
   if (end_to_remove > 0) {
     sealed_chunks_.erase(sealed_chunks_.begin(), sealed_chunks_.begin() + static_cast<std::ptrdiff_t>(end_to_remove));
+    invalidateChunkAggregate();
   }
 
   // Raise the logical retention floor to the requested cutoff. Whole-chunk
@@ -42,13 +92,37 @@ void TopicStorage::evictBefore(Timestamp t_keep_min) {
   // straddling the cutoff stays, but the floor makes its sub-cutoff rows
   // invisible to every read path (timeMin/metadata clamp; readers clamp their
   // lower bound). The floor only rises, so a smaller later cutoff is a no-op.
+  // The aggregate stores RAW extrema and the clamp happens at read time, so a
+  // floor-only change needs no invalidation.
   retention_floor_ = std::max(retention_floor_, t_keep_min);
 }
 
 void TopicStorage::clearChunks() noexcept {
   sealed_chunks_.clear();
+  invalidateChunkAggregate();
   // A full replace/reload retains no data, so it must carry no stale floor.
   retention_floor_ = kNoRetentionFloor;
+}
+
+void TopicStorage::ensureChunkAggregate() const noexcept {
+  if (chunk_agg_valid_) {
+    return;
+  }
+  chunk_agg_t_min_ = 0;
+  chunk_agg_t_max_ = 0;
+  chunk_agg_row_count_ = 0;
+  chunk_agg_byte_size_ = 0;
+  if (!sealed_chunks_.empty()) {
+    chunk_agg_t_min_ = sealed_chunks_.front().stats.t_min;
+    chunk_agg_t_max_ = sealed_chunks_.back().stats.t_max;
+    for (const auto& chunk : sealed_chunks_) {
+      chunk_agg_t_min_ = std::min(chunk_agg_t_min_, chunk.stats.t_min);
+      chunk_agg_t_max_ = std::max(chunk_agg_t_max_, chunk.stats.t_max);
+      chunk_agg_row_count_ += chunk.stats.row_count;
+      chunk_agg_byte_size_ += chunk.stats.encoded_byte_size;
+    }
+  }
+  chunk_agg_valid_ = true;
 }
 
 void TopicStorage::setColumnDescriptors(std::vector<ColumnDescriptor> descs) noexcept {
@@ -77,43 +151,11 @@ TopicMetadata TopicStorage::metadata() const {
     return meta;
   }
 
-  // Chunk ranges may overlap (out-of-order ingest), so the topic extrema are
-  // scanned, not taken from the first/last chunk.
-  meta.time_range_min = sealed_chunks_.front().stats.t_min;
-  meta.time_range_max = sealed_chunks_.back().stats.t_max;
-
-  for (const auto& chunk : sealed_chunks_) {
-    meta.time_range_min = std::min(meta.time_range_min, chunk.stats.t_min);
-    meta.time_range_max = std::max(meta.time_range_max, chunk.stats.t_max);
-    meta.total_row_count += chunk.stats.row_count;
-
-    // Approximate byte size: sum encoded timestamp buffer + all encoded column buffers
-    meta.total_byte_size += chunk.timestamps.size() * sizeof(Timestamp);
-    for (const auto& col : chunk.columns) {
-      std::visit(
-          [&](const auto& v) {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, RawBuffer>) {
-              meta.total_byte_size += v.size();
-            } else if constexpr (std::is_same_v<T, encoding::DictionaryEncoded>) {
-              meta.total_byte_size += v.indices.size();
-              for (const auto& s : v.dictionary) {
-                meta.total_byte_size += s.size();
-              }
-            } else if constexpr (std::is_same_v<T, encoding::PackedBools>) {
-              meta.total_byte_size += v.bits.size();
-            } else if constexpr (std::is_same_v<T, encoding::ConstantEncoded>) {
-              meta.total_byte_size += v.value_size;
-            } else if constexpr (std::is_same_v<T, encoding::FrameOfReferenceEncoded>) {
-              meta.total_byte_size += v.offsets.size();
-            }
-          },
-          col.data);
-      if (col.validity_bitmap) {
-        meta.total_byte_size += col.validity_bitmap->sizeBytes();
-      }
-    }
-  }
+  ensureChunkAggregate();
+  meta.time_range_min = chunk_agg_t_min_;
+  meta.time_range_max = chunk_agg_t_max_;
+  meta.total_row_count = chunk_agg_row_count_;
+  meta.total_byte_size = chunk_agg_byte_size_;
 
   // Clamp the reported minimum up to the retention floor: a straddling chunk's
   // sub-floor rows are logically evicted, so the catalog/axis must not see them.
@@ -138,26 +180,18 @@ Timestamp TopicStorage::timeMin() const noexcept {
   if (sealed_chunks_.empty()) {
     return 0;
   }
-  // Scan: chunk ranges may overlap under out-of-order ingest.
-  Timestamp t_min = sealed_chunks_.front().stats.t_min;
-  for (const auto& chunk : sealed_chunks_) {
-    t_min = std::min(t_min, chunk.stats.t_min);
-  }
+  ensureChunkAggregate();
   // Clamp up to the retention floor: rows below it are logically evicted even
   // when a straddling chunk still physically holds them.
-  return std::max(t_min, retention_floor_);
+  return std::max(chunk_agg_t_min_, retention_floor_);
 }
 
 Timestamp TopicStorage::timeMax() const noexcept {
   if (sealed_chunks_.empty()) {
     return 0;
   }
-  // Scan: chunk ranges may overlap under out-of-order ingest.
-  Timestamp t_max = sealed_chunks_.back().stats.t_max;
-  for (const auto& chunk : sealed_chunks_) {
-    t_max = std::max(t_max, chunk.stats.t_max);
-  }
-  return t_max;
+  ensureChunkAggregate();
+  return chunk_agg_t_max_;
 }
 
 Timestamp TopicStorage::retentionFloor() const noexcept {
