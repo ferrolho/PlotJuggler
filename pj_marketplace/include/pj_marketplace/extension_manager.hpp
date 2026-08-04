@@ -136,6 +136,18 @@ class ExtensionManager : public QObject {
   // on-disk flag; the version enables the "downgrade to bundled" affordance.
   void setBundledVersions(const QMap<QString, QString>& id_to_version);
 
+  // Sets id -> version for the copies the startup seed actually WROTE into the
+  // managed dir this session, so installedVersion() can report them: the scan
+  // snapshot predates the write and cannot be refreshed into agreement (see
+  // installedVersion). Distinct from setBundledVersions(), which names every
+  // shipped plugin whether or not the seed touched it.
+  //
+  // Only ids whose payload was promoted successfully belong here — an id the
+  // seed skipped or failed to write must keep reporting what the scan found.
+  // Unlike the bundled set this is not policy but a statement of fact about the
+  // managed dir, so the host reports it in every mode.
+  void setSeededVersions(const QMap<QString, QString>& id_to_version);
+
   // Returns true when `id` ships with the application ("core"). A core extension
   // at its bundled version cannot be uninstalled (uninstall() refuses it, the UI
   // disables the action); a core extension updated ABOVE its bundled version can
@@ -182,20 +194,23 @@ class ExtensionManager : public QObject {
   // `installedExtensions()[id].version` directly — the scan snapshot can be
   // stale in a specific window that this helper compensates for.
   //
-  // The window: the startup seed refreshes a core plugin whose bundled copy is
-  // newer, but it has to read the installed version first to make that call —
-  // and that read opens the DSO. glibc then answers every later dlopen of the
-  // same path from that first-loaded image (plugin DSOs export STB_GNU_UNIQUE
+  // The window: the startup seed writes a core plugin's managed copy, but it has
+  // to read the installed version first to decide whether to write at all — and
+  // that read opens the DSO. glibc then answers every later dlopen of the same
+  // path from that first-loaded image (plugin DSOs export STB_GNU_UNIQUE
   // symbols, so dlclose never unloads them), so no rescan in this process can
-  // observe the version the seed just promoted; only a restart can. Since the
-  // seed guarantees the managed dir never ends up older than the bundled set,
-  // the higher of the two (scanned, bundled) is the truth.
+  // observe what the seed promoted; only a restart can.
   //
-  // The bundled versions are supplied by the host at seed time via
-  // setBundledVersions() — that is where the write side lives.
+  // Which is why the seed reports what it wrote, via setSeededVersions(), and
+  // this returns that value verbatim for the ids it names. Inferring it from the
+  // bundled set instead would break on the seed's own downgrade case: restoring
+  // an incompatible installed copy leaves the managed dir BELOW the version the
+  // scan reported, so no rule over (scanned, bundled) can name it.
   //
-  // Empty when `id` is not installed. Falls back to the scanned version alone
-  // when no bundled set was provided (standalone app / --plugin-dir run).
+  // Empty when `id` is not installed. An id the seed did not write falls through
+  // to the scanned version, which is then authoritative — that covers a
+  // marketplace copy the seed deliberately left alone, and every id in a
+  // standalone-app or --plugin-dir run.
   QString installedVersion(const QString& id) const;
 
   // Returns true when the installed version is newer than the registry version.
@@ -326,6 +341,11 @@ class ExtensionManager : public QObject {
   // the host via setBundledVersions(). Membership locks uninstall (isBundled); the
   // version drives the downgrade-to-bundled affordance. Empty by default.
   QMap<QString, QString> bundled_versions_;
+
+  // id -> version the startup seed wrote into the managed dir this session, set by
+  // the host via setSeededVersions(). installedVersion() answers from here first,
+  // because the scan snapshot predates the write. Empty by default.
+  QMap<QString, QString> seeded_versions_;
 
   // Non-empty while a fetch is running; guards against concurrent install() calls.
   QString pending_id_;

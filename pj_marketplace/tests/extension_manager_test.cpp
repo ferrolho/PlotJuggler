@@ -949,6 +949,33 @@ TEST_F(ExtensionManagerTest, HasUpdateReturnsTrueForNewerVersion) {
   EXPECT_TRUE(mgr_->hasUpdate(ext_v2));
 }
 
+// installedVersion() answers from what the startup seed reported writing, not
+// from the scan snapshot, because the snapshot predates that write and the
+// process cannot re-read it (glibc serves a second dlopen of the same path from
+// the first-loaded image).
+//
+// The discriminating case is the seed's restore of an incompatible copy: it
+// leaves the managed dir BELOW the scanned version, so a rule that only ever
+// moved the answer upwards would keep reporting the version it just replaced.
+TEST_F(ExtensionManagerTest, SeededVersionOverridesTheScanSnapshotDownwards) {
+  server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
+  const Extension ext_v2 = makeExtension("mock-data-source", "2.0.0", server_.url());
+
+  QSignalSpy spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext_v2);
+  ASSERT_TRUE(waitForSignal(spy));
+  ASSERT_EQ(mgr_->installedVersion("mock-data-source"), "2.0.0") << "the scan sees what was installed";
+
+  // The host restored the bundled 1.0.0 over that incompatible 2.0.0.
+  mgr_->setBundledVersions({{"mock-data-source", "1.0.0"}});
+  mgr_->setSeededVersions({{"mock-data-source", "1.0.0"}});
+
+  EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "1.0.0");
+  Extension registry_v2 = ext_v2;
+  EXPECT_TRUE(mgr_->hasUpdate(registry_v2)) << "1.0.0 on disk against a 2.0.0 registry is an update again";
+  EXPECT_FALSE(mgr_->hasNewerInstalledVersion(registry_v2)) << "the restored copy is not newer than the registry";
+}
+
 // QVersionNumber must compare versions numerically, not lexically:
 // "10.0.0" > "2.0.0" — a raw string compare would invert this result.
 TEST_F(ExtensionManagerTest, HasUpdateHandlesMultiSegmentVersionsCorrectly) {
@@ -999,11 +1026,11 @@ TEST_F(ExtensionManagerTest, InstalledVersionFallsBackToScannedWithNoBundledSet)
   EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "1.0.0");
 }
 
-// The seed-refresh case: bundled_versions_ carries a higher version than the
-// scanner observed because the scanner's dlopen was poisoned by NODELETE.
-// installedVersion() has to report the bundled version — it is what is really
-// on disk after the seed's promote.
-TEST_F(ExtensionManagerTest, InstalledVersionReportsBundledWhenNewerThanScanned) {
+// The seed-refresh case: the scanner still sees the pre-seed version because its
+// dlopen was poisoned by NODELETE, and the seed reports the version it promoted.
+// installedVersion() has to report the promoted one — it is what is really on
+// disk.
+TEST_F(ExtensionManagerTest, InstalledVersionReportsSeededWhenNewerThanScanned) {
   server_.setBody(dummyPluginZip("mock-data-source", "1.0.0"));
   const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
 
@@ -1011,9 +1038,10 @@ TEST_F(ExtensionManagerTest, InstalledVersionReportsBundledWhenNewerThanScanned)
   mgr_->install(ext);
   ASSERT_TRUE(waitForSignal(spy));
 
-  QMap<QString, QString> bundled;
-  bundled.insert("mock-data-source", "2.0.0");
-  mgr_->setBundledVersions(bundled);
+  QMap<QString, QString> promoted;
+  promoted.insert("mock-data-source", "2.0.0");
+  mgr_->setBundledVersions(promoted);
+  mgr_->setSeededVersions(promoted);
 
   EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "2.0.0");
 }
@@ -1039,7 +1067,7 @@ TEST_F(ExtensionManagerTest, InstalledVersionKeepsScannedWhenBundledIsOlder) {
 // The consequence that motivates the whole change: hasUpdate stops offering an
 // update when bundled >= registry, even if the scanner still sees the pre-seed
 // version.
-TEST_F(ExtensionManagerTest, HasUpdateIsFalseWhenBundledMatchesRegistry) {
+TEST_F(ExtensionManagerTest, HasUpdateIsFalseWhenTheSeededVersionMatchesTheRegistry) {
   server_.setBody(dummyPluginZip("mock-data-source", "1.0.0"));
   const Extension registry_v2 = makeExtension("mock-data-source", "2.0.0", server_.url());
 
@@ -1047,9 +1075,10 @@ TEST_F(ExtensionManagerTest, HasUpdateIsFalseWhenBundledMatchesRegistry) {
   mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
   ASSERT_TRUE(waitForSignal(spy));
 
-  QMap<QString, QString> bundled;
-  bundled.insert("mock-data-source", "2.0.0");
-  mgr_->setBundledVersions(bundled);
+  QMap<QString, QString> promoted;
+  promoted.insert("mock-data-source", "2.0.0");
+  mgr_->setBundledVersions(promoted);
+  mgr_->setSeededVersions(promoted);
 
   EXPECT_FALSE(mgr_->hasUpdate(registry_v2));
 }

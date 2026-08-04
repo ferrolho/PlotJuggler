@@ -978,6 +978,10 @@ void ExtensionManager::setBundledVersions(const QMap<QString, QString>& id_to_ve
   bundled_versions_ = id_to_version;
 }
 
+void ExtensionManager::setSeededVersions(const QMap<QString, QString>& id_to_version) {
+  seeded_versions_ = id_to_version;
+}
+
 bool ExtensionManager::isBundled(const QString& id) const {
   // "Core" = the id ships with the application. The host computes the bundled
   // id -> version map from the bundled plugin directory and hands it in via
@@ -1012,12 +1016,16 @@ QString ExtensionManager::installedVersion(const QString& id) const {
   if (it == installed_.constEnd()) {
     return {};
   }
-  const QString& scanned = it->version;
-  const QString bundled = bundledVersion(id);
-  if (bundled.isEmpty()) {
-    return scanned;
+  // What the seed wrote wins outright over what the scan saw, in both directions:
+  // it is the later fact about the same directory, and the scan cannot be redone
+  // (see the header). A restore to the bundled build lands BELOW the scanned
+  // version, so anything that only ever moved the answer upwards would keep
+  // reporting the incompatible copy it just replaced.
+  const auto seeded = seeded_versions_.constFind(id);
+  if (seeded != seeded_versions_.constEnd() && !seeded->isEmpty()) {
+    return *seeded;
   }
-  return compareSemver(bundled.toStdString(), scanned.toStdString()) > 0 ? bundled : scanned;
+  return it->version;
 }
 
 bool ExtensionManager::hasNewerInstalledVersion(const Extension& ext) const {

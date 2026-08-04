@@ -165,6 +165,30 @@ TEST_F(ExtensionCatalogSeedTest, OverrideModeSeedsMarketplaceDirWithoutCoreLock)
   EXPECT_FALSE(service->extensionManager().isBundled(QString::fromUtf8(kMockId)));
 }
 
+// What the seed wrote is reported to the marketplace in EVERY mode, unlike the
+// bundled id -> version map, which stays scoped to default mode. The marketplace
+// reads the managed dir, and the seed writes that dir whether or not
+// --plugin-dir reorders the load hierarchy.
+//
+// This is the case no rule over (scanned, bundled) can satisfy: the core map is
+// empty here, and the scan snapshot was taken before the refresh, so the seed's
+// own report is the only thing that can name the version now on disk.
+TEST_F(ExtensionCatalogSeedTest, OverrideModeReportsTheSeededVersionToTheMarketplace) {
+  placePlugin(seededDir(), PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("old_v1"));     // installed 1.0.0
+  placePlugin(bundled_.path(), PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH, pluginFileName("ds"));  // bundled 2.0.0
+
+  const auto service = makeOverrideModeService();
+  const QString id = QString::fromUtf8(kMockId);
+
+  const LoadedDataSource* mock = findMock(*service);
+  ASSERT_NE(mock, nullptr);
+  ASSERT_EQ(mock->version, "2.0.0") << "precondition: the seed refreshed the managed copy";
+  ASSERT_TRUE(service->extensionManager().bundledVersion(id).isEmpty())
+      << "precondition: the core map is default-mode only, so there is nothing to infer from";
+
+  EXPECT_EQ(service->extensionManager().installedVersion(id), "2.0.0");
+}
+
 TEST_F(ExtensionCatalogSeedTest, OverrideDirOutranksNewerMarketplaceCopy) {
   placePlugin(override_.path(), PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("ds"));    // override 1.0.0
   placePlugin(bundled_.path(), PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH, pluginFileName("ds"));  // seeds 2.0.0

@@ -362,6 +362,12 @@ void ExtensionCatalogService::seedBundledPlugins() {
 
   // Every bundled id -> version, whether or not it gets copied this run.
   QMap<QString, QString> bundled_versions;
+  // Only the ids whose payload this run actually promoted, mapped to the version
+  // now on disk. The marketplace cannot re-read them: reading an installed
+  // version above opens its DSO, and glibc serves every later dlopen of that path
+  // from the first-loaded image, so the scan snapshot is frozen at the pre-seed
+  // version for the rest of the process.
+  QMap<QString, QString> seeded_versions;
   // Set when a failed promote could not restore the old copy: the stage dir
   // then holds the only surviving payload and must not be deleted below.
   bool stage_has_orphans = false;
@@ -473,6 +479,8 @@ void ExtensionCatalogService::seedBundledPlugins() {
       std::filesystem::last_write_time(installed_dso, bundled_mtime, stamp_ec);
     }
 
+    seeded_versions.insert(id, QString::fromStdString(descriptor.version));
+
     if (installed) {
       if (rescue_incompat) {
         const QString message = u"Restored bundled plugin \"%1\" %2 — installed %3 was incompatible: %4"_s.arg(
@@ -494,6 +502,12 @@ void ExtensionCatalogService::seedBundledPlugins() {
     std::error_code stage_cleanup_ec;
     std::filesystem::remove_all(stage_root, stage_cleanup_ec);
   }
+
+  // What this run wrote into the managed dir. Reported in every mode, unlike the
+  // bundled map below: it is not a policy about which plugins are core but a fact
+  // about a directory the marketplace also reads, and the seed writes that
+  // directory whether or not a --plugin-dir override reorders the load hierarchy.
+  extension_manager_->setSeededVersions(seeded_versions);
 
   // The bundled map powers the marketplace "core plugin" policy: uninstall lock
   // (isBundled) + downgrade-to-bundled. Scoped to default mode — in a
