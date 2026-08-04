@@ -53,6 +53,24 @@ if [ -s "${WORK}/ldd_missing.txt" ]; then
 fi
 echo "OK: every shipped ELF resolves"
 
+# The retro helper is launched as a child process and inherits the wrapper's
+# LD_LIBRARY_PATH, but it is packaged to stand on its own RUNPATH — so inspect
+# it with none set. The gate above skips it (neither a *.so* nor
+# bin/plotjuggler4). Absent from a package built without --retro-wad, hence the
+# presence test rather than a hard requirement; release CI asserts it shipped.
+RETRO=/opt/plotjuggler4/bin/thirdparty/retro
+if [ -d "${RETRO}" ]; then
+  echo "--- retro payload ---"
+  for f in pj-raster-helper base.wad COPYING SOURCE-OFFER.txt SHAREWARE-LICENSE.txt README.md; do
+    test -f "${RETRO}/${f}" || { echo "FAIL: ${RETRO}/${f} missing"; exit 1; }
+  done
+  if ldd "${RETRO}/pj-raster-helper" | grep "not found"; then
+    echo "FAIL: pj-raster-helper does not resolve without LD_LIBRARY_PATH"
+    exit 1
+  fi
+  echo "OK: helper, data and licenses present; helper resolves standalone"
+fi
+
 # Display-free by design: main() short-circuits this before any QApplication
 # exists, so it also proves the wrapper's PYTHONHOME reaches the bundled stdlib.
 echo "--- selftest-python ---"

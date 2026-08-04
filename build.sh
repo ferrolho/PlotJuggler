@@ -34,9 +34,12 @@ fi
 
 # Release/packaging pipelines export these to skip building the test suite
 # and the scene3D dev demos (neither ships, and no release flow runs ctest).
+# PJ_BUILD_RASTER_HELPER goes the other way: the Linux release turns the
+# standalone GPLv2 helper ON so appimage/build_appimage.sh can stage it.
 PJ_FLAG_ARGS=()
 [[ -n "${PJ_BUILD_TESTS:-}" ]] && PJ_FLAG_ARGS+=("-DPJ_BUILD_TESTS=${PJ_BUILD_TESTS}")
 [[ -n "${PJ_BUILD_DEMOS:-}" ]] && PJ_FLAG_ARGS+=("-DPJ_BUILD_DEMOS=${PJ_BUILD_DEMOS}")
+[[ -n "${PJ_BUILD_RASTER_HELPER:-}" ]] && PJ_FLAG_ARGS+=("-DPJ_BUILD_RASTER_HELPER=${PJ_BUILD_RASTER_HELPER}")
 
 # CI can opt into PlotJuggler's authenticated Artifactory remote while local
 # builds and untrusted pull requests remain reproducible against ConanCenter.

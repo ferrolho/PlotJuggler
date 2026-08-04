@@ -35,6 +35,11 @@
 # extensions dir (copying new ids, refreshing ones whose bundled version is
 # newer) and loads everything from there, so marketplace installs/uninstalls
 # work normally and the read-only bundle stays a seed source.
+#
+# --retro-wad <path> bundles the standalone GPLv2 pj-raster-helper (build it
+# with `PJ_BUILD_RASTER_HELPER=ON ./build.sh`) together with <path> as its game
+# data and the license texts from thirdparty/retro/. Omit it and no retro
+# payload ships.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,10 +101,11 @@ BUNDLE_IDS=(
 PLUGINS_MODE="none"        # none | local | registry
 PLUGINS_LOCAL_DIR=""
 COMMIT_HASH=""
+RETRO_WAD=""
 
-usage() {
-  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
+# Prints the header comment block, stopping at the first line of real code, so
+# it cannot drift out of sync with a fixed line range.
+usage() { awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -117,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --commit-hash)
       COMMIT_HASH="${2:?--commit-hash needs a value}"; shift 2 ;;
+    --retro-wad)
+      # Canonicalized now for the same reason --plugins-dir is: step 1 cd's into
+      # appimage/ before this value is read.
+      RETRO_WAD="$(realpath -m -- "${2:?--retro-wad needs a path}")"; shift 2 ;;
     -h | --help)
       usage; exit 0 ;;
     *)
@@ -301,6 +311,53 @@ if [[ -f "${PY_HOME_FILE}" ]]; then
   fi
 else
   echo "WARNING: ${PY_HOME_FILE} missing — cannot bundle Python stdlib (Python Data Processors will fail)" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 5c. Retro payload (only with --retro-wad): the standalone GPLv2
+#     pj-raster-helper, its game data, and the license texts that must travel
+#     with them. PlotJuggler links none of it — the helper is launched as a
+#     child process, so it ships as plain files under the app binary's own
+#     directory, which is where MainWindow::openEmbeddedConsole looks
+#     (applicationDirPath()/thirdparty/retro/). Landing it under usr/bin also
+#     means deb/build_deb.sh, which copies usr/bin wholesale, inherits it.
+#
+#     Staged AFTER linuxdeploy for the same reason plugins are: the helper's
+#     entire dependency closure (Qt Core + Network) is already deployed for the
+#     app, so there is nothing for linuxdeploy to add by walking it again.
+# ---------------------------------------------------------------------------
+if [[ -n "${RETRO_WAD}" ]]; then
+  RETRO_HELPER="${BUILD}/raster_helper/pj-raster-helper"
+  [[ -x "${RETRO_HELPER}" ]] || { echo "ERROR: ${RETRO_HELPER} missing — rebuild with PJ_BUILD_RASTER_HELPER=ON ./build.sh"; exit 1; }
+  [[ -f "${RETRO_WAD}" ]]    || { echo "ERROR: --retro-wad '${RETRO_WAD}' is not a file"; exit 1; }
+
+  RETRO_DIR="${APPDIR}/usr/bin/thirdparty/retro"
+  mkdir -p "${RETRO_DIR}"
+  install -m 0755 "${RETRO_HELPER}" "${RETRO_DIR}/pj-raster-helper"
+  install -m 0644 "${RETRO_WAD}" "${RETRO_DIR}/base.wad"
+  # GPLv2 section 3 (written offer) and the shareware terms are conditions of
+  # shipping these two files at all. Only the trigger is hidden; the licenses
+  # are not — see thirdparty/retro/README.md.
+  install -m 0644 "${ROOT}/thirdparty/retro/COPYING" \
+                  "${ROOT}/thirdparty/retro/SOURCE-OFFER.txt" \
+                  "${ROOT}/thirdparty/retro/SHAREWARE-LICENSE.txt" \
+                  "${ROOT}/thirdparty/retro/README.md" \
+                  "${RETRO_DIR}/"
+  # The build-tree binary points at this host's Qt and Conan trees. Repoint it
+  # at the deployed closure so it resolves Qt on its own; the launcher's
+  # LD_LIBRARY_PATH (which the child inherits) then stops being the only thing
+  # keeping it alive.
+  if command -v patchelf >/dev/null; then
+    patchelf --set-rpath '$ORIGIN/../../../lib' "${RETRO_DIR}/pj-raster-helper"
+  else
+    echo "WARNING: patchelf not found — pj-raster-helper keeps its build-tree RUNPATH" >&2
+  fi
+  # linuxdeploy strips everything it deploys; match it rather than shipping
+  # debug info for a payload nobody debugs from a release build.
+  if command -v strip >/dev/null; then
+    strip "${RETRO_DIR}/pj-raster-helper"
+  fi
+  echo "Retro: staged pj-raster-helper + $(basename "${RETRO_WAD}") -> usr/bin/thirdparty/retro"
 fi
 
 if [[ -n "${COMMIT_HASH}" ]]; then

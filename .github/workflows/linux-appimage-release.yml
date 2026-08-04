@@ -18,6 +18,10 @@ name: Release Linux packages
 #     resolved by appimage/build_appimage.sh --plugins-registry: every curated
 #     id (BUNDLE_IDS) must resolve, download, and pass its checksum or the
 #     release fails — nothing is compiled locally or skipped best-effort.
+#   * The retro payload (the standalone GPLv2 pj-raster-helper, its shareware
+#     data and the license texts) is compiled and staged HERE only:
+#     PJ_BUILD_RASTER_HELPER is off in every other build, so no other job
+#     compiles the GPL engine. Both artifacts carry it.
 #   * The .deb repackages the SAME build/AppDir the AppImage was made from, so
 #     it costs one relink (for the PJ_INSTALLATION=deb stamp) plus dpkg-deb.
 #     Unlike the AppImage it is gated on the smoke job, which installs it in
@@ -70,6 +74,10 @@ jobs:
         -v /opt:/host/opt
     env:
       APPIMAGE_EXTRACT_AND_RUN: "1"   # linuxdeploy/appimagetool without FUSE
+      # id Software's shareware DOOM1.WAD as shipped by Ubuntu's
+      # doom-wad-shareware. Checked when it is staged and again inside the
+      # finished AppImage.
+      PJ_RETRO_WAD_SHA256: "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771"
     steps:
       - name: Free host disk (from inside the container)
         shell: bash
@@ -211,16 +219,37 @@ jobs:
                     "appimage/${tool}-${PJ_APPIMAGE_ARCH}.AppImage"
           done
 
+      - name: Stage the retro payload's game data
+        # The shareware WAD the pj-raster-helper renders is not in this repo.
+        # Ubuntu multiverse's doom-wad-shareware carries id Software's freely
+        # redistributable DOOM1.WAD (see thirdparty/retro/SHAREWARE-LICENSE.txt);
+        # the container already has multiverse enabled, it just has no apt
+        # lists. The sha256 is pinned so a repackaged or mirror-swapped WAD
+        # fails the release instead of silently changing what ships — jammy's
+        # 1.9.fixed-4 and later revisions carry byte-identical data.
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends doom-wad-shareware
+          wad=/usr/share/games/doom/doom1.wad
+          echo "${PJ_RETRO_WAD_SHA256}  ${wad}" | sha256sum -c -
+          echo "PJ_RETRO_WAD=${wad}" >> "$GITHUB_ENV"
+
       - name: Build app and package the AppImage (registry plugins)
         # The app compiles in the jammy container (glibc 2.35 floor); the
         # curated plugin set is downloaded from pj-plugin-registry and
         # checksum-verified by build_appimage.sh --plugins-registry.
         # Tests and demos never ship and no release flow runs ctest; skipping
         # them drops ~271 uncacheable test links and ~17 GB of build tree.
+        # PJ_BUILD_RASTER_HELPER is the release's opt-in to the standalone
+        # GPLv2 helper (off everywhere else, incl. linux-ci); --retro-wad then
+        # stages it, its data and its licenses into the AppDir.
         id: package_appimage
         env:
           PJ_BUILD_TESTS: "OFF"
           PJ_BUILD_DEMOS: "OFF"
+          PJ_BUILD_RASTER_HELPER: "ON"
           PJ_INSTALLATION: "appimage"
         shell: bash
         run: |
@@ -231,9 +260,10 @@ jobs:
           # installer's -CleanReleaseName; dispatch builds need the hash so
           # otherwise-identical-looking artifacts stay distinguishable.
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            bash appimage/build_appimage.sh --plugins-registry
+            bash appimage/build_appimage.sh --plugins-registry --retro-wad "${PJ_RETRO_WAD}"
           else
-            bash appimage/build_appimage.sh --plugins-registry --commit-hash "${GITHUB_SHA:0:8}"
+            bash appimage/build_appimage.sh --plugins-registry --retro-wad "${PJ_RETRO_WAD}" \
+                                            --commit-hash "${GITHUB_SHA:0:8}"
           fi
           appimage_path="$(ls -1 appimage/PlotJuggler-*.AppImage | head -n 1)"
           if [[ -z "$appimage_path" ]]; then
@@ -254,6 +284,28 @@ jobs:
         # before QApplication exists (see pj_app/src/main.cpp).
         shell: bash
         run: '"${APPIMAGE}" --selftest-python'
+
+      - name: Verify the retro payload shipped
+        # The payload is opt-in at three independent points (the CMake option,
+        # the WAD staging, --retro-wad), so assert on the finished artifact
+        # instead of trusting that all three lined up. Extracting again rather
+        # than reusing the audit's tree keeps peak disk at one extraction.
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          cp "${APPIMAGE}" "${workdir}/app.AppImage"
+          ( cd "${workdir}" && ./app.AppImage --appimage-extract >/dev/null )
+          retro="${workdir}/squashfs-root/usr/bin/thirdparty/retro"
+          # The three license texts are a condition of shipping the other two
+          # files at all, so their absence fails the release like a missing binary.
+          for f in pj-raster-helper base.wad COPYING SOURCE-OFFER.txt SHAREWARE-LICENSE.txt README.md; do
+            [[ -f "${retro}/${f}" ]] || { echo "::error::retro payload is missing ${f}"; exit 1; }
+          done
+          [[ -x "${retro}/pj-raster-helper" ]] || { echo "::error::pj-raster-helper is not executable"; exit 1; }
+          echo "${PJ_RETRO_WAD_SHA256}  ${retro}/base.wad" | sha256sum -c -
+          echo "retro payload OK"
 
       - name: Trim Conan cache before saving
         if: always() && github.ref_type != 'tag' && steps.conan-cache.outputs.cache-hit != 'true'
@@ -346,6 +398,9 @@ jobs:
         env:
           PJ_BUILD_TESTS: "OFF"
           PJ_BUILD_DEMOS: "OFF"
+          # Kept ON so the reconfigure does not drop the helper target from the
+          # build tree; the .deb's own copy comes from the AppDir either way.
+          PJ_BUILD_RASTER_HELPER: "ON"
           PJ_INSTALLATION: "deb"
         shell: bash
         run: ./build.sh

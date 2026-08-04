@@ -25,6 +25,7 @@ appimage/build_appimage.sh                       # app-only AppImage
 appimage/build_appimage.sh --plugins-dir <path>  # bundle a local plugin folder
 appimage/build_appimage.sh --plugins-registry    # bundle the official set (CI default)
 appimage/build_appimage.sh --commit-hash <hash>  # append .<hash> to the filename
+appimage/build_appimage.sh --retro-wad <path>    # bundle the retro payload (CI default)
 ```
 
 Output lands at `appimage/PlotJuggler-<version>-<arch>.AppImage`, or
@@ -89,6 +90,30 @@ own platform plugins that `linuxdeploy-plugin-qt` deploys there. `AppRun.sh`
 does **not** pass `--plugin-dir`; that flag stays a user-facing option,
 forwarded verbatim if the user supplies one.
 
+## Retro payload (`--retro-wad <path>`)
+
+`thirdparty/retro/` inside the bundle holds an **independent, separately
+licensed** program that PlotJuggler launches as a child process and links none
+of: the GPLv2 `pj-raster-helper` (built from the vendored `doomgeneric`), its
+game data as `base.wad`, and the license texts that must travel with them
+(`COPYING`, `SOURCE-OFFER.txt`, `SHAREWARE-LICENSE.txt`, `README.md`). Only the
+in-app trigger is hidden — the licenses are not.
+
+It sits next to the app binary (`usr/bin/thirdparty/retro/`) because that is
+where `MainWindow::openEmbeddedConsole` looks (`applicationDirPath()`), which
+also means `deb/build_deb.sh` — which copies `usr/bin` wholesale — inherits it.
+
+Two independent opt-ins, and the WAD is not in this repo:
+
+```bash
+PJ_BUILD_RASTER_HELPER=ON ./build.sh              # compile the helper
+appimage/build_appimage.sh --retro-wad /usr/share/games/doom/doom1.wad
+```
+
+Release CI installs Ubuntu multiverse's `doom-wad-shareware` for that file,
+pins its `sha256`, and re-checks it inside the finished AppImage. Omit the flag
+and no retro payload ships.
+
 ## Build & verify in Docker
 
 `appimage/build_in_docker.sh` builds the AppImage in the fully-baked builder
@@ -125,7 +150,8 @@ runs in host-side `*-appimage-docker/` directories, so rebuilds are incremental.
 
 `.github/workflows/linux-appimage-release.yml` (the release build) compiles the
 app inside the `pj4-appimage-builder` container (glibc 2.35 floor), bundles the
-curated plugin set with `--plugins-registry`, audits the result's glibc needs,
+curated plugin set with `--plugins-registry` and the retro payload with
+`--retro-wad`, audits the result's glibc needs,
 and — on a version tag (e.g. `3.9.1`, no leading `v`) — attaches the AppImage to the GitHub Release
 (`workflow_dispatch` builds an artifact only).
 

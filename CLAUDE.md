@@ -149,7 +149,7 @@ Explicitly vendored (do not take from Conan or system packages):
 
 - **Qt-Advanced-Docking-System** — docking framework used by `pj_app`.
 - **nanocdr** — vendored via `add_subdirectory`.
-- **doomgeneric** — a vendored C engine whose sources are globbed directly into the `pj-raster-helper` target (not `add_subdirectory`'d). It and `raster_helper` form an optional, GPL-isolated standalone executable that PlotJuggler never links. **Off by default**: the `pj-raster-helper` target is built only with `-DPJ_BUILD_RASTER_HELPER=ON` (and only when the vendored source is checked out), so a default/CI build never compiles the doomgeneric engine.
+- **doomgeneric** — a vendored C engine whose sources are globbed directly into the `pj-raster-helper` target (not `add_subdirectory`'d). It and `raster_helper` form an optional, GPL-isolated standalone executable that PlotJuggler never links. **Off by default**: the `pj-raster-helper` target is built only with `-DPJ_BUILD_RASTER_HELPER=ON` (and only when the vendored source is checked out), so an ordinary dev or CI build never compiles the doomgeneric engine. The one exception is the Linux release (`linux-appimage-release.yml`), which turns it on — via `PJ_BUILD_RASTER_HELPER=ON ./build.sh` — and stages the helper with `appimage/build_appimage.sh --retro-wad`, so the AppImage and the `.deb` ship it under `thirdparty/retro/` next to the app binary.
 
 **Qwt is external, not vendored** (special case): `3rdparty/qwt/` holds only the
 CMake glue — the default build `FetchContent`s the official 6.3.0 release tarball

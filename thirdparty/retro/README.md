@@ -3,7 +3,7 @@
 This directory holds an **independent, separately-licensed** program that
 PlotJuggler launches as a child process. PlotJuggler links **none** of it.
 
-## Contents (placed at package time; git-ignored)
+## Contents (added at package time, not kept in git)
 
 - `pj-raster-helper` — GPLv2 render helper built from the doomgeneric git
   submodule (`3rdparty/doomgeneric`). It runs as a separate process and renders
@@ -23,7 +23,9 @@ PlotJuggler launches as a child process. PlotJuggler links **none** of it.
   covering `base.wad` (DOOM1.WAD), including id's confirmation that the
   unmodified shareware data is freely redistributable.
 
-The root `CMakeLists.txt` installs these files into `thirdparty/retro/`
-alongside the helper whenever it is bundled (`if(TARGET pj-raster-helper)`).
-They MUST remain present and legible in the shipped bundle. Only the *trigger*
-is hidden — the licenses are not.
+Two paths place these next to the helper, and both are conditional on the
+helper being built at all: `cmake --install` (root `CMakeLists.txt`,
+`if(TARGET pj-raster-helper)`), and `appimage/build_appimage.sh --retro-wad`,
+which stages helper + data + licenses into the AppDir — and thereby into both
+the AppImage and the `.deb`. They MUST remain present and legible in the
+shipped bundle. Only the *trigger* is hidden — the licenses are not.
