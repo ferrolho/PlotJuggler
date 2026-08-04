@@ -776,11 +776,17 @@ void MarketplaceWindow::updateDetailFooter() {
     html += u"<p style='margin:0 0 6px 0;'>%1</p>"_s.arg(esc(ext->description));
   }
 
-  // Changelog: version → text (QMap iterates ascending by version key).
+  // Changelog: newest version first, matching the marketplace spec's examples.
+  // The map is keyed by version string, so its natural order is lexicographic
+  // ("1.10.0" before "1.9.0"); sort the keys by semver instead.
   if (!ext->changelog.isEmpty()) {
+    QStringList versions = ext->changelog.keys();
+    std::sort(versions.begin(), versions.end(), [](const QString& a, const QString& b) {
+      return compareSemver(a.toStdString(), b.toStdString()) > 0;
+    });
     html += u"<p style='margin:0 0 2px 0;'><b>Changelog</b></p><ul style='margin:0 0 0 -20px;'>"_s;
-    for (auto it = ext->changelog.cbegin(); it != ext->changelog.cend(); ++it) {
-      html += u"<li><b>%1</b> — %2</li>"_s.arg(esc(it.key()), esc(it.value()));
+    for (const QString& version : versions) {
+      html += u"<li><b>%1</b> — %2</li>"_s.arg(esc(version), esc(ext->changelog.value(version)));
     }
     html += u"</ul>"_s;
   }
