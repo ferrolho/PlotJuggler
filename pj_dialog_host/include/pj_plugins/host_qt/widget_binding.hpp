@@ -5,6 +5,7 @@
 #include <QString>
 #include <QWidget>
 #include <functional>
+#include <optional>
 #include <pj_plugins/host/widget_data_view.hpp>
 #include <string>
 #include <string_view>

@@ -16,6 +16,7 @@ nlohmann_json/3.12.0
 # PUC-Lua/sol2 LuaProcessor's lua/5.4.7 dep was dropped in M9; the standalone
 # engine_shootout benchmarks pin their own lua/luajit via their own conanfiles.)
 luau/0.700
+kissfft/131.1.0  # FFT for the marker-analysis bandPower primitive (pj_scripting)
 # Embedded CPython for the Python Data Processors backend (pj_scripting's
 # PythonEngine). pybind11 provides the embed target; cpython is pinned explicitly.
 cpython/3.12.7

@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "pj_base/builtin/plot_markers.hpp"
 #include "pj_datastore/data_processor.hpp"
 #include "pj_datastore/topic_storage.hpp"
 #include "pj_datastore/writer.hpp"
@@ -1202,6 +1203,38 @@ TEST(SessionManagerRefillGuardTest, PruneVanishedTopicsRemovesEmptyPriorObjectTo
   const auto after = session.objectStore().listTopics(*ds);
   ASSERT_EQ(after.size(), 1u) << "the vanished object topic /cam/b is removed";
   EXPECT_EQ(after.front(), *cam_a) << "/cam/a kept (refilled)";
+}
+
+// beginRefill empties every object topic of the dataset, and prune then retires the
+// ones the reloaded file did not rewrite. Marker topics are host-published, never
+// file-backed, so a refill NEVER rewrites them — without the exemption a per-dataset
+// Reload silently deletes every committed marker (the regression #464 introduced).
+TEST(SessionManagerRefillGuardTest, PruneVanishedTopicsKeepsMarkerTopics) {
+  PJ::SessionManager session;
+  auto ds = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = "reload.mcap"});
+  ASSERT_TRUE(ds.has_value()) << ds.error();
+  const std::string marker_topic = PJ::sdk::markerObjectTopicName("/sensor/value");
+  auto cam = session.objectStore().registerTopic(
+      PJ::ObjectTopicDescriptor{.dataset_id = *ds, .topic_name = "/cam/a", .metadata_json = "{}"});
+  auto markers = session.objectStore().registerTopic(
+      PJ::ObjectTopicDescriptor{.dataset_id = *ds, .topic_name = marker_topic, .metadata_json = "{}"});
+  ASSERT_TRUE(cam.has_value()) << cam.error();
+  ASSERT_TRUE(markers.has_value()) << markers.error();
+  ASSERT_TRUE(session.objectStore().pushOwned(*cam, 100, std::vector<uint8_t>{1}).has_value());
+  ASSERT_TRUE(session.objectStore().pushOwned(*markers, 0, std::vector<uint8_t>{2}).has_value());
+
+  {
+    PJ::RefillGuard guard = session.beginRefill(*ds);
+    // The reloaded file rewrites its own object topic; nothing rewrites the markers.
+    ASSERT_TRUE(session.objectStore().pushOwned(*cam, 1000, std::vector<uint8_t>{3}).has_value());
+    guard.pruneVanishedTopics();
+    guard.commit();
+  }
+
+  const auto after = session.objectStore().listTopics(*ds);
+  EXPECT_NE(std::find(after.begin(), after.end(), *cam), after.end()) << "/cam/a kept (refilled)";
+  EXPECT_NE(std::find(after.begin(), after.end(), *markers), after.end())
+      << "the marker topic survives an empty refill — the producer is the host, not the file";
 }
 
 TEST(SessionManagerRefillGuardTest, MovedGuardRollsBackExactlyOnce) {

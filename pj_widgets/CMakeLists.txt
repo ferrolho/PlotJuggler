@@ -23,6 +23,7 @@ add_library(pj_widgets STATIC
     src/IngestProgressWidget.cpp
     src/IntScrubber.cpp
     src/LayerListView.cpp
+    src/MarkerTimeline.cpp
     src/MessageBox.cpp
     src/Search.cpp
     src/ProgressBar.cpp
@@ -63,6 +64,7 @@ add_library(pj_widgets STATIC
     include/pj_widgets/IngestProgressWidget.h
     include/pj_widgets/IntScrubber.h
     include/pj_widgets/LayerListView.h
+    include/pj_widgets/MarkerTimeline.h
     include/pj_widgets/MessageBox.h
     include/pj_widgets/Search.h
     include/pj_widgets/ProgressBar.h

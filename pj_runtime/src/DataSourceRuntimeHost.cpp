@@ -756,7 +756,8 @@ bool DataSourceRuntimeHost::cbPushMessage(
     if (policy == sdk::ObjectIngestPolicy::kLazyObjectsEagerScalars) {
       sdk::PayloadView seed;
       if (payload_anchor != nullptr) {
-        seed = sdk::PayloadView{Span<const uint8_t>{payload.data, payload.size}, std::move(payload_anchor)};
+        seed = sdk::PayloadView{
+            Span<const uint8_t>{payload.data, static_cast<size_t>(payload.size)}, std::move(payload_anchor)};
       } else if (payload.size > 0) {
         // Anchorless transient buffer: the bytes die with this call, so the
         // seed needs its own copy.

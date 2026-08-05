@@ -12,12 +12,14 @@
 #include <unordered_set>
 #include <utility>
 
+#include "pj_base/builtin/plot_markers.hpp"
 #include "pj_base/types.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/reader.hpp"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/CurveColorRegistry.h"
 #include "pj_runtime/ExtensionCatalogService.h"
+#include "pj_runtime/MarkerTopics.h"
 #include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/SessionManager.h"
 #include "pj_runtime/Time.h"
@@ -384,6 +386,11 @@ bool AppSession::focusPlaybackOnDatasets(const std::vector<DatasetId>& datasets)
       scalar_max = scalar_max ? std::max(*scalar_max, ds_max) : ds_max;
     }
     for (const ObjectTopicId object_topic_id : object_store.listTopics(dataset_id)) {
+      // Marker snapshots sit at a sentinel timestamp (0), off the data clock;
+      // folding them into the playback focus would stretch it back to the epoch.
+      if (isMarkerObjectTopic(object_store.descriptor(object_topic_id).topic_name)) {
+        continue;
+      }
       if (object_store.entryCount(object_topic_id) == 0) {
         continue;
       }

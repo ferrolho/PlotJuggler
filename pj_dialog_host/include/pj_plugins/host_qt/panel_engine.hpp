@@ -27,7 +27,7 @@ struct PanelEngineConfig {
   /// before the drop is delivered to the plugin's onItemsDropped. The PJ4 curve
   /// tree drags opaque catalog keys; plugins (Quaternion, FFT, …) expect names.
   /// If unset, or if it returns empty for a key, that key is delivered verbatim.
-  std::function<std::string(const std::string& catalog_key)> catalog_key_resolver;
+  std::function<std::string(const std::string& catalog_key)> catalog_key_resolver = {};
 
   /// Optional session + catalog. When both are non-null, QFrame chart containers
   /// use a full PlotWidget (zoom/tracker/legend) instead of ChartPreviewWidget,
@@ -44,6 +44,11 @@ struct PanelEngineConfig {
   // its whole duration — event-driven widget updates still apply per event, but
   // plugin-internal periodic work waits for the first quiet tick interval.
   bool restart_tick_timer_on_event = false;
+
+  // Open a QFileDialog for file/save/folder picker actions. Appended after
+  // restart_tick_timer_on_event for the same reason that member is late in the
+  // struct: positional initializers predating it stay valid.
+  bool enable_file_picker = true;
 };
 
 /// Hosts a long-lived interactive panel built from a plugin's typed-dialog UI.

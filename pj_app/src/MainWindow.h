@@ -115,6 +115,7 @@ class MainWindow : public QMainWindow {
   friend class MainWindowHistoryTestPeer;
   friend class MainWindowPanelGeometryTestPeer;
   friend class MainWindowLayoutImportTestPeer;
+  friend class MainWindowMarkerGeneratorTestPeer;
   friend class ToolboxPanelFoldTestPeer;
 
  public:

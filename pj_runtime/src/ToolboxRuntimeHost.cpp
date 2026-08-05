@@ -31,6 +31,7 @@ ToolboxRuntimeHost::ToolboxRuntimeHost(
     DataEngine& engine, ObjectStore& object_store, sdk::SettingsBackend& settings, Callbacks callbacks,
     ParserIngestDeps parser_ingest)
     : write_host_(engine, object_store),
+      read_host_(object_store),
       settings_host_(settings),
       callbacks_(std::move(callbacks)),
       engine_(engine),
@@ -154,6 +155,7 @@ void ToolboxRuntimeHost::requestStopActiveIngests() {
 
 void ToolboxRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
   registry.registerService<sdk::ToolboxHostService>(write_host_.raw());
+  registry.registerService<sdk::ToolboxObjectReadHostService>(read_host_.raw());
   registry.registerService<sdk::ToolboxRuntimeHostService>(runtime_);
   registry.registerService<sdk::SettingsStoreService>(settings_host_.view());
 }

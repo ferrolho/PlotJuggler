@@ -61,11 +61,14 @@ constexpr auto kCurveDisplayNameRole = Qt::UserRole + 1;
 
 constexpr auto kVisibilityOnPath = ":/resources/svg/visibility.svg";
 constexpr auto kVisibilityOffPath = ":/resources/svg/visibility_off.svg";
+constexpr auto kMarkersOnPath = ":/resources/svg/markers.svg";
+constexpr auto kMarkersOffPath = ":/resources/svg/markers_off.svg";
 constexpr auto kTrashIconPath = ":/resources/svg/trash.svg";
 
 // Property keys tagged onto per-row QToolButtons so onStylesheetChanged
 // can find them via findChildren and re-tint without rebuilding rows.
 constexpr auto kVisibilityButtonProperty = "pj.curveEditor.visibilityButton";
+constexpr auto kMarkersButtonProperty = "pj.curveEditor.markersButton";
 constexpr auto kTrashButtonProperty = "pj.curveEditor.trashButton";
 constexpr auto kColorButtonProperty = "pj.curveEditor.colorButton";
 
@@ -104,20 +107,31 @@ class CurveColorButton : public QPushButton {
 };
 
 // Custom row widget. Uses explicit geometry instead of a QHBoxLayout so
-// the eye + trash icons pin to the right edge regardless of available
-// width — they never get pushed out, no jitter while resizing, and the
-// name takes the leftover middle (or hides). The swatch is left-anchored,
-// the buttons are right-anchored, the name fills (or vanishes from) the
-// gap between them.
+// the markers + eye + trash icons pin to the right edge regardless of
+// available width — they never get pushed out, no jitter while resizing,
+// and the name takes the leftover middle (or hides). The swatch is
+// left-anchored, the buttons are right-anchored, the name fills (or
+// vanishes from) the gap between them.
 class CurveRowWidget : public QWidget {
  public:
   CurveRowWidget(
-      QPushButton* swatch, ElidingLabel* name, QToolButton* eye, QToolButton* trash, int row_height, QWidget* parent)
-      : QWidget(parent), swatch_(swatch), name_(name), eye_(eye), trash_(trash), row_height_(row_height) {
+      QPushButton* swatch, ElidingLabel* name, QToolButton* markers, QToolButton* eye, QToolButton* trash,
+      int row_height, QWidget* parent)
+      : QWidget(parent),
+        swatch_(swatch),
+        name_(name),
+        markers_(markers),
+        eye_(eye),
+        trash_(trash),
+        row_height_(row_height) {
+    // swatch and markers are absent on State Transitions strip rows.
     if (swatch_ != nullptr) {
       swatch_->setParent(this);
     }
     name_->setParent(this);
+    if (markers_ != nullptr) {
+      markers_->setParent(this);
+    }
     eye_->setParent(this);
     trash_->setParent(this);
     setAttribute(Qt::WA_TransparentForMouseEvents, false);
@@ -145,8 +159,10 @@ class CurveRowWidget : public QWidget {
 
     // Every inner widget is a square of side `h` (the row height), so
     // each one is 1:1 and flush with the top + bottom borders. The
-    // swatch anchors left (when the row has one), the two action buttons
-    // anchor right; both ends keep kRowEdgeInset off the panel border.
+    // swatch anchors left (when the row has one), the action buttons anchor
+    // right (markers, eye, trash, left-to-right); both ends keep
+    // kRowEdgeInset off the panel border. The markers toggle is absent on
+    // strip rows.
     if (swatch_ != nullptr) {
       swatch_->setGeometry(kRowEdgeInset, 0, h, h);
     }
@@ -155,11 +171,16 @@ class CurveRowWidget : public QWidget {
     trash_->setGeometry(trash_x, 0, h, h);
     const int eye_x = trash_x - kRowSpacing - h;
     eye_->setGeometry(eye_x, 0, h, h);
+    const int markers_x = eye_x - kRowSpacing - h;
+    if (markers_ != nullptr) {
+      markers_->setGeometry(markers_x, 0, h, h);
+    }
 
-    // Name lives between the swatch (when present) and the eye. If the gap
-    // is too small to be readable, hide it — eye + trash stay put.
+    // Name lives between the swatch (when present) and the leftmost right-
+    // anchored button — the markers toggle when present, else the eye. If the
+    // gap is too small to be readable, hide it; the buttons stay put.
     const int name_x = kRowEdgeInset + (swatch_ != nullptr ? h + kRowSpacing : 0);
-    const int name_right = eye_x - kRowSpacing;
+    const int name_right = (markers_ != nullptr ? markers_x : eye_x) - kRowSpacing;
     const int name_width = name_right - name_x;
     if (name_width < 1) {
       if (name_->isVisible()) {
@@ -176,6 +197,7 @@ class CurveRowWidget : public QWidget {
  private:
   QPushButton* swatch_;
   ElidingLabel* name_;
+  QToolButton* markers_;
   QToolButton* eye_;
   QToolButton* trash_;
   int row_height_;
@@ -362,7 +384,7 @@ void CurveEditor::refresh() {
     // Strip rows: keyed by the numeric row id; an invalid color = no swatch
     // (state colors are hash-derived, deliberately not editable).
     for (const auto& entry : state_controller_->seriesEntries()) {
-      appendRow(QString::number(entry.row_id), entry.name, QColor(), entry.visible);
+      appendRow(QString::number(entry.row_id), entry.name, QColor(), entry.visible, /*markers_visible=*/false);
     }
     applyFilter();
     return;
@@ -375,13 +397,16 @@ void CurveEditor::refresh() {
     if (info.curve == nullptr) {
       continue;
     }
-    appendRow(info.source_name, info.curve->title().text(), info.curve->pen().color(), info.curve->isVisible());
+    appendRow(
+        info.source_name, info.curve->title().text(), info.curve->pen().color(), info.curve->isVisible(),
+        info.show_markers);
   }
   // Preserve the active filter across refreshes.
   applyFilter();
 }
 
-void CurveEditor::appendRow(const QString& curve_key, const QString& display_name, QColor color, bool visible) {
+void CurveEditor::appendRow(
+    const QString& curve_key, const QString& display_name, QColor color, bool visible, bool markers_visible) {
   auto* item = new QListWidgetItem();
   item->setData(kCurveNameRole, curve_key);
   item->setData(kCurveDisplayNameRole, display_name);
@@ -398,23 +423,44 @@ void CurveEditor::appendRow(const QString& curve_key, const QString& display_nam
     connect(swatch, &QPushButton::clicked, this, [this, curve_key, swatch]() { onSwatchClicked(curve_key, swatch); });
   }
 
-  auto* visibility = new QToolButton();
-  // The objectName drives the curveVisibilityToggle QSS rule that strips
-  // QToolButton's default hover / checked background so the eye icon
-  // appears as a plain ink glyph regardless of state.
-  visibility->setObjectName(u"curveVisibilityToggle"_s);
-  visibility->setProperty(kVisibilityButtonProperty, curve_key);
-  visibility->setCheckable(true);
-  visibility->setAutoRaise(true);
-  visibility->setFocusPolicy(Qt::NoFocus);
-  visibility->setIconSize(QSize(row_height_, row_height_));
-  visibility->setChecked(visible);
-  visibility->setIcon(loadSvg(visible ? kVisibilityOnPath : kVisibilityOffPath, current_theme_));
-  visibility->setToolTip(tr("Toggle curve visibility"));
-  connect(visibility, &QToolButton::toggled, this, [this, curve_key, visibility](bool checked) {
-    visibility->setIcon(loadSvg(checked ? kVisibilityOnPath : kVisibilityOffPath, current_theme_));
-    onVisibilityToggled(curve_key, checked);
-  });
+  // The per-row checkable icon toggles (curve visibility eye, marker visibility)
+  // are built identically — a flat ink glyph whose 2-state SVG swaps on toggle.
+  // The objectName drives the matching QSS rule that strips QToolButton's default
+  // hover / checked background. on_toggled receives (curve_key, checked).
+  auto make_toggle = [&](const QString& object_name, const char* property_key, const char* on_path,
+                         const char* off_path, bool checked, const QString& tooltip, auto&& on_toggled) {
+    auto* button = new QToolButton();
+    button->setObjectName(object_name);
+    button->setProperty(property_key, curve_key);
+    button->setCheckable(true);
+    button->setAutoRaise(true);
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setIconSize(QSize(row_height_, row_height_));
+    button->setChecked(checked);
+    button->setIcon(loadSvg(checked ? on_path : off_path, current_theme_));
+    button->setToolTip(tooltip);
+    connect(
+        button, &QToolButton::toggled, this, [this, curve_key, button, on_path, off_path, on_toggled](bool is_checked) {
+          button->setIcon(loadSvg(is_checked ? on_path : off_path, current_theme_));
+          on_toggled(curve_key, is_checked);
+        });
+    return button;
+  };
+
+  // Curve-visibility eye gates the curve itself; the markers toggle gates this
+  // curve's contribution to the plot-markers overlay (CurveInfo::show_markers).
+  auto* visibility = make_toggle(
+      u"curveVisibilityToggle"_s, kVisibilityButtonProperty, kVisibilityOnPath, kVisibilityOffPath, visible,
+      tr("Toggle curve visibility"), [this](const QString& key, bool checked) { onVisibilityToggled(key, checked); });
+  // The markers toggle is meaningful only for real curves (plot_ bound); State
+  // Transitions strip rows have no plot-markers overlay, so they omit it. The
+  // eye still applies to strip rows via onVisibilityToggled.
+  QToolButton* markers = nullptr;
+  if (plot_ != nullptr) {
+    markers = make_toggle(
+        u"curveMarkersToggle"_s, kMarkersButtonProperty, kMarkersOnPath, kMarkersOffPath, markers_visible,
+        tr("Toggle marker visibility"), [this](const QString& key, bool checked) { onMarkersToggled(key, checked); });
+  }
 
   auto* name_label = new ElidingLabel();
   name_label->setObjectName(u"curveNameLabel"_s);
@@ -445,7 +491,8 @@ void CurveEditor::appendRow(const QString& curve_key, const QString& display_nam
     emit plot_->undoableChange();
   });
 
-  auto* row_widget = new CurveRowWidget(swatch, name_label, visibility, trash, row_height_, /*parent=*/nullptr);
+  auto* row_widget =
+      new CurveRowWidget(swatch, name_label, markers, visibility, trash, row_height_, /*parent=*/nullptr);
   ui_->listWidget->addItem(item);
   item->setSizeHint(QSize(0, row_height_));
   ui_->listWidget->setItemWidget(item, row_widget);
@@ -507,6 +554,13 @@ void CurveEditor::onVisibilityToggled(const QString& curve_name, bool visible) {
   plot_->setCurveVisible(curve_name, visible);
 }
 
+void CurveEditor::onMarkersToggled(const QString& curve_name, bool show) {
+  if (plot_ == nullptr) {
+    return;
+  }
+  plot_->setCurveShowMarkers(curve_name, show);
+}
+
 void CurveEditor::onChromeMetricsChanged(const ChromeMetrics& metrics) {
   const int button_extent = metrics.icon_size + metrics.icon_padding;
   const int band_extent = button_extent + (2 * metrics.layout_padding);
@@ -563,6 +617,8 @@ void CurveEditor::onStylesheetChanged(QString theme) {
     for (auto* button : row->findChildren<QToolButton*>()) {
       if (button->property(kVisibilityButtonProperty).isValid()) {
         button->setIcon(loadSvg(button->isChecked() ? kVisibilityOnPath : kVisibilityOffPath, current_theme_));
+      } else if (button->property(kMarkersButtonProperty).isValid()) {
+        button->setIcon(loadSvg(button->isChecked() ? kMarkersOnPath : kMarkersOffPath, current_theme_));
       } else if (button->property(kTrashButtonProperty).isValid()) {
         button->setIcon(loadSvg(kTrashIconPath, current_theme_));
       }

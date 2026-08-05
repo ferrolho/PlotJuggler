@@ -1091,13 +1091,17 @@ QToolButton:disabled {
     color: ${on_backdrop_disabled};
 }
 
-/* Curve-editor per-row inline buttons (visibility eye, trash): kept flat
-   in every state so the icons read as plain ink glyphs, no hover /
-   checked / pressed wash. */
+/* Curve-editor per-row inline buttons (markers toggle, visibility eye,
+   trash): kept flat in every state so the icons read as plain ink glyphs,
+   no hover / checked / pressed wash. */
 QToolButton#curveVisibilityToggle,
 QToolButton#curveVisibilityToggle:hover,
 QToolButton#curveVisibilityToggle:pressed,
 QToolButton#curveVisibilityToggle:checked,
+QToolButton#curveMarkersToggle,
+QToolButton#curveMarkersToggle:hover,
+QToolButton#curveMarkersToggle:pressed,
+QToolButton#curveMarkersToggle:checked,
 QToolButton#curveTrashToggle,
 QToolButton#curveTrashToggle:hover,
 QToolButton#curveTrashToggle:pressed,

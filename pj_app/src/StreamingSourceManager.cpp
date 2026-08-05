@@ -550,6 +550,14 @@ void StreamingSourceManager::workerLoop(DatasetId dataset_id) {
           for (const TopicId id : topic_ids) {
             ids.push_back(id);
           }
+          // Re-run whole-series marker generators over the freshly committed samples.
+          // The streaming write host commits straight to the engine, bypassing
+          // SessionManager::commitChunks, so this is the live-data marker recompute
+          // hook (cheap no-op when no generators exist). Paused writes land in the
+          // secondary engine with no DerivedEngine, matching the filter-advance gate.
+          if (!paused_) {
+            session_manager_.recomputeMarkersForChanged(topic_ids, dataset_id);
+          }
           session_manager_.notifyIngest(std::move(ids), /*live=*/!paused_);
         },
         Qt::QueuedConnection);

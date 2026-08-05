@@ -17,8 +17,11 @@
 #include <unordered_set>
 #include <utility>
 
+#include "pj_base/builtin/plot_markers.hpp"
 #include "pj_plugins/sdk/message_parser_plugin_base.hpp"
 #include "pj_runtime/DataProcessorService.h"
+#include "pj_runtime/MarkerService.h"
+#include "pj_runtime/MarkerTopics.h"
 #include "pj_scripting/filter_catalogue.h"
 #include "pj_scripting/script_engine.h"
 using namespace Qt::StringLiterals;
@@ -28,6 +31,20 @@ namespace PJ {
 namespace {
 Q_LOGGING_CATEGORY(lcSession, "pj.runtime.session")
 
+// Topic names of the `changed` topics — passed to MarkerService::recomputeForChangedInputs
+// so only generators whose input series key ("topic/field") starts with a changed topic
+// re-run, instead of re-running every generator on every commit. Accepts std::vector or
+// QVector<TopicId>.
+template <typename Container>
+std::vector<std::string> changedTopicNames(const DataReader& reader, const Container& changed) {
+  std::vector<std::string> names;
+  for (const TopicId id : changed) {
+    if (const std::optional<TopicMetadata> md = reader.getMetadata(id); md.has_value()) {
+      names.push_back(md->name);
+    }
+  }
+  return names;
+}
 }  // namespace
 
 QString SessionManager::normalizedSourcePath(const QString& path) {
@@ -60,6 +77,15 @@ SessionManager::SessionManager(QObject* parent) : QObject(parent) {
   // data_engine_ is already alive (member init precedes the ctor body), so the
   // processor service can bind its DerivedEngine to it.
   processor_service_ = std::make_unique<DataProcessorService>(*this);
+
+  // Whole-series object generators publish markers into object_store_ (the object
+  // engine never touches data_engine_). The real series resolver is injected by the
+  // shell once the catalog exists (setResolver); this stub, which resolves nothing,
+  // only covers the window before that. It must stay a window: a generator restored
+  // from a saved layout runs the moment it is re-created, so a shell that injected
+  // late would silently run every restored rule against no data.
+  marker_service_ = std::make_unique<MarkerService>(
+      object_store_, [](DatasetId, const std::string&) { return std::optional<MarkerService::ResolvedSeries>{}; });
 
   // Install the bundled Luau filter catalogue so applied/restored filters resolve
   // to Luau classes. The resource is embedded in the app; it is absent only in a
@@ -300,6 +326,12 @@ std::optional<std::pair<Timestamp, Timestamp>> SessionManager::datasetRawBounds(
     }
   }
   for (const ObjectTopicId object_topic_id : object_store_.listTopics(dataset_id)) {
+    // Reserved marker snapshot topics ("__markers__/...") are stored at a sentinel
+    // timestamp (0), not on the data clock — including them would drag the dataset
+    // origin to the epoch and stretch playback across decades.
+    if (isMarkerObjectTopic(object_store_.descriptor(object_topic_id).topic_name)) {
+      continue;
+    }
     if (object_store_.entryCount(object_topic_id) > 0) {
       const auto [object_min, object_max] = object_store_.timeRange(object_topic_id);
       t_min = std::min(t_min, object_min);
@@ -444,6 +476,10 @@ std::vector<TopicId> SessionManager::commitChunks(std::vector<std::pair<TopicId,
   const std::vector<TopicId> derived_outputs =
       processor_service_ ? processor_service_->advanceOnCommit(changed) : std::vector<TopicId>{};
 
+  // Whole-series generators are not incremental: a committed topic re-runs every
+  // generator that reads it. Repaint overlays if any marker set was republished.
+  // Unscoped: a commit batch may span datasets, and this path is cold (bulk load).
+  recomputeMarkersForChanged(changed, /*scope=*/0);
   QVector<TopicId> ids;
   ids.reserve(static_cast<qsizetype>(changed.size() + derived_outputs.size()));
   for (const TopicId id : changed) {
@@ -594,8 +630,28 @@ void RefillGuard::commit() {
   }
 }
 
+void SessionManager::recomputeMarkersForChanged(const std::vector<TopicId>& changed, DatasetId scope) {
+  // Gated by hasGenerators() so the common (no-generator) path is a single bool check.
+  if (marker_service_ && marker_service_->hasGenerators() &&
+      !marker_service_->recomputeForChangedInputs(changedTopicNames(createReader(), changed), scope).empty()) {
+    notifyMarkersChanged();
+  }
+}
+
 Status RefillGuard::recomputeProcessors() {
-  if (session_ == nullptr || replaced_source_topic_ids_.empty()) {
+  if (session_ == nullptr) {
+    return PJ::okStatus();
+  }
+  // Markers are whole-series generators: a reload swaps the dataset's data
+  // wholesale (and may rename or drop the inputs a generator read), so re-run
+  // every generator bound to this dataset rather than matching changed names.
+  // pruneVanishedTopics exempts marker topics, so the republished set lands on a
+  // topic that survived the refill.
+  if (session_->marker_service_ && session_->marker_service_->hasGenerators() &&
+      !session_->marker_service_->recomputeForDataset(dataset_id_).empty()) {
+    session_->notifyMarkersChanged();
+  }
+  if (replaced_source_topic_ids_.empty()) {
     return PJ::okStatus();
   }
   auto outputs = session_->dataProcessorService().rebindAndRecomputeForReplacedSources(replaced_source_topic_ids_);
@@ -632,8 +688,15 @@ void RefillGuard::pruneVanishedTopics() {
     session_->dataEngine().retireTopic(topic_id);
   }
   // Object: a prior object topic with no entries after the refill vanished too.
+  // Marker snapshot topics are exempt: the refill empties the dataset's markers
+  // (detach) but the file never re-writes them; the marker generators republish
+  // on the post-refill recompute, so evicting the topic here would drop live
+  // markers and orphan the recipe.
   std::vector<ObjectTopicId> vanished_object;
   for (const ObjectTopicId object_topic_id : prior_object_topic_ids_) {
+    if (isMarkerObjectTopic(session_->objectStore().descriptor(object_topic_id).topic_name)) {
+      continue;
+    }
     if (session_->objectStore().entryCount(object_topic_id) == 0) {
       vanished_object.push_back(object_topic_id);
     }
@@ -755,6 +818,14 @@ void SessionManager::replaceDataset(
     }
   }
 
+  // (4b) A replace swaps the dataset's data wholesale and may rename or drop the
+  // inputs a generator read, so re-run every generator bound to this dataset (not
+  // just those whose changed-input names still match) and repaint if any set changed.
+  if (marker_service_ && marker_service_->hasGenerators() &&
+      !marker_service_->recomputeForDataset(primary_id).empty()) {
+    notifyMarkersChanged();
+  }
+
   // (5) Re-index the (already-cleared) adapters against the swapped-in data.
   notifyIngest(std::move(changed), /*live=*/false);
 }
@@ -794,10 +865,15 @@ std::optional<DatasetMergeReport> SessionManager::mergeDatasets(
     dataset_source_records_.erase(source.dataset_id);
   }
 
-  // (3) Fold the object topics the same way. This shares the scalar merge's
-  // structural validation, so it cannot fail once the scalar merge above
+  // (3) Fold the object topics the same way, EXCEPT marker sets: those are
+  // single-entry supersede topics at a sentinel timestamp, so the generic
+  // interleave+retention fold would keep only one dataset's set (and strand it on
+  // the wrong clock). MarkerService merges them set-aware right after (3b), while
+  // the source datasets still hold their marker topics. This shares the scalar
+  // merge's structural validation, so it cannot fail once the scalar merge above
   // succeeded on the same inputs.
-  if (auto objects = object_store_.mergeDatasets(anchor, sources); objects.has_value()) {
+  const auto exclude_markers = [](const ObjectTopicDescriptor& d) { return isMarkerObjectTopic(d.topic_name); };
+  if (auto objects = object_store_.mergeDatasets(anchor, sources, exclude_markers); objects.has_value()) {
     // Shared-name source topics are now empty — their entries folded into the
     // anchor topic, which the anchor's own parser decodes. Evict those redundant
     // source-side topics AND their (now-orphaned) parser slots via evictObjectTopics
@@ -812,6 +888,19 @@ std::optional<DatasetMergeReport> SessionManager::mergeDatasets(
     evictObjectTopics(folded_sources);
   } else {
     qCWarning(lcSession).noquote() << "mergeDatasets(objects):" << QString::fromStdString(objects.error());
+  }
+
+  // (3b) Merge the marker sets set-aware (concatenate + shift onto the anchor
+  // clock), before the sources are dropped from the catalog. Runs regardless of
+  // live generators — markers may outlive the recipe that produced them.
+  if (marker_service_) {
+    marker_service_->mergeMarkerTopics(anchor, sources);
+    // The sources leave the catalog right after this call, so a generator still bound
+    // to one would resolve zero inputs from here on and quietly stop producing. Its
+    // data now lives in the anchor — move the rule with it. Driven by the engine's own
+    // record of what it folded, not by the request, so a source the engine declined to
+    // consume keeps its generator.
+    marker_service_->remapGeneratorsToAnchor(anchor, report.consumed_datasets);
   }
 
   // (4) Re-index adapters against the rebuilt anchor topics.
@@ -941,6 +1030,12 @@ void SessionManager::removeDataset(DatasetId dataset_id) {
   // must never resolve a future identity query (the record tier skips ids the
   // engine no longer knows, but a reminted id could collide).
   dataset_source_records_.erase(dataset_id);
+  // A generator bound to this dataset outlives its data otherwise: the object topics
+  // go with the dataset, but the recipe keeps naming the dead id, so the next
+  // recompute resolves nothing and re-registers a phantom marker topic under it.
+  if (marker_service_) {
+    marker_service_->clearGeneratorsForDataset(dataset_id);
+  }
   // The engine no longer holds this dataset; drop its pinned earliest-sample and
   // the memoized cross-dataset origin so globalTimeReference() re-scans the
   // survivors (removing the earliest dataset must re-base the display origin).

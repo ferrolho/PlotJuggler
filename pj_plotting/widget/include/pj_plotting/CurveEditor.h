@@ -24,9 +24,9 @@ class PlotWidget;
 class StateTransitionsController;
 
 // Side panel listing the curves of a single PlotWidget. One row per
-// curve: color swatch (click for picker) | name | visibility eye |
-// trash. Header strip has a Datasets-style filter + kebab popup with a
-// "Clear all curves" action.
+// curve: color swatch (click for picker) | name | markers toggle |
+// visibility eye | trash. Header strip has a Datasets-style filter +
+// kebab popup with a "Clear all curves" action.
 //
 // Bind via setPlot(plot) / setPlot(nullptr). The panel auto-refreshes
 // when the bound plot's curveListChanged() fires; a destroyed plot is
@@ -88,11 +88,13 @@ class CurveEditor : public QWidget {
   // Hides search + filter + label when the header band is too narrow,
   // keeping the kebab always reachable.
   void updateHeaderForWidth();
-  void appendRow(const QString& curve_key, const QString& display_name, QColor color, bool visible);
+  void appendRow(
+      const QString& curve_key, const QString& display_name, QColor color, bool visible, bool markers_visible);
   void onSwatchClicked(const QString& curve_name, QPushButton* swatch);
   void onPickerColorChanged(QColor color);
   void onCurveColorChanged(const QString& curve_name, QColor color);
   void onVisibilityToggled(const QString& curve_name, bool visible);
+  void onMarkersToggled(const QString& curve_name, bool show);
   void clearActivePicker();
 
   Ui::CurveEditor* ui_;

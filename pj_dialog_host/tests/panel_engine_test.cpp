@@ -271,8 +271,7 @@ TEST_F(PanelEngineTest, ThemeChangeKeepsSessionBackedChart) {
 }
 
 TEST_F(PanelEngineTest, TickPropagatesPluginStateChanges) {
-  PJ::PanelEngine engine(
-      makeMockHandle(), {/*tick_interval_ms=*/10, /*enable_diff=*/true, /*catalog_key_resolver=*/{}});
+  PJ::PanelEngine engine(makeMockHandle(), {.tick_interval_ms = 10, .enable_diff = true, .enable_file_picker = false});
   QWidget* panel = engine.openPanel();
   ASSERT_NE(panel, nullptr);
   panel->show();  // hidden panels tick at 1/10 rate; exercise the visible fast path
@@ -290,8 +289,7 @@ TEST_F(PanelEngineTest, TickPropagatesPluginStateChanges) {
 }
 
 TEST_F(PanelEngineTest, RequestCloseFiresCallback) {
-  PJ::PanelEngine engine(
-      makeMockHandle(), {/*tick_interval_ms=*/10, /*enable_diff=*/true, /*catalog_key_resolver=*/{}});
+  PJ::PanelEngine engine(makeMockHandle(), {.tick_interval_ms = 10, .enable_diff = true, .enable_file_picker = false});
   std::string captured_reason;
   bool fired = false;
   engine.onCloseRequested([&](std::string reason) {
@@ -402,8 +400,7 @@ TEST_F(PanelEngineTest, ButtonBoxRejectClosesPanel) {
 }
 
 TEST_F(PanelEngineTest, WidgetEventReachesPlugin) {
-  PJ::PanelEngine engine(
-      makeMockHandle(), {/*tick_interval_ms=*/10, /*enable_diff=*/true, /*catalog_key_resolver=*/{}});
+  PJ::PanelEngine engine(makeMockHandle(), {.tick_interval_ms = 10, .enable_diff = true, .enable_file_picker = false});
   QWidget* panel = engine.openPanel();
   ASSERT_NE(panel, nullptr);
 

@@ -33,6 +33,9 @@ class ServiceRegistryBuilder;
 //
 //   - ToolboxHostService        the write surface (DatastoreToolboxHost) into
 //                               the session's DataEngine + ObjectStore.
+//   - ToolboxObjectReadHostService  the read surface (DatastoreToolboxObjectReadHost)
+//                               so a toolbox can read back object topics it (or
+//                               another producer) published — e.g. existing markers.
 //   - ToolboxRuntimeHostService diagnostics (report_message) + notify_data_changed.
 //   - SettingsStoreService      persistence over an injected SettingsBackend.
 //
@@ -142,6 +145,7 @@ class ToolboxRuntimeHost {
   static bool onReleaseParserIngest(void* ctx, uint32_t data_source_id, PJ_error_t* out_error) noexcept;
 
   DatastoreToolboxHost write_host_;
+  DatastoreToolboxObjectReadHost read_host_;
   sdk::SettingsStoreHost settings_host_;
   Callbacks callbacks_;
   DataEngine& engine_;

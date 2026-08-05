@@ -10,8 +10,11 @@ add_library(pj_runtime STATIC
     src/CatalogModel.cpp
     src/CurveColorRegistry.cpp
     src/DataProcessorService.cpp
+    src/DataProcessorsKindRouter.cpp
     src/DataProcessorsRuntimeHost.cpp
     src/DataSourceRuntimeHost.cpp
+    src/MarkerService.cpp
+    src/MarkersRuntimeHost.cpp
     src/DiagnosticHistory.cpp
     src/ExtensionCatalogService.cpp
     src/HttpGet.cpp
@@ -34,6 +37,8 @@ add_library(pj_runtime STATIC
     include/pj_runtime/HttpGet.h
     include/pj_runtime/PluginRuntimeCatalog.h
     include/pj_runtime/IDataWidget.h
+    include/pj_runtime/MarkerService.h
+    include/pj_runtime/MarkersRuntimeHost.h
     include/pj_runtime/PlaybackEngine.h
     include/pj_runtime/QSettingsBackend.h
     include/pj_runtime/SessionManager.h
@@ -97,6 +102,38 @@ if(PJ_BUILD_TESTS)
         GTest::gtest_main
     )
     add_test(NAME DataProcessorServiceTest COMMAND data_processor_service_test)
+
+    add_executable(marker_service_test
+        tests/marker_service_test.cpp
+    )
+    target_compile_options(marker_service_test PRIVATE ${PJ_WARNING_FLAGS})
+    target_link_libraries(marker_service_test PRIVATE
+        pj_runtime
+        pj_scripting  # links the shared marker engine (runMarkerScript) the service drives
+        GTest::gtest_main
+    )
+    add_test(NAME MarkerServiceTest COMMAND marker_service_test)
+
+    add_executable(markers_runtime_host_test
+        tests/markers_runtime_host_test.cpp
+    )
+    target_compile_options(markers_runtime_host_test PRIVATE ${PJ_WARNING_FLAGS})
+    target_link_libraries(markers_runtime_host_test PRIVATE
+        pj_runtime
+        pj_scripting  # links the shared marker engine the service drives
+        GTest::gtest_main
+    )
+    add_test(NAME MarkersRuntimeHostTest COMMAND markers_runtime_host_test)
+
+    add_executable(data_processors_kind_router_test
+        tests/data_processors_kind_router_test.cpp
+    )
+    target_compile_options(data_processors_kind_router_test PRIVATE ${PJ_WARNING_FLAGS})
+    target_link_libraries(data_processors_kind_router_test PRIVATE
+        pj_runtime
+        GTest::gtest_main
+    )
+    add_test(NAME DataProcessorsKindRouterTest COMMAND data_processors_kind_router_test)
 
     add_executable(data_processor_service_transform_test
         tests/data_processor_service_transform_test.cpp

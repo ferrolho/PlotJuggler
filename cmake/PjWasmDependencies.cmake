@@ -268,4 +268,24 @@ if(PJ_WASM_WITH_LUAU)
             set_target_properties(${_unused} PROPERTIES EXCLUDE_FROM_ALL ON)
         endif()
     endforeach()
+
+    # kissfft — pj_scripting's marker engine uses it for the bandPower primitive,
+    # so it rides the same option that gates add_subdirectory(pj_scripting). Pure C
+    # with no OS calls, so it cross-compiles unchanged; it simply had no provider
+    # here, because the wasm build resolves nothing through Conan or pixi.
+    # Options mirror the Conan package and recipes/kissfft: static, float datatype.
+    set(KISSFFT_STATIC ON CACHE BOOL "" FORCE)
+    set(KISSFFT_DATATYPE "float" CACHE STRING "" FORCE)
+    set(KISSFFT_TEST OFF CACHE BOOL "" FORCE)
+    set(KISSFFT_TOOLS OFF CACHE BOOL "" FORCE)
+    set(KISSFFT_PKGCONFIG OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(kissfft
+        GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
+        GIT_TAG 131.1.0
+        GIT_SHALLOW TRUE
+        OVERRIDE_FIND_PACKAGE
+        SYSTEM)
+    FetchContent_MakeAvailable(kissfft)
+    # Upstream already aliases kissfft::kissfft and kissfft::kissfft-<datatype>,
+    # so pj_scripting's own non-Conan bridge finds its target and no-ops.
 endif()

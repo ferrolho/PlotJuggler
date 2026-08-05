@@ -29,6 +29,7 @@ namespace PJ {
 
 class MessageParserPluginBase;
 class DataProcessorService;
+class MarkerService;
 class RefillGuard;
 
 /// Result of resolving a persisted dataset identity against the live session.
@@ -78,6 +79,13 @@ class SessionManager : public QObject {
   [[nodiscard]] ObjectStore& objectStore() noexcept {
     return object_store_;
   }
+  // Plot markers (findings) live in the ObjectStore as serialized PlotMarkers
+  // object topics (one set per (dataset, topic), republished wholesale by the
+  // producer). Call notifyMarkersChanged() after a producer pushes/clears a
+  // marker object topic to repaint the plot overlays.
+  void notifyMarkersChanged() {
+    emit markersChanged();
+  }
 
   // The session-wide budget for ingest-seeded object payload residency (see
   // ResidentPayloadPool). One pool for the whole session so every dataset's
@@ -101,6 +109,14 @@ class SessionManager : public QObject {
   // through widget constructors" access pattern as curveColorRegistry above.
   [[nodiscard]] DataProcessorService& dataProcessorService() noexcept {
     return *processor_service_;
+  }
+
+  // The session's whole-series marker service (host-driven PlotMarkers generators
+  // run via pj_scripting and published to the ObjectStore). The marker sibling of
+  // dataProcessorService; the shell injects its series resolver after the catalog
+  // exists (see setResolver).
+  [[nodiscard]] MarkerService& markerService() noexcept {
+    return *marker_service_;
   }
 
   [[nodiscard]] DataReader createReader() const;
@@ -328,6 +344,15 @@ class SessionManager : public QObject {
   // commit(). Runs NO event loop until commit/rollback.
   [[nodiscard]] RefillGuard beginRefill(PJ::DatasetId dataset_id);
 
+  /// Re-run the marker generators whose inputs are among `changed` and repaint
+  /// overlays if any set was republished. The shared hook for every path that
+  /// commits new samples to existing inputs (file commit, streaming tick). Cheap
+  /// no-op when no generators exist. `changed` are TopicIds resolved to names here.
+  /// `scope` is the dataset whose data actually moved; it bounds an `all_datasets`
+  /// generator to that dataset instead of re-running it over every loaded one. Pass 0
+  /// only when the change cannot be attributed to a single dataset.
+  void recomputeMarkersForChanged(const std::vector<TopicId>& changed, DatasetId scope = 0);
+
   // Destructively fold `sources` (each with a raw timestamp shift) into the
   // `anchor` dataset via DataEngine::mergeDatasets. Mirrors replaceDataset's
   // ordered transaction: emit datasetAboutToBeReplaced for the anchor + every
@@ -468,6 +493,11 @@ class SessionManager : public QObject {
   // DatasetId/TopicIds stay valid (unlike catalog removal), only chunks change.
   void datasetAboutToBeReplaced(PJ::DatasetId dataset_id);
 
+  // Emitted when the session's plot markers change (a producer republished or
+  // cleared a marker object topic), so plot overlays re-read the ObjectStore and
+  // replot.
+  void markersChanged();
+
   // Emitted when the shared display offset changes (the "Use time offset" frame
   // toggled, or a load moved the earliest sample). No topic changed, so plot
   // widgets must drop EVERY curve adapter's cached offset and replot — a
@@ -575,6 +605,10 @@ class SessionManager : public QObject {
   // Owns the session's filter/transform engine; constructed in the ctor body
   // after data_engine_ is alive (it binds a DerivedEngine to data_engine_).
   std::unique_ptr<DataProcessorService> processor_service_;
+  // Owns the session's whole-series marker generators (host-driven PlotMarkers);
+  // constructed in the ctor after object_store_/data_engine_. Its series resolver
+  // is injected by the shell once the catalog exists (setResolver).
+  std::unique_ptr<MarkerService> marker_service_;
   // Per-object-topic parser slots. WRITTEN from the streaming worker thread (the
   // registrar callback fires when a plugin discovers/replaces a topic mid-stream)
   // and READ from the GUI thread on every render tick (each scene3D layer +

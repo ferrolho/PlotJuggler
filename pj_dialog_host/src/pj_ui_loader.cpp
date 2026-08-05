@@ -6,6 +6,7 @@
 #include <pj_widgets/ComboBox.h>
 #include <pj_widgets/CredentialsEditor.h>
 #include <pj_widgets/DateRangePicker.h>
+#include <pj_widgets/MarkerTimeline.h>
 #include <pj_widgets/RangeSlider.h>
 #include <pj_widgets/Search.h>
 #include <pj_widgets/SectionHeaderBand.h>
@@ -23,6 +24,8 @@ QWidget* PjUiLoader::createWidget(const QString& class_name, QWidget* parent, co
   QWidget* w = nullptr;
   if (class_name == QLatin1String("RangeSlider")) {
     w = new RangeSlider(Qt::Horizontal, RangeSlider::kDoubleHandles, parent);
+  } else if (class_name == QLatin1String("MarkerTimeline")) {
+    w = new MarkerTimeline(parent);
   } else if (class_name == QLatin1String("DateRangePicker")) {
     w = new DateRangePicker(parent);
   } else if (class_name == QLatin1String("CredentialsEditor")) {

@@ -20,6 +20,7 @@
 #include <QUiLoader>
 #include <QVBoxLayout>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <pj_plugins/host/widget_data_view.hpp>
 #include <pj_plugins/host/widget_event_builder.hpp>
 #include <pj_plugins/host_qt/drop_event_filter.hpp>

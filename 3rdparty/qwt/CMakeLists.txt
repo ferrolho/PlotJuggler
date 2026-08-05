@@ -66,7 +66,8 @@ if(PJ_SYSTEM_QWT)
     message(STATUS "PJ_SYSTEM_QWT: using ${PJ_QWT_LIBRARY} (headers: ${PJ_QWT_INCLUDE_DIR})")
 
     add_library(plotjuggler_qwt INTERFACE)
-    target_include_directories(plotjuggler_qwt INTERFACE ${PJ_QWT_INCLUDE_DIR})
+    # SYSTEM: same third-party-header treatment as the FetchContent path below.
+    target_include_directories(plotjuggler_qwt SYSTEM INTERFACE ${PJ_QWT_INCLUDE_DIR})
     target_link_libraries(plotjuggler_qwt INTERFACE ${PJ_QWT_LIBRARY} ${PJ_QWT_QT_LIBS})
     return()
 endif()
@@ -286,7 +287,11 @@ set_target_properties(plotjuggler_qwt PROPERTIES
     AUTOMOC ON
 )
 
-target_include_directories(plotjuggler_qwt PUBLIC
+# SYSTEM for consumers: external Qwt headers must not trip the strict
+# PJ_WARNING_FLAGS (-Werror=conversion on GCC, /W4 /WX on MSVC) of the modules
+# that include them — same treatment Qt and the Conan deps already get.
+target_include_directories(plotjuggler_qwt PRIVATE ${qwt_upstream_SOURCE_DIR}/src)
+target_include_directories(plotjuggler_qwt SYSTEM INTERFACE
     $<BUILD_INTERFACE:${qwt_upstream_SOURCE_DIR}/src>
 )
 

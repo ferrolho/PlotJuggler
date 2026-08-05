@@ -1,16 +1,43 @@
 # ---------------------------------------------------------------------------
-# pj_scripting — Luau scripting engine for PJ4 "Data Processors".
+# pj_scripting — Luau scripting engine for PJ4.
 #
-# The self-describing filter substrate: a hand-bound Luau ScriptEngine (sandbox +
-# instruction/memory watchdog), the FilterClass schema, the FilterCatalogue, and
-# LuaSisoTransform — a PJ::proc::DataProcessor whose calculateNextPoint runs a Luau
-# filter class. Filters are DATA (one bundled .luau resource), not C++ subclasses.
+# Dual-mode:
+#  - IN-TREE (PJ4 app): builds pj_scripting_core (the Luau engine + whole-series
+#    marker analysis) AND pj_scripting (the SISO DataProcessor/DerivedEngine
+#    adapter) AND the tests.
+#  - STANDALONE (Conan, `conan create`): builds ONLY pj_scripting_core against the
+#    Conan plotjuggler_sdk (pj_base) + Luau + kissfft, and installs it. The SDK-only
+#    headless runner and the GUI plugin link this same engine, so a rule runs
+#    identically GUI <-> headless.
 #
-# Qt-free. Depends on pj_base + pj_datastore (public) + Luau (private). MPL-2.0.
+# Qt-free. core: pj_base + Luau (+ kissfft) — NOT pj_datastore. MPL-2.0.
 # ---------------------------------------------------------------------------
+
+if(NOT TARGET pj_base)
+  # Standalone Conan build of pj_scripting_core only.
+  cmake_minimum_required(VERSION 3.20)
+  project(pj_scripting_core CXX)
+  find_package(plotjuggler_sdk CONFIG REQUIRED)
+  set(_PJS_BASE plotjuggler_sdk::base)
+  set(_PJS_STANDALONE TRUE)
+else()
+  set(_PJS_BASE pj_base)
+  set(_PJS_STANDALONE FALSE)
+endif()
 
 find_package(Luau REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(kissfft REQUIRED)
+
+# Conan's generated kissfft config defines kissfft::kissfft directly; upstream's
+# installed config (conda/pixi, recipes/kissfft) only defines the datatype-suffixed
+# target unless a datatype COMPONENT is requested — and requesting one would break
+# the Conan side, which validates components. Bridge the float variant instead
+# (same pattern as the cpython::embed bridge below).
+if(NOT TARGET kissfft::kissfft)
+  add_library(kissfft::kissfft INTERFACE IMPORTED)
+  target_link_libraries(kissfft::kissfft INTERFACE kissfft::kissfft-float)
+endif()
 if(NOT EMSCRIPTEN)
   # Conan's cpython package ships a build module that runs its own bin/python3.12 to
   # cross-check the version. That interpreter carries no RUNPATH, so with a shared
@@ -107,8 +134,52 @@ if(NOT WIN32 AND _pj_python_home)
   file(WRITE "${CMAKE_BINARY_DIR}/pj_python_home.txt" "${_pj_python_home}\n")
 endif()
 
-set(PJ_SCRIPTING_SOURCES
+# --- pj_scripting_core: the Luau engine + whole-series marker analysis ---------
+# Depends ONLY on pj_base + Luau (+ kissfft for bandPower) — NOT pj_datastore. This
+# is the shareable unit.
+add_library(pj_scripting_core STATIC
   src/luau_engine.cpp
+  src/marker_engine.cpp
+)
+target_include_directories(pj_scripting_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_compile_features(pj_scripting_core PUBLIC cxx_std_20)
+set_target_properties(pj_scripting_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(PJ_ASSERT_THROWS)
+  target_compile_definitions(pj_scripting_core PUBLIC PJ_ASSERT_THROWS)
+endif()
+# NOTE: PJ_WARNING_FLAGS (-Werror) is intentionally NOT applied here — the Luau
+# 3rd-party headers trip -Wextra at instantiation points.
+target_link_libraries(pj_scripting_core
+  PUBLIC
+    ${_PJS_BASE}
+    nlohmann_json::nlohmann_json  # filter_class.h exposes nlohmann::json in its public API
+  PRIVATE
+    Luau::VM                      # Luau backend (hand-bound) — luau_engine.cpp / marker_engine.cpp
+    Luau::Compiler
+    kissfft::kissfft              # FFT for marker_engine's bandPower primitive
+)
+
+if(_PJS_STANDALONE)
+  # Conan package: install the lib + the core public headers (the marker-analysis
+  # surface and the engine seam; the SISO/datastore headers are not shipped).
+  install(TARGETS pj_scripting_core ARCHIVE DESTINATION lib)
+  install(FILES
+    include/pj_scripting/marker_engine.h
+    include/pj_scripting/script_engine.h
+    include/pj_scripting/filter_class.h
+    include/pj_scripting/sandbox.h
+    DESTINATION include/pj_scripting)
+  return()
+endif()
+
+# --- pj_scripting: the DataProcessor/DerivedEngine adapter (in-tree only) ------
+# The SISO streaming path that couples the engine to pj_datastore's DerivedEngine.
+# Marker analysis does NOT use this; it stays out of the shareable core.
+# Luau lives in pj_scripting_core (linked PUBLIC below); python is desktop-only.
+set(PJ_SCRIPTING_SOURCES
   src/lua_siso_transform.cpp
   src/lua_mimo_transform.cpp
   src/filter_catalogue.cpp
@@ -120,25 +191,15 @@ else()
 endif()
 
 add_library(pj_scripting STATIC ${PJ_SCRIPTING_SOURCES})
-target_include_directories(pj_scripting PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
 target_compile_features(pj_scripting PUBLIC cxx_std_20)
 set_target_properties(pj_scripting PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(PJ_ASSERT_THROWS)
   target_compile_definitions(pj_scripting PUBLIC PJ_ASSERT_THROWS)
 endif()
-# NOTE: PJ_WARNING_FLAGS (-Werror) is intentionally NOT applied here — the Luau
-# 3rd-party headers trip -Wextra at instantiation points.
 target_link_libraries(pj_scripting
   PUBLIC
-    pj_base
+    pj_scripting_core             # Luau engine + marker analysis (brings Luau::VM/Compiler transitively)
     pj_datastore  # DataProcessor base + ProcessorSisoAdapter + ISISOTransform (formerly pj_proc)
-    nlohmann_json::nlohmann_json  # filter_class.h exposes nlohmann::json in its public API
-  PRIVATE
-    Luau::VM                      # Luau backend (hand-bound) — luau_engine.cpp only
-    Luau::Compiler
 )
 
 if(NOT EMSCRIPTEN)
@@ -169,6 +230,13 @@ if(PJ_BUILD_TESTS)
   add_executable(lua_siso_transform_test tests/lua_siso_transform_test.cpp)
   target_link_libraries(lua_siso_transform_test PRIVATE pj_scripting GTest::gtest_main)
   add_test(NAME lua_siso_transform_test COMMAND lua_siso_transform_test)
+
+  # --- Phase 1: whole-series marker engine (parity spike) ---
+  # Links ONLY pj_scripting_core (no pj_datastore) — proves the marker engine is
+  # self-contained and shareable with the SDK-only headless runner.
+  add_executable(marker_engine_test tests/marker_engine_test.cpp)
+  target_link_libraries(marker_engine_test PRIVATE pj_scripting_core GTest::gtest_main)
+  add_test(NAME marker_engine_test COMMAND marker_engine_test)
 
   add_executable(lua_time_precision_test tests/lua_time_precision_test.cpp)
   target_link_libraries(lua_time_precision_test PRIVATE pj_scripting GTest::gtest_main)

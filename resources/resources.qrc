@@ -179,6 +179,8 @@
     <file alias="list.svg">svg/list.svg</file>
     <file alias="logout.svg">svg/logout.svg</file>
     <file alias="loop.svg">svg/loop.svg</file>
+    <file alias="markers.svg">svg/markers.svg</file>
+    <file alias="markers_off.svg">svg/markers_off.svg</file>
     <file alias="maximize.svg">svg/maximize.svg</file>
     <file alias="merge.svg">svg/merge.svg</file>
     <file alias="minimize.svg">svg/minimize.svg</file>

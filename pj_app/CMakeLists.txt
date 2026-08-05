@@ -371,6 +371,11 @@ if(PJ_BUILD_TESTS)
     add_pj_app_gui_test(main_window_fanout_ambiguous_test MainWindowFanoutAmbiguousTest
         tests/main_window_fanout_ambiguous_test.cpp)
 
+    # A layout's marker generators are replayed — and their scripts run — on a
+    # session where no toolbox panel was ever opened.
+    add_pj_app_gui_test(main_window_marker_generator_restore_test MainWindowMarkerGeneratorRestoreTest
+        tests/main_window_marker_generator_restore_test.cpp)
+
     # Viewport re-frame after a layout's timeline offsets settle: sync leg (FIX 1)
     # and the progressive-drain pending-timeline seam (FIX 2).
     add_pj_app_gui_test(main_window_viewport_reframe_test MainWindowViewportReframeTest

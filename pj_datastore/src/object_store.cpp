@@ -580,7 +580,8 @@ Expected<ObjectDatasetReplaceResult> ObjectStore::replaceDatasetFrom(
 
 // Lazy callbacks own their backing through captured anchors; dataset removal only drops entries, so move them by value.
 Expected<ObjectDatasetMergeReport> ObjectStore::mergeDatasets(
-    DatasetId anchor_id, const std::vector<DatasetMergeSource>& sources) {
+    DatasetId anchor_id, const std::vector<DatasetMergeSource>& sources,
+    const std::function<bool(const ObjectTopicDescriptor&)>& exclude) {
   std::unique_lock lock(store_mutex_);
 
   std::unordered_set<DatasetId> seen_sources;
@@ -615,6 +616,9 @@ Expected<ObjectDatasetMergeReport> ObjectStore::mergeDatasets(
     if (series->descriptor.dataset_id != anchor_id) {
       continue;
     }
+    if (exclude && exclude(series->descriptor)) {
+      continue;  // owner merges this topic set-aware; keep it out of the fold
+    }
     const auto index = groups.size();
     groups.push_back(
         Group{
@@ -640,6 +644,9 @@ Expected<ObjectDatasetMergeReport> ObjectStore::mergeDatasets(
     report.consumed_datasets.push_back(src.dataset_id);
 
     for (const auto& [source_id, source_series] : source_topics) {
+      if (exclude && exclude(source_series->descriptor)) {
+        continue;  // left in place for the owner's set-aware merge
+      }
       const std::string& name = source_series->descriptor.topic_name;
       const auto group_it = group_by_name.find(name);
       if (group_it == group_by_name.end()) {
@@ -966,6 +973,11 @@ void ObjectStore::applyRetention(ObjectSeries& series, Timestamp newest_ts) {
   }
   if (series.budget.max_memory_bytes > 0) {
     while (!series.ordered.empty() && series.memory_bytes > series.budget.max_memory_bytes) {
+      evictFront(series);
+    }
+  }
+  if (series.budget.max_entries > 0) {
+    while (series.ordered.size() > series.budget.max_entries) {
       evictFront(series);
     }
   }

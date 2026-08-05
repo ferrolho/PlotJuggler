@@ -306,6 +306,26 @@ set_target_properties(style_input_height_test PROPERTIES
 
 add_test(NAME StyleInputHeight COMMAND style_input_height_test)
 
+add_executable(marker_timeline_test marker_timeline_test.cpp)
+
+target_link_libraries(marker_timeline_test PRIVATE
+    pj_widgets
+    GTest::gtest
+    Qt6::Test
+    Qt6::Widgets
+)
+
+if(DEFINED PJ_WARNING_FLAGS)
+    target_compile_options(marker_timeline_test PRIVATE ${PJ_WARNING_FLAGS})
+endif()
+
+set_target_properties(marker_timeline_test PROPERTIES
+    AUTOMOC ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+add_test(NAME MarkerTimeline COMMAND marker_timeline_test)
+
 add_executable(progress_bar_test progress_bar_test.cpp)
 
 target_link_libraries(progress_bar_test PRIVATE

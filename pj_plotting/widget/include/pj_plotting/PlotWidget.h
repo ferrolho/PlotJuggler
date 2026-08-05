@@ -32,6 +32,7 @@ namespace PJ {
 
 class CatalogModel;
 class SessionManager;
+class PlotMarkersItem;
 
 class PlotWidget : public PlotWidgetBase {
   Q_OBJECT
@@ -153,6 +154,9 @@ class PlotWidget : public PlotWidgetBase {
   void setCurveLineWidth(const QString& curve_name, double width);
   void setCurveStyle(const QString& curve_name, CurveStyle style);
   void setCurveVisible(const QString& curve_name, bool visible);
+  // Toggle whether this curve contributes plot markers to the overlay (see
+  // CurveInfo::show_markers). Independent from setCurveVisible.
+  void setCurveShowMarkers(const QString& curve_name, bool show);
   void removeAllCurves() override;
 
  signals:
@@ -269,10 +273,12 @@ class PlotWidget : public PlotWidgetBase {
   CatalogModel* catalog_ = nullptr;
   QMetaObject::Connection samples_ingested_connection_;
   QMetaObject::Connection dataset_replace_connection_;
+  QMetaObject::Connection markers_changed_connection_;
   QMetaObject::Connection display_offset_connection_;          // global "Use time offset" frame
   QMetaObject::Connection display_offset_dataset_connection_;  // per-source Timeline drag
   Timestamp last_global_time_reference_ = 0;
   DragInfo dragging_;
+  PlotMarkersItem* markers_item_ = nullptr;
   CurveTracker* tracker_ = nullptr;
   CurveTracker* reference_tracker_ = nullptr;
   bool tracker_enabled_ = true;

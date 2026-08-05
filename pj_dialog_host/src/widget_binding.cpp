@@ -5,8 +5,10 @@
 #include <pj_runtime/AppSession.h>
 #include <pj_runtime/CatalogModel.h>
 #include <pj_widgets/DateRangePicker.h>
+#include <pj_widgets/FileDialog.h>
 #include <pj_widgets/HeaderDividerHighlight.h>
 #include <pj_widgets/HeaderResizePolicy.h>
+#include <pj_widgets/MarkerTimeline.h>
 #include <pj_widgets/RangeSlider.h>
 #include <pj_widgets/SvgUtil.h>
 #include <pj_widgets/ToggleSwitch.h>
@@ -23,6 +25,8 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFile>
+#include <QFileDialog>
+#include <QFont>
 #include <QFontMetrics>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -96,6 +100,9 @@ QString resolveNamedIconPath(std::string_view icon_name) {
   }
   if (icon_name == "refresh") {
     return u":/resources/svg/refresh.svg"_s;
+  }
+  if (icon_name == "trash") {
+    return QStringLiteral(":/resources/svg/trash.svg");
   }
   if (icon_name == "search") {
     return u":/resources/svg/search_light.svg"_s;
@@ -1813,6 +1820,29 @@ static void applyToWidget(
     return;
   }
 
+  // --- MarkerTimeline (editable multi-marker strip) ---
+  if (auto* mt = qobject_cast<MarkerTimeline*>(w)) {
+    // Bounds before marks: setRange clamps existing marks into the new domain.
+    if (auto mn = view.markerTimelineMin(name)) {
+      if (auto mx = view.markerTimelineMax(name)) {
+        mt->setRange(*mn, *mx);
+      }
+    }
+    if (auto span = view.markerTimelineTimeSpan(name)) {
+      mt->setTimeSpan(span->first, span->second);
+    }
+    if (auto marks = view.markerTimelineMarks(name)) {
+      QVector<MarkerTimeline::Mark> out;
+      out.reserve(static_cast<int>(marks->size()));
+      for (const TimelineMark& m : *marks) {
+        out.push_back({m.id, m.region ? MarkerTimeline::Kind::kRegion : MarkerTimeline::Kind::kEvent, m.start, m.end});
+      }
+      // setMarks() is silent (owner-driven), so this does not echo back as an edit.
+      mt->setMarks(out);
+    }
+    return;
+  }
+
   // --- QDateTimeEdit (ISO-8601 value + allowed range) ---
   if (auto* dte = qobject_cast<QDateTimeEdit*>(w)) {
     // Range first: Qt clamps the value against the range in force when it lands.
@@ -1844,16 +1874,27 @@ static void applyToWidget(
     return;
   }
 
-  // --- QFrame with chart_series or chart_zoom_enabled → PlotWidget or ChartPreviewWidget ---
+  // --- QFrame with chart_series / chart_markers / chart_zoom_enabled → PlotWidget or ChartPreviewWidget ---
   if (auto* frame = qobject_cast<QFrame*>(w)) {
     auto series_data = view.chartSeries(name);
+    auto markers_data = view.chartMarkers(name);
     auto zoom_enabled = view.chartZoomEnabled(name);
     auto auto_zoom = view.chartAutoZoom(name);
     auto chart_placeholder = view.chartPlaceholder(name);
-    // chart_placeholder alone must be honored too — a plugin may send the
-    // hint before (or without) any series/zoom keys.
-    if (series_data || zoom_enabled || chart_placeholder) {
-      if ((series_data || zoom_enabled) && session != nullptr && catalog != nullptr) {
+    // chart_placeholder alone must be honored too — a plugin may send the hint
+    // before (or without) any series/markers/zoom keys; a placeholder-only payload
+    // constructs no chart widget (only the overlay below).
+    if (series_data || markers_data || zoom_enabled || chart_placeholder) {
+      // A frame carrying chart_markers renders through ChartPreviewWidget — the only
+      // chart that draws marker overlays; otherwise prefer the full PlotWidget when
+      // the session/catalog are available. The choice is sticky per frame so a tick
+      // without markers never swaps an already-created chart's widget type.
+      auto* existing_chart = frame->findChild<PJ::ChartPreviewWidget*>();
+      const bool has_chart_data = series_data || markers_data || zoom_enabled;
+      const bool use_plot_widget =
+          frame->findChild<PJ::PlotWidget*>() != nullptr ||
+          (existing_chart == nullptr && session != nullptr && catalog != nullptr && !markers_data);
+      if (has_chart_data && use_plot_widget) {
         // Full PlotWidget — zoom/tracker/legend, matching FilterEditorPanel preview quality.
         // Right-click context menu disabled per Davide's comment ("embedded PlotWidget
         // should have the right click menu disabled").
@@ -1987,11 +2028,11 @@ static void applyToWidget(
             plot->zoomOut(false);
           }
         }
-      } else if (series_data || zoom_enabled) {
-        // Fallback: ChartPreviewWidget (no session/catalog available). Guarded
-        // like the PlotWidget branch so a placeholder-only payload never
-        // constructs a chart widget.
-        auto* chart = frame->findChild<PJ::ChartPreviewWidget*>();
+      } else if (has_chart_data) {
+        // ChartPreviewWidget: no session/catalog available, or the frame carries
+        // chart_markers (the overlay only this chart renders). Guarded by
+        // has_chart_data so a placeholder-only payload never constructs a chart.
+        auto* chart = existing_chart;
         if (!chart) {
           auto* layout = frame->layout();
           if (!layout) {
@@ -2015,6 +2056,14 @@ static void applyToWidget(
             chart_series.push_back({s.label, s.points, s.color});
           }
           chart->setSeries(chart_series);
+        }
+        if (markers_data) {
+          std::vector<PJ::ChartPreviewWidget::Marker> chart_markers;
+          chart_markers.reserve(markers_data->size());
+          for (const auto& m : *markers_data) {
+            chart_markers.push_back({m.kind, m.x0, m.x1, m.y0, m.y1, m.has_value, m.color, m.label});
+          }
+          chart->setMarkers(chart_markers);
         }
         if (zoom_enabled) {
           chart->setZoomEnabled(*zoom_enabled);
@@ -2326,6 +2375,18 @@ void connectWidgetSignals(QWidget* root, WidgetEventCallback callback) {
       };
       QObject::connect(rs, &RangeSlider::lowerValueChanged, rs, [emit_range](int) { emit_range(); });
       QObject::connect(rs, &RangeSlider::upperValueChanged, rs, [emit_range](int) { emit_range(); });
+      continue;
+    }
+    if (auto* mt = qobject_cast<MarkerTimeline*>(w)) {
+      // A user drag/resize/delete republishes the whole mark set to the plugin.
+      QObject::connect(mt, &MarkerTimeline::marksChanged, mt, [callback, name, mt]() {
+        std::vector<TimelineMark> marks;
+        marks.reserve(mt->marks().size());
+        for (const MarkerTimeline::Mark& m : mt->marks()) {
+          marks.push_back({m.id, m.kind == MarkerTimeline::Kind::kRegion, m.start, m.end});
+        }
+        callback(name, WidgetEventBuilder::markerTimelineChanged(marks));
+      });
       continue;
     }
     if (auto* drp = qobject_cast<DateRangePicker*>(w)) {

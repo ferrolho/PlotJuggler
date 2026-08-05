@@ -32,7 +32,6 @@
 #include <functional>
 #include <memory>
 #include <pj_plugins/host/widget_data_view.hpp>
-#include <pj_plugins/host/widget_event_builder.hpp>
 #include <pj_plugins/host_qt/dialog_engine.hpp>
 #include <pj_plugins/host_qt/drop_event_filter.hpp>
 #include <pj_plugins/host_qt/pj_ui_loader.hpp>

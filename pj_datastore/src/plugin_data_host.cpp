@@ -1556,6 +1556,75 @@ bool toolboxRegisterObjectTopic(
   }
 }
 
+bool toolboxRegisterObjectTopicOnDataset(
+    void* ctx, uint32_t dataset_id, PJ_string_view_t topic_name, PJ_string_view_t metadata_json,
+    PJ_object_topic_handle_t* out_handle, PJ_error_t* out_error) noexcept {
+  auto* impl = static_cast<DatastoreToolboxHostState*>(ctx);
+  if (out_handle == nullptr) {
+    propagateError(out_error, "out_handle must not be null");
+    return false;
+  }
+  if (impl->core.engine.getDataset(dataset_id) == nullptr) {
+    impl->setObjectError(fmt::format("dataset {} not found", dataset_id));
+    propagateError(out_error, impl->object_last_error.c_str());
+    return false;
+  }
+  try {
+    const std::string name(toStringView(topic_name));
+    // Idempotent: a producer that republishes its whole marker set re-resolves
+    // the same topic handle on every push instead of failing on "already exists".
+    if (const auto existing = impl->object_store.findTopic(dataset_id, name)) {
+      out_handle->id = existing->id;
+      impl->object_last_error.clear();
+      return true;
+    }
+    ObjectTopicDescriptor desc{};
+    desc.dataset_id = dataset_id;
+    desc.topic_name = name;
+    desc.metadata_json = std::string(toStringView(metadata_json));
+    auto result = impl->object_store.registerTopic(desc);
+    if (!result) {
+      impl->setObjectError(result.error());
+      propagateError(out_error, impl->object_last_error.c_str());
+      return false;
+    }
+    out_handle->id = result->id;
+    impl->object_last_error.clear();
+    return true;
+  } catch (const std::exception& e) {
+    impl->setObjectError(e.what());
+    propagateError(out_error, impl->object_last_error.c_str());
+    return false;
+  } catch (...) {
+    impl->setObjectError("registerObjectTopicOnDataset: unknown exception");
+    propagateError(out_error, impl->object_last_error.c_str());
+    return false;
+  }
+}
+
+// Bound a topic's retention to its last `max_entries` snapshots (0 = unlimited).
+// A producer that republishes a whole set at a sentinel timestamp sets 1 so
+// superseded snapshots are evicted instead of accumulating across re-pushes.
+bool toolboxSetObjectTopicRetention(
+    void* ctx, PJ_object_topic_handle_t topic, uint64_t max_entries, PJ_error_t* out_error) noexcept {
+  auto* impl = static_cast<DatastoreToolboxHostState*>(ctx);
+  try {
+    RetentionBudget budget{};
+    budget.max_entries = static_cast<size_t>(max_entries);
+    impl->object_store.setRetentionBudget(ObjectTopicId{topic.id}, budget);
+    impl->object_last_error.clear();
+    return true;
+  } catch (const std::exception& e) {
+    impl->setObjectError(e.what());
+    propagateError(out_error, impl->object_last_error.c_str());
+    return false;
+  } catch (...) {
+    impl->setObjectError("setObjectTopicRetention: unknown exception");
+    propagateError(out_error, impl->object_last_error.c_str());
+    return false;
+  }
+}
+
 bool toolboxPushOwnedObject(
     void* ctx, PJ_object_topic_handle_t topic, int64_t timestamp_ns, const uint8_t* data, uint64_t size,
     PJ_error_t* out_error) noexcept {
@@ -1759,6 +1828,21 @@ PJ_object_topic_handle_t toolboxObjectLookupTopic(void* ctx, PJ_string_view_t to
       if (impl->store.descriptor(id).topic_name == needle) {
         return PJ_object_topic_handle_t{id.id};
       }
+    }
+  } catch (...) {
+    // Fall through to invalid handle.
+  }
+  return PJ_object_topic_handle_t{0};
+}
+
+// Dataset-scoped lookup: object-topic identity is (dataset, name), so this
+// resolves the topic owned by `dataset_id` rather than the first name match.
+PJ_object_topic_handle_t toolboxObjectLookupTopicOnDataset(
+    void* ctx, uint32_t dataset_id, PJ_string_view_t topic_name) noexcept {
+  auto* impl = static_cast<DatastoreToolboxObjectReadHostState*>(ctx);
+  try {
+    if (const auto id = impl->store.findTopic(dataset_id, toStringView(topic_name))) {
+      return PJ_object_topic_handle_t{id->id};
     }
   } catch (...) {
     // Fall through to invalid handle.
@@ -1994,12 +2078,8 @@ const PJ_toolbox_host_vtable_t kToolboxVTable = {
     toolboxReadSeriesArrow,
     toolboxRegisterObjectTopic,
     toolboxPushOwnedObject,
-    // Dataset-scoped object-topic registration and count-based object-topic
-    // retention are not provided by this host. The SDK guards every tail-slot
-    // call with PJ_HAS_TAIL_SLOT (struct_size AND non-null pointer), so a null
-    // slot reads as unavailable to plugins rather than being invoked.
-    nullptr,  // register_object_topic_on_dataset
-    nullptr,  // set_object_topic_retention
+    toolboxRegisterObjectTopicOnDataset,
+    toolboxSetObjectTopicRetention,
 };
 
 const PJ_object_write_host_vtable_t kSourceObjectWriteVTable = {
@@ -2018,10 +2098,7 @@ const PJ_object_read_host_vtable_t kToolboxObjectReadVTable = {
     toolboxObjectReleaseBytes,
     toolboxObjectEntryCount,
     toolboxObjectTimeRange,
-    // Dataset-scoped topic lookup is not provided by this host; the SDK's
-    // PJ_HAS_TAIL_SLOT guard (struct_size AND non-null pointer) reads a null
-    // slot as unavailable.
-    nullptr,  // lookup_topic_on_dataset
+    toolboxObjectLookupTopicOnDataset,
 };
 
 const PJ_parser_object_write_host_vtable_t kParserObjectWriteVTable = {

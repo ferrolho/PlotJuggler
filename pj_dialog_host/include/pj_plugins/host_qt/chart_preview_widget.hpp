@@ -10,6 +10,9 @@
 
 class QEvent;
 class QObject;
+class QwtPlotGrid;
+class QwtPlotItem;
+class QwtPlotPanner;
 class QwtPlotZoomer;
 
 namespace PJ {
@@ -34,7 +37,28 @@ class ChartPreviewWidget : public QwtPlot {
   void setSeries(const std::vector<Series>& series);
   void clearSeries();
 
-  /// Enable or disable interactive zoom (rubber band + mouse wheel).
+  /// One marker overlaid on top of the series. Interpret by `kind`:
+  /// "event" → a hollow point at (x0,y0) when has_value, else a vertical line at x0;
+  /// "region" → a shaded vertical band over x ∈ [x0,x1];
+  /// "value_band" → a shaded horizontal band over y ∈ [y0,y1] (a line when y0==y1);
+  /// "label" → a vertical line at x0 carrying `label`. Coordinates are in chart units.
+  struct Marker {
+    std::string kind;
+    double x0 = 0.0;
+    double x1 = 0.0;
+    double y0 = 0.0;
+    double y1 = 0.0;
+    bool has_value = false;
+    std::string color;  // hex "#rrggbb"; empty → a default
+    std::string label;
+  };
+
+  /// Overlay markers on top of the series. Replaces any previously-set markers;
+  /// pass an empty vector to clear them. Markers do not affect the auto-fit range.
+  void setMarkers(const std::vector<Marker>& markers);
+
+  /// Enable or disable interactive navigation: zoom (rubber band + mouse wheel), pan
+  /// (middle-drag or Ctrl+left-drag), and a background grid. All are off until enabled.
   /// When enabled, viewChanged() is emitted whenever the user zooms or pans.
   void setZoomEnabled(bool enabled);
 
@@ -50,7 +74,11 @@ class ChartPreviewWidget : public QwtPlot {
 
  private:
   QwtPlotZoomer* zoomer_ = nullptr;
+  QwtPlotGrid* grid_ = nullptr;           // background grid, shown only while interactive
+  QwtPlotPanner* panner_ = nullptr;       // middle-drag pan
+  QwtPlotPanner* panner_ctrl_ = nullptr;  // Ctrl+left-drag pan
   bool zoom_enabled_ = false;
+  std::vector<QwtPlotItem*> marker_items_;  // overlay items owned here (detached+deleted on replace)
 
   void emitViewChanged();
 };

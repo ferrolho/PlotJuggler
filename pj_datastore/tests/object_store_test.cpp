@@ -1062,6 +1062,24 @@ TEST(ObjectStoreTest, DefaultBudgetNoEviction) {
   EXPECT_EQ(store.entryCount(id), 100u);
 }
 
+TEST(ObjectStoreTest, MaxEntriesRetentionKeepsOnlyLatest) {
+  // A producer that republishes one snapshot per topic at a sentinel timestamp
+  // (e.g. plot markers, always ts=0) would otherwise append a blob per push.
+  // A keep-last-1 budget evicts superseded snapshots so the topic holds exactly 1.
+  ObjectStore store;
+  auto id = registerTestTopic(store);
+  store.setRetentionBudget(id, {.max_entries = 1});
+
+  for (int i = 0; i < 5; ++i) {
+    store.pushOwned(id, 0, makePayload(4, static_cast<uint8_t>(i)));
+  }
+
+  EXPECT_EQ(store.entryCount(id), 1u);
+  auto latest = store.latestAt(id, 1);
+  ASSERT_TRUE(latest.has_value());
+  EXPECT_EQ(latest->payload.bytes[0], 4);  // the newest survives
+}
+
 // Retention runs INSIDE pushOwned: an out-of-order push whose timestamp lands below
 // the time-window floor is sorted-inserted and then immediately front-evicted on the
 // same call. That insert-then-evict of the OOO slot must leave uid_order consistent,

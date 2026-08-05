@@ -40,6 +40,7 @@
 #include "pj_plotting/CurveTracker.h"
 #include "pj_plotting/DatastoreCurveAdapter.h"
 #include "pj_plotting/PlotLegend.h"
+#include "pj_plotting/PlotMarkersItem.h"
 #include "pj_plotting/PlotXml.h"
 #include "pj_plotting/PointSeriesXY.h"
 #include "pj_plotting/XYCurveDialog.h"
@@ -148,6 +149,47 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
   reference_tracker_->setParameter(CurveTracker::kLineOnly);
   reference_tracker_->setEnabled(false);
 
+  // Marker overlay: draws findings (regions / events / value bands / labels)
+  // read from the session ObjectStore (serialized PlotMarkers object topics) for
+  // the series shown on this plot plus the dataset-global topic. Targets are
+  // recomputed from the current curves on each paint; repaint is driven by
+  // SessionManager::markersChanged.
+  markers_item_ = new PlotMarkersItem(session_);
+  markers_item_->setTargetsProvider([this]() {
+    std::vector<MarkerTarget> targets;
+    std::set<DatasetId> datasets;
+    for (const CurveInfo& info : curveList()) {
+      // A curve with markers toggled off (per-row eye-style toggle in
+      // CurveEditor) contributes neither its per-series nor its dataset's
+      // global marker set to this plot's overlay.
+      if (!info.show_markers) {
+        continue;
+      }
+      const auto* adapter = dynamic_cast<const DatastoreCurveAdapter*>(info.curve->data());
+      if (adapter == nullptr) {
+        continue;
+      }
+      const auto& src = adapter->source();
+      // Per-series marker topic key is the human path "topic_name/field_name" —
+      // the exact string a producer (e.g. the markers toolbox) receives when a
+      // series is dropped on it (resolved via catalog_key_resolver), so the two
+      // sides agree on the marker object-topic name.
+      targets.push_back(
+          MarkerTarget{
+              src.dataset_id, QString::fromStdString(
+                                  sdk::markerSeriesKey(src.topic_name.toStdString(), src.field_name.toStdString()))});
+      datasets.insert(src.dataset_id);
+    }
+    for (const DatasetId dataset : datasets) {
+      targets.push_back(
+          MarkerTarget{
+              dataset, QString::fromUtf8(
+                           sdk::kGlobalMarkerTopic.data(), static_cast<qsizetype>(sdk::kGlobalMarkerTopic.size()))});
+    }
+    return targets;
+  });
+  markers_item_->attach(qwtPlot());
+
   // Mouse-hover inspector. Shows a snap-to-curve dot + value tooltip wherever
   // the mouse points, gated by show_points_. Independent from the playback
   // tracker (tracker_): the playback line always shows the current
@@ -183,6 +225,10 @@ PlotWidget::PlotWidget(SessionManager* session, CatalogModel* catalog, QWidget* 
 }
 
 PlotWidget::~PlotWidget() {
+  if (markers_item_ != nullptr) {
+    markers_item_->detach();
+    delete markers_item_;
+  }
   delete tracker_;
   delete reference_tracker_;
   if (show_point_marker_ != nullptr) {
@@ -207,6 +253,9 @@ void PlotWidget::setDataServices(SessionManager* session, CatalogModel* catalog)
   }
   session_ = session;
   catalog_ = catalog;
+  if (markers_item_ != nullptr) {
+    markers_item_->setSession(session_);
+  }
   reconnectDataSignals();
 }
 
@@ -720,6 +769,7 @@ QDomElement PlotWidget::xmlSaveState(QDomDocument& doc) const {
     QDomElement curve_element = doc.createElement(u"curve"_s);
     curve_element.setAttribute(u"color"_s, info.curve->pen().color().name());
     curve_element.setAttribute(u"visible"_s, info.curve->isVisible() ? u"true"_s : u"false"_s);
+    curve_element.setAttribute(u"markers_visible"_s, info.show_markers ? u"true"_s : u"false"_s);
     if (auto* xy_series = dynamic_cast<PointSeriesXY*>(info.curve->data())) {
       // An XY curve's title is the user alias (not derivable from x/y), so persist it.
       curve_element.setAttribute(u"name"_s, info.source_name);
@@ -1040,6 +1090,8 @@ PlotWidget::CurveInfo* PlotWidget::applyCurveElement(const QDomElement& curve_el
   if (loaded_curve != nullptr) {
     const QString visible_attr = curve_element.attribute(u"visible"_s, u"true"_s);
     loaded_curve->curve->setVisible(visible_attr == "true"_L1);
+    const QString markers_attr = curve_element.attribute(u"markers_visible"_s, u"true"_s);
+    loaded_curve->show_markers = (markers_attr == "true"_L1);
   }
   return loaded_curve;
 }
@@ -1161,6 +1213,18 @@ void PlotWidget::setCurveVisible(const QString& curve_name, bool visible) {
     return;
   }
   info->curve->setVisible(visible);
+  replot();
+  emit undoableChange();
+}
+
+void PlotWidget::setCurveShowMarkers(const QString& curve_name, bool show) {
+  CurveInfo* info = curveFromTitle(curve_name);
+  if (info == nullptr || info->curve == nullptr) {
+    return;
+  }
+  info->show_markers = show;
+  // markers_item_'s targets are recomputed on each paint from show_markers,
+  // so a replot is all that's needed to re-evaluate the overlay.
   replot();
   emit undoableChange();
 }
@@ -1826,6 +1890,9 @@ void PlotWidget::reconnectDataSignals() {
   if (dataset_replace_connection_) {
     disconnect(dataset_replace_connection_);
   }
+  if (markers_changed_connection_) {
+    disconnect(markers_changed_connection_);
+  }
   if (display_offset_connection_) {
     disconnect(display_offset_connection_);
   }
@@ -1837,6 +1904,10 @@ void PlotWidget::reconnectDataSignals() {
     return;
   }
   last_global_time_reference_ = session_->globalTimeReference();
+
+  // Markers changed (a producer republished or cleared a marker object topic):
+  // the overlay re-reads the ObjectStore on each paint, so a plain replot suffices.
+  markers_changed_connection_ = connect(session_, &SessionManager::markersChanged, this, [this]() { replot(); });
 
   samples_ingested_connection_ =
       connect(session_, &SessionManager::samplesIngested, this, [this](const QVector<TopicId>& ids, bool live) {

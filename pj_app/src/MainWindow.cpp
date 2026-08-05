@@ -110,6 +110,7 @@
 #include "TitleBar.h"
 #include "ToolboxHostWiring.h"
 #include "TopicDemandController.h"
+#include "pj_base/builtin/plot_markers.hpp"
 #include "pj_base/dataset.hpp"
 #include "pj_base/types.hpp"
 #include "pj_datastore/data_processor.hpp"
@@ -146,10 +147,13 @@
 #include "pj_runtime/AppSession.h"
 #include "pj_runtime/CatalogModel.h"
 #include "pj_runtime/DataProcessorService.h"
+#include "pj_runtime/DataProcessorsKindRouter.h"
 #include "pj_runtime/DataProcessorsRuntimeHost.h"
 #include "pj_runtime/DiagnosticHistory.h"
 #include "pj_runtime/ExtensionCatalogService.h"
 #include "pj_runtime/IObjectViewer.h"
+#include "pj_runtime/MarkerService.h"
+#include "pj_runtime/MarkersRuntimeHost.h"
 #include "pj_runtime/PlaybackEngine.h"
 #include "pj_runtime/QSettingsBackend.h"
 #include "pj_runtime/SessionManager.h"
@@ -410,6 +414,24 @@ inline constexpr std::array<std::pair<const char*, double>, 4> kWidthButtonSpecs
     {"globalWidth2_0", 2.0},
     {"globalWidth3_0", 3.0},
 }};
+
+// The scalar payload behind `item` when it is the plottable series a marker generator
+// names `key` (markerSeriesKey naming), else nullptr. Shared by the two readers of that
+// question — the generator's series resolver and the dataset it binds to — which must
+// agree: a generator bound to a dataset whose series the resolver cannot find runs
+// against no data.
+[[nodiscard]] const PJ::ScalarFieldPayload* markerSeriesField(const PJ::CatalogItem& item, const std::string& key) {
+  const PJ::ScalarFieldPayload* scalar = PJ::asScalarField(item);
+  if (scalar == nullptr || !PJ::isPlottablePrimitive(scalar->logical_type)) {
+    return nullptr;
+  }
+  const std::string topic = item.topic_name.toStdString();
+  if (PJ::sdk::markerSeriesKey(topic, scalar->field_path.toStdString()) != key &&
+      PJ::sdk::markerSeriesKey(topic, scalar->field_name.toStdString()) != key) {
+    return nullptr;
+  }
+  return scalar;
+}
 }  // namespace
 
 #ifdef PJ_TARGET_WASM
@@ -810,6 +832,50 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
   ui_->curveListPanel->setTopicDemandTracker(&session_->topicDemandTracker());
   ui_->curveListPanel->setTopicDemandController(topic_demand_controller_.get());
 
+  // Marker generators read their inputs through these two catalog-backed callbacks.
+  // They are SESSION state, not panel state: a generator can also arrive from a saved
+  // layout, which is replayed before any toolbox panel exists, so they are installed
+  // once here rather than per toolbox launch. The resolver maps an input key
+  // (markerSeriesKey) to its samples using the same naming the producer and the
+  // overlay use, so a generator yields the same markers in GUI and CI.
+  session_->sessionManager().markerService().setResolver(
+      [this](PJ::DatasetId dataset, const std::string& key) -> std::optional<PJ::MarkerService::ResolvedSeries> {
+        const PJ::DataReader reader = session_->sessionManager().createReader();
+        for (const PJ::CatalogItem& item : session_->catalogModel().items()) {
+          if (item.dataset_id != dataset) {
+            continue;
+          }
+          const PJ::ScalarFieldPayload* scalar = markerSeriesField(item, key);
+          if (scalar == nullptr) {
+            continue;
+          }
+          PJ::Expected<PJ::SeriesReader> series = reader.series(scalar->topic_id, scalar->column_index);
+          if (!series.has_value()) {
+            return std::nullopt;
+          }
+          PJ::MarkerService::ResolvedSeries out;
+          const std::size_t n = series->size();
+          out.timestamps.reserve(n);
+          out.values.reserve(n);
+          for (std::size_t i = 0; i < n; ++i) {
+            if (const std::optional<PJ::SeriesSample> s = series->sampleAt(i)) {
+              out.timestamps.push_back(static_cast<double>(s->timestamp));
+              out.values.push_back(s->value);
+            }
+          }
+          return out;
+        }
+        return std::nullopt;
+      });
+  // For `all_datasets` (global-across-all) generators: list every loaded dataset.
+  session_->sessionManager().markerService().setDatasetLister([this]() -> std::vector<PJ::DatasetId> {
+    std::vector<PJ::DatasetId> ids;
+    for (const std::pair<PJ::DatasetId, QString>& ds : session_->catalogModel().datasets()) {
+      ids.push_back(ds.first);
+    }
+    return ids;
+  });
+
   // Keep data widgets coherent with catalog removals, whoever triggers them.
   // Each widget prunes its OWN pieces against the live catalog/store. One pass
   // per removal.
@@ -906,6 +972,9 @@ MainWindow::MainWindow(QString extensions_dir, QWidget* parent)
     // Eviction lives at the confirmed-removal site, not in clearAll(), so the
     // low-level catalog op stays safe for speculative callers. Keep
     // lastLoadedSource for the quick-reload path (#99).
+    // An all_datasets generator is bound to the session, not to a dataset, so
+    // removeDataset() below would leave it alive to publish onto whatever loads next.
+    session_->sessionManager().markerService().clearAllGenerators();
     session_->sessionManager().clearAllObjects();
     // TF buffers derive from the just-evicted objects; drop them with the data.
 #ifdef PJ_WITH_SCENE3D
@@ -2929,6 +2998,8 @@ void MainWindow::onCatalogTrashRequested(QStringList keys, bool covers_all) {
     // Free ObjectStore topics before the catalog wipe so the cleared()
     // subscription sees them gone and resets 2D viewers (symmetric with the
     // "Remove all Datasets" path). Keep lastLoadedSource for reload.
+    // Session-scoped all_datasets generators go too — see the sibling wipe path.
+    session_->sessionManager().markerService().clearAllGenerators();
     session_->sessionManager().clearAllObjects();
     // TF buffers derive from the just-evicted objects; drop them with the data.
 #ifdef PJ_WITH_SCENE3D
@@ -6328,6 +6399,44 @@ QDomElement MainWindow::saveDataProcessors(QDomDocument& doc) const {
     transform.appendChild(script);
     element.appendChild(transform);
   }
+
+  // Marker generators (kind=markers of pj.data_processors.v1): whole-series object
+  // generators run by MarkerService. Persisted like transforms — script + inputs
+  // BY VALUE so they replay on load without the originating plugin. Dataset identity
+  // is stamped for cross-session rebind (mirrors the <processor> qualifiers); an
+  // all_datasets generator has no single dataset, so it stamps none.
+  for (const auto& recipe : session_->sessionManager().markerService().recipes()) {
+    QDomElement gen = doc.createElement(u"generator"_s);
+    gen.setAttribute(u"id"_s, QString::fromStdString(recipe.id));
+    gen.setAttribute(u"language"_s, QString::fromStdString(recipe.language));
+    gen.setAttribute(u"all_datasets"_s, recipe.all_datasets ? u"1"_s : u"0"_s);
+    if (!recipe.all_datasets) {
+      gen.setAttribute(u"dataset_id"_s, QString::number(recipe.dataset_id));
+      if (const auto source = session_->catalogModel().datasetSourceName(recipe.dataset_id); source.has_value()) {
+        gen.setAttribute(u"dataset_source"_s, *source);
+      }
+      gen.setAttribute(u"dataset_path"_s, session_->sessionManager().datasetSourcePath(recipe.dataset_id));
+    }
+    for (const auto& input_name : recipe.inputs) {
+      QDomElement in = doc.createElement(u"input"_s);
+      in.setAttribute(u"name"_s, QString::fromStdString(input_name));
+      gen.appendChild(in);
+    }
+    for (const auto& output_name : recipe.outputs) {
+      QDomElement out = doc.createElement(u"output"_s);
+      out.setAttribute(u"name"_s, QString::fromStdString(output_name));
+      gen.appendChild(out);
+    }
+    if (!recipe.params_json.empty()) {
+      QDomElement params = doc.createElement(u"params"_s);
+      layout_xml::appendJsonAsCdata(doc, params, QString::fromStdString(recipe.params_json));
+      gen.appendChild(params);
+    }
+    QDomElement gen_script = doc.createElement(u"script"_s);
+    layout_xml::appendJsonAsCdata(doc, gen_script, QString::fromStdString(recipe.script));
+    gen.appendChild(gen_script);
+    element.appendChild(gen);
+  }
   return element;
 }
 
@@ -6483,6 +6592,65 @@ bool MainWindow::restoreDataProcessors(const QDomElement& root) {
           tr("Could not restore transform '%1': %2")
               .arg(QString::fromStdString(recipe.key), QString::fromStdString(restored.error())));
       restored_all = false;
+    }
+  }
+
+  // Marker generators: clear-all + replay, same as transforms. Done after them so a
+  // generator reading a transform/filter output resolves it by name. upsertGenerator
+  // re-creates AND re-runs each in one call, so no separate recompute is needed.
+  MarkerService& marker_service = session_->sessionManager().markerService();
+  marker_service.clearAllGenerators();
+  for (QDomElement gen = element.firstChildElement(u"generator"_s); !gen.isNull();
+       gen = gen.nextSiblingElement(u"generator"_s)) {
+    MarkerService::GeneratorRecipe recipe;
+    recipe.id = gen.attribute(u"id"_s).toStdString();
+    recipe.kind = GeneratorKind::kMarkers;
+    recipe.language = gen.attribute(u"language"_s, u"luau"_s).toStdString();
+    recipe.all_datasets = gen.attribute(u"all_datasets"_s) == u"1"_s;
+    QString gen_parse_error;
+    if (!recipe.all_datasets) {
+      bool ok = false;
+      const qulonglong raw = gen.attribute(u"dataset_id"_s).toULongLong(&ok);
+      if (ok && raw <= std::numeric_limits<DatasetId>::max()) {
+        recipe.dataset_id = static_cast<DatasetId>(raw);
+      }
+      const QString saved_path = gen.attribute(u"dataset_path"_s);
+      if (!saved_path.isEmpty()) {
+        const DatasetIdentityResolution resolved = session_->sessionManager().resolveDatasetIdentity(
+            recipe.dataset_id, gen.attribute(u"dataset_source"_s), saved_path);
+        if (resolved.id.has_value()) {
+          recipe.dataset_id = *resolved.id;
+        } else {
+          gen_parse_error = resolved.ambiguous ? tr("ambiguous dataset path") : tr("dataset path is not loaded");
+        }
+      }
+    }
+    for (QDomElement in = gen.firstChildElement(u"input"_s); !in.isNull(); in = in.nextSiblingElement(u"input"_s)) {
+      recipe.inputs.push_back(in.attribute(u"name"_s).toStdString());
+    }
+    for (QDomElement out = gen.firstChildElement(u"output"_s); !out.isNull();
+         out = out.nextSiblingElement(u"output"_s)) {
+      recipe.outputs.push_back(out.attribute(u"name"_s).toStdString());
+    }
+    recipe.params_json = layout_xml::directCdataText(gen.firstChildElement(u"params"_s)).toStdString();
+    recipe.script = layout_xml::directCdataText(gen.firstChildElement(u"script"_s)).toStdString();
+    // A generator that cannot be restored is reported and skipped, but does NOT fail
+    // the restore: unlike a filter or transform, it publishes only overlay decoration
+    // — no topic that a curve, a plot or a scene binds to. Failing the restore here
+    // costs the user the whole workspace (applyWorkspace rolls back) to save a set of
+    // annotations, and a rule whose input series is legitimately absent in the data
+    // this layout was reopened against is an ordinary outcome, not a corrupt layout.
+    if (!gen_parse_error.isEmpty()) {
+      emitDiagnostic(
+          DiagnosticLevel::kWarning, "Layout", "generator-restore-failed",
+          tr("Could not restore marker generator '%1': %2").arg(QString::fromStdString(recipe.id), gen_parse_error));
+      continue;
+    }
+    if (const auto restored = marker_service.upsertGenerator(recipe); !restored.has_value()) {
+      emitDiagnostic(
+          DiagnosticLevel::kWarning, "Layout", "generator-restore-failed",
+          tr("Could not restore marker generator '%1': %2")
+              .arg(QString::fromStdString(recipe.id), QString::fromStdString(restored.error())));
     }
   }
   session_->catalogModel().rebuildFromDatastore();
@@ -8688,7 +8856,9 @@ void MainWindow::launchToolbox(
     std::unique_ptr<QSettingsBackend> settings;
     std::unique_ptr<ServiceRegistryBuilder> builder;
     std::unique_ptr<ToolboxRuntimeHost> host;
+    std::unique_ptr<MarkersRuntimeHost> markers_host;
     std::unique_ptr<DataProcessorsRuntimeHost> dp_host;
+    std::unique_ptr<DataProcessorsKindRouter> dp_router;
     std::unique_ptr<SourcePromotionHost> promotion_host;
     std::shared_ptr<ToolboxHandle> handle;
 
@@ -8717,7 +8887,9 @@ void MainWindow::launchToolbox(
       }
       handle.reset();
       promotion_host.reset();
-      builder.reset();
+      builder.reset();       // drops the service views into host + the routed bridges first
+      dp_router.reset();     // holds fat pointers into markers_host + dp_host, so goes before them
+      markers_host.reset();  // bridge only; the generators live on in MarkerService
       dp_host.reset();
       host.reset();
       settings.reset();
@@ -8774,6 +8946,8 @@ void MainWindow::launchToolbox(
     if (ingested_datasets.empty() || !session_->focusPlaybackOnDatasets(ingested_datasets)) {
       session_->seedPlaybackFromSession();
     }
+    // A toolbox write may have added/removed markers; repaint plot overlays.
+    session_->sessionManager().notifyMarkersChanged();
     // Surface this plugin's transform outputs in the Custom Series panel (flat,
     // not in the main data tree).
     auto& dps = session_->sessionManager().dataProcessorService();
@@ -8892,9 +9066,46 @@ void MainWindow::launchToolbox(
       std::move(callbacks), std::move(ingest_deps));
   session->host->registerServices(*session->builder);
 
+  // Host-driven data processors (pj.data_processors.v1, kind=markers): expose the marker
+  // service so a toolbox can submit whole-series generators the HOST runs + recomputes
+  // (the anomaly-detector path) instead of executing the script in-process. The service's
+  // catalog-backed resolver/lister are installed once at construction, not here — see
+  // the MainWindow constructor.
+  session->markers_host = std::make_unique<MarkersRuntimeHost>(
+      session_->sessionManager().markerService(), plugin_id.toStdString(),
+      [this](const std::vector<std::string>& inputs) -> PJ::DatasetId {
+        // Bind the generator to the dataset that actually holds its input series,
+        // not just the first-loaded one (which stranded generators on the wrong
+        // dataset when several are open). Fall back to the first dataset when the
+        // inputs name no known series or are ambiguous across datasets.
+        for (const std::string& key : inputs) {
+          std::optional<PJ::DatasetId> found;
+          bool ambiguous = false;
+          for (const PJ::CatalogItem& item : session_->catalogModel().items()) {
+            if (markerSeriesField(item, key) == nullptr) {
+              continue;
+            }
+            if (found.has_value() && *found != item.dataset_id) {
+              ambiguous = true;
+              break;
+            }
+            found = item.dataset_id;
+          }
+          if (found.has_value() && !ambiguous) {
+            return *found;
+          }
+        }
+        const std::vector<std::pair<PJ::DatasetId, QString>> datasets = session_->catalogModel().datasets();
+        return datasets.empty() ? PJ::DatasetId{0} : datasets.front().first;
+      });
   session->dp_host = std::make_unique<DataProcessorsRuntimeHost>(
       session_->sessionManager().dataProcessorService(), plugin_id.toStdString());
-  session->dp_host->registerServices(*session->builder);
+  // ONE pj.data_processors.v1 registration, routed by kind: the registry rejects
+  // duplicate names, so registering both bridges directly would silently drop the
+  // second one and break that kind's toolboxes.
+  session->dp_router =
+      std::make_unique<DataProcessorsKindRouter>(session->markers_host->raw(), session->dp_host->raw());
+  session->dp_router->registerServices(*session->builder);
 
   // Source promotion ("pj.source_promotion.v1"), bound per toolbox instance:
   // the provider identity is THIS binding's stable manifest id (host-derived,
@@ -8946,7 +9157,9 @@ void MainWindow::launchToolbox(
     if (!descriptor) {
       return {};
     }
-    return (descriptor->topic_name + "/" + descriptor->field_name).toStdString();
+    // Shared key builder so the producer and the plot overlay agree (and avoid a
+    // doubled "//" when the field path already starts with '/').
+    return sdk::markerSeriesKey(descriptor->topic_name.toStdString(), descriptor->field_name.toStdString());
   };
   auto* engine = new PanelEngine(DialogHandle::fromBorrowed(borrowed), panel_config, this);
   QWidget* panel = engine->openPanel();

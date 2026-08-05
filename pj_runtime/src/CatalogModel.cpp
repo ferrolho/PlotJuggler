@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "pj_base/builtin/plot_markers.hpp"
 #include "pj_base/dataset.hpp"
 #include "pj_base/type_tree.hpp"
 #include "pj_datastore/column_buffer.hpp"
@@ -28,6 +29,7 @@
 #include "pj_datastore/reader.hpp"
 #include "pj_datastore/topic_storage.hpp"
 #include "pj_runtime/DataProcessorService.h"
+#include "pj_runtime/MarkerTopics.h"
 #include "pj_runtime/SessionManager.h"
 #include "pj_runtime/Time.h"
 using namespace Qt::StringLiterals;
@@ -783,6 +785,12 @@ void CatalogModel::rebuildNow() {
 
     for (const ObjectTopicId object_topic_id : object_store.listTopics(dataset_id)) {
       const ObjectTopicDescriptor& object_topic = object_store.descriptor(object_topic_id);
+      // Reserved marker storage topics ("__markers__/...") are internal annotation
+      // state, not user-facing series — keep them out of the Datasets tree. The
+      // overlay reads them straight from the ObjectStore, not via the catalog.
+      if (isMarkerObjectTopic(object_topic.topic_name)) {
+        continue;
+      }
       const QString key = makeObjectTopicKey(dataset_id, object_topic_id);
       if (removed_names_for_dataset != nullptr && removed_names_for_dataset->count(key) > 0) {
         // Honor the per-dataset removal blacklist for object topics too.

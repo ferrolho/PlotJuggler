@@ -93,6 +93,10 @@ struct ResolvedObjectEntry {
 struct RetentionBudget {
   int64_t time_window_ns = 0;
   size_t max_memory_bytes = 0;
+  // Keep at most this many of the most recent entries (0 = unlimited). Lets a
+  // producer that republishes one snapshot per topic (e.g. plot markers, pushed
+  // at a sentinel timestamp) cap accumulation at 1 instead of growing per push.
+  size_t max_entries = 0;
 };
 
 /// Read view over a topic's entry timestamps that holds the series read lock for
@@ -280,8 +284,15 @@ class ObjectStore {
   /// their ObjectTopicId. Purely mechanical: canonical-type conflict detection is
   /// handled by pj_runtime. Validates self/duplicate sources up front; a source
   /// with no object topics is a no-op. GUI-thread only.
+  ///
+  /// `exclude` (optional) opts a topic out of the generic fold entirely — it is
+  /// neither folded nor reparented, left untouched on its dataset. The store stays
+  /// domain-neutral: the caller supplies the policy. Used for single-entry,
+  /// supersede-style topics (plot markers) whose owner merges them set-aware,
+  /// where the generic interleave+retention fold would drop all but one entry.
   [[nodiscard]] Expected<ObjectDatasetMergeReport> mergeDatasets(
-      DatasetId anchor_id, const std::vector<DatasetMergeSource>& sources);
+      DatasetId anchor_id, const std::vector<DatasetMergeSource>& sources,
+      const std::function<bool(const ObjectTopicDescriptor&)>& exclude = {});
 
   // --- Lifecycle ---
 

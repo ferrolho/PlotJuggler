@@ -5,12 +5,18 @@
 #include <qwt_legend_data.h>
 #include <qwt_plot_canvas.h>
 #include <qwt_plot_curve.h>
+#include <qwt_plot_grid.h>
 #include <qwt_plot_item.h>
+#include <qwt_plot_marker.h>
+#include <qwt_plot_panner.h>
+#include <qwt_plot_zoneitem.h>
 #include <qwt_plot_zoomer.h>
 #include <qwt_scale_div.h>
 #include <qwt_scale_draw.h>
+#include <qwt_symbol.h>
 #include <qwt_text.h>
 
+#include <QBrush>
 #include <QColor>
 #include <QEvent>
 #include <QFrame>
@@ -91,11 +97,34 @@ ChartPreviewWidget::ChartPreviewWidget(QWidget* parent) : QwtPlot(parent) {
     }
   });
 
+  // Background grid (major dashed, minor dotted) — mirrors the main plot widget
+  // (PlotWidgetBase). Shown only while interactive (toggled in setZoomEnabled).
+  grid_ = new QwtPlotGrid();
+  grid_->enableX(true);
+  grid_->enableY(true);
+  grid_->enableXMin(true);
+  grid_->enableYMin(true);
+  grid_->setMajorPen(QPen(QColor(150, 150, 150), 0.0, Qt::DashLine));
+  grid_->setMinorPen(QPen(QColor(210, 210, 210), 0.0, Qt::DotLine));
+  grid_->attach(this);
+  grid_->setVisible(false);
+
   // Rubber-band zoom (left-drag to zoom in, right-click steps out). Disabled
   // until setZoomEnabled(true); wheel zoom is handled in eventFilter().
   zoomer_ = new QwtPlotZoomer(canvas());
   zoomer_->setEnabled(false);
   QObject::connect(zoomer_, &QwtPlotZoomer::zoomed, this, [this](const QRectF&) { emitViewChanged(); });
+
+  // Pan: middle-drag, plus Ctrl+left-drag (so it coexists with the left-drag zoomer) —
+  // the same two-panner scheme as PlotWidgetBase. Disabled until setZoomEnabled(true).
+  panner_ = new QwtPlotPanner(canvas());
+  panner_->setMouseButton(Qt::MiddleButton);
+  panner_->setEnabled(false);
+  panner_ctrl_ = new QwtPlotPanner(canvas());
+  panner_ctrl_->setMouseButton(Qt::LeftButton, Qt::ControlModifier);
+  panner_ctrl_->setEnabled(false);
+  QObject::connect(panner_, &QwtPlotPanner::panned, this, [this](int, int) { emitViewChanged(); });
+  QObject::connect(panner_ctrl_, &QwtPlotPanner::panned, this, [this](int, int) { emitViewChanged(); });
 
   canvas()->installEventFilter(this);
 }
@@ -162,14 +191,89 @@ void ChartPreviewWidget::setSeries(const std::vector<Series>& series) {
   }
 }
 
+void ChartPreviewWidget::setMarkers(const std::vector<Marker>& markers) {
+  for (auto* item : marker_items_) {
+    item->detach();
+    delete item;
+  }
+  marker_items_.clear();
+
+  // Resolve the marker color: explicit hex wins; otherwise a neutral red so an
+  // unstyled marker is still visible.
+  auto resolveColor = [](const std::string& hex) -> QColor {
+    const QColor c(QString::fromStdString(hex));
+    return c.isValid() ? c : QColor(0xd6, 0x27, 0x28);
+  };
+
+  for (const auto& m : markers) {
+    const QColor color = resolveColor(m.color);
+
+    // Filled bands: a region is a vertical x-band; a value_band with height is a
+    // horizontal y-band. (A zero-height value_band falls through to an HLine.)
+    if (m.kind == "region" || (m.kind == "value_band" && m.y0 != m.y1)) {
+      const bool vertical = (m.kind == "region");
+      auto* zone = new QwtPlotZoneItem();
+      zone->setOrientation(vertical ? Qt::Vertical : Qt::Horizontal);
+      zone->setInterval(vertical ? m.x0 : m.y0, vertical ? m.x1 : m.y1);
+      QColor fill = color;
+      fill.setAlpha(40);
+      zone->setBrush(QBrush(fill));
+      QPen pen(color);
+      pen.setWidthF(1.0);
+      zone->setPen(pen);
+      zone->attach(this);
+      marker_items_.push_back(zone);
+      continue;
+    }
+
+    auto* marker = new QwtPlotMarker();
+    if (m.kind == "value_band") {  // y0 == y1 → horizontal line
+      marker->setLineStyle(QwtPlotMarker::HLine);
+      marker->setYValue(m.y0);
+    } else if (m.kind == "event" && m.has_value) {  // point: a hollow ring on the sample
+      marker->setLineStyle(QwtPlotMarker::NoLine);
+      marker->setValue(m.x0, m.y0);
+      marker->setSymbol(new QwtSymbol(QwtSymbol::Ellipse, Qt::NoBrush, QPen(color, 1.5), QSize(8, 8)));
+    } else {  // event vertical line / label
+      marker->setLineStyle(QwtPlotMarker::VLine);
+      marker->setXValue(m.x0);
+    }
+    QPen pen(color);
+    pen.setWidthF(1.0);
+    marker->setLinePen(pen);
+    if (!m.label.empty()) {
+      QwtText label(QString::fromStdString(m.label));
+      label.setColor(color);
+      marker->setLabel(label);
+      marker->setLabelAlignment(Qt::AlignTop | Qt::AlignRight);
+    }
+    marker->attach(this);
+    marker_items_.push_back(marker);
+  }
+
+  replot();
+}
+
 void ChartPreviewWidget::clearSeries() {
   detachItems(QwtPlotItem::Rtti_PlotCurve, /*autoDelete=*/true);
+  for (auto* item : marker_items_) {
+    item->detach();
+    delete item;
+  }
+  marker_items_.clear();
   replot();
 }
 
 void ChartPreviewWidget::setZoomEnabled(bool enabled) {
+  if (enabled == zoom_enabled_) {
+    return;  // idempotent: the panel re-declares this every tick
+  }
   zoom_enabled_ = enabled;
   zoomer_->setEnabled(enabled);
+  panner_->setEnabled(enabled);
+  panner_ctrl_->setEnabled(enabled);
+  grid_->setVisible(enabled);
+  replot();
 }
 
 bool ChartPreviewWidget::eventFilter(QObject* obj, QEvent* event) {

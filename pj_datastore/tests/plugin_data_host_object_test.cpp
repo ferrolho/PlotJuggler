@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "pj_base/sdk/plugin_data_api.hpp"
+#include "pj_datastore/engine.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/plugin_data_host.hpp"
 
@@ -287,6 +288,37 @@ TEST(PluginDataHostObjectTest, ParserSetTargetRedirectsPushToSecondary) {
   ASSERT_TRUE(host.pushOwned(3000, payload_c).has_value());
   EXPECT_EQ(primary.entryCount(primary_topic), 2U);
   EXPECT_EQ(secondary.entryCount(secondary_topic), 1U);
+}
+
+// Annotation path (toolbox surface): a toolbox attaches an object topic to a
+// dataset by its DatasetId (not a source it created), idempotently — this is how
+// a marker producer publishes its set onto a dataset another source loaded.
+TEST(PluginDataHostObjectTest, ToolboxRegistersObjectTopicOnExistingDatasetIdempotently) {
+  DataEngine engine;
+  ObjectStore store;
+  DatastoreToolboxHost toolbox_impl{engine, store};
+  sdk::ToolboxHostView toolbox{toolbox_impl.raw()};
+
+  const auto source = *toolbox.createDataSource("loaded_elsewhere");
+  const auto dataset = static_cast<DatasetId>(source.id);
+  constexpr const char* kTopic = "__markers__/__global__";
+
+  auto handle = toolbox.registerObjectTopicOnDataset(dataset, kTopic, R"({"object_type":"plot_markers"})");
+  ASSERT_TRUE(handle.has_value()) << handle.error();
+
+  // Idempotent: republishing re-resolves the SAME topic handle, never "exists".
+  auto again = toolbox.registerObjectTopicOnDataset(dataset, kTopic, "{}");
+  ASSERT_TRUE(again.has_value()) << again.error();
+  EXPECT_EQ(handle->id, again->id);
+
+  const std::vector<uint8_t> payload{0x10, 0x20, 0x30};
+  ASSERT_TRUE(toolbox.pushOwnedObject(*handle, 0, Span<const uint8_t>{payload.data(), payload.size()}).has_value());
+  const auto resolved = store.latestAt(ObjectTopicId{handle->id}, 0);
+  ASSERT_TRUE(resolved.has_value());
+  EXPECT_EQ(resolved->payload.bytes.size(), payload.size());
+
+  // An unknown dataset is rejected.
+  EXPECT_FALSE(toolbox.registerObjectTopicOnDataset(DatasetId{999999}, "x", "{}").has_value());
 }
 
 }  // namespace

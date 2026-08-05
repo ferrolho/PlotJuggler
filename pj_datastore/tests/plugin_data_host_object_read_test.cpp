@@ -195,5 +195,29 @@ TEST(ToolboxObjectReadHostTest, MovedObjectBytesIsSafelyEmptied) {
   EXPECT_FALSE(moved.empty());
 }
 
+TEST(ToolboxObjectReadHostTest, LookupTopicOnDatasetDisambiguatesByDataset) {
+  // Object-topic identity is (dataset, name): the same series path can carry
+  // markers on two loaded datasets. The dataset-scoped lookup must return the
+  // topic owned by the requested dataset, not the first name match.
+  ObjectStore store;
+  DatastoreToolboxObjectReadHost read_impl{store};
+  ToolboxObjectReadHostView reader{read_impl.raw()};
+
+  const auto a = store.registerTopic({.dataset_id = 1, .topic_name = "__markers__//s/p", .metadata_json = "{}"});
+  const auto b = store.registerTopic({.dataset_id = 2, .topic_name = "__markers__//s/p", .metadata_json = "{}"});
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(b.has_value());
+  ASSERT_NE(a->id, b->id);
+
+  const auto ha = reader.lookupTopicOnDataset(DatasetId{1}, "__markers__//s/p");
+  const auto hb = reader.lookupTopicOnDataset(DatasetId{2}, "__markers__//s/p");
+  ASSERT_TRUE(ha.has_value());
+  ASSERT_TRUE(hb.has_value());
+  EXPECT_EQ(ha->id, a->id);
+  EXPECT_EQ(hb->id, b->id);
+  EXPECT_NE(ha->id, hb->id);
+  EXPECT_FALSE(reader.lookupTopicOnDataset(DatasetId{3}, "__markers__//s/p").has_value());
+}
+
 }  // namespace
 }  // namespace PJ
