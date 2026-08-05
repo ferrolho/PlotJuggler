@@ -954,7 +954,11 @@ void MarketplaceWindow::refreshAfterInstalledChange() {
 }
 
 void MarketplaceWindow::applyFilters() {
-  const QString search = ui_->search_edit_->text().toLower();
+  // Trim before matching: leading/trailing whitespace is not meaningful in a
+  // search term, and an untrimmed space makes contains() miss every plugin
+  // whose name/description doesn't embed that exact space (a stray space →
+  // empty list).
+  const QString search = ui_->search_edit_->text().trimmed().toLower();
 
   // Category values are the strings the published registry actually ships in each
   // extension's "category" field, NOT the button labels and NOT the vocabulary in
