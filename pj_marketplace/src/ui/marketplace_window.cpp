@@ -417,23 +417,29 @@ void MarketplaceWindow::setupSignals() {
     local_install_in_flight_ = false;
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
+    ++restart_pending_count_;
     refreshAfterInstalledChange();
     setStatus(QString("Extension %1 staged — will be active after restart").arg(id));
     processInstallQueue();
+    maybeShowRestartRequiredDialog();
   });
 
   connect(ext_mgr_, &ExtensionManager::uninstallPendingRestart, this, [this](const QString& id) {
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
+    ++restart_pending_count_;
     refreshAfterInstalledChange();
     setStatus(QString("Extension %1 staged — will be uninstalled after restart").arg(id));
+    maybeShowRestartRequiredDialog();
   });
 
   connect(ext_mgr_, &ExtensionManager::downgradePendingRestart, this, [this](const QString& id) {
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
+    ++restart_pending_count_;
     refreshAfterInstalledChange();
     setStatus(QString("Extension %1 will revert to its bundled version after restart").arg(id));
+    maybeShowRestartRequiredDialog();
   });
 
   connect(registry_mgr_, &RegistryManager::fetchError, this, [this](const QString& error) {
@@ -494,6 +500,9 @@ void MarketplaceWindow::setupSignals() {
     }
     // On failure the status was already set by installError — do not overwrite it.
     processInstallQueue();
+    // A batch whose LAST item finishes without staging (fresh install, or a
+    // failed item) must still surface the dialog for the items that DID stage.
+    maybeShowRestartRequiredDialog();
   });
 
   connect(ext_mgr_, &ExtensionManager::installError, this, [this](const QString& /*id*/, const QString& error) {
@@ -1308,6 +1317,30 @@ void MarketplaceWindow::processInstallQueue() {
   if (!update_queue_.isEmpty()) {
     ext_mgr_->update(update_queue_.takeFirst());
   }
+}
+
+void MarketplaceWindow::maybeShowRestartRequiredDialog() {
+  // Wait for the whole batch: while anything is active or queued — including a
+  // local-ZIP sideload, which runs id-less until its manifest is read — the
+  // next completion handler calls back here, so the dialog fires exactly once
+  // when everything settles.
+  if (restart_pending_count_ == 0 || restart_dialog_open_ || !active_install_id_.isEmpty() ||
+      local_install_in_flight_ || !pending_clicks_.isEmpty() || !update_queue_.isEmpty()) {
+    return;
+  }
+  const int staged = std::exchange(restart_pending_count_, 0);
+  const QString text = staged == 1
+                           ? tr("An extension change is staged. Restart PlotJuggler to apply it.")
+                           : tr("%1 extension changes are staged. Restart PlotJuggler to apply them.").arg(staged);
+  // Parent to the visible host: in the app this window is a hidden controller
+  // whose content widget is embedded elsewhere, so parenting to `this` would
+  // center the modal on hidden stale geometry.
+  QWidget* host = content_widget_ != nullptr ? content_widget_->window() : this;
+  restart_dialog_open_ = true;
+  MessageBox::information(host, tr("Restart required"), text);
+  restart_dialog_open_ = false;
+  // Anything that staged inside the modal's nested event loop shows now.
+  maybeShowRestartRequiredDialog();
 }
 
 }  // namespace PJ

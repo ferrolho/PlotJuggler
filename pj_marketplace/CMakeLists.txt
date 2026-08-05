@@ -169,7 +169,8 @@ target_compile_options(registry_manager_test PRIVATE ${PJ_WARNING_FLAGS})
 add_test(NAME registry_manager_test COMMAND registry_manager_test)
 
 if(TARGET mock_data_source_plugin AND TARGET mock_file_source_plugin
-   AND TARGET mock_data_source_v2_plugin AND TARGET missing_id_data_source_plugin)
+   AND TARGET mock_data_source_v2_plugin AND TARGET missing_id_data_source_plugin
+   AND TARGET mock_data_source_pinning_plugin AND TARGET mock_data_source_pinning_v2_plugin)
   add_executable(extension_manager_test
     tests/extension_manager_test.cpp
   )
@@ -179,9 +180,12 @@ if(TARGET mock_data_source_plugin AND TARGET mock_file_source_plugin
     PJ_MOCK_DATA_SOURCE_V2_PLUGIN_PATH="$<TARGET_FILE:mock_data_source_v2_plugin>"
     PJ_MOCK_FILE_SOURCE_PLUGIN_PATH="$<TARGET_FILE:mock_file_source_plugin>"
     PJ_MISSING_ID_PLUGIN_PATH="$<TARGET_FILE:missing_id_data_source_plugin>"
+    PJ_MOCK_PINNING_PLUGIN_PATH="$<TARGET_FILE:mock_data_source_pinning_plugin>"
+    PJ_MOCK_PINNING_V2_PLUGIN_PATH="$<TARGET_FILE:mock_data_source_pinning_v2_plugin>"
   )
   add_dependencies(extension_manager_test mock_data_source_plugin mock_file_source_plugin
-                   mock_data_source_v2_plugin missing_id_data_source_plugin)
+                   mock_data_source_v2_plugin missing_id_data_source_plugin
+                   mock_data_source_pinning_plugin mock_data_source_pinning_v2_plugin)
 
   target_link_libraries(extension_manager_test PRIVATE
     pj_marketplace

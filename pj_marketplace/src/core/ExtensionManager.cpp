@@ -12,6 +12,7 @@
 #include <QStringList>
 #include <QUuid>
 #include <filesystem>
+#include <utility>
 
 #include "pj_marketplace/download_manager.hpp"
 #include "pj_marketplace/extension_manager.hpp"
@@ -821,7 +822,13 @@ void ExtensionManager::replaceConflictingInstallDirs(const QString& id, const QS
     } else {
       qWarning("ExtensionManager: could not remove prior install of '%s' at '%s'", qPrintable(id), qPrintable(root));
     }
-    installed_.remove(id);
+    // Drop the record only if it tracks the displaced copy: after a promotion
+    // installed_[id] already points at keep_dir, and erasing it here would
+    // un-register the extension applyPendingInstalls just promoted.
+    const auto tracked = installed_.constFind(id);
+    if (tracked != installed_.constEnd() && QDir::cleanPath(tracked->path) == clean) {
+      installed_.remove(id);
+    }
   }
 }
 
@@ -830,6 +837,16 @@ void ExtensionManager::applyPendingInstalls() {
   if (!pending.exists()) {
     return;
   }
+
+  // Conflict cleanup for the promoted ids runs AFTER the whole promotion loop.
+  // replaceConflictingInstallDirs() dlopens sibling directories to read their
+  // embedded ids, and opening a sibling's not-yet-promoted DSO pins its old
+  // image in the process (same glibc quirk as in initComponents): the rescan
+  // that follows this drain would then report the pre-update version for every
+  // pinned sibling, and the marketplace would re-offer updates that are
+  // already on disk. Deferring the scans guarantees any DSO they open is a
+  // post-promotion payload.
+  QList<std::pair<QString, QString>> promoted;  // (id, promoted dir)
 
   for (const QFileInfo& entry :
        pending.entryInfoList(QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot)) {
@@ -891,10 +908,6 @@ void ExtensionManager::applyPendingInstalls() {
 
     const QString dst = extRoot(extensions_dir_, intent.id);
 
-    // Replace any prior copy of this id stored under a different directory name
-    // (e.g. a bundled plugin) so promoting to "<id>" does not leave a duplicate.
-    replaceConflictingInstallDirs(intent.id, dst);
-
     // Back up the existing install before the staged version takes its place:
     // move the current dir aside first, so promoting an update never silently
     // destroys the previous install (this is the single backup point for updates).
@@ -943,7 +956,14 @@ void ExtensionManager::applyPendingInstalls() {
     QFile::remove(pendingInstallIntentPath(dst));
     registerInstalledExtension(intent.id, dst, discovered.record);
     pending_backup_path_.clear();
+    promoted.append({intent.id, dst});
     emit installFinished(intent.id, true);
+  }
+
+  // Replace any prior copy of a promoted id stored under a different directory
+  // name (e.g. a bundled plugin) so "<id>" becomes the sole install of that id.
+  for (const auto& [promoted_id, promoted_dir] : promoted) {
+    replaceConflictingInstallDirs(promoted_id, promoted_dir);
   }
 }
 

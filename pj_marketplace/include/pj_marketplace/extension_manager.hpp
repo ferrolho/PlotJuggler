@@ -316,14 +316,14 @@ class ExtensionManager : public QObject {
   void registerInstalledExtension(const QString& id, const QString& dst, InstalledExtension record);
 
   // Backs up (or removes) any directory under extensions_dir_ — other than
-  // `keep_dir` — whose embedded plugin id equals `id`. Called before promoting
-  // an install/update so a prior copy stored under a DIFFERENT directory name
-  // (e.g. a bundled plugin in "data-load-foo" for id "foo") is replaced instead
-  // of left behind as a duplicate that refreshInstalledFromDisk would then
-  // resolve non-deterministically by directory name.
-  // Moves aside any directory in extensions_dir_ other than keep_dir whose embedded
-  // manifest carries `id`, so the promoted "<id>" directory is that extension's sole
-  // install of it.
+  // `keep_dir` — whose embedded plugin id equals `id`, so the promoted "<id>"
+  // directory is that extension's sole install: a prior copy stored under a
+  // DIFFERENT directory name (e.g. a bundled plugin in "data-load-foo" for id
+  // "foo") would otherwise linger as a duplicate that refreshInstalledFromDisk
+  // resolves non-deterministically by directory name. The scan dlopens sibling
+  // DSOs, so during the startup drain this must only run once every staged
+  // promotion has landed (see applyPendingInstalls) — opening a not-yet-promoted
+  // sibling would pin its pre-update image in the process.
   void replaceConflictingInstallDirs(const QString& id, const QString& keep_dir);
 
   // Emits uninstallError + uninstallFinished(false) and records a diagnostic.

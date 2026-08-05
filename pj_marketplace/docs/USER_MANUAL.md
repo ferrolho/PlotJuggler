@@ -95,8 +95,9 @@ parsers. The search box narrows the result further.
 2. Click on the extension
 3. Click **Update**
 4. The new version is staged and the extension shows **Needs Restart** — the update is applied on the next launch, so the currently loaded plugin keeps working for the rest of the session
-5. On restart, the old version is automatically backed up before the new one is promoted
-6. If promotion fails, the old version remains in `.backup/` and can be recovered manually
+5. Once every queued update has been staged, a **Restart required** dialog summarizes how many changes are waiting (one dialog per batch, also shown for staged uninstalls and downgrades)
+6. On restart, the old version is automatically backed up before the new one is promoted
+7. If promotion fails, the old version remains in `.backup/` and can be recovered manually
 
 **Update All:** Click "Update All" in the toolbar to stage updates for all extensions at once
 

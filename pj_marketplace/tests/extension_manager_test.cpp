@@ -147,6 +147,12 @@ QString pluginPathForId(const QString& ext_id, const QString& version = "1.0.0")
   if (ext_id == "mock-file-source") {
     return QStringLiteral(PJ_MOCK_FILE_SOURCE_PLUGIN_PATH);
   }
+  if (ext_id == "pinning-data-source" && version == "2.0.0") {
+    return QStringLiteral(PJ_MOCK_PINNING_V2_PLUGIN_PATH);
+  }
+  if (ext_id == "pinning-data-source") {
+    return QStringLiteral(PJ_MOCK_PINNING_PLUGIN_PATH);
+  }
   if (ext_id == "missing-id-source") {
     return QStringLiteral(PJ_MISSING_ID_PLUGIN_PATH);
   }
@@ -672,9 +678,9 @@ TEST_F(ExtensionManagerTest, UpdateStagesNewVersionUntilRestart) {
   // Ensure clean backup state before test (in case previous run failed mid-test).
   cleanBackups("mock-data-source");
 
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_pending_dir.isValid());
 
   DownloadManager local_dl;
@@ -722,9 +728,9 @@ TEST_F(ExtensionManagerTest, UpdatePromotionBacksUpOldVersion) {
   // Ensure clean backup state before test (in case previous run failed mid-test).
   cleanBackups("mock-data-source");
 
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_pending_dir.isValid());
 
   DownloadManager local_dl;
@@ -767,9 +773,9 @@ TEST_F(ExtensionManagerTest, UpdatePromotionBacksUpOldVersion) {
 TEST_F(ExtensionManagerTest, FailedUpdateStagingLeavesLiveInstallUntouched) {
   cleanBackups("mock-data-source");
 
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_pending_dir.isValid());
 
   DownloadManager local_dl;
@@ -815,9 +821,9 @@ TEST_F(ExtensionManagerTest, FailedUpdateStagingLeavesLiveInstallUntouched) {
 TEST_F(ExtensionManagerTest, UpdateRejectsAlreadyPendingInstall) {
   cleanBackups("mock-data-source");
 
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_pending_dir.isValid());
 
   DownloadManager local_dl;
@@ -865,9 +871,9 @@ TEST_F(ExtensionManagerTest, UpdateRejectsAlreadyPendingInstall) {
 TEST_F(ExtensionManagerTest, UpdateRejectsAlreadyPendingUninstall) {
   cleanBackups("mock-data-source");
 
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_pending_dir.isValid());
 
   DownloadManager local_dl;
@@ -1153,14 +1159,18 @@ TEST_F(ExtensionManagerTest, ApplyPendingInstallsPromotesStagedExtension) {
 }
 
 // Constructing the manager (the "one restart") must reflect a staged update over
-// an existing install as installed in a SINGLE pass: initComponents() snapshots
-// disk first, then promotes, so it never re-scans the just-replaced extension
-// path. Re-scanning after promotion re-opened that path and could read stale
-// metadata, making the update look un-applied until a second restart.
+// an existing install as installed in a SINGLE pass: initComponents() promotes
+// staged work first and only then snapshots disk, so the first in-process open
+// of the extension path reads the promoted payload instead of pinning a stale
+// pre-update image that would make the update look un-applied until a second
+// restart.
 TEST_F(ExtensionManagerTest, ConstructionReflectsStagedUpdateInOnePass) {
-  QTemporaryDir ext_dir;
+  cleanBackups("mock-data-source");
+  // Same filesystem as backupDir(): promoting over the existing v1 backs it up
+  // via QDir::rename(), which cannot cross filesystems (e.g. a tmpfs /tmp).
+  QTemporaryDir ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
   ASSERT_TRUE(ext_dir.isValid());
-  QTemporaryDir pend_dir;
+  QTemporaryDir pend_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(pend_dir.isValid());
 
   // Pre-existing v1 install.
@@ -1185,6 +1195,70 @@ TEST_F(ExtensionManagerTest, ConstructionReflectsStagedUpdateInOnePass) {
   mgr.refreshInstalledFromDisk();
   EXPECT_EQ(mgr.installedExtensions()["mock-data-source"].version, "2.0.0")
       << "a re-scan after promotion must not revert to the stale old version";
+
+  cleanBackups("mock-data-source");
+}
+
+// A staged batch must report every promoted extension at its NEW version even
+// when a SIBLING's pre-update DSO stays resident after dlclose (NODELETE via a
+// bound STB_GNU_UNIQUE symbol — the pinning fixture models real plugin builds).
+// A conflict scan that dlopens a sibling's not-yet-promoted old build pins its
+// image, and the pinned image keeps answering for that path after promotion:
+// the rescan reports the pre-update version and the marketplace re-offers an
+// update that is already on disk. Contract: no sibling dir is opened before
+// its own promotion. The single-id test above cannot catch this — the
+// conflict scan skips its own target.
+TEST_F(ExtensionManagerTest, ConstructionPromotesStagedBatchDespitePinnedSibling) {
+  cleanBackups("mock-data-source");
+  cleanBackups("pinning-data-source");
+
+  // Same filesystem as backupDir() so promotion's backup renames are moves.
+  QTemporaryDir ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
+  ASSERT_TRUE(ext_dir.isValid());
+  QTemporaryDir pend_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
+  ASSERT_TRUE(pend_dir.isValid());
+
+  // Installed v1 pair + staged v2 pair, laid out exactly as update() leaves
+  // them. Nothing may dlopen the installed paths before the manager
+  // constructs: the drain must be this process's first touch of them.
+  // "mock-data-source" sorts before "pinning-data-source", so the old pinning
+  // build is the sibling a pre-promotion conflict scan would open.
+  ASSERT_TRUE(copyFixturePlugin(ext_dir.path() + "/mock-data-source", "mock-data-source", "1.0.0"));
+  ASSERT_TRUE(copyFixturePlugin(ext_dir.path() + "/pinning-data-source", "pinning-data-source", "1.0.0"));
+  const QString staged_mock = pend_dir.path() + "/mock-data-source";
+  ASSERT_TRUE(copyFixturePlugin(staged_mock, "mock-data-source", "2.0.0"));
+  ASSERT_TRUE(writePendingIntentForTest(staged_mock, "mock-data-source", "2.0.0"));
+  const QString staged_pinning = pend_dir.path() + "/pinning-data-source";
+  ASSERT_TRUE(copyFixturePlugin(staged_pinning, "pinning-data-source", "2.0.0"));
+  ASSERT_TRUE(writePendingIntentForTest(staged_pinning, "pinning-data-source", "2.0.0"));
+
+  DownloadManager dl;
+  ExtensionManager mgr(&dl, ext_dir.path(), pend_dir.path());
+
+  EXPECT_EQ(mgr.installedVersion("mock-data-source"), "2.0.0");
+  EXPECT_EQ(mgr.installedVersion("pinning-data-source"), "2.0.0")
+      << "the drain read a pinned pre-update sibling image instead of the promoted file";
+
+#ifdef Q_OS_LINUX
+  // Canary that the scenario was real: the promoted pinning DSO must be
+  // resident (the post-promotion scans pin the NEW image), and no displaced
+  // pre-update image may linger under the backup dir (a mapping there means a
+  // pre-promotion open pinned it). If the fixture ever stops pinning after a
+  // toolchain change, the first expectation fails loudly — rework the
+  // fixture's anchor rather than deleting the check.
+  QFile maps("/proc/self/maps");
+  ASSERT_TRUE(maps.open(QIODevice::ReadOnly));
+  const QString mapped = QString::fromUtf8(maps.readAll());
+  EXPECT_TRUE(mapped.contains(QDir(ext_dir.path()).canonicalPath() + "/pinning-data-source/"));
+  // Canonicalized like the kernel reports mapping paths; the dir exists here —
+  // both promotions displaced an existing install into it.
+  const QString backup_prefix = QDir(PlatformUtils::backupDir()).canonicalPath();
+  ASSERT_FALSE(backup_prefix.isEmpty());
+  EXPECT_FALSE(mapped.contains(backup_prefix + "/pinning-data-source-"));
+#endif
+
+  cleanBackups("mock-data-source");
+  cleanBackups("pinning-data-source");
 }
 
 TEST_F(ExtensionManagerTest, StageInstallRejectsEmbeddedIdMismatchBeforeRestart) {
@@ -1287,8 +1361,8 @@ TEST_F(ExtensionManagerTest, ApplyPendingInstallsRejectsEmptyStagingDirectory) {
 TEST_F(ExtensionManagerTest, ApplyPendingInstallsBacksUpExistingExtensionBeforePromotion) {
   // Place ext_dir + pending_dir on the same filesystem as backupDir() so all the
   // QDir::rename moves are atomic (no cross-device copy fallback).
-  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
-  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
   ASSERT_TRUE(local_ext_dir.isValid());
   ASSERT_TRUE(local_pending_dir.isValid());
   // Clean any stale backup from a previous failed run.
@@ -1885,29 +1959,43 @@ TEST_F(ExtensionManagerTest, InstallFromLocalZipHonoursDeclinedReplacement) {
 // The staged replacement is promoted on the next launch, into the same extensions
 // dir every other install uses, and the displaced copy is kept in the backup dir.
 TEST_F(ExtensionManagerTest, StagedLocalReplacementIsPromotedOnNextLaunch) {
+  cleanBackups("mock-data-source");
+
   QTemporaryDir src;
   ASSERT_TRUE(src.isValid());
+  // Same filesystem as backupDir(): promoting over the existing v1 backs it up
+  // via QDir::rename(), which cannot cross filesystems (e.g. a tmpfs /tmp).
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_ext_XXXXXX"));
+  ASSERT_TRUE(local_ext_dir.isValid());
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::configDir()).absoluteFilePath("test_pending_XXXXXX"));
+  ASSERT_TRUE(local_pending_dir.isValid());
+
+  DownloadManager local_dl;
+  ExtensionManager local_mgr(&local_dl, local_ext_dir.path(), local_pending_dir.path());
 
   const QString v2 = writeZipFile(src, dummyPluginZip("mock-data-source", "2.0.0"), "v2.zip");
   ASSERT_FALSE(v2.isEmpty());
-  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source", "1.0.0"));
+  ASSERT_TRUE(copyFixturePlugin(local_ext_dir.path() + "/mock-data-source", "mock-data-source", "1.0.0"));
+  local_mgr.refreshInstalledFromDisk();
 
-  mgr_->setReplaceConfirmation([](const QString&, const QString&, const QString&) { return true; });
-  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
-  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
-  mgr_->installFromLocalZip(v2);
+  local_mgr.setReplaceConfirmation([](const QString&, const QString&, const QString&) { return true; });
+  QSignalSpy spy_pending(&local_mgr, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_finished(&local_mgr, &ExtensionManager::installFinished);
+  local_mgr.installFromLocalZip(v2);
   ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
   ASSERT_EQ(spy_pending.count(), 1);
-  EXPECT_TRUE(mgr_->hasPendingInstall("mock-data-source"));
+  EXPECT_TRUE(local_mgr.hasPendingInstall("mock-data-source"));
   // Untouched until promotion: the running session may still have this DSO loaded.
-  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+  EXPECT_EQ(local_mgr.installedExtensions()["mock-data-source"].version, "1.0.0");
 
   // Next launch.
-  mgr_->applyPendingInstalls();
+  local_mgr.applyPendingInstalls();
 
-  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "2.0.0")
+  EXPECT_EQ(local_mgr.installedExtensions()["mock-data-source"].version, "2.0.0")
       << "the staged replacement must be promoted into the extensions dir";
-  EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source")) << "the stage must be consumed by promotion";
+  EXPECT_FALSE(local_mgr.hasPendingInstall("mock-data-source")) << "the stage must be consumed by promotion";
+
+  cleanBackups("mock-data-source");
 }
 
 // A path that is not a readable file fails before any transaction directory is

@@ -166,6 +166,12 @@ class MarketplaceWindow : public Dialog {
   // "Refreshing", "Ready", "Loading registry"). Errors still go via setStatus().
   void setInfoStatus(const QString& msg);
 
+  // Pops the canonical restart-required MessageBox once the install queue has
+  // fully settled and at least one operation staged for restart. No-op while a
+  // batch is still in flight, so an Update All run yields ONE dialog at the
+  // end, not one per staged item.
+  void maybeShowRestartRequiredDialog();
+
   Ui::MarketplaceWindow* ui_ = nullptr;
   QWidget* content_widget_ = nullptr;  ///< the UI body; exposed for embedding
   DownloadManager* download_mgr_ = nullptr;
@@ -195,6 +201,14 @@ class MarketplaceWindow : public Dialog {
   // phrase their message from the installed snapshot instead of the registry list,
   // which a sideloaded id is by definition absent from.
   bool local_install_in_flight_ = false;
+  // Staged operations (updates, sideload replacements, staged uninstalls and
+  // downgrades) whose effect waits for an app restart, accumulated until
+  // maybeShowRestartRequiredDialog() surfaces them and resets the count.
+  int restart_pending_count_ = 0;
+  // True while the restart-required MessageBox is up: its exec() spins a nested
+  // event loop, so a completion arriving inside it must not open a second
+  // dialog on top; the count it accumulates is surfaced right after.
+  bool restart_dialog_open_ = false;
   bool installations_changed_ = false;
   bool status_error_sticky_ = false;
   bool initial_snapshot_provided_ = false;

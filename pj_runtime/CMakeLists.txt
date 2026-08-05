@@ -362,6 +362,28 @@ if(PJ_BUILD_TESTS)
     target_compile_options(mock_data_source_v2_plugin PRIVATE ${PJ_WARNING_FLAGS})
     target_link_libraries(mock_data_source_v2_plugin PRIVATE pj_base)
 
+    # v1/v2 builds of a mock whose image stays resident after dlclose. Two
+    # mechanisms: -z nodelete (DF_1_NODELETE, compiler-independent) and a bound
+    # STB_GNU_UNIQUE anchor (models real GCC plugin builds; needs default
+    # symbol visibility). Consumed by extension_manager_test's staged-promotion
+    # regression coverage.
+    add_library(mock_data_source_pinning_plugin SHARED tests/mock_data_source_pinning_plugin.cpp)
+    target_compile_features(mock_data_source_pinning_plugin PRIVATE cxx_std_20)
+    target_compile_options(mock_data_source_pinning_plugin PRIVATE ${PJ_WARNING_FLAGS})
+    target_compile_definitions(mock_data_source_pinning_plugin PRIVATE PIN_MOCK_VERSION="1.0.0")
+    target_link_libraries(mock_data_source_pinning_plugin PRIVATE pj_base)
+
+    add_library(mock_data_source_pinning_v2_plugin SHARED tests/mock_data_source_pinning_plugin.cpp)
+    target_compile_features(mock_data_source_pinning_v2_plugin PRIVATE cxx_std_20)
+    target_compile_options(mock_data_source_pinning_v2_plugin PRIVATE ${PJ_WARNING_FLAGS})
+    target_compile_definitions(mock_data_source_pinning_v2_plugin PRIVATE PIN_MOCK_VERSION="2.0.0")
+    target_link_libraries(mock_data_source_pinning_v2_plugin PRIVATE pj_base)
+
+    if(NOT WIN32)
+      target_link_options(mock_data_source_pinning_plugin PRIVATE -Wl,-z,nodelete)
+      target_link_options(mock_data_source_pinning_v2_plugin PRIVATE -Wl,-z,nodelete)
+    endif()
+
     add_library(mock_data_source_incompatible_plugin SHARED tests/mock_data_source_incompatible_plugin.cpp)
     target_compile_features(mock_data_source_incompatible_plugin PRIVATE cxx_std_20)
     target_compile_options(mock_data_source_incompatible_plugin PRIVATE ${PJ_WARNING_FLAGS})
