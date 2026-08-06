@@ -168,8 +168,9 @@ class MarketplaceWindow : public Dialog {
   // name instead — otherwise the whole download/extract window is silent.
   void showInstallProgress(const QString& verb = QStringLiteral("Installing"));
 
-  // "  ·  N queued" for the combined pending_clicks_ + update_queue_ depth,
-  // or an empty string when nothing is waiting.
+  // "  ·  N queued" for the combined depth of every queue (card clicks, local
+  // ZIPs, the Update All batch), followed by "  ·  M failed" once this run has
+  // failures to report. Empty when nothing is waiting and nothing has failed.
   QString queueSuffix() const;
 
   // Success message for a finished install. `from_file` selects the sideload
@@ -189,6 +190,28 @@ class MarketplaceWindow : public Dialog {
   // batch is still in flight, so an Update All run yields ONE dialog at the
   // end, not one per staged item.
   void maybeShowRestartRequiredDialog();
+
+  // Once all install activity has settled (nothing active or queued), if any
+  // items failed during this run, replace the last item's success status with a
+  // summary ("Finished with N failures — see Diagnostics") so a mid-batch failure is
+  // not buried under a later success. No-op while anything is still in flight or
+  // when nothing failed. Resets batch_failed_count_.
+  void maybeShowBatchSummary();
+
+  // Total depth of every queue: card clicks, local ZIPs and the Update All
+  // batch. The one place that enumerates them, so adding a fourth queue cannot
+  // silently leave the settled gate or the status suffix counting the old three.
+  [[nodiscard]] int queuedCount() const {
+    return static_cast<int>(pending_clicks_.size() + pending_local_zips_.size() + update_queue_.size());
+  }
+
+  // True when nothing is installing or queued — the shared "batch settled" gate
+  // used by both maybeShowRestartRequiredDialog and maybeShowBatchSummary. Every
+  // queue counts, sideloads included: a summary or a restart dialog fired while
+  // a queued ZIP is still waiting would report on a batch that is not over.
+  [[nodiscard]] bool installBatchSettled() const {
+    return !isInstallBusy() && queuedCount() == 0;
+  }
 
   Ui::MarketplaceWindow* ui_ = nullptr;
   QWidget* content_widget_ = nullptr;  ///< the UI body; exposed for embedding
@@ -231,6 +254,12 @@ class MarketplaceWindow : public Dialog {
   // downgrades) whose effect waits for an app restart, accumulated until
   // maybeShowRestartRequiredDialog() surfaces them and resets the count.
   int restart_pending_count_ = 0;
+  // Failures accumulated across the current run of install activity (any mix of
+  // Update All, queued card clicks and queued sideloads), so the summary shown
+  // when everything settles reports them instead of ending on the last item's
+  // "Installed X" — a failure must not be buried under a later success. Reset
+  // once the batch settles (same gate as restart_pending_count_).
+  int batch_failed_count_ = 0;
   // True while the restart-required MessageBox is up: its exec() spins a nested
   // event loop, so a completion arriving inside it must not open a second
   // dialog on top; the count it accumulates is surfaced right after.

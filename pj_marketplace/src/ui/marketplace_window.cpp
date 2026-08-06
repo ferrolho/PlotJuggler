@@ -424,6 +424,11 @@ void MarketplaceWindow::setupSignals() {
     setStatus(QString("Extension %1 staged — will be active after restart").arg(id));
     processInstallQueue();
     maybeShowRestartRequiredDialog();
+    // Staging is how every successful update ends, so this — not installFinished
+    // — is the handler that closes a typical mixed batch. Must stay after
+    // processInstallQueue(): a dispatched next item is what makes both reports
+    // below correctly suppress themselves mid-batch.
+    maybeShowBatchSummary();
   });
 
   connect(ext_mgr_, &ExtensionManager::uninstallPendingRestart, this, [this](const QString& id) {
@@ -451,6 +456,13 @@ void MarketplaceWindow::setupSignals() {
   // ExtensionManager
   connect(ext_mgr_, &ExtensionManager::installStarted, this, [this](const QString& id) {
     active_install_id_ = id;
+    // A new install/update is starting, so a previous item's sticky error no
+    // longer applies — clear it before showInstallProgress() so the live
+    // "Installing…" status is not suppressed. Individual clicks clear the sticky
+    // themselves, but an Update All batch dispatches each item straight from
+    // processInstallQueue(), so without this a failed item would freeze the red
+    // error over the next item's moving progress bar.
+    clearStickyStatus();
     ui_->progress_bar_->setValue(0);
     ui_->progress_bar_->setRange(0, 100);
     ui_->progress_bar_->setVisible(true);
@@ -500,12 +512,21 @@ void MarketplaceWindow::setupSignals() {
     if (success) {
       status_error_sticky_ = false;
       setStatus(installedStatusText(id, was_sideload));
+    } else {
+      // Count every failure of this run so the end-of-batch summary can report
+      // it. installFinished(false) fires for both a genuine mid-download failure
+      // and an op rejected before installStarted, which is exactly the set we
+      // want to surface. On failure the status was already set by installError —
+      // do not overwrite it here.
+      ++batch_failed_count_;
     }
-    // On failure the status was already set by installError — do not overwrite it.
     processInstallQueue();
     // A batch whose LAST item finishes without staging (fresh install, or a
     // failed item) must still surface the dialog for the items that DID stage.
     maybeShowRestartRequiredDialog();
+    // …and, once everything settles, a summary if anything failed, so the last
+    // item's "Installed X" never hides a mid-batch failure.
+    maybeShowBatchSummary();
   });
 
   connect(ext_mgr_, &ExtensionManager::installError, this, [this](const QString& /*id*/, const QString& error) {
@@ -1060,11 +1081,17 @@ void MarketplaceWindow::clearStickyStatus() {
 }
 
 QString MarketplaceWindow::queueSuffix() const {
-  const int queued = pending_clicks_.size() + pending_local_zips_.size() + update_queue_.size();
-  if (queued == 0) {
-    return {};
+  const int queued = queuedCount();
+  QString suffix;
+  if (queued > 0) {
+    suffix += u"  ·  "_s + QString::number(queued) + u" queued"_s;
   }
-  return u"  ·  "_s + QString::number(queued) + u" queued"_s;
+  // Surface failures live too, so a mid-batch failure is visible while the rest
+  // of the queue is still running, not only in the end-of-batch summary.
+  if (batch_failed_count_ > 0) {
+    suffix += u"  ·  "_s + QString::number(batch_failed_count_) + u" failed"_s;
+  }
+  return suffix;
 }
 
 void MarketplaceWindow::setInfoStatus(const QString& msg) {
@@ -1367,8 +1394,7 @@ void MarketplaceWindow::maybeShowRestartRequiredDialog() {
   // local-ZIP sideload, which runs id-less until its manifest is read — the
   // next completion handler calls back here, so the dialog fires exactly once
   // when everything settles.
-  if (restart_pending_count_ == 0 || restart_dialog_open_ || isInstallBusy() || !pending_clicks_.isEmpty() ||
-      !pending_local_zips_.isEmpty() || !update_queue_.isEmpty()) {
+  if (restart_pending_count_ == 0 || restart_dialog_open_ || !installBatchSettled()) {
     return;
   }
   const int staged = std::exchange(restart_pending_count_, 0);
@@ -1384,6 +1410,21 @@ void MarketplaceWindow::maybeShowRestartRequiredDialog() {
   restart_dialog_open_ = false;
   // Anything that staged inside the modal's nested event loop shows now.
   maybeShowRestartRequiredDialog();
+}
+
+void MarketplaceWindow::maybeShowBatchSummary() {
+  // Only once the whole run has settled, and only if something failed: otherwise
+  // the normal per-item "Installed X" / restart dialog already tells the story.
+  if (batch_failed_count_ == 0 || !installBatchSettled()) {
+    return;
+  }
+  const int failed = std::exchange(batch_failed_count_, 0);
+  // Sticky (is_error=true) so it isn't overwritten by a trailing non-error
+  // status, and so it reads as the outcome it is: not everything succeeded.
+  // Point at Diagnostics, where the per-item errors are recorded.
+  const QString summary = failed == 1 ? tr("Finished with 1 failure — see Diagnostics for details.")
+                                      : tr("Finished with %1 failures — see Diagnostics for details.").arg(failed);
+  setStatus(summary, /*is_error=*/true);
 }
 
 }  // namespace PJ
