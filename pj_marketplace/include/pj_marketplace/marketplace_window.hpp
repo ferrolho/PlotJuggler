@@ -142,12 +142,30 @@ class MarketplaceWindow : public Dialog {
   // Processes one pending bulk-update item at a time.
   void processInstallQueue();
 
+  // Dispatches a local-ZIP sideload and marks it in flight. Takes the path BY
+  // VALUE: a synchronous failure inside installFromLocalZip() reaches
+  // installFinished, which clears local_install_path_ while the callee is still
+  // reading its argument.
+  void startLocalInstall(QString zip_path);
+
+  // True while ExtensionManager is busy with any install/update — a registry
+  // op (active_install_id_ set) OR a local-ZIP sideload. The dispatch gates use
+  // this so a new action is queued rather than dispatched into the manager's
+  // single-install-at-a-time guard (which would reject it as "already in
+  // progress"). A local install sets no active_install_id_, so checking that
+  // alone missed it.
+  [[nodiscard]] bool isInstallBusy() const {
+    return !active_install_id_.isEmpty() || !local_install_path_.isEmpty();
+  }
+
   // Shows the status of the in-flight install together with the queue depth,
   // e.g. "Installing mcap…  ·  2 queued". `verb` is the current phase word
   // ("Installing", "Verifying", "Extracting"). No-op when nothing is active, so
   // it never clobbers a terminal "Installed"/"Failed" message. Called on every
   // event that changes the active id or the queue, so the count stays live and
-  // an enqueue no longer hides what is currently installing.
+  // an enqueue no longer hides what is currently installing. A sideload has no
+  // active_install_id_ until its manifest is read, so it is named by its file
+  // name instead — otherwise the whole download/extract window is silent.
   void showInstallProgress(const QString& verb = QStringLiteral("Installing"));
 
   // "  ·  N queued" for the combined pending_clicks_ + update_queue_ depth,
@@ -189,6 +207,12 @@ class MarketplaceWindow : public Dialog {
   // is already running. Drained by processInstallQueue() in FIFO order once
   // active_install_id_ clears.
   QList<QString> pending_clicks_;
+  // Local-ZIP install paths that arrive while another install is already
+  // running. "Install local…" is queued like a card click instead of being
+  // rejected by the manager's single-install-at-a-time guard; drained by
+  // processInstallQueue() after pending_clicks_. Canonical paths, so the same
+  // file reached by a different spelling (relative, symlink) is one entry.
+  QList<QString> pending_local_zips_;
   // Id of the extension currently being installed or updated by the manager,
   // set from installStarted and cleared from installFinished. Empty means
   // idle — the UI-side guard uses this to decide whether to enqueue a click
@@ -197,10 +221,12 @@ class MarketplaceWindow : public Dialog {
   // Registry id of the row whose details the footer shows; preserved across
   // table rebuilds so an install/update repaint keeps the same row selected.
   QString footer_ext_id_;
-  // True while a local-ZIP sideload is in flight, so the outcome handlers can
-  // phrase their message from the installed snapshot instead of the registry list,
-  // which a sideloaded id is by definition absent from.
-  bool local_install_in_flight_ = false;
+  // Canonical path of the local-ZIP sideload in flight, empty when none. The
+  // outcome handlers phrase their message from the installed snapshot instead of
+  // the registry list, which a sideloaded id is by definition absent from; the
+  // path also dedupes a re-pick of the same file and names the status line for
+  // the window before installStarted supplies an id.
+  QString local_install_path_;
   // Staged operations (updates, sideload replacements, staged uninstalls and
   // downgrades) whose effect waits for an app restart, accumulated until
   // maybeShowRestartRequiredDialog() surfaces them and resets the count.

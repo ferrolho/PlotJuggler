@@ -398,6 +398,42 @@ TEST_F(ExtensionManagerTest, InstallBlocksConcurrentRequests) {
   EXPECT_FALSE(spy_error.first().at(1).toString().isEmpty());
 }
 
+// Symmetric to InstallBlocksConcurrentRequests: installFromLocalZip() must
+// also reject if a registry install is in flight (both paths share the
+// pending_id_ guard). The UI queues sideloads behind card actions so users
+// never see this error, but the manager still enforces single-install-at-a-
+// time at the boundary — this locks that invariant in either direction.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipBlockedByConcurrentInstall) {
+  QTcpServer hanging_server;
+  hanging_server.listen(QHostAddress::LocalHost, 0);
+  const QUrl hanging_url = QUrl(u"http://127.0.0.1:%1/"_s.arg(hanging_server.serverPort()));
+
+  const Extension ext_a = makeExtension("mock-data-source", "1.0.0", hanging_url);
+
+  // A real on-disk zip: installFromLocalZip() reads the file at the boundary
+  // before touching the pending_id_ guard, so we cannot fake the path.
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip_path = QDir(src.path()).absoluteFilePath("pkg.zip");
+  {
+    QFile f(zip_path);
+    ASSERT_TRUE(f.open(QIODevice::WriteOnly));
+    f.write(dummyPluginZip("mock-file-source"));
+  }
+
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->install(ext_a);  // begins — will hang until TearDown cleans up
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  mgr_->installFromLocalZip(zip_path);  // must be rejected immediately
+
+  ASSERT_EQ(spy_error.count(), 1);
+  // The failure is reported against the sideload's file label, not the
+  // running download's id.
+  EXPECT_EQ(spy_error.first().at(0).toString(), "pkg.zip");
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("already in progress"));
+}
+
 // If the Extension's platforms map does not contain the current platform, install()
 // must emit installError without initiating any download.
 TEST_F(ExtensionManagerTest, InstallRejectsUnsupportedPlatform) {

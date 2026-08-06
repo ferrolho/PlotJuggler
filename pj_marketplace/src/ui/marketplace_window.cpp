@@ -6,7 +6,9 @@
 #include <QColor>
 #include <QDesktopServices>
 #include <QDialog>
+#include <QDir>
 #include <QEvent>
+#include <QFileInfo>
 #include <QFont>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -414,7 +416,7 @@ void MarketplaceWindow::setupSignals() {
       active_install_id_.clear();
     }
     installations_changed_ = true;
-    local_install_in_flight_ = false;
+    local_install_path_.clear();
     ui_->progress_bar_->setVisible(false);
     status_error_sticky_ = false;
     ++restart_pending_count_;
@@ -493,7 +495,8 @@ void MarketplaceWindow::setupSignals() {
       installations_changed_ = true;
     }
     refreshAfterInstalledChange();
-    const bool was_sideload = std::exchange(local_install_in_flight_, false);
+    const bool was_sideload = !local_install_path_.isEmpty();
+    local_install_path_.clear();
     if (success) {
       status_error_sticky_ = false;
       setStatus(installedStatusText(id, was_sideload));
@@ -1057,7 +1060,7 @@ void MarketplaceWindow::clearStickyStatus() {
 }
 
 QString MarketplaceWindow::queueSuffix() const {
-  const int queued = pending_clicks_.size() + update_queue_.size();
+  const int queued = pending_clicks_.size() + pending_local_zips_.size() + update_queue_.size();
   if (queued == 0) {
     return {};
   }
@@ -1065,7 +1068,7 @@ QString MarketplaceWindow::queueSuffix() const {
 }
 
 void MarketplaceWindow::setInfoStatus(const QString& msg) {
-  if (!active_install_id_.isEmpty()) {
+  if (isInstallBusy()) {
     // An install owns the status line; keep it showing the live progress rather
     // than letting a filter/refresh/registry-load message desync it from the
     // still-moving progress bar.
@@ -1076,14 +1079,19 @@ void MarketplaceWindow::setInfoStatus(const QString& msg) {
 }
 
 void MarketplaceWindow::showInstallProgress(const QString& verb) {
-  if (active_install_id_.isEmpty()) {
+  if (!isInstallBusy()) {
     return;
   }
-  QString name = active_install_id_;
-  for (const auto& ext : extensions_) {
-    if (ext.id == active_install_id_) {
-      name = ext.name;
-      break;
+  QString name;
+  if (active_install_id_.isEmpty()) {
+    name = QFileInfo(local_install_path_).fileName();  // no id until the manifest is read
+  } else {
+    name = active_install_id_;
+    for (const auto& ext : extensions_) {
+      if (ext.id == active_install_id_) {
+        name = ext.name;
+        break;
+      }
     }
   }
   setStatus(verb + u" "_s + name + u"…"_s + queueSuffix());
@@ -1128,8 +1136,36 @@ void MarketplaceWindow::onInstallLocalClicked() {
     return;  // cancelled
   }
   clearStickyStatus();
-  local_install_in_flight_ = true;
-  ext_mgr_->installFromLocalZip(path);
+  // Canonical form, so the same archive picked through a relative path or a
+  // symlink counts as one file for the dedupe below.
+  const QFileInfo info(path);
+  const QString canonical = info.canonicalFilePath();
+  const QString zip_path = QDir::cleanPath(canonical.isEmpty() ? info.absoluteFilePath() : canonical);
+  // If anything is already installing, queue this sideload behind it instead of
+  // dispatching straight into ExtensionManager (which would reject it with
+  // "already in progress"). processInstallQueue() drains it when the manager
+  // frees up. Mirrors how a card click is queued via pending_clicks_.
+  if (isInstallBusy()) {
+    // Picking a file that is already running or already waiting is treated as
+    // picking nothing at all: silently dropped, never queued behind itself.
+    // Installing the same archive twice is a REPLACE of the id the first pass
+    // just installed, so it would stage the plugin and demand a restart for no
+    // gain.
+    if (zip_path == local_install_path_ || pending_local_zips_.contains(zip_path)) {
+      return;
+    }
+    pending_local_zips_.append(zip_path);
+    showInstallProgress();  // keep the active op visible; reflect the new queue depth
+    rebuildTable();
+    return;
+  }
+  startLocalInstall(zip_path);
+}
+
+void MarketplaceWindow::startLocalInstall(QString zip_path) {
+  local_install_path_ = zip_path;
+  showInstallProgress();  // installStarted only arrives after the manifest read
+  ext_mgr_->installFromLocalZip(zip_path);
 }
 
 QString MarketplaceWindow::installedStatusText(const QString& id, bool from_file) const {
@@ -1188,12 +1224,12 @@ void MarketplaceWindow::activateEmbedded() {
 }
 
 void MarketplaceWindow::onActionButtonClicked(const QString& ext_id) {
-  // If another install/update is already in flight, queue this click and let
-  // processInstallQueue() dispatch it when the current one completes.
-  // Otherwise ExtensionManager::install() would reject with
-  // "Install of X is already in progress" — its single-install-at-a-time
-  // model is intentional, we just hide it behind a queue at the UI layer.
-  if (!active_install_id_.isEmpty()) {
+  // If another install/update is already in flight — a registry op OR a local
+  // sideload — queue this click and let processInstallQueue() dispatch it when
+  // the current one completes. Otherwise ExtensionManager::install() would
+  // reject with "Install of X is already in progress" — its single-install-at-
+  // a-time model is intentional, we just hide it behind a queue at the UI layer.
+  if (isInstallBusy()) {
     const bool in_update_queue =
         std::any_of(update_queue_.begin(), update_queue_.end(), [&](const Extension& e) { return e.id == ext_id; });
     if (ext_id == active_install_id_ || pending_clicks_.contains(ext_id) || in_update_queue) {
@@ -1294,9 +1330,10 @@ void MarketplaceWindow::onDiagnosticsClicked() {
 }
 
 void MarketplaceWindow::processInstallQueue() {
-  // Wait until the current install/update finishes before dispatching the
-  // next one — ExtensionManager only runs one at a time.
-  if (!active_install_id_.isEmpty()) {
+  // Wait until the current install/update finishes before dispatching the next
+  // one — ExtensionManager only runs one at a time. A local sideload sets no
+  // active_install_id_, so isInstallBusy() (not the id alone) is the gate.
+  if (isInstallBusy()) {
     return;
   }
   // Individual button clicks (pending_clicks_) run ahead of Update All
@@ -1309,9 +1346,15 @@ void MarketplaceWindow::processInstallQueue() {
     // already installed or is "local newer" by now), no installFinished will
     // fire to advance the queue — keep draining so one dead entry can't stall
     // the rest.
-    if (active_install_id_.isEmpty()) {
+    if (!isInstallBusy()) {
       processInstallQueue();
     }
+    return;
+  }
+  // Queued "Install local…" sideloads run after explicit card clicks and ahead
+  // of the bulk Update All batch.
+  if (!pending_local_zips_.isEmpty()) {
+    startLocalInstall(pending_local_zips_.takeFirst());
     return;
   }
   if (!update_queue_.isEmpty()) {
@@ -1324,8 +1367,8 @@ void MarketplaceWindow::maybeShowRestartRequiredDialog() {
   // local-ZIP sideload, which runs id-less until its manifest is read — the
   // next completion handler calls back here, so the dialog fires exactly once
   // when everything settles.
-  if (restart_pending_count_ == 0 || restart_dialog_open_ || !active_install_id_.isEmpty() ||
-      local_install_in_flight_ || !pending_clicks_.isEmpty() || !update_queue_.isEmpty()) {
+  if (restart_pending_count_ == 0 || restart_dialog_open_ || isInstallBusy() || !pending_clicks_.isEmpty() ||
+      !pending_local_zips_.isEmpty() || !update_queue_.isEmpty()) {
     return;
   }
   const int staged = std::exchange(restart_pending_count_, 0);
