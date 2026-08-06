@@ -239,6 +239,34 @@ TEST(DownloadManagerTest, EmptyChecksumSkipsVerification) {
   EXPECT_TRUE(QFile::exists(tmp.path() + "/readme.txt"));
 }
 
+// A bare "sha256:" prefix with no digest is a malformed registry field. It must
+// fail (a garbage checksum should not silently pass), but with a message that
+// names the registry, not the generic "Checksum mismatch" that implies a corrupt
+// or tampered artifact.
+TEST(DownloadManagerTest, BareSha256PrefixFailsAsMalformedNotMismatch) {
+  const QByteArray zip_data = buildZip({{"readme.txt", "content"}});
+
+  LocalHttpServer server;
+  server.setBody(zip_data);
+
+  PJ::DownloadManager dm;
+  QTemporaryDir tmp;
+  ASSERT_TRUE(tmp.isValid());
+
+  QSignalSpy failed_spy(&dm, &PJ::DownloadManager::failed);
+  QSignalSpy finished_spy(&dm, &PJ::DownloadManager::finished);
+
+  dm.fetch(server.url(), u"sha256:"_s, tmp.path());
+
+  EXPECT_TRUE(waitForSignal(failed_spy));
+  EXPECT_TRUE(finished_spy.isEmpty());
+  const QString reason = failed_spy.first().at(1).toString();
+  EXPECT_TRUE(reason.contains("Malformed", Qt::CaseInsensitive))
+      << "a prefix-only checksum must report a malformed registry field, got: " << reason.toStdString();
+  EXPECT_FALSE(reason.contains("mismatch", Qt::CaseInsensitive))
+      << "must not blame the artifact with a generic mismatch";
+}
+
 TEST(DownloadManagerTest, ChecksumMismatchEmitsFailed) {
   const QByteArray zip_data = buildZip({{"file.txt", "content"}});
 

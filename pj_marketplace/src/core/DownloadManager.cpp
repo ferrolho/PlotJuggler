@@ -217,6 +217,19 @@ void DownloadManager::onReplyFinished(QNetworkReply* reply) {
     // this window, the flag is caught at the boundary check below or inside
     // extractFromMemory; the watcher slot maps the outcome to cancelled(id).
     if (!expected.isEmpty()) {
+      // A "sha256:" prefix with no digest is a malformed registry field, not a
+      // real hash. Fail (a garbage checksum should not silently pass), but with
+      // a message that points at the registry — "Checksum mismatch" wrongly
+      // implies the downloaded artifact is corrupt/tampered and sends whoever
+      // debugs it to the wrong place. (An empty/absent checksum still skips
+      // verification via the emptiness gate above.)
+      QString digest = expected;
+      if (digest.startsWith("sha256:"_L1, Qt::CaseInsensitive)) {
+        digest = digest.mid(7);
+      }
+      if (digest.isEmpty()) {
+        return u"Malformed checksum in registry (\"%1\" has no digest)"_s.arg(expected);
+      }
       emit phaseChanged(id, WorkPhase::Verifying);
       if (!verifyChecksum(data, expected)) {
         return u"Checksum mismatch"_s;
