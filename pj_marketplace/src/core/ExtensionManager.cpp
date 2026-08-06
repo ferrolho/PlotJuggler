@@ -954,7 +954,9 @@ void ExtensionManager::applyPendingInstalls() {
     }
 
     QFile::remove(pendingInstallIntentPath(dst));
-    registerInstalledExtension(intent.id, dst, discovered.record);
+    // Staged promotions are updates/replaces of an already-installed plugin;
+    // preserve the user's disable choice instead of forcing it back to enabled.
+    registerInstalledExtension(intent.id, dst, discovered.record, /*preserve_disabled_state=*/true);
     pending_backup_path_.clear();
     promoted.append({intent.id, dst});
     emit installFinished(intent.id, true);
@@ -1141,14 +1143,25 @@ void ExtensionManager::emitUninstallFailure(const QString& id, const QString& me
   emit uninstallFinished(id, false);
 }
 
-void ExtensionManager::registerInstalledExtension(const QString& id, const QString& dst, InstalledExtension record) {
+void ExtensionManager::registerInstalledExtension(
+    const QString& id, const QString& dst, InstalledExtension record, bool preserve_disabled_state) {
   record.path = dst;
   record.install_date = QFileInfo(dst).lastModified();
-  record.enabled = true;
-  installed_[id] = record;
+
+  if (preserve_disabled_state) {
+    // A staged update/replace keeps the user's enable/disable choice: promoting
+    // the new version must not re-enable a plugin the user explicitly disabled.
+    // Leave the persisted disabled entry untouched and mirror it into the record.
+    record.enabled = !disabledExtensionIds().contains(id);
+    installed_[id] = record;
+    return;
+  }
+
   // A fresh install starts enabled. Clear any stale disabled entry that may
   // linger from a previous uninstall of the same id, so the plugin loads
   // instead of being silently skipped on the next launch.
+  record.enabled = true;
+  installed_[id] = record;
   setEnabled(id, true);
 }
 

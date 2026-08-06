@@ -313,7 +313,13 @@ class ExtensionManager : public QObject {
   // Stamps a freshly-promoted directory with its absolute path + mtime and
   // adds it to the installed_ map under `id`. Caller supplies the record
   // already populated from the embedded manifest.
-  void registerInstalledExtension(const QString& id, const QString& dst, InstalledExtension record);
+  //
+  // A fresh install (default) starts enabled and clears any stale disabled
+  // entry. A staged update/replace passes preserve_disabled_state=true so
+  // promoting the new version keeps the user's enable/disable choice — a plugin
+  // the user disabled must not silently come back enabled after its update.
+  void registerInstalledExtension(
+      const QString& id, const QString& dst, InstalledExtension record, bool preserve_disabled_state = false);
 
   // Backs up (or removes) any directory under extensions_dir_ — other than
   // `keep_dir` — whose embedded plugin id equals `id`, so the promoted "<id>"

@@ -767,6 +767,49 @@ TEST_F(ExtensionManagerTest, UpdatePromotionBacksUpOldVersion) {
   cleanBackups("mock-data-source");
 }
 
+// Counterpart to InstallResetsDisabledState: a staged UPDATE promotion must
+// PRESERVE the user's disabled choice. A plugin the user disabled must not come
+// back enabled just because its update was promoted at the next restart.
+TEST_F(ExtensionManagerTest, UpdatePromotionPreservesDisabledState) {
+  cleanBackups("mock-data-source");
+
+  QTemporaryDir local_ext_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_ext_XXXXXX"));
+  ASSERT_TRUE(local_ext_dir.isValid());
+  QTemporaryDir local_pending_dir(QDir(PlatformUtils::backupDir()).absoluteFilePath("../test_pending_XXXXXX"));
+  ASSERT_TRUE(local_pending_dir.isValid());
+
+  DownloadManager local_dl;
+  ExtensionManager local_mgr(&local_dl, local_ext_dir.path(), local_pending_dir.path());
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext_v1 = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy_install(&local_mgr, &ExtensionManager::installFinished);
+  local_mgr.install(ext_v1);
+  ASSERT_TRUE(waitForSignal(spy_install));
+
+  // The user disables the installed plugin.
+  local_mgr.setEnabled("mock-data-source", false);
+  ASSERT_FALSE(local_mgr.isEnabled("mock-data-source"));
+
+  // Stage an update and promote it as a restart would.
+  server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
+  const Extension ext_v2 = makeExtension("mock-data-source", "2.0.0", server_.url());
+  QSignalSpy spy_pending(&local_mgr, &ExtensionManager::installPendingRestart);
+  local_mgr.update(ext_v2);
+  ASSERT_TRUE(waitForSignal(spy_pending));
+  local_mgr.applyPendingInstalls();
+
+  EXPECT_EQ(local_mgr.installedExtensions()["mock-data-source"].version, "2.0.0") << "the update must have promoted";
+  EXPECT_FALSE(local_mgr.installedExtensions()["mock-data-source"].enabled)
+      << "a staged update promotion must preserve the disabled state, not re-enable";
+  EXPECT_FALSE(local_mgr.isEnabled("mock-data-source"));
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the persisted disabled entry must survive an update promotion";
+
+  local_mgr.setEnabled("mock-data-source", true);  // cleanup: don't leak into other tests
+  cleanBackups("mock-data-source");
+}
+
 // A failed update fails during staging, before the live install is touched: the
 // installed version stays fully intact, nothing is staged, and no backup is made
 // (there is nothing to recover — the running copy was never moved).
