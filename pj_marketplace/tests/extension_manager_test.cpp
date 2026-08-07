@@ -2251,6 +2251,35 @@ TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
       << "uninstall must remove the id from the persisted disabled set";
 }
 
+// A downgrade-to-bundled is a version change, not a removal: the plugin stays
+// installed (only its version reverts to the shipped baseline). It therefore
+// PRESERVES the user's enable/disable choice, exactly like an update does — and
+// unlike uninstall, which clears the entry only to avoid leaving an orphan id
+// for a plugin that no longer exists. So a disabled plugin stays disabled
+// across a downgrade.
+TEST_F(ExtensionManagerEnableDisableTest, DowngradeToBundledPreservesDisabledState) {
+  // Install 2.0.0, then declare 1.0.0 as the bundled version so the installed
+  // copy sits ABOVE bundled and downgradeToBundled is applicable.
+  server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
+  const Extension ext = makeExtension("mock-data-source", "2.0.0", server_.url());
+  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(install_spy));
+  mgr_->setBundledVersions({{"mock-data-source", "1.0.0"}});
+
+  // The user disables the plugin, then downgrades it to bundled.
+  mgr_->setEnabled("mock-data-source", false);
+  ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
+
+  QSignalSpy downgrade_spy(mgr_, &ExtensionManager::downgradePendingRestart);
+  mgr_->downgradeToBundled("mock-data-source");
+  ASSERT_TRUE(waitForSignal(downgrade_spy)) << "downgrade must stage successfully";
+
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "downgradeToBundled must preserve the disabled state (a version change, like update), "
+         "not clear it like uninstall";
+}
+
 // A staged downgrade keeps the plugin in installed_ until the next launch: it is
 // still on disk and loaded this session, exactly like a staged update. The row
 // must keep reporting it as installed (with a "Needs Restart" badge driven by
