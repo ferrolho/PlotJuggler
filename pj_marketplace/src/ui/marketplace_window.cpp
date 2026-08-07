@@ -979,6 +979,26 @@ bool MarketplaceWindow::rebuildExtensionList() {
     extensions_.append(local);
   }
 
+  // An extension whose uninstall is staged has already left installedExtensions()
+  // but is still on disk and still running, so it needs a row to carry its "Needs
+  // Restart" state. A registry-listed one already has one; a local-only one would
+  // vanish from the table with nothing to say the removal is still pending.
+  const auto staged_uninstalls = ext_mgr_->stagedUninstalls();
+  for (auto it = staged_uninstalls.cbegin(); it != staged_uninstalls.cend(); ++it) {
+    if (std::any_of(
+            extensions_.cbegin(), extensions_.cend(), [&](const Extension& ext) { return ext.id == it.key(); })) {
+      continue;
+    }
+    const InstalledExtension& record = it.value();
+    Extension staged;
+    staged.id = record.id;
+    staged.name = record.name;
+    staged.description = record.description;
+    staged.category = record.category;
+    staged.version = record.version;
+    extensions_.append(staged);
+  }
+
   QStringList current_ids;
   current_ids.reserve(extensions_.size());
   for (const Extension& ext : extensions_) {

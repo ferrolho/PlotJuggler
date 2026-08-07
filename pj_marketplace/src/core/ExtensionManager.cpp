@@ -381,6 +381,16 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
     // in applyPendingInstalls warns against opening a directory about to be
     // replaced — a confirmed replacement is staged, so the promotion happens in
     // the next process, where this dlopen cannot serve a stale image.
+    //
+    // A staged uninstall is checked first and separately: it already dropped the
+    // id from installed_, so isInstalled() below would send this down the
+    // fresh-install branch, which clears the destination — marker included — and
+    // would make the pending removal vanish without a word. doInstall() refuses
+    // the same case; this path does not route through it.
+    if (hasPendingUninstall(ext_id)) {
+      fail(ext_id, QString("Uninstall of \"%1\" is staged; restart to apply it before installing again").arg(ext_id));
+      return;
+    }
     if (isInstalled(ext_id)) {
       if (!replace_confirmation_) {
         fail(ext_id, QString("Extension \"%1\" is already installed").arg(ext_id));
@@ -490,6 +500,18 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
 
   if (!allow_existing && isInstalled(ext.id)) {
     emitInstallFailure(ext.id, QString("Extension \"%1\" is already installed").arg(ext.id));
+    return;
+  }
+
+  // A staged uninstall drops the id from installed_, so isInstalled() above no
+  // longer speaks for it — yet its directory is still on disk carrying the
+  // marker, and applyPendingUninstalls() will delete whatever occupies that name
+  // at the next launch. Installing into it now would be erased on startup, so
+  // refuse until the pending removal has actually been applied. update() already
+  // makes the same check for its own reasons.
+  if (hasPendingUninstall(ext.id)) {
+    emitInstallFailure(
+        ext.id, QString("Uninstall of \"%1\" is staged; restart to apply it before installing again").arg(ext.id));
     return;
   }
 
@@ -698,32 +720,32 @@ void ExtensionManager::uninstall(const QString& extension_id) {
     }
   }
 
+  // Staged on every platform, never removed in place. Deleting the directory
+  // here would free its NAME for reuse while the DSO the session loaded stays
+  // mapped, and dlopen resolves by path name: a later install into that same
+  // name is answered from the resident image instead of the payload on disk.
+  // Deferring keeps a directory name from ever being reused inside one process,
+  // which is what makes that whole class of stale reads unreachable rather than
+  // merely guarded against. It also stops the UI overstating what happened —
+  // the extension keeps running until the restart either way, so "removed on
+  // the next launch" is the honest report. downgradeToBundled() stages for the
+  // same reason; applyPendingUninstalls() drains both at startup.
   const QString dir_path = installed_[extension_id].path;
-
-  if (!QDir(dir_path).removeRecursively()) {
-    if (PlatformUtils::isWindows()) {
-      if (!schedulePendingUninstall(dir_path)) {
-        emitUninstallFailure(
-            extension_id, QString("Could not mark \"%1\" for restart cleanup; uninstall not scheduled").arg(dir_path));
-        return;
-      }
-      installed_.remove(extension_id);
-      // Clear any disabled entry so a later reinstall of the same id starts
-      // clean (see registerInstalledExtension for the reinstall counterpart).
-      setEnabled(extension_id, true);
-      emit uninstallPendingRestart(extension_id);
-    } else {
-      emitUninstallFailure(
-          extension_id, QString("Could not remove directory \"%1\" — the plugin may still be loaded").arg(dir_path));
-    }
+  if (!schedulePendingUninstall(dir_path)) {
+    emitUninstallFailure(
+        extension_id, QString("Could not mark \"%1\" for restart cleanup; uninstall not scheduled").arg(dir_path));
     return;
   }
 
+  // Keep the record: the extension leaves installed_ but stays on disk and keeps
+  // running until the restart, and a caller composing rows from the installed set
+  // would otherwise have nothing left to show for it (see stagedUninstalls).
+  staged_uninstalls_.insert(extension_id, installed_[extension_id]);
   installed_.remove(extension_id);
   // Clear any disabled entry so a later reinstall of the same id starts
   // clean (see registerInstalledExtension for the reinstall counterpart).
   setEnabled(extension_id, true);
-  emit uninstallFinished(extension_id, true);
+  emit uninstallPendingRestart(extension_id);
 }
 
 void ExtensionManager::downgradeToBundled(const QString& extension_id) {
@@ -759,7 +781,17 @@ void ExtensionManager::downgradeToBundled(const QString& extension_id) {
   // the "Needs Restart" badge (driven by hasPendingUninstall), instead of the
   // "—" not-installed placeholder for a plugin that is still live this session.
   // applyPendingUninstalls promotes the removal at the next launch, and the host
-  // seed restores the bundled version.
+  // seed restores the bundled version. Deliberately do NOT clear the disabled
+  // entry either: a downgrade is a version change, not a removal, so it preserves
+  // the user's enable/disable choice, exactly like update() (see
+  // registerInstalledExtension's preserve_disabled_state path). uninstall() clears
+  // the entry only because the plugin is gone and the id would otherwise be an
+  // orphan — which does not apply here.
+  //
+  // Keeping it in installed_ only holds until the next scan, which skips a
+  // directory carrying the marker — so record it as a staged removal too, and the
+  // row survives every rescan for the rest of the session (see stagedUninstalls).
+  staged_uninstalls_.insert(extension_id, installed_[extension_id]);
   emit downgradePendingRestart(extension_id);
 }
 
@@ -1035,8 +1067,26 @@ bool ExtensionManager::hasPendingInstall(const QString& id) const {
   return validateRegistryIntent(discovered, intent.id, intent.version).isEmpty();
 }
 
+QMap<QString, InstalledExtension> ExtensionManager::stagedUninstalls() const {
+  return staged_uninstalls_;
+}
+
 bool ExtensionManager::hasPendingUninstall(const QString& id) const {
-  return QFile::exists(extRoot(extensions_dir_, id) + "/" + kPendingUninstallMarker);
+  // The marker lives inside the directory the scan actually found, and that
+  // directory's NAME is not necessarily the id: the id comes from the embedded
+  // manifest, so a copy placed by hand can be called anything (the same case
+  // replaceConflictingInstallDirs cleans up). uninstall() marks the real path,
+  // so ask the record it kept; looking only under "<id>" would report no pending
+  // removal for one that is genuinely staged, leaving the card without its
+  // "Needs Restart" state and the install guards inert.
+  //
+  // The fallback covers a marker this process did not write — one left by a
+  // previous run whose drain could not remove the directory. Those are keyed by
+  // the canonical layout because applyPendingUninstalls() finds them by scanning,
+  // not by id.
+  const auto staged = staged_uninstalls_.constFind(id);
+  const QString root = staged != staged_uninstalls_.constEnd() ? staged->path : extRoot(extensions_dir_, id);
+  return QFile::exists(root + "/" + kPendingUninstallMarker);
 }
 
 QString ExtensionManager::installedVersion(const QString& id) const {
@@ -1216,6 +1266,13 @@ void ExtensionManager::refreshInstalledFromDisk() {
     discovered[item.record.id] = item.record;
   }
   installed_ = std::move(discovered);
+  // Retire a staged record once its marker is gone — drained by a restart, or
+  // cleared because the directory was replaced.
+  // Checked against the record's own path rather than through
+  // hasPendingUninstall(), which would read this very map while removeIf is
+  // erasing from it.
+  staged_uninstalls_.removeIf(
+      [](const auto& entry) { return !QFile::exists(entry.value().path + "/" + kPendingUninstallMarker); });
 
   // Reflect the persisted enable/disable state on each record so the UI can read
   // installedExtensions()[id].enabled without consulting QSettings itself.

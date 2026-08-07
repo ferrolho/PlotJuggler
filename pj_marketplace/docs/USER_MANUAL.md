@@ -106,7 +106,13 @@ parsers. The search box narrows the result further.
 1. Click on the installed extension
 2. Click **Uninstall**
 3. Confirm in the dialog
-4. Extension files are removed
+4. The removal is **staged**: the extension leaves the list and its row shows
+   **Needs Restart**, and the files are deleted the next time PlotJuggler starts
+
+An extension the session already loaded keeps running until that restart —
+its code cannot be unmapped from a live process — so the removal is reported as
+pending rather than done. The same id cannot be reinstalled until the restart
+has applied the removal.
 
 Core (bundled) extensions have no Uninstall action — see §2.8.
 
@@ -262,7 +268,7 @@ When the marketplace runs **inside** a host application (e.g. PlotJuggler), the 
 | "Installed version is newer" | Local plugin is ahead of registry | Downgrade is blocked; keep the local version |
 | "Update failed after backup" | New artifact did not install | Check marketplace diagnostics for the retained backup path |
 | "Post-promotion validation failed" | The DSO loads in the staging area but not from `extensions/` (rpath/dep issue) | The install is rolled back; check the diagnostic for the linker error |
-| "Could not mark … for restart cleanup" | Marketplace could not write the `.pj_pending_uninstall` marker (Windows; permissions or AV) | The uninstall is **not** scheduled; resolve the file-permission issue and retry |
+| "Could not mark … for restart cleanup" | Marketplace could not write the `.pj_pending_uninstall` marker (permissions, or AV on Windows) | The uninstall is **not** scheduled; resolve the file-permission issue and retry |
 | "Moved to quarantine: …" | A previous staged update could not be removed; it has been moved aside | Inspect the quarantined directory and delete it manually once safe |
 | "Invalid registry URL" when saving Preferences | The Marketplace registry URL field holds a non-http(s)/file value | Fix the URL or clear the field to restore the default (see §5.2) |
 

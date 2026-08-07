@@ -361,7 +361,8 @@ combined behavior:
 | Update requested | Stage the new version and apply on restart — never hot-swap a plugin the running session has loaded |
 | Invalid staged update | Remove staged files and leave the active install untouched |
 | PlotJuggler crashes before applying update | Pending update remains for next start |
-| Plugin DLL in use on uninstall (Windows) | Mark the directory for restart cleanup; removed on next start |
+| Uninstall requested | Mark the directory for restart cleanup and report it as pending; removed on next start, on every platform — never delete in place a directory whose DSO the running session has loaded |
+| Install requested for an id with a staged uninstall | Refuse until the restart has applied the removal, which would otherwise delete the new payload |
 
 ### 8.5 Plugin Loading
 

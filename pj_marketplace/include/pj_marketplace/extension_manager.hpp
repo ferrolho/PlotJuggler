@@ -190,6 +190,14 @@ class ExtensionManager : public QObject {
   // Returns true when an installed directory is marked for restart cleanup.
   bool hasPendingUninstall(const QString& id) const;
 
+  // Records of the extensions whose removal is staged, kept because they are no
+  // longer in installedExtensions() yet still exist on disk and keep running
+  // until the restart. A UI that composes its rows from the installed set alone
+  // would drop them and leave the user with no sign that anything is pending —
+  // which matters most for an extension the registry does not list, since the
+  // registry cannot supply a replacement row. Pruned once the marker is gone.
+  QMap<QString, InstalledExtension> stagedUninstalls() const;
+
   // The version of `id` actually on disk. Prefer this over reading
   // `installedExtensions()[id].version` directly — the scan snapshot can be
   // stale in a specific window that this helper compensates for.
@@ -342,6 +350,11 @@ class ExtensionManager : public QObject {
   DiagnosticSink sink_;
 
   QMap<QString, InstalledExtension> installed_;
+
+  // id -> the record it had when its uninstall was staged. Survives the panel
+  // being closed and reopened because this manager outlives the window; a
+  // restart needs no entry, since the drain removes the extension outright.
+  QMap<QString, InstalledExtension> staged_uninstalls_;
 
   // id -> version for the plugins that ship with the application ("core"), set by
   // the host via setBundledVersions(). Membership locks uninstall (isBundled); the

@@ -661,8 +661,13 @@ TEST_F(ExtensionManagerTest, InstallRejectsExtraTopLevelDirectoryWithoutLeavingS
 // [3] Uninstall
 // ---------------------------------------------------------------------------
 
-// A successful uninstall removes the extension directory and clears it from memory.
-TEST_F(ExtensionManagerTest, UninstallRemovesDirectoryAndState) {
+// Uninstall stages the removal on every platform: the directory stays on disk
+// carrying the marker until the next launch drains it, while the extension
+// leaves the installed set right away. Removing in place would free the
+// directory NAME for reuse with the session's DSO still mapped, and dlopen
+// resolves by path name — a reinstall into that name would then be answered
+// from the resident image instead of the payload on disk.
+TEST_F(ExtensionManagerTest, UninstallStagesRemovalUntilRestart) {
   server_.setBody(dummyPluginZip("mock-data-source"));
   const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
 
@@ -674,15 +679,128 @@ TEST_F(ExtensionManagerTest, UninstallRemovesDirectoryAndState) {
   const QString ext_path = ext_dir_.path() + "/mock-data-source";
   ASSERT_TRUE(QDir(ext_path).exists());
 
-  QSignalSpy spy_uninstall(mgr_, &ExtensionManager::uninstallFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::uninstallPendingRestart);
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::uninstallFinished);
   mgr_->uninstall("mock-data-source");
 
-  ASSERT_EQ(spy_uninstall.count(), 1);
-  EXPECT_EQ(spy_uninstall.first().at(0).toString(), "mock-data-source");
-  EXPECT_TRUE(spy_uninstall.first().at(1).toBool());
+  ASSERT_EQ(spy_pending.count(), 1);
+  EXPECT_EQ(spy_pending.first().at(0).toString(), "mock-data-source");
+  EXPECT_TRUE(spy_finished.isEmpty()) << "a staged uninstall must not report as completed";
 
   EXPECT_FALSE(mgr_->isInstalled("mock-data-source"));
+  EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source"));
+  EXPECT_TRUE(QDir(ext_path).exists()) << "the directory name must stay taken until the restart";
+
+  // The restart-time drain is what actually removes it.
+  mgr_->applyPendingUninstalls();
   EXPECT_FALSE(QDir(ext_path).exists());
+}
+
+// Installing over a staged uninstall would be erased by the next startup drain,
+// which deletes whatever occupies that directory name. isInstalled() no longer
+// speaks for the id at this point, so the pending marker is the guard.
+TEST_F(ExtensionManagerTest, InstallRejectsAnIdWithAStagedUninstall) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+
+  QSignalSpy spy_install(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(spy_install));
+  mgr_->uninstall("mock-data-source");
+  ASSERT_TRUE(mgr_->hasPendingUninstall("mock-data-source"));
+  ASSERT_FALSE(mgr_->isInstalled("mock-data-source"));
+
+  spy_install.clear();
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+  mgr_->install(ext);
+
+  ASSERT_TRUE(waitForSignal(spy_install));
+  EXPECT_FALSE(spy_install.first().at(1).toBool());
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("staged"))
+      << spy_error.first().at(1).toString().toStdString();
+}
+
+// The sideload path does not route through doInstall(), so it needs the guard of
+// its own: its fresh-install branch clears the destination directory — marker
+// included — which would make the pending removal disappear unannounced.
+TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsAnIdWithAStagedUninstall) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  QSignalSpy spy_install(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(spy_install));
+  mgr_->uninstall("mock-data-source");
+  ASSERT_TRUE(mgr_->hasPendingUninstall("mock-data-source"));
+
+  const QString zip_path = QDir(ext_dir_.path()).absoluteFilePath("sideload.zip");
+  QFile zip(zip_path);
+  ASSERT_TRUE(zip.open(QIODevice::WriteOnly));
+  zip.write(dummyPluginZip("mock-data-source"));
+  zip.close();
+
+  spy_install.clear();
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+  mgr_->installFromLocalZip(zip_path);
+
+  ASSERT_TRUE(waitForSignal(spy_install));
+  EXPECT_FALSE(spy_install.first().at(1).toBool());
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("staged"))
+      << spy_error.first().at(1).toString().toStdString();
+  EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source")) << "the pending removal must survive the refused install";
+}
+
+// The scan takes the id from the embedded manifest, so an extension directory
+// placed by hand can be named anything. uninstall() marks the directory it
+// actually found; reporting the pending state by looking only under "<id>" would
+// miss it, leaving the card without its "Needs Restart" state and the install
+// guards inert for a removal that is genuinely staged.
+TEST_F(ExtensionManagerTest, PendingUninstallIsVisibleForADirectoryNotNamedForItsId) {
+  const QString odd_dir = ext_dir_.path() + "/oddly-named-dir";
+  ASSERT_TRUE(copyFixturePlugin(odd_dir, "mock-data-source"));
+  mgr_->refreshInstalledFromDisk();
+  ASSERT_TRUE(mgr_->isInstalled("mock-data-source"));
+  ASSERT_FALSE(QDir(ext_dir_.path() + "/mock-data-source").exists()) << "the directory name must differ from the id";
+
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::uninstallPendingRestart);
+  mgr_->uninstall("mock-data-source");
+  ASSERT_EQ(spy_pending.count(), 1);
+
+  EXPECT_TRUE(QFile::exists(odd_dir + "/.pj_pending_uninstall")) << "the marker belongs in the directory it found";
+  EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source"))
+      << "the staged removal must be visible to the badge and the install guards";
+
+  // The drain finds it by scanning, so the removal itself was never at risk.
+  mgr_->applyPendingUninstalls();
+  EXPECT_FALSE(QDir(odd_dir).exists());
+  mgr_->refreshInstalledFromDisk();
+  EXPECT_FALSE(mgr_->hasPendingUninstall("mock-data-source"));
+}
+
+// The record outlives installedExtensions() so a UI can still show the pending
+// state, and retires itself once the marker is gone.
+TEST_F(ExtensionManagerTest, StagedUninstallKeepsTheRecordUntilTheMarkerIsGone) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  QSignalSpy spy_install(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(spy_install));
+  ASSERT_TRUE(mgr_->stagedUninstalls().isEmpty());
+
+  mgr_->uninstall("mock-data-source");
+  ASSERT_FALSE(mgr_->isInstalled("mock-data-source"));
+  const auto staged = mgr_->stagedUninstalls();
+  ASSERT_TRUE(staged.contains("mock-data-source"));
+  EXPECT_EQ(staged["mock-data-source"].version, "1.0.0");
+  EXPECT_FALSE(staged["mock-data-source"].name.isEmpty()) << "the row needs a label to render";
+
+  // A rescan while the removal is still pending keeps it.
+  mgr_->refreshInstalledFromDisk();
+  EXPECT_TRUE(mgr_->stagedUninstalls().contains("mock-data-source"));
+
+  // Once the restart-time drain has removed the directory, the record retires.
+  mgr_->applyPendingUninstalls();
+  mgr_->refreshInstalledFromDisk();
+  EXPECT_FALSE(mgr_->stagedUninstalls().contains("mock-data-source"));
 }
 
 // Attempting to uninstall an extension that was never installed must emit
@@ -1624,9 +1742,12 @@ TEST_F(ExtensionManagerTest, UninstallRemovesEntryFromPersistentState) {
 
   mgr_->uninstall("mock-data-source");
 
+  // The next process drains the staged removal in initComponents() before it
+  // snapshots installed state, so the id is gone AND so is its directory.
   DownloadManager downloader2;
   ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
   EXPECT_FALSE(mgr2.isInstalled("mock-data-source"));
+  EXPECT_FALSE(QDir(ext_dir_.path() + "/mock-data-source").exists());
 }
 
 TEST_F(ExtensionManagerTest, RefreshEvictsExtensionWhenDsoIsRemovedExternally) {
@@ -2243,7 +2364,7 @@ TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
   mgr_->setEnabled("mock-data-source", false);
   ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
 
-  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallFinished);
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallPendingRestart);
   mgr_->uninstall("mock-data-source");
   ASSERT_TRUE(waitForSignal(uninstall_spy));
 
@@ -2253,10 +2374,10 @@ TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
 
 // A downgrade-to-bundled is a version change, not a removal: the plugin stays
 // installed (only its version reverts to the shipped baseline). It therefore
-// PRESERVES the user's enable/disable choice, exactly like an update does — and
-// unlike uninstall, which clears the entry only to avoid leaving an orphan id
-// for a plugin that no longer exists. So a disabled plugin stays disabled
-// across a downgrade.
+// PRESERVES the user's enable/disable choice, exactly like an update does (see
+// UpdatePromotionPreservesDisabledState) — and unlike uninstall, which clears
+// the entry only to avoid leaving an orphan id for a plugin that no longer
+// exists. So a disabled plugin stays disabled across a downgrade.
 TEST_F(ExtensionManagerEnableDisableTest, DowngradeToBundledPreservesDisabledState) {
   // Install 2.0.0, then declare 1.0.0 as the bundled version so the installed
   // copy sits ABOVE bundled and downgradeToBundled is applicable.
