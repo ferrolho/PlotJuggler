@@ -314,6 +314,51 @@ TEST_F(StreamParserSwapTest, CachedParserFieldHandleResolvesAfterPauseSwap) {
   host_->flushPending();
 }
 
+// Mid-session new topic while PAUSED. A topic first observed AFTER the pause
+// swap gets its parser binding minted mid-pause. setDataEngineTarget only
+// retargeted the bindings that existed at swap time, so the new binding's write
+// host initialised against the PRIMARY (frozen) engine — its first push landed
+// on the frozen primary and dragged the global timeline, even though every
+// pre-existing binding respected the pause. The dummy streamer never hit this
+// (it declares all topics in onStart, before any pause could apply); real
+// streamers publishing a brand-new topic mid-session (ZMQ, MQTT) did.
+//
+// The fix initialises a freshly-minted binding's write host to the ACTIVE
+// target, so a binding born during pause writes into the secondary like every
+// other paused write. Pre-fix the sample lands on the primary → RED here; with
+// the fix it lands on the secondary and the frozen primary stays at zero rows.
+TEST_F(StreamParserSwapTest, BindingCreatedWhilePausedWritesToSecondaryEngine) {
+  // Enter the pause window BEFORE the topic has ever been seen.
+  host_->setDataEngineTarget(&secondary_engine_);
+
+  // First observation of the topic happens now, mid-pause: the binding (and its
+  // write host) is minted while the swap is already active.
+  auto binding_or = runtime().ensureParserBinding(
+      PJ::ParserBindingRequest{
+          .topic_name = "/late/value",
+          .parser_encoding = "streaming_caching",
+          .type_name = "streaming/cached_scalar",
+          .schema = PJ::Span<const uint8_t>{},
+          .parser_config_json = "{}",
+      });
+  ASSERT_TRUE(binding_or.has_value()) << binding_or.error();
+
+  // The empty topic descriptor is minted on both engines at bind time (that is
+  // harmless — no samples, no time bounds); the SAMPLE is what must not touch
+  // the frozen primary.
+  const auto topic_ids = primary_engine_.listTopics(dataset_id_);
+  ASSERT_EQ(topic_ids.size(), 1U);
+  const PJ::TopicId topic_id = topic_ids.front();
+
+  ASSERT_TRUE(pushFloat(*binding_or, 20, 2.0F).has_value());
+  host_->flushPending();
+
+  EXPECT_EQ(rowCount(secondary_engine_, topic_id), 1U)
+      << "a mid-pause topic's sample must land on the secondary (live/tail) engine";
+  EXPECT_EQ(rowCount(primary_engine_, topic_id), 0U)
+      << "the frozen primary gained a row during pause — the timeline would advance";
+}
+
 // A demand-driven source unsubscribes and later RE-subscribes a topic; the
 // plugin calls ensure_parser_binding again with the identical request (its own
 // binding cache was dropped with the subscription). The host must hand back

@@ -472,6 +472,18 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
   // needed in the worker — we only post back via QueuedConnection.
   session->worker.reset(QThread::create([this, dataset_id]() { workerLoop(dataset_id); }));
 
+  // If the user added this source while streaming is paused, honour the pause
+  // for it too: onPauseToggled only redirected the sessions that existed when
+  // pause was pressed, so a session created afterwards would otherwise write
+  // into the frozen primary store (mutating the paused snapshot) while its
+  // retention trim targets the secondary (leaving the primary tail unbounded).
+  // Mirror the pause branch here so its writes land on the secondary tail buffer
+  // and merge into the primary on resume, exactly like every other session.
+  if (paused_) {
+    session->runtime_host->setObjectStoreTarget(secondary_object_store_.get());
+    session->runtime_host->setDataEngineTarget(secondary_data_engine_.get());
+  }
+
   QThread* worker_ptr = session->worker.get();
   sessions_.emplace(dataset_id, std::move(session));
   worker_ptr->start();

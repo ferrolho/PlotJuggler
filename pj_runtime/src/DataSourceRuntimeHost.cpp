@@ -328,10 +328,9 @@ void DataSourceRuntimeHost::setObjectStoreTarget(ObjectStore* target) {
   // Route cbPushMessage's lazy-object push through the swap (it pushed straight
   // to the primary before, evicting the paused scrub-back snapshot).
   object_store_target_.store(target);
-  // TODO(stream-pause): deferred edge cases (none hit a topic registered before
-  // the first pause): bindings created while paused still init against A; an
-  // in-flight push can strand a frame in B across the resume flush; resume's
-  // catch-up notifyIngest lists only scalar TopicIds (object-only flush nudge).
+  // TODO(stream-pause): deferred edge cases: an in-flight push can strand a
+  // frame in B across the resume flush; resume's catch-up notifyIngest lists
+  // only scalar TopicIds (object-only flush nudge).
   // Retarget the source-level object write host and every per-parser-binding
   // one (the streaming hot path). Each host's atomic swap lets in-flight
   // pushes finish on the old target while the next lands on the new one; the
@@ -348,6 +347,9 @@ void DataSourceRuntimeHost::setDataEngineTarget(DataEngine* target) {
   // Mirrors setObjectStoreTarget but for scalar writes. Retargets the
   // source-level write host and every parser binding so all scalar pushes
   // land on the secondary engine during pause and on the primary on resume.
+  // Record it so a binding created AFTER this swap (a mid-pause new topic)
+  // initializes against the active target rather than the frozen primary.
+  data_engine_target_.store(target);
   source_write_host_.setTarget(target);
   for (auto& [_id, binding] : parser_bindings_) {
     if (binding.write_host != nullptr) {
@@ -548,6 +550,11 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
     // the same FieldId, so the cached handle resolves after a pause/resume
     // target swap.
     write_host->setSecondaryEngine(self->secondary_data_engine_);
+    // If this binding is minted while paused, the source-level swap already
+    // happened, so point it at the active target (secondary) now — otherwise
+    // this mid-pause topic's samples would write into the frozen primary and
+    // drag the global timeline. When live, this is the primary (a no-op).
+    write_host->setTarget(self->data_engine_target_.load());
 
     // Build the service registry the parser binds against. The builder must
     // outlive bind() because the plugin may hold a view into it; we move it
@@ -619,6 +626,10 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
         }
       }
       object_write_host = std::make_unique<DatastoreParserObjectWriteHost>(self->object_store_, object_topic_id->id);
+      // Same mid-pause rule as the scalar host above: a binding minted while
+      // paused must push into the active (secondary) store, not the frozen
+      // primary. When live, object_store_target_ is the primary (a no-op).
+      object_write_host->setTarget(self->object_store_target_.load());
       registry_builder->registerService<sdk::ParserObjectWriteHostService>(object_write_host->raw());
 
       if (self->object_topic_parser_registrar_) {

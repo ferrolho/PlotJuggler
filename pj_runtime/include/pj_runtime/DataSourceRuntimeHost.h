@@ -303,6 +303,13 @@ class DataSourceRuntimeHost {
   // for single-store callers). See the constructor doc for the id-sharing
   // invariant that lets write hosts retarget between the two.
   ObjectStore* secondary_object_store_ = nullptr;
+  // Scalar-write analogue of object_store_target_: the active DataEngine a new
+  // parser binding must write into — primary (A) while live, secondary (B) while
+  // paused (swapped by setDataEngineTarget). A binding CREATED while paused (a
+  // topic first seen mid-session) must init here, not at the primary, or its
+  // samples land on the frozen engine and drag the global timeline. Atomic: UI
+  // thread swaps, worker thread reads at bind time.
+  std::atomic<DataEngine*> data_engine_target_{&engine_};
   // Lockstep mirror of `engine_` for the streaming dual-engine flow (null for
   // single-engine callers); same id-sharing invariant as above.
   DataEngine* secondary_data_engine_ = nullptr;
