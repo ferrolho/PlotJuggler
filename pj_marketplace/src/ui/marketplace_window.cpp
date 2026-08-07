@@ -725,8 +725,17 @@ void MarketplaceWindow::updateDetailFooter() {
   // Tear down the previous action row (widgets + the leading stretch).
   QLayoutItem* old_item = nullptr;
   while ((old_item = ui_->detail_buttons_layout->takeAt(0)) != nullptr) {
-    if (old_item->widget() != nullptr) {
-      old_item->widget()->deleteLater();
+    if (QWidget* old_widget = old_item->widget()) {
+      // deleteLater (not delete) because this rebuild can be triggered from a
+      // footer button's own clicked() slot (e.g. Downgrade) — destroying the
+      // signal's emitter mid-emission would crash. But takeAt only unmanages the
+      // widget from the layout; it stays a visible child at its old geometry
+      // until the deferred delete fires, and a nested event loop (the "Restart
+      // required" modal that a downgrade opens) leaves it painted underneath the
+      // freshly-added badge — the two overlap. hide() it now so it disappears
+      // immediately while its destruction stays safely deferred.
+      old_widget->hide();
+      old_widget->deleteLater();
     }
     delete old_item;
   }

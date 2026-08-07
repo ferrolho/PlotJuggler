@@ -753,7 +753,13 @@ void ExtensionManager::downgradeToBundled(const QString& extension_id) {
     emitUninstallFailure(extension_id, QString("Could not stage the downgrade of \"%1\"").arg(extension_id));
     return;
   }
-  installed_.remove(extension_id);
+  // Do NOT remove the record from installed_ here: the downgrade is deferred, so
+  // the updated copy stays installed and loaded until the next launch. Keeping
+  // it (like a staged update does) lets the row keep showing "Installed vN" with
+  // the "Needs Restart" badge (driven by hasPendingUninstall), instead of the
+  // "—" not-installed placeholder for a plugin that is still live this session.
+  // applyPendingUninstalls promotes the removal at the next launch, and the host
+  // seed restores the bundled version.
   emit downgradePendingRestart(extension_id);
 }
 

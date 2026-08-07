@@ -2251,6 +2251,30 @@ TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
       << "uninstall must remove the id from the persisted disabled set";
 }
 
+// A staged downgrade keeps the plugin in installed_ until the next launch: it is
+// still on disk and loaded this session, exactly like a staged update. The row
+// must keep reporting it as installed (with a "Needs Restart" badge driven by
+// hasPendingUninstall), not flip to the "—" not-installed placeholder.
+TEST_F(ExtensionManagerTest, DowngradeToBundledKeepsInstalledUntilRestart) {
+  server_.setBody(dummyPluginZip("mock-data-source", "2.0.0"));
+  const Extension ext = makeExtension("mock-data-source", "2.0.0", server_.url());
+  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+  ASSERT_TRUE(waitForSignal(install_spy));
+  mgr_->setBundledVersions({{"mock-data-source", "1.0.0"}});
+
+  QSignalSpy downgrade_spy(mgr_, &ExtensionManager::downgradePendingRestart);
+  mgr_->downgradeToBundled("mock-data-source");
+  ASSERT_TRUE(waitForSignal(downgrade_spy)) << "downgrade must stage successfully";
+
+  EXPECT_TRUE(mgr_->isInstalled("mock-data-source"))
+      << "a staged downgrade must keep the plugin installed until restart, not remove the record now";
+  EXPECT_EQ(mgr_->installedVersion("mock-data-source"), "2.0.0")
+      << "the still-live updated version must keep being reported until the restart promotes the removal";
+  EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source"))
+      << "the pending-uninstall marker drives the 'Needs Restart' badge";
+}
+
 }  // namespace
 }  // namespace PJ
 
