@@ -81,6 +81,58 @@ TEST(CatalogModelTest, KeepsDuplicateDatasetTopicsVisibleUnderDatasetRoot) {
   EXPECT_EQ(second_descriptor->topic_id, second_topic);
 }
 
+// Regression guard for the "topics duplicated after create/delete/recreate"
+// bug. Two datasets with the same source_name must get
+// STABLE, distinct display labels — the lower-id one keeps the un-suffixed base
+// label and the higher-id one gets " (2)" — even after a delete/recreate cycle
+// that scrambles the engine's (robin_map) dataset iteration order. Before the
+// fix, that order was used directly, so a pre-existing shown dataset could be
+// relabeled base->" (2)"; the view (which groups tree nodes by the label string)
+// never learned of the relabel and merged both datasets' topics into one node
+// (doubled fields). Sorting dataset ids pins the base label to the oldest.
+TEST(CatalogModelTest, DatasetLabelStableForDuplicateSourceAcrossDeleteRecreate) {
+  PJ::SessionManager session;
+  PJ::CatalogModel catalog(&session);
+
+  const auto make = [&](const char* source_name) -> PJ::DatasetId {
+    auto ds = session.dataEngine().createDataset(PJ::DatasetDescriptor{.source_name = source_name});
+    EXPECT_TRUE(ds.has_value()) << (ds.has_value() ? std::string{} : ds.error());
+    EXPECT_NE(addScalarTopic(session, *ds, "/sensor_a"), 0U);
+    return static_cast<PJ::DatasetId>(*ds);
+  };
+
+  // First cycle: two same-named datasets, then delete both (real delete).
+  const auto a = make("[stream] X");
+  const auto b = make("[stream] X");
+  catalog.rebuildFromDatastore();
+  catalog.removeDataset(a, /*tombstone=*/false);
+  catalog.removeDataset(b, /*tombstone=*/false);
+  session.dataEngine().removeDataset(a);
+  session.dataEngine().removeDataset(b);
+  catalog.rebuildFromDatastore();
+
+  // Recreate two more with the SAME name — new (higher) monotonic ids.
+  const auto c = make("[stream] X");
+  const auto d = make("[stream] X");
+  catalog.rebuildFromDatastore();
+
+  const PJ::DatasetId lo = std::min(c, d);
+  const PJ::DatasetId hi = std::max(c, d);
+  QString lo_label;
+  QString hi_label;
+  for (const auto& item : catalog.items()) {
+    if (item.dataset_id == lo) {
+      lo_label = item.dataset_name;
+    } else if (item.dataset_id == hi) {
+      hi_label = item.dataset_name;
+    }
+  }
+  EXPECT_EQ(lo_label, u"[stream] X"_s) << "the older dataset must keep the un-suffixed base label";
+  EXPECT_EQ(hi_label, u"[stream] X (2)"_s) << "the newer dataset must get the (2) suffix";
+  EXPECT_NE(lo_label, hi_label)
+      << "two datasets share a display label -> the tree would merge them (duplicated topics)";
+}
+
 TEST(CatalogModelTest, DatasetSourceNameReturnsRawIdentityNotDisplayLabel) {
   PJ::SessionManager session;
   PJ::CatalogModel catalog(&session);

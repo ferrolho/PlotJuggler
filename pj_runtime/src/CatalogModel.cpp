@@ -668,7 +668,18 @@ void CatalogModel::rebuildNow() {
   const DataReader reader = impl_->session->createReader();
   DataEngine& engine = impl_->session->dataEngine();
   ObjectStore& object_store = impl_->session->objectStore();
-  const std::vector<DatasetId> dataset_ids = reader.listDatasets();
+  std::vector<DatasetId> dataset_ids = reader.listDatasets();
+  // Deterministic order (ascending by id). listDatasets() iterates a robin_map
+  // whose order is unstable across create/delete/recreate. The duplicate-label
+  // ordinal below gives the un-suffixed BASE label to the FIRST dataset seen for
+  // a given name and " (N)" to the rest; an unstable order let that flip between
+  // two same-named datasets on successive rebuilds. A pre-existing dataset thus
+  // relabeled base->" (N)" is invisible to the key-only diff further down, and
+  // the tree view groups nodes by the label STRING — so the stale base-label node
+  // lingered and absorbed the other dataset's topics (duplicated fields, no "(N)"
+  // node). Sorting pins the base label to the oldest dataset, so no already-shown
+  // dataset is ever relabeled and the bug cannot arise.
+  std::sort(dataset_ids.begin(), dataset_ids.end());
   // Ephemeral (preview) transform outputs are intentionally NOT catalogued — the
   // Transform Editor's live preview materializes a real output topic, and it must
   // never surface in the Sources tree regardless of when a rebuild fires.
@@ -905,6 +916,11 @@ void CatalogModel::clearAll(bool tombstone) {
   impl_->removed_names_per_dataset.clear();
   impl_->advertised.clear();
   impl_->per_topic_pause_capable_datasets.clear();
+  // Only a REAL delete (tombstone=false) drops the display-name overrides: a
+  // tombstoning clear keeps them so restoreDataset() re-applies the plugin name.
+  if (!tombstone) {
+    impl_->dataset_display_overrides.clear();
+  }
   emit cleared();
 }
 
@@ -1048,6 +1064,13 @@ bool CatalogModel::removeDataset(DatasetId dataset_id, bool tombstone) {
     impl_->removed_datasets.insert(dataset_id);
   }
   impl_->removed_names_per_dataset.erase(dataset_id);
+  // Drop the plugin-provided display-name override only on a REAL delete
+  // (tombstone=false); a tombstoning remove keeps it so restoreDataset()
+  // re-applies the name. Erasing on real delete avoids leaving stale overrides
+  // to accumulate (a latent hazard for the duplicate-label ordinal).
+  if (!tombstone) {
+    impl_->dataset_display_overrides.erase(dataset_id);
+  }
   for (const QString& key : keys) {
     impl_->items.erase(key);
   }
