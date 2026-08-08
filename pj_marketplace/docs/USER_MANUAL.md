@@ -114,6 +114,17 @@ its code cannot be unmapped from a live process — so the removal is reported a
 pending rather than done. The same id cannot be reinstalled until the restart
 has applied the removal.
 
+If the deletion cannot go through at that next start (a file locked by another
+process, antivirus, missing permissions), the extension is reported in the
+diagnostics and retried at the following start. It stays unloaded in the
+meantime, so a removal that is stuck on disk never brings the plugin back.
+
+An uninstalled id stays on the disabled list even after its files are gone, so
+that nothing but an explicit install can make it load again. Installing the
+extension a second time clears that automatically. The one case where it shows:
+copying an extension folder back by hand does **not** re-enable it, so use the
+enable toggle after doing so.
+
 Core (bundled) extensions have no Uninstall action — see §2.8.
 
 ### 2.7 Enabling/Disabling Extensions

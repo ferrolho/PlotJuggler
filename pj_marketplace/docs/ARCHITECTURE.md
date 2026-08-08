@@ -235,7 +235,7 @@ A companion no-arg `ExtensionManager()` overload also exists; it creates an owne
 - Embedding apps may seed the marketplace with a loaded-plugin snapshot before first render. That snapshot is initialization data, not a second source of truth; the embedded manifest remains the authority for installed state.
 - **Pending queues drained at construction.** `ExtensionManager::initComponents()` runs `applyPendingUninstalls()` then `applyPendingInstalls()` before computing the installed snapshot, so restart-deferred work is processed regardless of which `MarketplaceWindow` constructor (or host wiring) ends up using the manager.
 - **Duplicate-directory cleanup runs after the whole promotion loop.** `applyPendingInstalls()` first promotes every staged directory, then replaces prior same-id directories (`replaceConflictingInstallDirs`). The cleanup scan dlopens sibling directories to read their embedded ids, and opening a sibling's not-yet-promoted DSO would pin its old image in the process (glibc never unloads a DSO whose `STB_GNU_UNIQUE` symbols were bound), making the post-drain rescan report pre-update versions and the marketplace re-offer updates already on disk.
-- **Restart-cleanup marker honors write failures.** `schedulePendingUninstall` returns `bool`; if the marker file cannot be written the in-memory entry is left intact and `uninstallError` is emitted, so an uninstall that cannot mark the directory does not silently revert on the next start.
+- **Removal intent is journalled outside the payload, and honors write failures.** `uninstall()` and `downgradeToBundled()` record `{schema, operation, id, path}` under `extensions.state/` (see §4.6) instead of writing a marker into the directory being deleted — a partially failed recursive delete would otherwise destroy its own retry record. Every record is a deletion capability and is fully validated before use (schema, exact operation, id matching the filename, target confined to a direct child of the canonical store root); a refused record is quarantined and reported, never acted on. `writeRemovalIntent` returns `bool`; if the record cannot be committed the in-memory entry is left intact, the enable state is rolled back, and `uninstallError` is emitted, so a removal that cannot be recorded does not silently revert on the next start. Markers older builds left inside payloads become path-only `cleanup` records that carry no id authority; their content is never trusted.
 - **Broken staged installs are quarantined, not retried forever.** When `applyPendingInstalls` fails to remove a rejected stage, the directory is renamed to `.pj_quarantine_<name>_<uuid>/` next to it. The next startup ignores quarantine entries and reports the path in the diagnostic so the user can inspect and clean it up.
 
 #### ExtensionManager — Diagnostic propagation
@@ -471,6 +471,97 @@ filesystem is refused rather than degraded to a copy.
 `ExtensionCatalogService::seedBundledPlugins()` (`pj_runtime`) is the one store
 writer outside `ExtensionManager`'s mutating API, so it is gated on
 `hasStoreWriteAccess()` too and skips with a diagnostic in a read-only session.
+### 4.6 Removal Journal (staged uninstall / downgrade)
+
+A removal cannot happen when the user asks for it: the DSO is loaded, and on
+Windows locked. Both `uninstall()` and `downgradeToBundled()` therefore record the
+intent and let `applyPendingUninstalls()` perform it at the next launch.
+
+That intent lives in `extensions.state/<id>.json`, holding
+`{schema, operation, id, path}` — committed with `QSaveFile`, so a reader never
+sees a half-written record and a crash mid-write leaves the previous state. The
+journal root is derived from the **canonical** store root, so two aliases of a
+symlinked store share one journal rather than keeping divergent records.
+
+**Why outside the payload.** The journal is a sibling of `extensions/` for the
+same reason as `extensions.install_stage/` (outside the recursive plugin scan),
+plus one that is specific to removals: `QDir::removeRecursively()` deletes
+children *before* it can fail on the one it cannot unlink. An intent stored
+inside the directory being deleted is therefore destroyed by its own partially
+failed deletion — the payload survives with its locked DSO while the record that
+would have retried the removal is gone. The journal cannot be consumed by the
+deletion it describes.
+
+**A record is a capability, so every record is validated.** Processing one runs
+`QDir::removeRecursively()` on the path it names, and the store lease does not
+protect against this: records live inside the rightful writer's own state
+directory, so corruption — or anything able to drop a file there — would
+otherwise inherit that privilege. `parseRemovalIntent()` refuses a record unless
+**all** of the following hold, and nothing is defaulted, inferred, or repaired:
+
+- it declares the current `schema`;
+- `operation` is exactly `uninstall`, `downgrade`, or `cleanup` (absent or
+  unrecognised is invalid — never read as `uninstall`, the destructive choice);
+- for an id-bearing operation, `id` passes the filesystem-safety rule **and
+  equals the filename stem**, so a record cannot be filed under one name and
+  speak for a different extension;
+- `path` is absolute and a **direct child of the canonical store root**. That one
+  rule rejects the store root itself, any ancestor, an unrelated absolute path,
+  anything reached through `..`, and the sibling `state` / `install_stage` /
+  `seed_stage` roots and lease file (siblings are not children). Confinement is
+  re-checked on the *canonical* target, so a symlink planted inside the store
+  cannot carry the deletion out of it.
+
+The store root the comparison is made against is canonicalized **once at
+construction**, so a symlinked config or home does not put a record's lexical
+parent and the canonical root on different footings and strand every valid
+uninstall.
+
+Confinement runs a **second time at the moment of deletion**, because
+parse-time skips the canonical check for a target that did not exist yet (there
+was nothing to abuse then) — leaving a startup-race window in which a
+matching-named symlink could be planted before the drain. A managed payload is a
+real directory, so a symlink at the target is refused outright (`removeRecursively`
+would otherwise follow it), and confinement is re-evaluated against what is on
+disk now.
+
+A refused record is **quarantined** (renamed `*.rejected-<uuid>`, keeping the
+evidence while taking it out of the `*.json` glob so it is not re-refused every
+launch) and reported as a diagnostic — never silently skipped. On success the
+**exact record file that was parsed** is retired, never a name recomputed from
+the id it claims.
+
+**Write order.** `uninstall()` persists the disabled entry *first*, syncs it, and
+**checks `QSettings::status()`** — an unwritten setting is not persistence, and
+the staged-removal contract depends on that entry surviving a crash. Only then is
+the record committed. The loader decides what to load from the disabled list
+alone, so the only state a crash can expose mid-stage is "unloadable but still
+installed": recoverable, and never a removed plugin quietly coming back. Any step
+that cannot be persisted rolls the enable state back (itself synced and checked)
+and fails the operation.
+
+**Tombstones: the drain can never enable anything.** A successful removal drops
+the record but **keeps** the id's disabled entry, as a tombstone. The files are
+gone, so the entry costs nothing — and because it is never cleared here, journal
+processing needs no authority over enable state at all. No record, however
+corrupt or hostile, can make a plugin loadable, and a same-id copy left elsewhere
+on disk cannot be resurrected by a deletion elsewhere. A fresh install clears the
+tombstone (`registerInstalledExtension` with `preserve_disabled_state=false`), so
+reinstalling is what brings an id back. `downgrade` never writes a tombstone: it
+is a version change, and the restored bundled version inherits the user's
+enable/disable choice unchanged.
+
+**Trust boundary — legacy in-payload markers.** Older builds wrote a
+`.pj_pending_uninstall` marker inside the payload. Each such directory is
+converted into an external record *before* anything is deleted, so the retry
+survives a partial failure like any other. The marker's *content* is never read:
+it is package-controlled filesystem content — an archive can ship one naming any
+id — so honouring it would let a package steer an unrelated extension's state.
+The derived record is `cleanup`, which carries **no id and therefore no authority
+over any extension**; it only deletes, and is path-confined exactly like every
+other record. Externalization is idempotent: a marker whose delete keeps failing
+is not re-filed while a live `cleanup` record already targets its directory, so
+the journal does not grow a record per launch.
 
 ---
 
@@ -496,6 +587,10 @@ The root is `QStandardPaths::AppDataLocation` (the `PlotJuggler/PlotJuggler4` or
 │                                    # sibling of extensions/ for the same
 │                                    # reason; removed once the transaction
 │                                    # promotes, swept if a crash orphans it
+├── extensions.state/                # Removal journal: one record per pending
+│   └── <id>.json                    # uninstall/downgrade, {operation,id,path}.
+│                                    # A third sibling, and deliberately NOT
+│                                    # inside the payload it describes — see §4.6
 ├── .extensions.lock                 # Single-writer lock over extensions/ (§4.5);
 │                                    # a second live instance runs read-only
 ├── .extension_staging/      # Staging area: updates land here and are promoted

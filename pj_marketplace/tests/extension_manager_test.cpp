@@ -29,6 +29,8 @@
 #include <QFile>
 #include <QFileDevice>
 #include <QHostAddress>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
 #include <QSettings>
 #include <QSignalSpy>
@@ -40,9 +42,10 @@
 #include <QThread>
 #include <QUrl>
 #include <string>
+#include <utility>
 
 #ifndef Q_OS_WIN
-#include <unistd.h>  // geteuid: root ignores the directory permissions one test relies on
+#include <unistd.h>  // geteuid: root ignores the directory permissions some tests rely on
 #endif
 
 #include "pj_marketplace/download_manager.hpp"
@@ -309,6 +312,83 @@ QStringList transactionDirsIn(const QString& path) {
 QString transactionStageDirFor(const QString& extensions_dir) {
   return extensions_dir + u".install_stage"_s;
 }
+
+// The journal ExtensionManager records pending removals in. Spelled out for the
+// same reason as transactionStageDirFor: the PLACEMENT is the thing under test. It
+// has to stay a sibling of the extensions dir so that a record can never live
+// inside the payload whose deletion it describes - a recursive delete that removed
+// its own retry record was the defect this journal replaces.
+QString removalJournalDirFor(const QString& extensions_dir) {
+  return extensions_dir + u".state"_s;
+}
+
+QString removalIntentFileFor(const QString& extensions_dir, const QString& id) {
+  return removalJournalDirFor(extensions_dir) + "/" + id + u".json"_s;
+}
+
+// The recorded intent for `id`, or an empty object when nothing is journalled.
+QJsonObject removalIntentFor(const QString& extensions_dir, const QString& id) {
+  QFile record(removalIntentFileFor(extensions_dir, id));
+  if (!record.open(QIODevice::ReadOnly)) {
+    return {};
+  }
+  return QJsonDocument::fromJson(record.readAll()).object();
+}
+
+// Plants a journal record by hand, standing in for corruption or for a hostile
+// writer trying to borrow the drain's delete privilege. `stem` names the file, so
+// a test can file a record under a name that disagrees with the id inside.
+bool writeRawRemovalRecord(const QString& extensions_dir, const QString& stem, const QByteArray& contents) {
+  if (!QDir().mkpath(removalJournalDirFor(extensions_dir))) {
+    return false;
+  }
+  QFile record(removalJournalDirFor(extensions_dir) + "/" + stem + u".json"_s);
+  if (!record.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    return false;
+  }
+  return record.write(contents) == contents.size();
+}
+
+// A well-formed record body, so each test can corrupt exactly one field.
+QByteArray removalRecordJson(const QString& operation, const QString& id, const QString& path, int schema = 1) {
+  QJsonObject object;
+  if (schema != 0) {
+    object[u"schema"_s] = schema;
+  }
+  if (!operation.isNull()) {
+    object[u"operation"_s] = operation;
+  }
+  object[u"id"_s] = id;
+  object[u"path"_s] = path;
+  return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+// Records the drain moved aside rather than acting on.
+QStringList quarantinedRecordsIn(const QString& extensions_dir) {
+  return QDir(removalJournalDirFor(extensions_dir))
+      .entryList(QStringList{u"*.rejected-*"_s}, QDir::Files | QDir::Hidden);
+}
+
+// Clamps a directory's permissions for the duration of a test and restores them
+// on scope exit. Used to make a removal fail on purpose; the restore must happen
+// even when an ASSERT bails out early, or QTemporaryDir would be unable to clean
+// up and the tree would be left behind in the system temp area.
+class ScopedDirectoryPermissions {
+ public:
+  ScopedDirectoryPermissions(QString path, QFileDevice::Permissions locked)
+      : path_(std::move(path)), previous_(QFile::permissions(path_)) {
+    QFile::setPermissions(path_, locked);
+  }
+  ~ScopedDirectoryPermissions() {
+    QFile::setPermissions(path_, previous_);
+  }
+  ScopedDirectoryPermissions(const ScopedDirectoryPermissions&) = delete;
+  ScopedDirectoryPermissions& operator=(const ScopedDirectoryPermissions&) = delete;
+
+ private:
+  QString path_;
+  QFileDevice::Permissions previous_;
+};
 
 // Builds an Extension whose download artifact for the current platform points to `url`.
 // Checksum is empty by default so DownloadManager skips SHA-256 verification.
@@ -824,10 +904,10 @@ TEST_F(ExtensionManagerTest, InstallFromLocalZipRejectsAnIdWithAStagedUninstall)
 }
 
 // The scan takes the id from the embedded manifest, so an extension directory
-// placed by hand can be named anything. uninstall() marks the directory it
-// actually found; reporting the pending state by looking only under "<id>" would
-// miss it, leaving the card without its "Needs Restart" state and the install
-// guards inert for a removal that is genuinely staged.
+// placed by hand can be named anything. The journal records the path uninstall()
+// actually found, keyed by id; reporting the pending state by looking only under
+// "<id>" would miss it, leaving the card without its "Needs Restart" state and the
+// install guards inert for a removal that is genuinely staged.
 TEST_F(ExtensionManagerTest, PendingUninstallIsVisibleForADirectoryNotNamedForItsId) {
   const QString odd_dir = ext_dir_.path() + "/oddly-named-dir";
   ASSERT_TRUE(copyFixturePlugin(odd_dir, "mock-data-source"));
@@ -839,7 +919,12 @@ TEST_F(ExtensionManagerTest, PendingUninstallIsVisibleForADirectoryNotNamedForIt
   mgr_->uninstall("mock-data-source");
   ASSERT_EQ(spy_pending.count(), 1);
 
-  EXPECT_TRUE(QFile::exists(odd_dir + "/.pj_pending_uninstall")) << "the marker belongs in the directory it found";
+  const QJsonObject intent = removalIntentFor(ext_dir_.path(), "mock-data-source");
+  EXPECT_EQ(intent.value("operation").toString(), "uninstall");
+  EXPECT_EQ(QDir::cleanPath(intent.value("path").toString()), QDir::cleanPath(odd_dir))
+      << "the record must name the directory the scan actually found, not the id's canonical path";
+  EXPECT_FALSE(QFile::exists(odd_dir + "/.pj_pending_uninstall"))
+      << "nothing is written into the payload any more; the record lives outside it";
   EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source"))
       << "the staged removal must be visible to the badge and the install guards";
 
@@ -1157,10 +1242,11 @@ TEST_F(ExtensionManagerTest, UpdateRejectsAlreadyPendingUninstall) {
   ASSERT_TRUE(waitForSignal(spy_finished));
   ASSERT_TRUE(spy_finished.first().at(1).toBool());
 
-  // Simulate a pending uninstall by dropping the marker in the installed dir.
-  // Real code takes this path only on Windows (schedulePendingUninstall) when a
-  // loaded DSO cannot be removed; the marker file itself is portable and is what
-  // hasPendingUninstall() checks.
+  // Stand in for an older build's staged uninstall by dropping its in-payload
+  // marker. Current code journals removals outside the payload instead, but the
+  // marker's EXISTENCE still has to register as a pending removal so an upgrade
+  // does not let update() run over one — content is never read (see
+  // sweepLegacyUninstallMarkers).
   const QString marker = local_ext_dir.path() + "/mock-data-source/.pj_pending_uninstall";
   QFile marker_file(marker);
   ASSERT_TRUE(marker_file.open(QIODevice::WriteOnly));
@@ -2464,6 +2550,18 @@ class ExtensionManagerEnableDisableTest : public ExtensionManagerTest {
     ExtensionManagerTest::TearDown();
   }
 
+  // Installs the standard fixture extension and returns its directory, or an empty
+  // string if the install never completed. Empty is the caller's cue to ASSERT.
+  QString installVictim() {
+    server_.setBody(dummyPluginZip("mock-data-source"));
+    QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+    mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+    if (!waitForSignal(install_spy)) {
+      return {};
+    }
+    return ext_dir_.path() + "/mock-data-source";
+  }
+
   // The manager owns this string as a private constant. Duplicated here so a
   // rename on that side breaks the test at compile time (via the sync check
   // further down) instead of silently starting to leak state.
@@ -2580,14 +2678,12 @@ TEST_F(ExtensionManagerEnableDisableTest, InstallResetsDisabledState) {
       << "install must remove the id from the persisted disabled set";
 }
 
-// A successful uninstall also clears the persisted disabled entry, so the
-// id doesn't linger in QSettings as an orphan after the plugin is gone.
-TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
-  server_.setBody(dummyPluginZip("mock-data-source"));
-  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
-  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
-  mgr_->install(ext);
-  ASSERT_TRUE(waitForSignal(install_spy));
+// The disabled entry outlives the removal as a TOMBSTONE. Staging sets it because
+// the files are still there; the drain deliberately does NOT clear it, which is
+// what keeps journal processing free of any authority to enable an id. The entry
+// costs nothing once the payload is gone, and a reinstall clears it.
+TEST_F(ExtensionManagerEnableDisableTest, UninstallLeavesADisabledTombstoneOnceTheRemovalIsApplied) {
+  ASSERT_FALSE(installVictim().isEmpty());
 
   mgr_->setEnabled("mock-data-source", false);
   ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
@@ -2596,16 +2692,512 @@ TEST_F(ExtensionManagerEnableDisableTest, UninstallClearsDisabledEntry) {
   mgr_->uninstall("mock-data-source");
   ASSERT_TRUE(waitForSignal(uninstall_spy));
 
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the staged removal must keep the id unloadable while its directory is still there";
+
+  mgr_->applyPendingUninstalls();
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the tombstone must survive the removal: re-enabling is a power the drain must not have";
+}
+
+// Staging a removal must make the id unloadable straight away. The plugin the
+// user asked to remove is still on disk until the next launch drains it, and the
+// loader decides what to load from the disabled list alone — it knows nothing
+// about pending removals. Leaving the id enabled is what lets a failed deletion
+// resurrect it (see PartiallyFailedUninstallKeepsItsRetryRecordAndDisabledState).
+TEST_F(ExtensionManagerEnableDisableTest, StagedUninstallDisablesUntilRemovalVerified) {
+  ASSERT_FALSE(installVictim().isEmpty());
+  ASSERT_TRUE(mgr_->isEnabled("mock-data-source"));
+
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallPendingRestart);
+  mgr_->uninstall("mock-data-source");
+  ASSERT_TRUE(waitForSignal(uninstall_spy));
+
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the id must be disabled while its directory is still on disk, or the loader would load it again";
+  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+
+  // The verified removal deletes the payload and leaves the tombstone standing.
+  mgr_->applyPendingUninstalls();
+  ASSERT_FALSE(QDir(ext_dir_.path() + "/mock-data-source").exists());
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the drain must never enable an id, so the entry stays as a tombstone";
+}
+
+// The regression test for the defect that sank the in-payload marker, and the
+// portable form of the Windows CI failure that exposed it.
+//
+// removeRecursively() deletes children before it can fail on the one it cannot
+// unlink, so a removal that loses part-way through has ALREADY destroyed some of
+// the directory's content. When the record of the removal lived in that same
+// directory, it was simply among the casualties: the payload survived (its locked
+// DSO still there) while the intent that would have retried the deletion was gone,
+// and with the old code the disabled entry had been cleared at staging time too, so
+// the next launch loaded the plugin the user removed.
+//
+// Poisoning a SUBDIRECTORY reproduces that shape, and deliberately on EVERY
+// platform rather than skipping where the Windows original was seen: an open file
+// handle blocks the unlink on Windows (which IS the production failure — a mapped
+// DSO), and dropping write permission on the holding directory blocks it on POSIX.
+// Both are applied, so the drain fails part-way here and on CI alike.
+TEST_F(ExtensionManagerEnableDisableTest, PartiallyFailedUninstallKeepsItsRetryRecordAndDisabledState) {
+#ifndef Q_OS_WIN
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "running as root: directory permissions cannot make a POSIX unlink fail";
+  }
+#endif
+  const QString ext_path = installVictim();
+  ASSERT_FALSE(ext_path.isEmpty());
+  const QString locked_child = ext_path + "/locked-subdir";
+  ASSERT_TRUE(QDir().mkpath(locked_child));
+  // Held OPEN for the whole drain: that alone is what defeats the delete on Windows.
+  QFile undeletable(locked_child + "/undeletable.bin");
+  ASSERT_TRUE(undeletable.open(QIODevice::WriteOnly));
+  undeletable.write("content the drain must fail to remove");
+  ASSERT_TRUE(undeletable.flush());
+  // A top-level payload file the drain WILL delete. It sits exactly where the old
+  // in-payload marker sat, so its disappearance below is the standing proof that a
+  // record kept in there cannot survive a partial deletion.
+  QFile doomed(ext_path + "/doomed.txt");
+  ASSERT_TRUE(doomed.open(QIODevice::WriteOnly));
+  doomed.write("removed before the failure");
+  doomed.close();
+
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallPendingRestart);
+  mgr_->uninstall("mock-data-source");
+  ASSERT_TRUE(waitForSignal(uninstall_spy));
+  ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
+  ASSERT_FALSE(removalIntentFor(ext_dir_.path(), "mock-data-source").isEmpty()) << "the removal must be journalled";
+
+  {
+    // The POSIX half: its child cannot be unlinked, so removeRecursively() fails
+    // after having deleted everything it could reach.
+    const ScopedDirectoryPermissions locked(locked_child, QFileDevice::ReadOwner | QFileDevice::ExeOwner);
+
+    mgr_->applyPendingUninstalls();
+
+    ASSERT_TRUE(QDir(ext_path).exists()) << "the drain was supposed to fail on the poisoned child";
+    EXPECT_FALSE(QFile::exists(ext_path + "/doomed.txt"))
+        << "the removal must really have got part-way (this file sits where the old marker did, so its loss is "
+           "why an in-payload record could not survive), or this is not testing the partial-deletion case";
+    EXPECT_FALSE(removalIntentFor(ext_dir_.path(), "mock-data-source").isEmpty())
+        << "the retry record lives outside the payload, so a partial deletion cannot destroy it";
+    EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source")) << "the removal is still pending and must report so";
+    EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+        << "the DSO is still on disk, so the desired-removed state must outlive the failed deletion";
+  }
+
+  // The retry at the following launch succeeds, and only then does anything retire.
+  undeletable.close();
+  mgr_->applyPendingUninstalls();
+  EXPECT_FALSE(QDir(ext_path).exists());
+  EXPECT_TRUE(removalIntentFor(ext_dir_.path(), "mock-data-source").isEmpty()) << "a drained record must be dropped";
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the tombstone outlives the payload; only a reinstall clears it";
+}
+
+// The staging window has two persisted writes, and a crash can land between them.
+// Order decides which way the gap fails. The disabled entry is written and synced
+// FIRST, so the reachable intermediate state is "unloadable but still installed" —
+// recoverable, and never a plugin the user removed coming back.
+//
+// The crash is simulated by reproducing that first step alone (no journal record
+// follows) and then draining, which is exactly what the next launch would do.
+TEST_F(ExtensionManagerEnableDisableTest, CrashBetweenDisableAndJournalLeavesThePluginUnloadable) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(install_spy));
+  const QString ext_path = ext_dir_.path() + "/mock-data-source";
+
+  // Step 1 of uninstall() and nothing more: the process dies before the journal.
+  mgr_->setEnabled("mock-data-source", false);
+  QSettings().sync();
+  ASSERT_TRUE(removalIntentFor(ext_dir_.path(), "mock-data-source").isEmpty()) << "no record must have been written";
+
+  // The next launch. Nothing schedules a deletion, so the files stay.
+  mgr_->applyPendingUninstalls();
+  EXPECT_TRUE(QDir(ext_path).exists()) << "with no record there is nothing to drain; the payload stays put";
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "the surviving half of the intent must be the one that keeps the plugin from loading";
+  EXPECT_FALSE(mgr_->isEnabled("mock-data-source"));
+}
+
+// A pending-uninstall marker is package-controlled filesystem content: an archive
+// can ship one, and it names whatever the packager put in it. Nothing may be
+// inferred from that content — least of all an id whose enable/disable state to
+// change, which would let one package silently re-enable an unrelated plugin the
+// user had disabled. Existence alone schedules a deletion of the directory holding
+// it, so a package can only ever harm itself.
+TEST_F(ExtensionManagerEnableDisableTest, InjectedUninstallMarkerCannotSteerAnotherExtensionsState) {
+  // A victim the user has deliberately disabled.
+  server_.setBody(dummyPluginZip("mock-file-source"));
+  QSignalSpy victim_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-file-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(victim_spy));
+  mgr_->setEnabled("mock-file-source", false);
+  ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-file-source"));
+
+  // A package that ships a marker naming the victim rather than itself.
+  const QByteArray plugin = readAll(pluginPathForId("mock-data-source"));
+  ASSERT_FALSE(plugin.isEmpty());
+  const QString zip_path = QDir(ext_dir_.path()).absoluteFilePath("injected.zip");
+  QFile zip(zip_path);
+  ASSERT_TRUE(zip.open(QIODevice::WriteOnly));
+  zip.write(buildZip({
+      {"mock-data-source/" + pluginFileName(), plugin},
+      {"mock-data-source/.pj_pending_uninstall", "mock-file-source\n"},
+  }));
+  zip.close();
+
+  QSignalSpy install_spy(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy pending_spy(mgr_, &ExtensionManager::installPendingRestart);
+  mgr_->installFromLocalZip(zip_path);
+  ASSERT_TRUE(waitForInstallOutcome(install_spy, pending_spy));
+
+  // Whatever the install did on its own merits, the drain must not act on the
+  // injected bytes.
+  mgr_->applyPendingUninstalls();
+
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-file-source"))
+      << "payload content must never re-enable an id; the victim's disabled state is the user's, not the package's";
+  EXPECT_FALSE(mgr_->isEnabled("mock-file-source"));
+  EXPECT_TRUE(QDir(ext_dir_.path() + "/mock-file-source").exists())
+      << "the victim's files must be untouched by another package's marker";
+  EXPECT_TRUE(removalIntentFor(ext_dir_.path(), "mock-file-source").isEmpty())
+      << "no journal record may be conjured from package content";
+}
+
+// ---------------------------------------------------------------------------
+// [11] Removal-journal record validation (the drain's delete privilege)
+// ---------------------------------------------------------------------------
+// A journal record authorises `QDir::removeRecursively()`. That makes the journal
+// a capability, and the store lease does not protect it: these records live inside
+// the rightful writer's own state directory, so corruption or anything that can
+// drop a file there would otherwise inherit the drain's privilege. Every record is
+// therefore validated before ANY deletion, and every refusal is fail-closed:
+// nothing deleted, record quarantined, diagnostic raised.
+
+// Installs one extension and returns its directory, so each case below has a real
+// payload that must still be standing afterwards.
+class RemovalJournalValidationTest : public ExtensionManagerEnableDisableTest {
+ protected:
+  // Drives the drain over a hand-planted record and asserts the universal
+  // fail-closed outcome: the named target survives, the record is quarantined
+  // rather than left to be re-refused forever, and the user is told.
+  void expectRefused(const QString& stem, const QByteArray& record, const QString& must_survive) {
+    ASSERT_TRUE(writeRawRemovalRecord(ext_dir_.path(), stem, record));
+    QSignalSpy diagnostics(mgr_, &ExtensionManager::diagnosticReported);
+
+    mgr_->applyPendingUninstalls();
+
+    EXPECT_TRUE(QFileInfo::exists(must_survive))
+        << "a refused record must delete NOTHING: " << must_survive.toStdString();
+    EXPECT_TRUE(removalIntentFor(ext_dir_.path(), stem).isEmpty()) << "the refused record must not stay live";
+    EXPECT_FALSE(quarantinedRecordsIn(ext_dir_.path()).isEmpty())
+        << "a refused record must be quarantined, not deleted";
+    EXPECT_FALSE(diagnostics.isEmpty()) << "a refused record must be reported, never silently skipped";
+  }
+};
+
+// The store root itself: the most damaging target, and the one a path-confinement
+// bug hands over first.
+TEST_F(RemovalJournalValidationTest, RecordTargetingTheStoreRootIsRefused) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  expectRefused(u"evil"_s, removalRecordJson(u"uninstall"_s, u"evil"_s, ext_dir_.path()), ext_dir_.path());
+  EXPECT_TRUE(QDir(victim).exists()) << "the store's contents must be untouched";
+}
+
+// The journal's own directory, and the staging sibling: both are OUTSIDE the store
+// (siblings, not children), which the direct-child rule refuses on its own.
+TEST_F(RemovalJournalValidationTest, RecordTargetingAStateOrStagingRootIsRefused) {
+  ASSERT_FALSE(installVictim().isEmpty());
+  const QString staging = transactionStageDirFor(ext_dir_.path());
+  ASSERT_TRUE(QDir().mkpath(staging));
+  expectRefused(u"evil"_s, removalRecordJson(u"uninstall"_s, u"evil"_s, staging), staging);
+
+  const QString journal = removalJournalDirFor(ext_dir_.path());
+  expectRefused(u"evil2"_s, removalRecordJson(u"uninstall"_s, u"evil2"_s, journal), journal);
+}
+
+// "../" traversal and a wholly unrelated absolute path.
+TEST_F(RemovalJournalValidationTest, RecordEscapingTheStoreByTraversalOrAbsolutePathIsRefused) {
+  ASSERT_FALSE(installVictim().isEmpty());
+  QTemporaryDir elsewhere;
+  ASSERT_TRUE(elsewhere.isValid());
+  const QString outsider = QDir(elsewhere.path()).absoluteFilePath(u"precious"_s);
+  ASSERT_TRUE(QDir().mkpath(outsider));
+
+  expectRefused(u"evil"_s, removalRecordJson(u"uninstall"_s, u"evil"_s, outsider), outsider);
+  // Traversal that lands back outside the store after normalisation.
+  const QString traversal = ext_dir_.path() + "/../";
+  expectRefused(
+      u"evil2"_s, removalRecordJson(u"uninstall"_s, u"evil2"_s, traversal), QFileInfo(ext_dir_.path()).absolutePath());
+}
+
+// A symlink planted inside the store must not carry the delete out of it: the
+// target is confined on its CANONICAL form, not the name used to reach it.
+TEST_F(RemovalJournalValidationTest, RecordWhoseTargetSymlinksOutOfTheStoreIsRefused) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "symlink creation needs elevation on Windows; the canonical-path rule is platform-neutral";
+#else
+  ASSERT_FALSE(installVictim().isEmpty());
+  QTemporaryDir elsewhere;
+  ASSERT_TRUE(elsewhere.isValid());
+  const QString outsider = QDir(elsewhere.path()).absoluteFilePath(u"precious"_s);
+  ASSERT_TRUE(QDir().mkpath(outsider));
+  QFile guard(outsider + "/keep.txt");
+  ASSERT_TRUE(guard.open(QIODevice::WriteOnly));
+  guard.close();
+
+  // A DIRECT child of the store by name, resolving outside it.
+  const QString bait = ext_dir_.path() + "/bait";
+  ASSERT_TRUE(QFile::link(outsider, bait));
+
+  expectRefused(u"bait"_s, removalRecordJson(u"uninstall"_s, u"bait"_s, bait), outsider);
+  EXPECT_TRUE(QFile::exists(outsider + "/keep.txt")) << "the symlink target's contents must be untouched";
+#endif
+}
+
+// A record filed as A.json claiming to be extension B: acting on it would delete
+// B's payload and, when it succeeded, retire a record that was never B's.
+TEST_F(RemovalJournalValidationTest, RecordWhoseFilenameDisagreesWithItsIdIsRefused) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  expectRefused(u"evil"_s, removalRecordJson(u"uninstall"_s, u"mock-data-source"_s, victim), victim);
+}
+
+// An unknown or absent operation is invalid. It must never fall back to
+// "uninstall", which is the destructive reading.
+TEST_F(RemovalJournalValidationTest, RecordWithUnknownOrAbsentOperationIsRefused) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  expectRefused(u"mock-data-source"_s, removalRecordJson(u"purge"_s, u"mock-data-source"_s, victim), victim);
+  expectRefused(u"mock-data-source"_s, removalRecordJson(QString(), u"mock-data-source"_s, victim), victim);
+}
+
+// No schema, and a schema from a shape this build does not know.
+TEST_F(RemovalJournalValidationTest, RecordWithMissingOrUnknownSchemaIsRefused) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  expectRefused(
+      u"mock-data-source"_s, removalRecordJson(u"uninstall"_s, u"mock-data-source"_s, victim, /*schema=*/0), victim);
+  expectRefused(
+      u"mock-data-source"_s, removalRecordJson(u"uninstall"_s, u"mock-data-source"_s, victim, /*schema=*/99), victim);
+}
+
+TEST_F(RemovalJournalValidationTest, MalformedRecordIsRefused) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  expectRefused(u"mock-data-source"_s, QByteArray("{ this is not json"), victim);
+}
+
+// The whole point of the validation: a legitimate record still drains.
+// An extension id may begin with a dot — invalidExtensionIdReason only rejects
+// exactly "." / ".." and path separators — and the record is named for the id, so
+// ".local-plugin" is journalled as ".local-plugin.json": a HIDDEN file on POSIX.
+// A journal listing that does not ask for hidden entries never sees it, so the
+// removal stays pending forever while the payload sits on disk, still loadable.
+TEST_F(RemovalJournalValidationTest, RecordForADottedIdIsDrained) {
+  const QString payload = ext_dir_.path() + "/.local-plugin";
+  ASSERT_TRUE(QDir().mkpath(payload));
+  QFile content(payload + "/plugin.bin");
+  ASSERT_TRUE(content.open(QIODevice::WriteOnly));
+  content.write("payload the drain must remove");
+  content.close();
+
+  ASSERT_TRUE(writeRawRemovalRecord(
+      ext_dir_.path(), u".local-plugin"_s, removalRecordJson(u"uninstall"_s, u".local-plugin"_s, payload)));
+  ASSERT_FALSE(removalIntentFor(ext_dir_.path(), ".local-plugin").isEmpty())
+      << "the record must be on disk to begin with";
+
+  mgr_->applyPendingUninstalls();
+
+  EXPECT_FALSE(QDir(payload).exists()) << "a hidden record must be listed and drained, not skipped forever";
+  EXPECT_TRUE(removalIntentFor(ext_dir_.path(), ".local-plugin").isEmpty()) << "the drained record must be retired";
+  EXPECT_TRUE(quarantinedRecordsIn(ext_dir_.path()).isEmpty()) << "a valid record must not be quarantined";
+}
+
+TEST_F(RemovalJournalValidationTest, AValidRecordStillDrains) {
+  const QString victim = installVictim();
+  ASSERT_FALSE(victim.isEmpty());
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallPendingRestart);
+  mgr_->uninstall(u"mock-data-source"_s);
+  ASSERT_TRUE(waitForSignal(uninstall_spy));
+
+  mgr_->applyPendingUninstalls();
+
+  EXPECT_FALSE(QDir(victim).exists()) << "a valid record must still delete its payload";
+  EXPECT_TRUE(quarantinedRecordsIn(ext_dir_.path()).isEmpty()) << "a valid record must not be quarantined";
+}
+
+// A reinstall is what clears the tombstone, which is the whole reason the drain can
+// safely be denied any power to enable an id.
+TEST_F(RemovalJournalValidationTest, ReinstallAfterUninstallClearsTheTombstone) {
+  ASSERT_FALSE(installVictim().isEmpty());
+  QSignalSpy uninstall_spy(mgr_, &ExtensionManager::uninstallPendingRestart);
+  mgr_->uninstall(u"mock-data-source"_s);
+  ASSERT_TRUE(waitForSignal(uninstall_spy));
+  mgr_->applyPendingUninstalls();
+  ASSERT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"));
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  QSignalSpy reinstall_spy(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(reinstall_spy));
+  ASSERT_TRUE(reinstall_spy.first().at(1).toBool()) << "the reinstall must succeed once the removal was applied";
+
   EXPECT_FALSE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
-      << "uninstall must remove the id from the persisted disabled set";
+      << "a fresh install clears the tombstone, so the plugin loads again";
+  EXPECT_TRUE(mgr_->isEnabled("mock-data-source"));
+}
+
+// TOCTOU at the delete site: removeRecursively() FOLLOWS a symlink at the target,
+// which the parse-time check does not catch when the link resolves to a legitimate
+// in-store directory. A record filed for `bait` (a symlink to a real sibling
+// payload) passes validation — its canonical form is a direct managed child — yet
+// draining it naively would recurse through the link and delete the sibling's
+// contents. The exploitable variant of the same window is a link planted to resolve
+// OUTSIDE the store between validation and the delete. The delete-time re-confinement
+// refuses a symlink target outright: nothing deleted, quarantined, diagnosed.
+//
+// A managed payload is always a real directory, so this scenario cannot arise from
+// the manager's own records; it models corruption or a concurrent writer.
+TEST_F(RemovalJournalValidationTest, RecordWhoseTargetIsASymlinkIsRefusedAtDeletion) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "symlink creation needs elevation on Windows; the canonical-path rule is platform-neutral";
+#else
+  ASSERT_FALSE(installVictim().isEmpty());
+  const QString sibling = ext_dir_.path() + "/mock-data-source";  // a real, legitimate payload
+  ASSERT_TRUE(QDir(sibling).exists());
+
+  // `bait` is a symlink to that sibling. It is a direct child of the store BY NAME,
+  // and its canonical form resolves to a direct managed child, so parse-time
+  // validation admits it. Only the delete-time symlink refusal stops the drain from
+  // recursing through it and wiping the sibling.
+  const QString bait = ext_dir_.path() + "/bait";
+  ASSERT_TRUE(QFile::link(sibling, bait));
+  ASSERT_TRUE(writeRawRemovalRecord(ext_dir_.path(), u"bait"_s, removalRecordJson(u"uninstall"_s, u"bait"_s, bait)));
+
+  QSignalSpy diagnostics(mgr_, &ExtensionManager::diagnosticReported);
+  mgr_->applyPendingUninstalls();
+
+  EXPECT_TRUE(QDir(sibling).exists()) << "the drain must not follow a symlink target and delete the real payload";
+  EXPECT_FALSE(QDir(sibling).entryList(QDir::Files).isEmpty())
+      << "the sibling payload's contents must be intact, not recursively removed through the link";
+  EXPECT_TRUE(removalIntentFor(ext_dir_.path(), "bait").isEmpty()) << "the refused record must not stay live";
+  EXPECT_FALSE(quarantinedRecordsIn(ext_dir_.path()).isEmpty()) << "the record must be quarantined at deletion time";
+  EXPECT_FALSE(diagnostics.isEmpty()) << "the delete-time refusal must be reported";
+#endif
+}
+
+// The lexical-vs-canonical asymmetry: unmanagedPayloadRejection compares a record's
+// lexical parent against the CANONICAL store root, so if the configured store path
+// itself contains a symlink component, even a legitimate uninstall record is
+// rejected and the removal is stranded. Canonicalizing the store dir once at
+// construction is what puts the two comparisons on one footing. RED before that
+// fix: the record is quarantined and the payload never drains.
+TEST_F(ExtensionManagerTest, UninstallDrainsUnderASymlinkedExtensionsDir) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "symlink creation needs elevation on Windows; the canonical-path rule is platform-neutral";
+#else
+  QSettings().remove("Marketplace/disabledExtensions");
+  QTemporaryDir root;
+  ASSERT_TRUE(root.isValid());
+  const QString real_store = QDir(root.path()).absoluteFilePath(u"real_store"_s);
+  const QString link_store = QDir(root.path()).absoluteFilePath(u"link_store"_s);
+  ASSERT_TRUE(QDir().mkpath(real_store));
+  ASSERT_TRUE(QFile::link(real_store, link_store));
+
+  DownloadManager downloader;
+  // The store is reached through a symlink, exactly as a symlinked $HOME/config
+  // would produce.
+  ExtensionManager mgr(&downloader, link_store, pending_dir_.path());
+  ASSERT_TRUE(mgr.hasStoreWriteAccess());
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  QSignalSpy install_spy(&mgr, &ExtensionManager::installFinished);
+  mgr.install(makeExtension("mock-data-source", "1.0.0", server_.url()));
+  ASSERT_TRUE(waitForSignal(install_spy));
+  ASSERT_TRUE(mgr.isInstalled("mock-data-source"));
+
+  QSignalSpy uninstall_spy(&mgr, &ExtensionManager::uninstallPendingRestart);
+  mgr.uninstall(u"mock-data-source"_s);
+  ASSERT_TRUE(waitForSignal(uninstall_spy)) << "a valid uninstall under a symlinked store must not be rejected";
+
+  mgr.applyPendingUninstalls();
+  EXPECT_FALSE(QDir(real_store + "/mock-data-source").exists())
+      << "the uninstall must actually drain; a symlinked store path must not strand it";
+  EXPECT_TRUE(quarantinedRecordsIn(real_store).isEmpty())
+      << "a legitimate record must not be quarantined as if it escaped the store";
+
+  mgr.setEnabled(u"mock-data-source"_s, true);  // clear the tombstone: QSettings key is process-global
+  QSettings().remove("Marketplace/disabledExtensions");
+#endif
+}
+
+// A legacy in-payload marker whose directory will not delete survives every launch.
+// externalizeLegacyUninstallMarkers must NOT file a fresh cleanup record on each
+// pass, or the journal grows without bound. RED before the dedup: the second pass
+// adds a second cleanup-<uuid>.json.
+//
+// The payload directory ITSELF is made read-only, not a subdirectory: that stops
+// removeRecursively from unlinking any child — the marker included — so the marker
+// (and thus the reason to re-externalize) genuinely persists across passes. A
+// locked subdirectory would not do: the recursive delete would remove the top-level
+// marker before failing deeper, and the second pass would find nothing to re-file.
+TEST_F(ExtensionManagerEnableDisableTest, StuckLegacyMarkerIsNotReExternalizedEveryLaunch) {
+#ifndef Q_OS_WIN
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "running as root: directory permissions cannot make a POSIX unlink fail";
+  }
+#endif
+  const QString ext_path = ext_dir_.path() + "/legacy-plugin";
+  ASSERT_TRUE(QDir().mkpath(ext_path));
+
+  // The marker must SURVIVE both drain attempts, or the second pass has no marker
+  // to re-externalize and the test would pass without exercising the dedup at all.
+  // Blocking the delete takes a different mechanism on each platform, so use both:
+  // an open handle is what stops a delete on Windows (a read-only DIRECTORY does
+  // not — that is why this test failed there), and dropping write permission on the
+  // holding directory is what stops the unlink on POSIX (where an open handle does
+  // not). Held open across BOTH passes.
+  QFile marker(ext_path + "/.pj_pending_uninstall");
+  ASSERT_TRUE(marker.open(QIODevice::WriteOnly));
+  marker.write("legacy in-payload marker");
+  ASSERT_TRUE(marker.flush());
+
+  const auto cleanupRecordCount = [&]() {
+    return QDir(removalJournalDirFor(ext_dir_.path()))
+        .entryList(QStringList{u"cleanup-*.json"_s}, QDir::Files | QDir::Hidden)
+        .size();
+  };
+
+  {
+    const ScopedDirectoryPermissions locked(ext_path, QFileDevice::ReadOwner | QFileDevice::ExeOwner);
+
+    mgr_->applyPendingUninstalls();
+    ASSERT_TRUE(QFile::exists(ext_path + "/.pj_pending_uninstall")) << "the marker must survive the failed delete";
+    ASSERT_EQ(cleanupRecordCount(), 1) << "the first pass externalizes the marker into one cleanup record";
+
+    mgr_->applyPendingUninstalls();
+    EXPECT_EQ(cleanupRecordCount(), 1) << "a second pass over the same stuck marker must not add another record";
+  }
+  marker.close();
 }
 
 // A downgrade-to-bundled is a version change, not a removal: the plugin stays
 // installed (only its version reverts to the shipped baseline). It therefore
 // PRESERVES the user's enable/disable choice, exactly like an update does (see
-// UpdatePromotionPreservesDisabledState) — and unlike uninstall, which clears
-// the entry only to avoid leaving an orphan id for a plugin that no longer
-// exists. So a disabled plugin stays disabled across a downgrade.
+// UpdatePromotionPreservesDisabledState). So a disabled plugin stays disabled
+// across a downgrade, drain included.
+//
+// The contrast with uninstall is about which entry gets WRITTEN, not about anything
+// being cleared: an uninstall adds a disabled tombstone that PERSISTS after the
+// files are gone (only a reinstall clears it), while a downgrade adds none and
+// leaves whatever the user chose exactly as it was. Neither ever re-enables an id —
+// draining has no authority to do so at all.
 TEST_F(ExtensionManagerEnableDisableTest, DowngradeToBundledPreservesDisabledState) {
   // Install 2.0.0, then declare 1.0.0 as the bundled version so the installed
   // copy sits ABOVE bundled and downgradeToBundled is applicable.
@@ -2627,6 +3219,14 @@ TEST_F(ExtensionManagerEnableDisableTest, DowngradeToBundledPreservesDisabledSta
   EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
       << "downgradeToBundled must preserve the disabled state (a version change, like update), "
          "not clear it like uninstall";
+
+  // The drain that removes the updated copy at the next launch must not re-enable
+  // the id either: the host seed restores the bundled version, and the user's
+  // choice applies to it just the same.
+  mgr_->applyPendingUninstalls();
+  EXPECT_TRUE(ExtensionManager::disabledExtensionIds().contains("mock-data-source"))
+      << "applying a staged downgrade must leave the disabled state alone; only an uninstall's own "
+         "marker retires it";
 }
 
 // A staged downgrade keeps the plugin in installed_ until the next launch: it is
@@ -3024,6 +3624,20 @@ TEST_F(ExtensionManagerTest, StoreSiblingsFollowTheCanonicalExtensionsDir) {
       << (spy_error.isEmpty() ? std::string("install failed with no error signal")
                               : spy_error.first().at(1).toString().toStdString());
   EXPECT_TRUE(QDir(real_store + "/mock-data-source").exists()) << "the install lands in the resolved store";
+
+  // Same rule for the removal journal: two aliases of one store must share it, or
+  // each would hold its own record of the same pending removal and drain blind to
+  // the other's.
+  QSignalSpy spy_pending(&mgr, &ExtensionManager::uninstallPendingRestart);
+  mgr.uninstall(u"mock-data-source"_s);
+  ASSERT_TRUE(waitForSignal(spy_pending));
+  EXPECT_FALSE(removalIntentFor(real_store, u"mock-data-source"_s).isEmpty())
+      << "the journal must be created beside the RESOLVED store";
+  EXPECT_FALSE(QDir(removalJournalDirFor(link_store)).exists())
+      << "a journal beside the symlink would let an alias of the same store keep a second, divergent record";
+  // uninstall() disables the id in process-wide QSettings; this fixture does not
+  // scope that key, so put it back before it reaches a sibling test.
+  mgr.setEnabled(u"mock-data-source"_s, true);
 
   // Same rule for the lease, with a consequence of its own: an alias of a locked
   // store must not hand out a second writer lease.

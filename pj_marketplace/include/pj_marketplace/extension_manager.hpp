@@ -146,7 +146,20 @@ class ExtensionManager : public QObject {
   // is known (after the manifest is read), since that signal is keyed by id.
   void installFromLocalZip(const QString& zip_path);
 
-  // Removes an installed extension or schedules Windows cleanup after restart.
+  // Stages the removal of an installed extension: the removal is journalled outside
+  // the payload rather than performed now, since the DSO is still loaded. Emits
+  // uninstallPendingRestart(), NOT uninstallFinished().
+  //
+  // Disables the id first — persisted and synced, with the sync CHECKED, before the
+  // journal record is written — because the deletion is deferred and can fail: the
+  // loader decides what to load from the disabled list alone, so an id left enabled
+  // would load again from a directory that survived the drain. Ordering it first
+  // means a crash mid-stage can only leave the plugin unloaded, never resurrected;
+  // a step that cannot be persisted rolls the enable state back and fails.
+  //
+  // The disabled entry then REMAINS after the files are gone, as a tombstone. A
+  // reinstall clears it (registerInstalledExtension), and keeping it is what lets
+  // journal processing stay free of any authority to enable an id.
   void uninstall(const QString& extension_id);
 
   // Reverts a core extension that was updated ABOVE its bundled version back to the
@@ -166,7 +179,19 @@ class ExtensionManager : public QObject {
   // Promotes validated staged installs from PlatformUtils::pendingDir().
   void applyPendingInstalls();
 
-  // Deletes extension directories previously marked for restart cleanup.
+  // Drains the removal journal: deletes each recorded directory and drops the record
+  // only once that directory is verifiably gone. A directory that resists deletion
+  // keeps its record (so the next launch retries) and reports a diagnostic —
+  // including after a PARTIAL deletion, since the record lives outside the payload
+  // and cannot be destroyed by the delete it describes.
+  //
+  // Every record is validated before any deletion: schema, an exact operation, an id
+  // matching the file it is filed under, and a target confined to a direct child of
+  // the canonical store root. A record failing any of those is quarantined and
+  // reported, never acted on. Draining NEVER enables an id — an uninstall's disabled
+  // entry is left as a tombstone — so no record can make a plugin loadable.
+  //
+  // Requires the store write lease; a read-only instance leaves the work alone.
   void applyPendingUninstalls();
 
   // Returns true when the latest disk scan found this extension id.
@@ -392,10 +417,23 @@ class ExtensionManager : public QObject {
   // Disconnects downloader signals for the current operation.
   void disconnectDlConns();
 
-  // Writes the restart-cleanup marker into an installed extension directory.
-  // Returns false if the marker file could not be created — caller must NOT remove
-  // the in-memory entry in that case, otherwise the directory will leak.
-  bool schedulePendingUninstall(const QString& path);
+  // Converts an older build's in-payload cleanup marker into an external, path-only
+  // journal record, so the retry survives a deletion that fails part-way. Marker
+  // content is package-controlled and is never read: the derived record carries no
+  // id, hence no authority over any extension's enable state.
+  void externalizeLegacyUninstallMarkers();
+
+  // Read-modify-writes the persisted disabled list for one id and reports whether
+  // it actually reached the backing store. Everything happens on a SINGLE QSettings
+  // instance: status() reflects only the object that performed the write, so a
+  // sync-or-status check made through any other instance would silently lose a
+  // failure (notably a Windows registry write). Staging a removal depends on that
+  // entry surviving a crash, so the result must be checked, never assumed.
+  bool writeDisabledState(const QString& id, bool enabled);
+
+  // Puts `id` back to `enabled` after a failed staging step, reporting a diagnostic
+  // if even the rollback could not be persisted.
+  void restoreEnabledState(const QString& id, bool enabled);
 
   // Appends a diagnostic and notifies observers.
   void reportDiagnostic(const QString& id, const QString& message, bool is_error);
