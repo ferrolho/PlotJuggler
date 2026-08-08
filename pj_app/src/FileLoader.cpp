@@ -1343,7 +1343,11 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
   applyDefaultIngestPolicies(ingest_session.policyResolver());
 
   ServiceRegistryBuilder registry;
-  ingest_session.registerServices(registry);
+  if (auto status = ingest_session.registerServices(registry); !status) {
+    (void)fail(
+        tr("Plugin '%1': service registration failed: %2").arg(source_name, QString::fromStdString(status.error())));
+    co_return;
+  }
 
   if (auto status = handle.bind(registry.view()); !status) {
     (void)fail(tr("Plugin '%1': bind failed: %2").arg(source_name, QString::fromStdString(status.error())));
@@ -1737,7 +1741,13 @@ FileLoader::BeginLoadTask FileLoader::beginLoad(LoadRequest request) {
       applyDefaultIngestPolicies(iter_ingest.policyResolver());
 
       ServiceRegistryBuilder iter_registry;
-      iter_ingest.registerServices(iter_registry);
+      if (auto status = iter_ingest.registerServices(iter_registry); !status) {
+        qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx
+                                << "]: service registration failed:" << QString::fromStdString(status.error());
+        ++failed;
+        failed_labels << iter_display;
+        continue;
+      }
 
       if (auto status = iter_handle.bind(iter_registry.view()); !status) {
         qCWarning(lcFileLoader) << "[FileLoader] fanout[" << idx

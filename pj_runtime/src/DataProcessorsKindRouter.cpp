@@ -9,6 +9,7 @@
 #include "pj_base/sdk/plugin_data_api.hpp"  // sdk::fillError, sdk::toStringView
 #include "pj_base/sdk/service_traits.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
+#include "pj_runtime/ServiceRegistration.h"
 
 namespace PJ {
 
@@ -53,8 +54,8 @@ DataProcessorsKindRouter::DataProcessorsKindRouter(
       },
       raw_{this, &vtable_} {}
 
-void DataProcessorsKindRouter::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::DataProcessorsHostService>(raw_);
+Status DataProcessorsKindRouter::registerServices(ServiceRegistryBuilder& registry) {
+  return registerRequiredService<sdk::DataProcessorsHostService>(registry, raw_);
 }
 
 const PJ_data_processors_host_t& DataProcessorsKindRouter::backendFor(PJ_string_view_t kind) const noexcept {

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "pj_base/expected.hpp"
 #include "pj_base/plugin_data_api.h"
 
 namespace PJ {
@@ -45,7 +46,10 @@ class DataProcessorsKindRouter {
   DataProcessorsKindRouter& operator=(DataProcessorsKindRouter&&) = delete;
 
   /// Register the routed `pj.data_processors.v1` service into the plugin's registry.
-  void registerServices(ServiceRegistryBuilder& registry);
+  /// The name may be claimed only once — routing through this class is exactly how
+  /// both backends share it — so a rejection would strand every toolbox of that
+  /// kind on someone else's backend. The Status fails the caller instead.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   /// The raw C-ABI fat pointer (for direct wiring / tests).
   [[nodiscard]] PJ_data_processors_host_t raw() const noexcept {

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "pj_base/expected.hpp"
 #include "pj_base/plugin_data_api.h"
 
 namespace PJ {
@@ -46,8 +47,10 @@ class DataProcessorsRuntimeHost {
   DataProcessorsRuntimeHost& operator=(DataProcessorsRuntimeHost&&) = delete;
 
   /// Register the `pj.data_processors.v1` service into the plugin's registry
-  /// (beside `pj.toolbox_write.v1`).
-  void registerServices(ServiceRegistryBuilder& registry);
+  /// (beside `pj.toolbox_write.v1`). It is this host's only service, so a
+  /// rejection fails the Status rather than leaving the plugin unable to create
+  /// any processor.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   /// The raw C-ABI fat pointer (for direct wiring / tests).
   [[nodiscard]] PJ_data_processors_host_t raw() const noexcept {

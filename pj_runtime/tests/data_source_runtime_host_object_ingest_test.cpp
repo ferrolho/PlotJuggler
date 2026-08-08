@@ -48,7 +48,7 @@ class DataSourceRuntimeHostObjectIngestTest : public ::testing::Test {
         engine_, catalog_, dataset_id_, source_handle_, object_store_, "runtime_host_test_source",
         /*parser_registrar=*/nullptr, /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/nullptr,
         /*library_keepalive=*/nullptr);
-    host_->registerServices(registry_builder_);
+    EXPECT_TRUE(host_->registerServices(registry_builder_).has_value());
   }
 
   [[nodiscard]] PJ::DataSourceRuntimeHostView runtime() {
@@ -265,7 +265,7 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, PureLazyFetcherReleaseRunsWhileDso
   local_host->policyResolver().setDefault(PJ::sdk::ObjectIngestPolicy::kPureLazy);
 
   PJ::ServiceRegistryBuilder local_registry;
-  local_host->registerServices(local_registry);
+  ASSERT_TRUE(local_host->registerServices(local_registry).has_value());
   PJ::sdk::ServiceRegistry services(local_registry.view());
   auto runtime_or = services.require<PJ::sdk::DataSourceRuntimeHostService>();
   ASSERT_TRUE(runtime_or.has_value()) << runtime_or.error();
@@ -357,7 +357,7 @@ TEST_F(DataSourceRuntimeHostObjectIngestTest, ObjectPushFollowsStoreTargetSwap) 
       engine_, catalog_, dataset_id_, source_handle_, object_store_, "dual_store_src", {}, &secondary_object_store,
       &secondary_engine, /*library_keepalive=*/nullptr);
   host.policyResolver().setDefault(PJ::sdk::ObjectIngestPolicy::kEager);
-  host.registerServices(builder);
+  ASSERT_TRUE(host.registerServices(builder).has_value());
 
   PJ::sdk::ServiceRegistry services(builder.view());
   auto runtime_or = services.require<PJ::sdk::DataSourceRuntimeHostService>();

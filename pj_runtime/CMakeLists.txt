@@ -21,6 +21,7 @@ add_library(pj_runtime STATIC
     src/PluginRuntimeCatalog.cpp
     src/PlaybackEngine.cpp
     src/QSettingsBackend.cpp
+    src/ServiceRegistration.cpp
     src/SessionManager.cpp
     src/TelemetryPing.cpp
     src/ToolboxRuntimeHost.cpp
@@ -41,6 +42,7 @@ add_library(pj_runtime STATIC
     include/pj_runtime/MarkersRuntimeHost.h
     include/pj_runtime/PlaybackEngine.h
     include/pj_runtime/QSettingsBackend.h
+    include/pj_runtime/ServiceRegistration.h
     include/pj_runtime/SessionManager.h
     include/pj_runtime/TelemetryPing.h
     include/pj_runtime/ToolboxRuntimeHost.h

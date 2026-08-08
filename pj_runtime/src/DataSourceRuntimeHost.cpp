@@ -19,6 +19,7 @@
 #include "pj_plugins/host/message_parser_handle.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
 #include "pj_runtime/ExtensionCatalogService.h"
+#include "pj_runtime/ServiceRegistration.h"
 #include "pj_runtime/detail/payload_anchor.h"
 using namespace Qt::StringLiterals;
 
@@ -269,10 +270,15 @@ DataSourceRuntimeHost::~DataSourceRuntimeHost() = default;
 // Public API
 // ---------------------------------------------------------------------------
 
-void DataSourceRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::SourceWriteHostService>(source_write_host_.raw());
-  registry.registerService<sdk::SourceObjectWriteHostService>(source_object_write_host_.raw());
-  registry.registerService<sdk::DataSourceRuntimeHostService>(hostHandle());
+Status DataSourceRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
+  if (auto status = registerRequiredService<sdk::SourceWriteHostService>(registry, source_write_host_.raw()); !status) {
+    return status;
+  }
+  registerOptionalService<sdk::SourceObjectWriteHostService>(registry, source_object_write_host_.raw());
+  if (auto status = registerRequiredService<sdk::DataSourceRuntimeHostService>(registry, hostHandle()); !status) {
+    return status;
+  }
+  return {};
 }
 
 void DataSourceRuntimeHost::flushAll() {
@@ -560,7 +566,13 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
     // outlive bind() because the plugin may hold a view into it; we move it
     // into the ParserBinding so its lifetime matches the parser's.
     auto registry_builder = std::make_unique<ServiceRegistryBuilder>();
-    registry_builder->registerService<sdk::ParserWriteHostService>(write_host->raw());
+    // The parser's scalar sink: message_parser_plugin_base require<>()s it, so a
+    // rejection must fail the binding here rather than surface later as an
+    // unexplained parse failure.
+    if (auto status = registerRequiredService<sdk::ParserWriteHostService>(*registry_builder, write_host->raw());
+        !status) {
+      return self->fail(out_error, ("failed to register the parser write host: " + status.error()).c_str());
+    }
 
     const Span<const uint8_t> schema_span(request->schema.data, request->schema.size);
     if (auto status = parser->bindSchema(type_name, schema_span); !status) {
@@ -630,7 +642,18 @@ bool DataSourceRuntimeHost::cbEnsureParserBinding(
       // paused must push into the active (secondary) store, not the frozen
       // primary. When live, object_store_target_ is the primary (a no-op).
       object_write_host->setTarget(self->object_store_target_.load());
-      registry_builder->registerService<sdk::ParserObjectWriteHostService>(object_write_host->raw());
+      // Required at THIS point despite being an optional service in general: the
+      // host only reaches here after committing this topic to object ingest (the
+      // object topic is registered and mirrored). Merely warning would let the
+      // parser bind with no object sink and drop every object payload silently.
+      if (auto status =
+              registerRequiredService<sdk::ParserObjectWriteHostService>(*registry_builder, object_write_host->raw());
+          !status) {
+        return self->fail(
+            out_error,
+            ("failed to register the parser object write host for '" + std::string(topic_name) + "': " + status.error())
+                .c_str());
+      }
 
       if (self->object_topic_parser_registrar_) {
         auto object_parser = std::make_unique<MessageParserHandle>(self->catalog_.createParserHandleForEncoding(

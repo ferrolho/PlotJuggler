@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "pj_base/expected.hpp"
 #include "pj_base/plugin_data_api.h"
 #include "pj_base/types.hpp"
 #include "pj_runtime/MarkerService.h"
@@ -48,7 +49,9 @@ class MarkersRuntimeHost {
   MarkersRuntimeHost& operator=(const MarkersRuntimeHost&) = delete;
 
   /// Register `DataProcessorsHostService` into the builder used to bind the plugin.
-  void registerServices(ServiceRegistryBuilder& registry);
+  /// It is this host's only service, so a rejection leaves nothing to bind against:
+  /// the Status fails the caller rather than producing a mute host.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   /// The fat pointer this registers — exposed for direct binding in tests.
   [[nodiscard]] PJ_data_processors_host_t raw() const noexcept {

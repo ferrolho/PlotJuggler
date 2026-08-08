@@ -5,8 +5,10 @@
 
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QLoggingCategory>
 #include <QString>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,10 +39,29 @@ using namespace Qt::StringLiterals;
 
 namespace {
 
+// Collect the qWarning output `body` produces. The Qt handler is process-global,
+// so the previous one is restored before returning and the sink is only live for
+// the duration of the call.
+std::vector<std::string> captureWarnings(const std::function<void()>& body) {
+  static std::vector<std::string>* sink = nullptr;
+  std::vector<std::string> captured;
+  sink = &captured;
+  QtMessageHandler previous =
+      qInstallMessageHandler([](QtMsgType type, const QMessageLogContext&, const QString& text) {
+        if (type == QtWarningMsg && sink != nullptr) {
+          sink->push_back(text.toStdString());
+        }
+      });
+  body();
+  qInstallMessageHandler(previous);
+  sink = nullptr;
+  return captured;
+}
+
 class ToolboxRuntimeHostTest : public ::testing::Test {
  protected:
   PJ::sdk::ServiceRegistry registered() {
-    host_->registerServices(builder_);
+    EXPECT_TRUE(host_->registerServices(builder_).has_value());
     return PJ::sdk::ServiceRegistry(builder_.view());
   }
 
@@ -127,6 +148,47 @@ TEST_F(ToolboxRuntimeHostTest, RegistersWriteRuntimeAndSettingsServices) {
   EXPECT_TRUE(services.get<PJ::sdk::ToolboxHostService>().has_value());
   EXPECT_TRUE(services.get<PJ::sdk::ToolboxRuntimeHostService>().has_value());
   EXPECT_TRUE(services.get<PJ::sdk::SettingsStoreService>().has_value());
+}
+
+// A REQUIRED service the host could not register must fail registration at the
+// boundary where the cause is still known. A duplicate name is a host wiring
+// defect: continuing would bind the plugin against whichever instance got there
+// first — the wrong service surface, indistinguishable from the right one.
+TEST_F(ToolboxRuntimeHostTest, DuplicateRequiredServiceFailsRegistration) {
+  host_ =
+      std::make_unique<PJ::ToolboxRuntimeHost>(engine_, object_store_, settings_, PJ::ToolboxRuntimeHost::Callbacks{});
+  ASSERT_TRUE(host_->registerServices(builder_).has_value());
+  ASSERT_EQ(builder_.size(), 4U);
+
+  const PJ::Status status = host_->registerServices(builder_);
+
+  ASSERT_FALSE(status.has_value());
+  EXPECT_NE(status.error().find(PJ::sdk::ToolboxHostService::kName), std::string::npos) << status.error();
+  EXPECT_NE(status.error().find("duplicate name"), std::string::npos) << status.error();
+  // Fail-fast: nothing new landed, and the later services were not attempted.
+  EXPECT_EQ(builder_.size(), 4U);
+}
+
+// An OPTIONAL service is one the SDK plugin bases reach through get<>(), so its
+// absence is a supported degraded mode — it must warn and let the host succeed
+// rather than failing the whole bind.
+TEST_F(ToolboxRuntimeHostTest, DuplicateOptionalServiceWarnsButStillSucceeds) {
+  host_ =
+      std::make_unique<PJ::ToolboxRuntimeHost>(engine_, object_store_, settings_, PJ::ToolboxRuntimeHost::Callbacks{});
+  // Pre-claim ONLY the optional settings service; every required name stays free.
+  int decoy = 0;
+  ASSERT_TRUE(
+      builder_.tryRegisterService(PJ::sdk::SettingsStoreService::kName, 1, PJ_service_t{&decoy, &decoy}).has_value());
+
+  PJ::Status status{};
+  const auto warnings = captureWarnings([&]() { status = host_->registerServices(builder_); });
+
+  EXPECT_TRUE(status.has_value()) << status.error();
+  ASSERT_EQ(warnings.size(), 1U);
+  EXPECT_NE(warnings[0].find(PJ::sdk::SettingsStoreService::kName), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("duplicate name"), std::string::npos) << warnings[0];
+  // The three required services still landed alongside the pre-claimed decoy.
+  EXPECT_EQ(builder_.size(), 4U);
 }
 
 TEST_F(ToolboxRuntimeHostTest, NotifyDataChangedFiresOnDataChangedCallback) {

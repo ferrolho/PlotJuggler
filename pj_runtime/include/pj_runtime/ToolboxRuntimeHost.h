@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pj_base/expected.hpp"
 #include "pj_base/sdk/settings_store_host.hpp"
 #include "pj_base/toolbox_protocol.h"
 #include "pj_datastore/object_store.hpp"
@@ -107,8 +108,12 @@ class ToolboxRuntimeHost {
   ToolboxRuntimeHost& operator=(const ToolboxRuntimeHost&) = delete;
 
   // Registers ToolboxHostService + ToolboxRuntimeHostService + SettingsStoreService
-  // into the builder used to bind the toolbox plugin.
-  void registerServices(ServiceRegistryBuilder& registry);
+  // into the builder used to bind the toolbox plugin. Fails (without binding) when
+  // a service the toolbox ABI requires could not be registered; a rejected
+  // SettingsStore / object-read service only warns, since a toolbox runs without
+  // them. Do not bind the plugin on a failed Status: the surface is not the one
+  // this host meant to publish.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   // True when this host has (ever) created a parser-ingest context for
   // `dataset_id` — deliberately including finished and released ingests: the

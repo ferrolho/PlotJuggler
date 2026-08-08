@@ -13,6 +13,7 @@
 
 #include "FileLoader.h"
 #include "pj_base/descriptor_import_protocol.h"
+#include "pj_base/expected.hpp"
 #include "pj_base/types.hpp"
 
 namespace PJ {
@@ -84,8 +85,11 @@ class SourcePromotionHost : public QObject {
   SourcePromotionHost& operator=(const SourcePromotionHost&) = delete;
 
   // Register "pj.source_promotion.v1" into the builder used to bind the
-  // toolbox plugin (before the handle's bind()).
-  void registerServices(ServiceRegistryBuilder& registry);
+  // toolbox plugin (before the handle's bind()). It is this host's only service
+  // and promotion is its entire purpose, so a rejection fails the Status; do not
+  // bind the plugin on a failure, or promotion requests would reach a host the
+  // caller never published.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   // The raw C-ABI fat pointer (for direct wiring / tests).
   [[nodiscard]] PJ_source_promotion_host_t raw() const noexcept {

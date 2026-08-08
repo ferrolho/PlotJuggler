@@ -122,7 +122,7 @@ class StreamEngineSwapTest : public ::testing::Test {
         primary_engine_, catalog_, dataset_id_, source_handle_, primary_object_store_, "stream_swap_source",
         /*parser_registrar=*/nullptr, /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/&secondary_engine_,
         /*library_keepalive=*/nullptr);
-    host_->registerServices(registry_builder_);
+    EXPECT_TRUE(host_->registerServices(registry_builder_).has_value());
   }
 
   // The SourceWriteHostView a source plugin would receive from bind().
@@ -246,7 +246,7 @@ class StreamParserSwapTest : public ::testing::Test {
         primary_engine_, catalog_, dataset_id_, source_handle_, primary_object_store_, "stream_parser_swap_source",
         /*parser_registrar=*/nullptr, /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/&secondary_engine_,
         /*library_keepalive=*/nullptr);
-    host_->registerServices(registry_builder_);
+    EXPECT_TRUE(host_->registerServices(registry_builder_).has_value());
   }
 
   [[nodiscard]] PJ::DataSourceRuntimeHostView runtime() {

@@ -9064,7 +9064,12 @@ void MainWindow::launchToolbox(
   session->host = std::make_unique<ToolboxRuntimeHost>(
       session_->sessionManager().dataEngine(), session_->sessionManager().objectStore(), *session->settings,
       std::move(callbacks), std::move(ingest_deps));
-  session->host->registerServices(*session->builder);
+  if (auto status = session->host->registerServices(*session->builder); !status) {
+    report_error(
+        source,
+        tr("Failed to publish toolbox services for '%1': %2").arg(source, QString::fromStdString(status.error())));
+    return;
+  }
 
   // Host-driven data processors (pj.data_processors.v1, kind=markers): expose the marker
   // service so a toolbox can submit whole-series generators the HOST runs + recomputes
@@ -9105,7 +9110,12 @@ void MainWindow::launchToolbox(
   // second one and break that kind's toolboxes.
   session->dp_router =
       std::make_unique<DataProcessorsKindRouter>(session->markers_host->raw(), session->dp_host->raw());
-  session->dp_router->registerServices(*session->builder);
+  if (auto status = session->dp_router->registerServices(*session->builder); !status) {
+    report_error(
+        source, tr("Failed to publish data-processor services for '%1': %2")
+                    .arg(source, QString::fromStdString(status.error())));
+    return;
+  }
 
   // Source promotion ("pj.source_promotion.v1"), bound per toolbox instance:
   // the provider identity is THIS binding's stable manifest id (host-derived,
@@ -9116,7 +9126,12 @@ void MainWindow::launchToolbox(
   session->promotion_host = std::make_unique<SourcePromotionHost>(
       *file_loader_, session_->sessionManager(), QString::fromStdString(it->id),
       [host = session->host.get()](DatasetId dataset_id) { return host->hasIngestForDataset(dataset_id); });
-  session->promotion_host->registerServices(*session->builder);
+  if (auto status = session->promotion_host->registerServices(*session->builder); !status) {
+    report_error(
+        source, tr("Failed to publish the source-promotion service for '%1': %2")
+                    .arg(source, QString::fromStdString(status.error())));
+    return;
+  }
 
   // 3. Create the toolbox instance and bind it to the assembled services.
   session->handle = std::make_shared<ToolboxHandle>(it->library.createHandle());

@@ -15,6 +15,7 @@
 #include "pj_base/sdk/descriptor_import.hpp"
 #include "pj_base/sdk/plugin_data_api.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
+#include "pj_runtime/ServiceRegistration.h"
 #include "pj_runtime/SessionManager.h"
 
 namespace PJ {
@@ -163,8 +164,8 @@ void SourcePromotionHost::shutdown() {
   }
 }
 
-void SourcePromotionHost::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::SourcePromotionHostService>(raw_);
+Status SourcePromotionHost::registerServices(ServiceRegistryBuilder& registry) {
+  return registerRequiredService<sdk::SourcePromotionHostService>(registry, raw_);
 }
 
 bool SourcePromotionHost::onPromote(

@@ -379,7 +379,12 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
   };
 
   ServiceRegistryBuilder registry;
-  session->runtime_host->registerServices(registry);
+  if (auto status = session->runtime_host->registerServices(registry); !status) {
+    emit streamError(
+        dataset_id,
+        tr("Plugin '%1': service registration failed: %2").arg(source_name, QString::fromStdString(status.error())));
+    return;
+  }
 
   if (auto status = session->handle.bind(registry.view()); !status) {
     emit streamError(

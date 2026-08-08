@@ -50,7 +50,7 @@ class DataSourceRuntimeHostAdvertiseTest : public ::testing::Test {
         engine_, catalog_, dataset_id_, source_handle_, object_store_, "advertise_test_source",
         /*parser_registrar=*/nullptr, /*secondary_object_store=*/nullptr, /*secondary_data_engine=*/nullptr,
         /*library_keepalive=*/nullptr);
-    host_->registerServices(registry_builder_);
+    EXPECT_TRUE(host_->registerServices(registry_builder_).has_value());
   }
 
   [[nodiscard]] PJ::DataSourceRuntimeHostView runtime() {

@@ -150,7 +150,7 @@ TEST(ToolboxParserIngestRealRos, TfMessageBecomesFrameTransformsObjectTopic) {
     registered.push_back(id);
   };
   PJ::ToolboxRuntimeHost host(engine, object_store, settings, PJ::ToolboxRuntimeHost::Callbacks{}, std::move(deps));
-  host.registerServices(builder);
+  ASSERT_TRUE(host.registerServices(builder).has_value());
   PJ::sdk::ServiceRegistry services(builder.view());
 
   auto toolbox = services.require<PJ::sdk::ToolboxHostService>();

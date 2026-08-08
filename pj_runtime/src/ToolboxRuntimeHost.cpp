@@ -20,6 +20,7 @@
 #include "pj_plugins/host/service_registry_builder.hpp"
 #include "pj_runtime/DataSourceRuntimeHost.h"
 #include "pj_runtime/ExtensionCatalogService.h"
+#include "pj_runtime/ServiceRegistration.h"
 
 namespace PJ {
 
@@ -153,11 +154,16 @@ void ToolboxRuntimeHost::requestStopActiveIngests() {
   }
 }
 
-void ToolboxRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::ToolboxHostService>(write_host_.raw());
-  registry.registerService<sdk::ToolboxObjectReadHostService>(read_host_.raw());
-  registry.registerService<sdk::ToolboxRuntimeHostService>(runtime_);
-  registry.registerService<sdk::SettingsStoreService>(settings_host_.view());
+Status ToolboxRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
+  if (auto status = registerRequiredService<sdk::ToolboxHostService>(registry, write_host_.raw()); !status) {
+    return status;
+  }
+  registerOptionalService<sdk::ToolboxObjectReadHostService>(registry, read_host_.raw());
+  if (auto status = registerRequiredService<sdk::ToolboxRuntimeHostService>(registry, runtime_); !status) {
+    return status;
+  }
+  registerOptionalService<sdk::SettingsStoreService>(registry, settings_host_.view());
+  return {};
 }
 
 void ToolboxRuntimeHost::onReportMessage(

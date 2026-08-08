@@ -11,6 +11,7 @@
 #include "pj_base/sdk/plugin_data_api.hpp"  // sdk::toStringView / toAbiString / fillError
 #include "pj_base/sdk/service_traits.hpp"   // sdk::DataProcessorsHostService
 #include "pj_plugins/host/service_registry_builder.hpp"
+#include "pj_runtime/ServiceRegistration.h"
 
 namespace PJ {
 
@@ -45,8 +46,8 @@ MarkersRuntimeHost::MarkersRuntimeHost(
   data_processors_ = PJ_data_processors_host_t{.ctx = this, .vtable = &vtable_};
 }
 
-void MarkersRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::DataProcessorsHostService>(data_processors_);
+Status MarkersRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
+  return registerRequiredService<sdk::DataProcessorsHostService>(registry, data_processors_);
 }
 
 std::string MarkersRuntimeHost::makeKey(std::string_view local_id) const {

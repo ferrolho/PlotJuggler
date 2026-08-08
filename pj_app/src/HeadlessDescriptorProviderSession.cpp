@@ -105,10 +105,14 @@ Expected<HeadlessDescriptorProviderSession::Ptr> HeadlessDescriptorProviderSessi
   session->host_ = std::make_unique<ToolboxRuntimeHost>(
       session_manager.dataEngine(), session_manager.objectStore(), *session->settings_, std::move(callbacks),
       std::move(ingest_deps));
-  session->host_->registerServices(*session->builder_);
+  if (auto status = session->host_->registerServices(*session->builder_); !status) {
+    return unexpected("failed to publish toolbox services for '" + wanted + "': " + status.error());
+  }
 
   session->dp_host_ = std::make_unique<DataProcessorsRuntimeHost>(session_manager.dataProcessorService(), wanted);
-  session->dp_host_->registerServices(*session->builder_);
+  if (auto status = session->dp_host_->registerServices(*session->builder_); !status) {
+    return unexpected("failed to publish data-processor services for '" + wanted + "': " + status.error());
+  }
 
   // Source promotion, bound per plugin instance: provider identity is THIS
   // binding's manifest id (host-derived, unspoofable) and the ownership
@@ -118,7 +122,9 @@ Expected<HeadlessDescriptorProviderSession::Ptr> HeadlessDescriptorProviderSessi
   session->promotion_host_ = std::make_unique<SourcePromotionHost>(
       loader, session_manager, provider_manifest_id,
       [host = session->host_.get()](DatasetId dataset_id) { return host->hasIngestForDataset(dataset_id); });
-  session->promotion_host_->registerServices(*session->builder_);
+  if (auto status = session->promotion_host_->registerServices(*session->builder_); !status) {
+    return unexpected("failed to publish the source-promotion service for '" + wanted + "': " + status.error());
+  }
 
   // 3. Create + bind the plugin instance. Every failure from here returns
   //    through `session`'s destructor: no jobs exist yet, so the quiescence

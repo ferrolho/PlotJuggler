@@ -16,6 +16,7 @@
 #include "pj_base/builtin/builtin_object.hpp"
 #include "pj_base/data_source_protocol.h"
 #include "pj_base/dataset.hpp"
+#include "pj_base/expected.hpp"
 #include "pj_datastore/object_store.hpp"
 #include "pj_datastore/plugin_data_host.hpp"
 #include "pj_plugins/sdk/object_ingest_policy.hpp"
@@ -98,8 +99,11 @@ class DataSourceRuntimeHost {
   }
 
   // Registers SourceWriteHostService + DataSourceRuntimeHostService into the
-  // builder used to bind the DataSource plugin.
-  void registerServices(ServiceRegistryBuilder& registry);
+  // builder used to bind the DataSource plugin. Both are required by the
+  // DataSource ABI, so a rejection fails the Status; the object-write service is
+  // optional (plugins publishing only scalars never resolve it) and merely warns.
+  // Do not bind the plugin on a failed Status.
+  [[nodiscard]] Status registerServices(ServiceRegistryBuilder& registry);
 
   // Fat pointer to this runtime host for handing across the C ABI outside of
   // registerServices() — ToolboxRuntimeHost's parser-ingest slots return it.

@@ -21,6 +21,8 @@
 #include <vector>
 
 #include "pj_base/plugin_data_api.h"
+#include "pj_base/sdk/service_traits.hpp"
+#include "pj_plugins/host/service_registry_builder.hpp"
 #include "pj_runtime/DataProcessorsKindRouter.h"
 
 namespace {
@@ -197,6 +199,26 @@ TEST(DataProcessorsKindRouterTest, ListSurfacesDuplicateIdsCreatedBehindTheRoute
   EXPECT_TRUE(r.vtable->remove_data_processor(r.ctx, s("shared"), &err));
   EXPECT_TRUE(transforms.ids.empty());
   EXPECT_EQ(markers.ids.count("shared"), 1u);
+}
+
+// The router exists precisely because pj.data_processors.v1 can be registered only
+// once (MainWindow routes both bridges through it for that reason). So a name that
+// is already taken must fail registration and name the cause — silently dropping it
+// would leave the whole kind's toolboxes wired to someone else's backend.
+TEST(DataProcessorsKindRouterTest, RegisterServicesFailsWhenTheServiceNameIsTaken) {
+  FakeBackend markers;
+  FakeBackend transforms;
+  DataProcessorsKindRouter router(markers.host(), transforms.host());
+
+  PJ::ServiceRegistryBuilder builder;
+  ASSERT_TRUE(router.registerServices(builder).has_value());
+  ASSERT_EQ(builder.size(), 1u);
+
+  const PJ::Status status = router.registerServices(builder);
+
+  ASSERT_FALSE(status.has_value());
+  EXPECT_NE(status.error().find(PJ::sdk::DataProcessorsHostService::kName), std::string::npos) << status.error();
+  EXPECT_NE(status.error().find("duplicate name"), std::string::npos) << status.error();
 }
 
 }  // namespace

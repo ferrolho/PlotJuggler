@@ -13,6 +13,7 @@
 #include "pj_base/sdk/service_traits.hpp"
 #include "pj_plugins/host/service_registry_builder.hpp"
 #include "pj_runtime/DataProcessorService.h"
+#include "pj_runtime/ServiceRegistration.h"
 
 namespace PJ {
 
@@ -43,8 +44,8 @@ DataProcessorsRuntimeHost::DataProcessorsRuntimeHost(DataProcessorService& servi
       },
       raw_{this, &vtable_} {}
 
-void DataProcessorsRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
-  registry.registerService<sdk::DataProcessorsHostService>(raw_);
+Status DataProcessorsRuntimeHost::registerServices(ServiceRegistryBuilder& registry) {
+  return registerRequiredService<sdk::DataProcessorsHostService>(registry, raw_);
 }
 
 bool DataProcessorsRuntimeHost::onCreate(
