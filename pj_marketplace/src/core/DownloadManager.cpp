@@ -153,6 +153,18 @@ void DownloadManager::cancel(int id) {
   }
 }
 
+void DownloadManager::cancelAndWait(int id) {
+  cancel(id);
+  // Copy the future before waiting: the map can be mutated by a nested cancel path,
+  // and a QFuture handle keeps the work item alive on its own.
+  const auto it = extract_futures_.constFind(id);
+  if (it == extract_futures_.constEnd()) {
+    return;  // download phase (aborted above) or nothing in flight: no worker to wait for
+  }
+  QFuture<QString> extract = *it;
+  extract.waitForFinished();
+}
+
 void DownloadManager::onDownloadProgress(qint64 bytes_received, qint64 bytes_total) {
   auto* reply = qobject_cast<QNetworkReply*>(sender());
   if (!reply) {
@@ -200,6 +212,7 @@ void DownloadManager::onReplyFinished(QNetworkReply* reply) {
         watcher->deleteLater();
         const bool was_cancelled = cancel_flag->load(std::memory_order_relaxed);
         cancel_flags_.remove(id);
+        extract_futures_.remove(id);
         if (was_cancelled) {
           emit cancelled(id);
           return;
@@ -246,6 +259,7 @@ void DownloadManager::onReplyFinished(QNetworkReply* reply) {
   });
   watcher->setFuture(future);
   pending_extracts_.addFuture(future);
+  extract_futures_.insert(id, future);
 }
 
 QString DownloadManager::calculateSha256(const QByteArray& data) const {

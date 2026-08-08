@@ -19,6 +19,7 @@
 
 #include "mock_data_source_vtable.h"
 #include "pj_base/plugin_data_api.h"
+#include "pj_marketplace/download_manager.hpp"
 #include "pj_marketplace/extension_manager.hpp"
 #include "pj_plugins/host/plugin_catalog.hpp"
 #include "pj_runtime/ExtensionCatalogService.h"
@@ -257,6 +258,81 @@ TEST_F(ExtensionCatalogSeedTest, OverrideModeExtensionManagerTracksMarketplaceDi
          "even when --plugin-dir is used";
   EXPECT_EQ(installed.value(mock_id).version, "1.0.0")
       << "installedExtensions() must reflect the marketplace-managed copy, not the --plugin-dir override";
+}
+
+// The seed is the one writer into the marketplace dir that does not go through
+// ExtensionManager's own mutating API: it removes the shared seed-stage tree and
+// renames payloads straight into the managed dir. A session that could not take the
+// store's writer lease must therefore skip it, or "read-only" would be a claim the
+// second instance breaks on every launch.
+TEST_F(ExtensionCatalogSeedTest, SecondInstanceDoesNotReseedBundledPlugins) {
+  placePlugin(bundled_.path(), PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("ds"));
+
+  // Stands in for the first PlotJuggler process: it owns the store for as long as
+  // it lives, exactly like the ExtensionManager inside a running app session.
+  DownloadManager holder_downloader;
+  ExtensionManager holder(&holder_downloader, marketplace_.path(), marketplace_.path() + "/.pending");
+  ASSERT_TRUE(holder.hasStoreWriteAccess()) << "the first instance must own the store for this test to mean anything";
+
+  const auto service = makeDefaultModeService();
+
+  EXPECT_FALSE(service->extensionManager().hasStoreWriteAccess()) << "the second instance must be read-only";
+  EXPECT_FALSE(QDir(seededDir()).exists())
+      << "a read-only session must not copy bundled payloads into the store another process is managing";
+  EXPECT_FALSE(QDir(marketplace_.path() + ".seed_stage").exists())
+      << "a read-only session must not create or clear the shared seed-stage tree";
+}
+
+// The seed stages into a SIBLING of the marketplace dir and promotes by rename, so
+// the sibling has to be derived from the resolved store: beside a symlink it can sit
+// on another filesystem, and then the rename is EXDEV rather than an atomic move.
+// Same policy the writer lease and the install staging area follow.
+TEST_F(ExtensionCatalogSeedTest, SeedStageFollowsTheCanonicalMarketplaceDir) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "symlink creation needs elevation on Windows; the canonical-path rule is platform-neutral";
+#else
+  QTemporaryDir root;
+  ASSERT_TRUE(root.isValid());
+  const QString real_store = QDir(root.path()).absoluteFilePath("real_marketplace");
+  const QString link_store = QDir(root.path()).absoluteFilePath("link_marketplace");
+  ASSERT_TRUE(QDir().mkpath(real_store));
+  ASSERT_TRUE(QFile::link(real_store, link_store));
+  placePlugin(bundled_.path(), PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("ds"));
+
+  // A stale stage beside the RESOLVED store: the seed clears its staging area
+  // before it does anything else, so a run that resolves the path correctly
+  // removes this, and one that works textually leaves it untouched.
+  const QString canonical_stage = real_store + ".seed_stage";
+  ASSERT_TRUE(QDir().mkpath(canonical_stage + "/leftover"));
+
+  const ExtensionCatalogService service(
+      ExtensionCatalogService::Paths{{}, link_store, bundled_.path()}, DiagnosticSink{}, nullptr);
+
+  EXPECT_TRUE(QDir(real_store + "/" + kMockId).exists()) << "the seed must land in the resolved store";
+  EXPECT_FALSE(QDir(canonical_stage).exists())
+      << "the seed's staging sibling must be derived from the resolved store, so its own cleanup finds it";
+  EXPECT_FALSE(QDir(link_store + ".seed_stage").exists())
+      << "a staging area beside the symlink can resolve onto another filesystem, which breaks promote-by-rename";
+#endif
+}
+
+// The seed still runs, unchanged, once the store is free again: the gate is about
+// who owns the store, not a permanent opt-out.
+TEST_F(ExtensionCatalogSeedTest, SeedRunsOnceTheStoreLeaseIsFree) {
+  placePlugin(bundled_.path(), PJ_MOCK_DATA_SOURCE_PLUGIN_PATH, pluginFileName("ds"));
+
+  {
+    DownloadManager holder_downloader;
+    ExtensionManager holder(&holder_downloader, marketplace_.path(), marketplace_.path() + "/.pending");
+    ASSERT_TRUE(holder.hasStoreWriteAccess());
+    const auto blocked = makeDefaultModeService();
+    ASSERT_FALSE(QDir(seededDir()).exists());
+  }
+
+  const auto service = makeDefaultModeService();
+
+  EXPECT_TRUE(service->extensionManager().hasStoreWriteAccess());
+  EXPECT_TRUE(QDir(seededDir()).exists()) << "the seed must resume for the session that owns the store";
 }
 
 // -----------------------------------------------------------------------------

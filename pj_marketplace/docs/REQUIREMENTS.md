@@ -345,6 +345,7 @@ combined behavior:
 | No write permission to extensions dir | Clear error message, suggest running with permissions |
 | Extension directory doesn't exist | Create it automatically |
 | Corrupted ZIP file | Extraction fails gracefully, user notified |
+| A second PlotJuggler instance opens the same store | The first instance keeps write access; the second is read-only (it still lists installed extensions) and refuses every mutation with "Another PlotJuggler instance is managing extensions" |
 
 ### 8.3 Version Conflicts
 

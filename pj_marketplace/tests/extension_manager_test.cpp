@@ -24,16 +24,26 @@
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QDir>
+#include <QDirIterator>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileDevice>
 #include <QHostAddress>
+#include <QProcess>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QString>
+#include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QUrl>
+#include <string>
+
+#ifndef Q_OS_WIN
+#include <unistd.h>  // geteuid: root ignores the directory permissions one test relies on
+#endif
 
 #include "pj_marketplace/download_manager.hpp"
 #include "pj_marketplace/extension.hpp"
@@ -62,6 +72,34 @@ bool waitForInstallOutcome(QSignalSpy& finished, QSignalSpy& pending_restart, in
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
   }
   return !finished.isEmpty() || !pending_restart.isEmpty();
+}
+
+// Spins the event loop until `predicate` holds, or the deadline expires. Returns
+// what the predicate said last, so a caller can assert either outcome: waiting
+// for something to APPEAR and waiting to confirm it never does are both real
+// assertions here, and neither is a sleep on a guessed duration.
+template <typename Predicate>
+bool waitUntil(Predicate predicate, int timeout_ms) {
+  QDeadlineTimer deadline(timeout_ms);
+  while (!deadline.hasExpired()) {
+    if (predicate()) {
+      return true;
+    }
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    QThread::msleep(5);
+  }
+  return predicate();
+}
+
+// Every regular file under `path`, recursively. Used as evidence that an extract
+// worker is (or is no longer) writing into the store.
+QStringList filesUnder(const QString& path) {
+  QStringList found;
+  QDirIterator it(path, QDir::Files | QDir::Hidden | QDir::System, QDirIterator::Subdirectories);
+  while (it.hasNext()) {
+    found.append(it.next());
+  }
+  return found;
 }
 
 // Minimal HTTP/1.1 server that answers every request with a fixed in-memory body.
@@ -103,8 +141,10 @@ class LocalHttpServer {
 };
 
 // Builds an in-memory ZIP archive from a map of { relative_path -> file_content }.
-QByteArray buildZip(const QMap<QString, QByteArray>& files) {
-  std::vector<char> buf(4 * 1024 * 1024);
+// `capacity` bounds the in-memory archive; raise it for a deliberately large
+// multi-entry fixture (see manyEntryPluginZip).
+QByteArray buildZip(const QMap<QString, QByteArray>& files, size_t capacity = 4 * 1024 * 1024) {
+  std::vector<char> buf(capacity);
   size_t used = 0;
 
   auto* a = archive_write_new();
@@ -212,6 +252,21 @@ QByteArray pluginZipWithDso(const QString& ext_id, const QString& fixture_id, co
 // metadata sidecar.
 QByteArray dummyPluginZip(const QString& ext_id, const QString& version = "1.0.0") {
   return pluginZipWithDso(ext_id, ext_id, version);
+}
+
+// A valid plugin archive padded with `filler_count` extra small entries, so its
+// extraction takes long enough to still be running when a test tears the manager
+// down. MANY SMALL entries rather than one big file on purpose: the extract worker
+// only observes cancellation at entry and block boundaries, so entry count is what
+// makes the in-flight window reliably observable.
+QByteArray manyEntryPluginZip(const QString& ext_id, int filler_count) {
+  QMap<QString, QByteArray> files;
+  files.insert(ext_id + "/" + pluginFileName(), readAll(pluginPathForId(ext_id)));
+  const QByteArray filler(4096, 'x');
+  for (int index = 0; index < filler_count; ++index) {
+    files.insert(u"%1/filler/%2.bin"_s.arg(ext_id).arg(index, 5, 10, QChar('0')), filler);
+  }
+  return buildZip(files, 64 * 1024 * 1024);
 }
 
 QByteArray pluginZipWithTwoDsos(const QString& ext_id, const QString& first_id, const QString& second_id) {
@@ -1761,7 +1816,12 @@ TEST_F(ExtensionManagerTest, UninstallRemovesEntryFromPersistentState) {
   mgr_->uninstall("mock-data-source");
 
   // The next process drains the staged removal in initComponents() before it
-  // snapshots installed state, so the id is gone AND so is its directory.
+  // snapshots installed state, so the id is gone AND so is its directory. That
+  // drain belongs to the instance that owns the store, so this one must release
+  // it first — as the restart being simulated would.
+  delete mgr_;
+  mgr_ = nullptr;
+
   DownloadManager downloader2;
   ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
   EXPECT_FALSE(mgr2.isInstalled("mock-data-source"));
@@ -2667,11 +2727,379 @@ TEST_F(ExtensionManagerTest, LegacyInTreeTransactionResidueIsStillSweptAtStartup
   ASSERT_TRUE(copyFixturePlugin(legacy, u"mock-data-source"_s));
   ASSERT_TRUE(QFile::exists(legacy));
 
+  // Sweeping is the store writer's job, so the "first launch after the upgrade"
+  // being modelled here has to be the instance that owns the store: the fixture's
+  // manager hands the lease over first, exactly as the previous process would.
+  delete mgr_;
+  mgr_ = nullptr;
+
   DownloadManager downloader;
   ExtensionManager mgr(&downloader, ext_dir_.path(), pending_dir_.path());
 
   EXPECT_FALSE(QFile::exists(legacy)) << "legacy in-tree transaction residue must still be swept at startup";
   EXPECT_FALSE(mgr.isInstalled("mock-data-source")) << "residue must never register as an installed extension";
+}
+
+// ---------------------------------------------------------------------------
+// [14] Interprocess single-writer lock over the managed store
+//
+// Two ExtensionManagers over the same directories look exactly like two running
+// PlotJuggler processes to the filesystem — the lock is arbitrated by file, not
+// by process — so one test process covers most of the contract; the
+// SecondProcessCannotMutateStore case below crosses a real process boundary.
+// ---------------------------------------------------------------------------
+
+// Re-exec flag that turns this test binary into a bare lock holder.
+QString holdStoreLockFlag() {
+  return u"--hold-store-lock"_s;
+}
+constexpr int kHolderBadArguments = 64;
+constexpr int kHolderLeaseRefused = 65;
+constexpr int kHolderMarkerFailed = 66;
+
+// Child-process entry point: take the store's writer lease, announce it by
+// creating `ready_file`, then hold it until the parent creates "<ready_file>.stop".
+// The parent therefore controls the window explicitly, with no sleep on either side
+// guessing how long the other needs.
+int runStoreLockHolder(const QString& extensions_dir, const QString& ready_file) {
+  DownloadManager downloader;
+  ExtensionManager manager(&downloader, extensions_dir, extensions_dir + u"_pending"_s);
+  if (!manager.hasStoreWriteAccess()) {
+    return kHolderLeaseRefused;
+  }
+
+  QFile marker(ready_file);
+  if (!marker.open(QIODevice::WriteOnly)) {
+    return kHolderMarkerFailed;
+  }
+  marker.close();
+
+  // The deadline is a backstop only: a parent that dies without writing the stop
+  // marker must not leave this process holding the lease forever.
+  const QString stop_file = ready_file + u".stop"_s;
+  QDeadlineTimer deadline(60000);
+  while (!QFile::exists(stop_file) && !deadline.hasExpired()) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    QThread::msleep(10);
+  }
+  return 0;
+}
+
+// An instance that does not own the store runs read-only: it still scans and
+// reports installed state, its startup cleanup leaves the owner's live
+// transaction directory alone, and a mutating call refuses with a reason the
+// user can act on.
+TEST_F(ExtensionManagerTest, SecondManagerCannotMutateLockedStore) {
+  server_.setBody(dummyPluginZip("mock-file-source"));
+  const Extension installed_ext = makeExtension("mock-file-source", "1.0.0", server_.url());
+  QSignalSpy spy_installed(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(installed_ext);
+  ASSERT_TRUE(waitForSignal(spy_installed));
+  ASSERT_TRUE(spy_installed.first().at(1).toBool());
+
+  // Stands in for an extraction the owning instance has in flight.
+  const QString live_transaction = ext_dir_.path() + "/.pj_install_xyz";
+  ASSERT_TRUE(QDir().mkpath(live_transaction));
+
+  DownloadManager downloader2;
+  ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
+
+  EXPECT_TRUE(QDir(live_transaction).exists())
+      << "a second instance must not delete the owner's in-flight transaction directory at startup";
+  EXPECT_TRUE(mgr2.isInstalled("mock-file-source")) << "a read-only session must still scan installed state";
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy_error(&mgr2, &ExtensionManager::installError);
+  QSignalSpy spy_finished(&mgr2, &ExtensionManager::installFinished);
+
+  mgr2.install(ext);
+
+  ASSERT_EQ(spy_error.count(), 1) << "install must be refused synchronously, before any download starts";
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("Another PlotJuggler instance is managing extensions"))
+      << "actual diagnostic: " << spy_error.first().at(1).toString().toStdString();
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_FALSE(spy_finished.first().at(1).toBool());
+  EXPECT_FALSE(QDir(ext_dir_.path() + "/mock-data-source").exists()) << "a refused install must write nothing";
+}
+
+// The transaction directory of a live writer survives a second process starting
+// up, in BOTH places cleanup looks: the staging sibling every install actually
+// extracts into, and the extensions dir itself, where an older build could have
+// left one. Neither name says who owns it, so neither sweep may run without the
+// lease.
+TEST_F(ExtensionManagerTest, SecondProcessNeverDeletesFirstProcessTransaction) {
+  const QString live_in_staging =
+      QDir(transactionStageDirFor(ext_dir_.path())).absoluteFilePath(u".pj_install_alive"_s);
+  const QString live_legacy_in_tree = QDir(ext_dir_.path()).absoluteFilePath(u".pj_install_alive"_s);
+  ASSERT_TRUE(QDir().mkpath(live_in_staging));
+  ASSERT_TRUE(QDir().mkpath(live_legacy_in_tree));
+
+  DownloadManager downloader2;
+  ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
+  // The marketplace window rescans on show; that pass must not sweep either.
+  mgr2.refreshInstalledFromDisk();
+
+  EXPECT_TRUE(QDir(live_in_staging).exists()) << "extraction directory of the live writer was deleted";
+  EXPECT_TRUE(QDir(live_legacy_in_tree).exists()) << "legacy in-tree transaction of the live writer was deleted";
+
+  QDir(transactionStageDirFor(ext_dir_.path())).removeRecursively();
+}
+
+// Releasing the lock hands the store to the next instance: it may sweep the
+// leftovers of the process that exited, and its mutating operations work again.
+TEST_F(ExtensionManagerTest, LockReleasedOnDestructionRestoresWriteMode) {
+  const QString stale_transaction = ext_dir_.path() + "/.pj_install_stale";
+  ASSERT_TRUE(QDir().mkpath(stale_transaction));
+
+  // The owner exits, exactly as it would before a restart.
+  delete mgr_;
+  mgr_ = nullptr;
+
+  DownloadManager downloader2;
+  ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
+
+  EXPECT_FALSE(QDir(stale_transaction).exists())
+      << "the new owner must sweep the transaction directory left by the instance that exited";
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy_finished(&mgr2, &ExtensionManager::installFinished);
+  QSignalSpy spy_error(&mgr2, &ExtensionManager::installError);
+
+  mgr2.install(ext);
+
+  ASSERT_TRUE(waitForSignal(spy_finished)) << "install must proceed once the lock is free";
+  EXPECT_TRUE(spy_finished.first().at(1).toBool())
+      << (spy_error.isEmpty() ? std::string("install failed with no error signal")
+                              : spy_error.first().at(1).toString().toStdString());
+  EXPECT_TRUE(mgr2.isInstalled("mock-data-source"));
+}
+
+// The lease is a real interprocess lock, so the case it exists for has to be shown
+// across a process boundary: two ExtensionManagers in one process share nothing but
+// the file, yet an in-process test cannot rule out that some accident of shared
+// state is doing the work. The holder runs as a child of this very binary (see
+// holdStoreLockFlag() in main), which keeps the fixture self-contained.
+TEST_F(ExtensionManagerTest, SecondProcessCannotMutateStore) {
+  // A store of its own, so the child's lease covers nothing else in the suite.
+  QTemporaryDir store;
+  ASSERT_TRUE(store.isValid());
+  const QString ready_file = QDir(store.path()).absoluteFilePath(u"holder.ready"_s);
+  const QString stop_file = ready_file + u".stop"_s;
+  const QString live_transaction = QDir(transactionStageDirFor(store.path())).absoluteFilePath(u".pj_install_alive"_s);
+
+  QProcess holder;
+  holder.setProgram(QCoreApplication::applicationFilePath());
+  holder.setArguments({holdStoreLockFlag(), store.path(), ready_file});
+  holder.start();
+  ASSERT_TRUE(holder.waitForStarted(10000)) << "could not start the lock-holder process";
+  // Readiness marker, not a sleep: the child writes it only after its lease is in
+  // hand, so the assertions below cannot race the child's startup.
+  ASSERT_TRUE(waitUntil([&] { return QFile::exists(ready_file); }, 15000))
+      << "holder process never reported taking the store lease";
+
+  // Created only now, with the lease already held elsewhere: it stands for an
+  // extraction the OTHER process has in flight. (Created any earlier it would be
+  // pre-lease residue, which that process is entitled to sweep at its own startup.)
+  ASSERT_TRUE(QDir().mkpath(live_transaction));
+
+  DownloadManager downloader;
+  ExtensionManager mgr(&downloader, store.path(), pending_dir_.path());
+
+  EXPECT_FALSE(mgr.hasStoreWriteAccess()) << "the lease is held by another PROCESS, so this one is read-only";
+  EXPECT_TRUE(QDir(live_transaction).exists())
+      << "startup cleanup deleted a transaction directory owned by the process holding the lease";
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy_error(&mgr, &ExtensionManager::installError);
+  QSignalSpy spy_finished(&mgr, &ExtensionManager::installFinished);
+
+  mgr.install(ext);
+
+  ASSERT_EQ(spy_error.count(), 1) << "install must be refused synchronously while another process holds the lease";
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("Another PlotJuggler instance is managing extensions"))
+      << "actual diagnostic: " << spy_error.first().at(1).toString().toStdString();
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_FALSE(spy_finished.first().at(1).toBool());
+  EXPECT_FALSE(QDir(store.path() + "/mock-data-source").exists()) << "a refused install must write nothing";
+
+  // Hand the store back: the holder exits, and the lease becomes available to the
+  // next process (here, the next manager) exactly as it would after a restart.
+  QFile stop(stop_file);
+  ASSERT_TRUE(stop.open(QIODevice::WriteOnly));
+  stop.close();
+  ASSERT_TRUE(holder.waitForFinished(20000)) << "holder process did not exit after the stop marker";
+  EXPECT_EQ(holder.exitStatus(), QProcess::NormalExit);
+  EXPECT_EQ(holder.exitCode(), 0) << "holder process reported a failure taking or holding the lease";
+
+  ExtensionManager successor(&downloader, store.path(), pending_dir_.path());
+  EXPECT_TRUE(successor.hasStoreWriteAccess()) << "the lease must be free once the holding process is gone";
+
+  QDir(transactionStageDirFor(store.path())).removeRecursively();
+}
+
+// The extract worker writes into the transaction directory inside the store, so the
+// lease has to outlive it: releasing the lock while a worker is still unpacking
+// hands the store to the next process and then keeps writing into it. The
+// destructor must cancel, drain, and only then let go.
+TEST_F(ExtensionManagerTest, DestroyMidExtractionReleasesLockOnlyAfterDrain) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, manyEntryPluginZip("mock-data-source", 1200));
+  ASSERT_FALSE(zip.isEmpty());
+
+  const QString stage_dir = transactionStageDirFor(ext_dir_.path());
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+
+  mgr_->installFromLocalZip(zip);
+
+  // Wait for the worker to have actually written something: a state marker, not a
+  // guessed duration. Past this point extraction is provably in flight, with the
+  // overwhelming majority of the filler entries still to go.
+  ASSERT_TRUE(waitUntil([&] { return !filesUnder(stage_dir).isEmpty(); }, 15000))
+      << "extraction never started, so the drain cannot be observed";
+  ASSERT_TRUE(spy_finished.isEmpty() && spy_pending.isEmpty())
+      << "extraction already finished; the fixture is too small to cover the in-flight case";
+
+  delete mgr_;
+  mgr_ = nullptr;
+
+  // Everything the worker could have been writing is gone with the transaction root
+  // the destructor retired. A worker still running would put it straight back:
+  // extractFromMemory mkpaths each entry's parent before opening the file, so any
+  // reappearance below is a write that happened AFTER the lock was released.
+  QDir(stage_dir).removeRecursively();
+  ASSERT_FALSE(QDir(stage_dir).exists())
+      << "the staging tree came back while it was being removed, so a worker is still extracting into the store "
+         "after the manager was destroyed";
+
+  DownloadManager successor_downloader;
+  ExtensionManager successor(&successor_downloader, ext_dir_.path(), pending_dir_.path());
+  EXPECT_TRUE(successor.hasStoreWriteAccess()) << "the destructor must release the lease";
+
+  EXPECT_FALSE(waitUntil([&] { return QDir(stage_dir).exists() || !filesUnder(ext_dir_.path()).isEmpty(); }, 2000))
+      << "an extraction worker wrote into the store after the manager released the lease";
+}
+
+// Both the staging area and the lease file are SIBLINGS of the extensions dir, and
+// a configured path can be a symlink (a packaged install pointing at a data volume,
+// a developer linking the store elsewhere). Derived textually, the sibling is
+// created next to the LINK: the promoting rename then crosses filesystems, and two
+// aliases of one store take two different locks and both believe they are the
+// writer. Both must be derived from the resolved target instead.
+TEST_F(ExtensionManagerTest, StoreSiblingsFollowTheCanonicalExtensionsDir) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "symlink creation needs elevation on Windows; the canonical-path rule is platform-neutral";
+#else
+  QTemporaryDir root;
+  ASSERT_TRUE(root.isValid());
+  const QString real_store = QDir(root.path()).absoluteFilePath(u"real_store"_s);
+  const QString link_store = QDir(root.path()).absoluteFilePath(u"link_store"_s);
+  ASSERT_TRUE(QDir().mkpath(real_store));
+  ASSERT_TRUE(QFile::link(real_store, link_store));
+
+  DownloadManager downloader;
+  ExtensionManager mgr(&downloader, link_store, pending_dir_.path());
+  ASSERT_TRUE(mgr.hasStoreWriteAccess());
+
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+  QSignalSpy spy_finished(&mgr, &ExtensionManager::installFinished);
+  QSignalSpy spy_error(&mgr, &ExtensionManager::installError);
+
+  mgr.install(ext);
+
+  // The transaction root is created synchronously by install(), so this observes
+  // the placement without racing the worker.
+  EXPECT_FALSE(transactionDirsIn(transactionStageDirFor(real_store)).isEmpty())
+      << "the staging area must be created beside the RESOLVED store";
+  EXPECT_FALSE(QDir(transactionStageDirFor(link_store)).exists())
+      << "a staging area beside the symlink can resolve onto another filesystem, which breaks promote-by-rename";
+
+  ASSERT_TRUE(waitForSignal(spy_finished));
+  EXPECT_TRUE(spy_finished.first().at(1).toBool())
+      << (spy_error.isEmpty() ? std::string("install failed with no error signal")
+                              : spy_error.first().at(1).toString().toStdString());
+  EXPECT_TRUE(QDir(real_store + "/mock-data-source").exists()) << "the install lands in the resolved store";
+
+  // Same rule for the lease, with a consequence of its own: an alias of a locked
+  // store must not hand out a second writer lease.
+  EXPECT_TRUE(QFile::exists(QDir(root.path()).absoluteFilePath(u".real_store.lock"_s)))
+      << "the lease file must be keyed to the resolved store, not to the name used to reach it";
+  DownloadManager alias_downloader;
+  ExtensionManager alias(&alias_downloader, real_store, pending_dir_.path());
+  EXPECT_FALSE(alias.hasStoreWriteAccess()) << "a symlink alias of a locked store must not get a second writer lease";
+
+  QDir(transactionStageDirFor(real_store)).removeRecursively();
+#endif
+}
+
+// A lease that could not be taken because the lock file cannot be CREATED is a
+// broken config dir, not a second instance. Telling that user to close another
+// PlotJuggler sends them hunting for a process that does not exist, so the two
+// causes must not share a message.
+TEST_F(ExtensionManagerTest, UnwritableLockLocationIsNotReportedAsContention) {
+#ifdef Q_OS_WIN
+  GTEST_SKIP() << "POSIX directory permissions do not model the Windows failure the same way";
+#else
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "running as root: directory permissions cannot make the lock location unwritable";
+  }
+  QTemporaryDir root;
+  ASSERT_TRUE(root.isValid());
+  // The lease is a sibling of the store, so it is the store's PARENT that has to
+  // refuse the write.
+  const QString parent = QDir(root.path()).absoluteFilePath(u"readonly_parent"_s);
+  const QString store = QDir(parent).absoluteFilePath(u"extensions"_s);
+  ASSERT_TRUE(QDir().mkpath(store));
+  ASSERT_TRUE(QFile::setPermissions(parent, QFileDevice::ReadOwner | QFileDevice::ExeOwner));
+
+  DownloadManager downloader;
+  {
+    ExtensionManager mgr(&downloader, store, pending_dir_.path());
+    EXPECT_FALSE(mgr.hasStoreWriteAccess()) << "an uncreatable lock file must not grant a writer lease";
+
+    server_.setBody(dummyPluginZip("mock-data-source"));
+    const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+    QSignalSpy spy_error(&mgr, &ExtensionManager::installError);
+    mgr.install(ext);
+
+    ASSERT_EQ(spy_error.count(), 1);
+    const QString message = spy_error.first().at(1).toString();
+    EXPECT_FALSE(message.contains("Another PlotJuggler instance"))
+        << "a filesystem failure must not be reported as contention: " << message.toStdString();
+    EXPECT_TRUE(message.contains("lock file"))
+        << "the message must name what could not be created: " << message.toStdString();
+  }
+
+  // Restore write permission so QTemporaryDir can clean up after itself.
+  ASSERT_TRUE(QFile::setPermissions(parent, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+#endif
+}
+
+// Contention has no retry path: a read-only session never reacquires the lease, so
+// the advice has to be to restart once the other instance is closed.
+TEST_F(ExtensionManagerTest, ContentionDiagnosticTellsTheUserToRestart) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+
+  DownloadManager downloader2;
+  ExtensionManager mgr2(&downloader2, ext_dir_.path(), pending_dir_.path());
+  ASSERT_FALSE(mgr2.hasStoreWriteAccess());
+
+  QSignalSpy spy_error(&mgr2, &ExtensionManager::installError);
+  mgr2.install(ext);
+
+  ASSERT_EQ(spy_error.count(), 1);
+  const QString message = spy_error.first().at(1).toString();
+  EXPECT_TRUE(message.contains("Another PlotJuggler instance is managing extensions")) << message.toStdString();
+  EXPECT_TRUE(message.contains("restart"))
+      << "the user must be told a restart is what makes this session the writer: " << message.toStdString();
+  EXPECT_FALSE(message.contains("try again"))
+      << "nothing retries the lease, so promising that is wrong: " << message.toStdString();
 }
 
 }  // namespace
@@ -2689,6 +3117,18 @@ int main(int argc, char** argv) {
   // developer machine cannot leak into these tests.
   QCoreApplication::setOrganizationName("pj4-test-extension-manager");
   QCoreApplication::setApplicationName("extension_manager_test");
+
+  // Lock-holder mode (see SecondProcessCannotMutateStore): this binary re-executes
+  // itself to own a store from a SECOND process, which is the only way to test an
+  // interprocess lock honestly. Handled before gtest so the child never runs tests.
+  const QStringList args = QCoreApplication::arguments();
+  if (const int flag = static_cast<int>(args.indexOf(PJ::holdStoreLockFlag())); flag >= 0) {
+    if (args.size() < flag + 3) {
+      return PJ::kHolderBadArguments;
+    }
+    return PJ::runStoreLockHolder(args.at(flag + 1), args.at(flag + 2));
+  }
+
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

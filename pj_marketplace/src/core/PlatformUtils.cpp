@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <QDir>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QSysInfo>
 
@@ -61,6 +62,11 @@ QString PlatformUtils::pendingDir() {
 
 QString PlatformUtils::backupDir() {
   return configDir() + "/.backup";
+}
+
+QString PlatformUtils::canonicalStoreRoot(const QString& store_dir) {
+  const QString canonical = QFileInfo(store_dir).canonicalFilePath();
+  return canonical.isEmpty() ? QDir::cleanPath(store_dir) : canonical;
 }
 
 }  // namespace PJ

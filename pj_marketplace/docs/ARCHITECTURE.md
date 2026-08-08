@@ -427,6 +427,51 @@ Folder precedence at load time is host policy (`PluginRuntimeCatalog`):
 `--plugin-dir` override → custom Preferences folders → extensions dir; the
 user-explicit tiers win duplicate ids version-blind.
 
+### 4.5 Single-Writer Lock
+
+A managed store has **one writer at a time across processes**. Constructing an
+`ExtensionManager` takes a `QLockFile` on `<config-root>/.extensions.lock`
+(`acquireStoreLock`, before any cleanup runs). The holder behaves as described
+everywhere else in this document; an instance that cannot take the lock runs
+**read-only** — it still scans and reports installed state, but install,
+sideload, update, uninstall, downgrade-to-bundled, enable/disable and the
+startup drains all refuse with *"Another PlotJuggler instance is managing
+extensions."* `hasStoreWriteAccess()` exposes the mode so a UI can disable those
+actions up front.
+
+Why it exists: startup cleanup deletes every `.pj_install_*` transaction
+directory it finds, and nothing in the name says which process owns it. Without
+the lock, a second PlotJuggler starting up deletes the extraction directory of a
+download the first one is still running. With it, cleanup only ever runs in the
+process holding the lock and every live writer holds it, so the only
+transactions a drain can meet are its own or those of a process that is no
+longer alive. Staleness is decided by the owner PID's liveness alone
+(`setStaleLockTime(0)`): a crashed writer's lock is reclaimed, a slow writer's
+is never stolen.
+
+Two failures reach the user through separate messages, because they call for
+opposite actions: `LockFailedError` is a live competitor ("close it and restart
+PlotJuggler"), while `PermissionError`/`UnknownError` mean this config dir cannot
+hold a lock file at all and name the file instead. Neither promises a retry —
+nothing reacquires the lease mid-session, so a read-only session stays read-only
+until the next launch.
+
+The lock file is a **sibling** of `extensions/`, never a file inside it
+(everything under the store is treated as extension payload). Its name is derived
+from the store's **canonical** path — via `PlatformUtils::canonicalStoreRoot()`,
+the one policy every store sibling follows (writer lease,
+`extensions.install_stage/`, and the seed's `extensions.seed_stage/` in
+`pj_runtime`). So a `--plugin-dir` session or a test over its own temp dir never
+contends with the default store, while two *names* for one store (a symlinked
+install) always contend instead of handing out two leases. The same resolution
+keeps every staging sibling on the store's filesystem, which is what makes
+promote-by-rename atomic; an install whose staging area lands on a different
+filesystem is refused rather than degraded to a copy.
+
+`ExtensionCatalogService::seedBundledPlugins()` (`pj_runtime`) is the one store
+writer outside `ExtensionManager`'s mutating API, so it is gated on
+`hasStoreWriteAccess()` too and skips with a diagnostic in a read-only session.
+
 ---
 
 ## 5. Directory Structure
@@ -451,6 +496,8 @@ The root is `QStandardPaths::AppDataLocation` (the `PlotJuggler/PlotJuggler4` or
 │                                    # sibling of extensions/ for the same
 │                                    # reason; removed once the transaction
 │                                    # promotes, swept if a crash orphans it
+├── .extensions.lock                 # Single-writer lock over extensions/ (§4.5);
+│                                    # a second live instance runs read-only
 ├── .extension_staging/      # Staging area: updates land here and are promoted
 │   │                                # on the next startup; a fresh install uses it
 │   │                                # only as the post-promotion validation gate

@@ -318,13 +318,37 @@ std::vector<PluginDirEntry> ExtensionCatalogService::buildScanHierarchy(bool ext
 
 #ifndef PJ_TARGET_WASM
 void ExtensionCatalogService::seedBundledPlugins() {
+  // The seed is a writer into the managed dir that does not go through the
+  // ExtensionManager mutating API: it clears the shared seed-stage tree and renames
+  // payloads straight in. So it needs the same permission every other mutation
+  // needs. Without the store's writer lease another live instance owns that dir,
+  // and seeding anyway would write across the lease it just failed to take.
+  //
+  // Skipping costs this session the bundled refresh only: the plugins already in
+  // the managed dir still load, and the instance that owns the store has either
+  // done the seed or will. It also leaves bundled_versions_ unset, so nothing is
+  // marked core here — harmless, because every action that gates on core (uninstall,
+  // downgrade) is refused by the lease anyway.
+  if (!extension_manager_->hasStoreWriteAccess()) {
+    const QString message =
+        u"Another PlotJuggler instance is managing extensions: bundled plugins were not refreshed this session."_s;
+    qCInfo(lcCatalog).noquote() << message;
+    reportDiagnostic(DiagnosticLevel::kWarning, message);
+    return;
+  }
+
   // Refresh staging area: a SIBLING of the marketplace dir, so the promote
   // rename never crosses a filesystem, yet an interrupted seed can never leak
   // a stale payload into the plugin scan (which walks the marketplace dir
   // recursively). Leftovers from a crashed launch are cleared before anything
   // else — even when the bundled dir is absent this run.
+  // Derived from the RESOLVED store, like every other sibling PlotJuggler keeps
+  // next to the extensions dir (see PlatformUtils::canonicalStoreRoot): beside a
+  // symlinked store the staging area can land on another filesystem, and then the
+  // promoting rename below is EXDEV instead of an atomic move.
   const std::filesystem::path market_root(marketplace_dir_.toStdString());
-  const std::filesystem::path stage_root((marketplace_dir_ + u".seed_stage"_s).toStdString());
+  const std::filesystem::path stage_root(
+      (PlatformUtils::canonicalStoreRoot(marketplace_dir_) + u".seed_stage"_s).toStdString());
   std::error_code ec;
   std::filesystem::remove_all(stage_root, ec);
 

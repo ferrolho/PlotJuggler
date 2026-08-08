@@ -41,6 +41,27 @@ class PlatformUtils {
 
   // <config-root>/.backup/ — pre-update backups (F-12, deferred to April+).
   static QString backupDir();
+
+  // Identity of a managed store: `store_dir` made absolute with symlinks resolved.
+  //
+  // Anything placed BESIDE a store must be derived from this rather than from the
+  // configured string, because a configured path can be a symlink: a packaged
+  // install pointing at a data volume, a developer linking the store elsewhere.
+  // Derived textually, a sibling is created next to the LINK, which resolves onto
+  // a different filesystem than the store itself and turns promote-by-rename into
+  // EXDEV; and two names for one store yield two different sibling paths, so a
+  // lock file keyed that way would hand out two writer leases for one store.
+  //
+  // Shared policy for every sibling PlotJuggler keeps next to the extensions dir:
+  // the writer lease (ExtensionManager), the install transaction staging area
+  // (ExtensionManager), and the bundled-seed staging area (pj_runtime's
+  // ExtensionCatalogService).
+  //
+  // Falls back to the cleaned path when resolution fails — canonicalFilePath() is
+  // empty for a path that does not exist, which is the first-run state rather than
+  // an error. Create the store before deriving siblings from it to stay off that
+  // path.
+  static QString canonicalStoreRoot(const QString& store_dir);
 };
 
 }  // namespace PJ

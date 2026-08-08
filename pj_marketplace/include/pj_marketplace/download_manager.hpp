@@ -2,6 +2,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MPL-2.0
 
+#include <QFuture>
 #include <QFutureSynchronizer>
 #include <QMap>
 #include <QNetworkAccessManager>
@@ -47,6 +48,21 @@ class DownloadManager : public QObject {
   /// transaction directory when it receives `cancelled`.
   void cancel(int id);
 
+  /// cancel(id), then BLOCK until that operation's worker has stopped touching its
+  /// destination directory. Bounded to milliseconds by the worker's cancel
+  /// checkpoints, and a no-op for an id with no extract in flight.
+  ///
+  /// For a consumer that must guarantee "nothing is writing there any more" before
+  /// it does something else: releasing an interprocess lock over the destination,
+  /// deleting the transaction directory, or tearing itself down. Unlike the
+  /// destructor's drain, this waits for ONE operation, so an unrelated consumer
+  /// sharing this downloader is not stalled.
+  ///
+  /// Runs the wait on the calling thread WITHOUT spinning an event loop, so the
+  /// queued completion slot for `id` cannot run inside this call: a caller in its
+  /// own destructor is not re-entered.
+  void cancelAndWait(int id);
+
  signals:
   void started(int id);
   void progress(int id, qint64 bytes_received, qint64 bytes_total);
@@ -77,6 +93,10 @@ class DownloadManager : public QObject {
   QMap<int, std::shared_ptr<std::atomic<bool>>> cancel_flags_;
   int next_id_ = 1;
   QFutureSynchronizer<QString> pending_extracts_;
+  // Per-operation handle on the same futures pending_extracts_ drains as a batch,
+  // so cancelAndWait() can wait for one operation instead of all of them. Entries
+  // are retired by the completion slot.
+  QMap<int, QFuture<QString>> extract_futures_;
 };
 
 }  // namespace PJ

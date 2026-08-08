@@ -6,12 +6,14 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStorageInfo>
 #include <QStringList>
 #include <QUuid>
 #include <filesystem>
+#include <memory>
 #include <utility>
 
 #include "pj_marketplace/download_manager.hpp"
@@ -29,6 +31,10 @@ static constexpr const char* kPendingUninstallMarker = ".pj_pending_uninstall";
 static constexpr const char* kPendingInstallIntent = ".pj_pending_install";
 static constexpr const char* kQuarantinePrefix = ".pj_quarantine_";
 static constexpr int kMaxDiagnostics = 50;
+// How long construction waits for the store's single-writer lock. Long enough to
+// ride out another instance's in-flight rename, short enough not to stall startup:
+// a busy store means read-only, never a hang.
+static constexpr int kStoreLockTimeoutMs = 200;
 // QSettings key holding the QStringList of disabled extension ids (installed but
 // not loaded). Read by both the marketplace and the runtime plugin catalog.
 static constexpr const char* kDisabledExtensionsKey = "Marketplace/disabledExtensions";
@@ -39,6 +45,53 @@ QString extRoot(const QString& extensions_dir, const QString& id) {
 
 QString pendingRoot(const QString& pending_dir, const QString& id) {
   return QDir(pending_dir).absoluteFilePath(id);
+}
+
+// Path of the single-writer lock guarding `extensions_dir`.
+//
+// A hidden SIBLING of the managed dir, never a file inside it: everything under
+// extensions_dir is treated as extension payload, scanned and swept. The name is
+// derived from the store's resolved directory so that two managers over DIFFERENT
+// stores (a --plugin-dir run, a test's temp dir) never contend while two names for
+// the SAME store always do: the lock identifies the store, not the application and
+// not the path spelling.
+QString storeLockPath(const QString& extensions_dir) {
+  const QFileInfo store(PlatformUtils::canonicalStoreRoot(extensions_dir));
+  return QDir(store.absolutePath()).absoluteFilePath(u"."_s + store.fileName() + u".lock"_s);
+}
+
+// True when both paths sit on the same mounted filesystem, so a rename between
+// them is an atomic move rather than an EXDEV failure.
+bool sameFilesystem(const QString& first, const QString& second) {
+  const QStorageInfo first_volume(first);
+  const QStorageInfo second_volume(second);
+  return first_volume.isValid() && second_volume.isValid() && first_volume.device() == second_volume.device();
+}
+
+// Why the writer lease could not be taken, in the user's terms.
+//
+// QLockFile reports contention and filesystem failure through the same tryLock()
+// false, and they call for opposite actions: one means another PlotJuggler is
+// running, the other means this config dir cannot hold a lock file at all. Telling
+// the second user to close another instance sends them after a process that does
+// not exist.
+//
+// Neither case offers "try again": nothing reacquires the lease mid-session, so
+// the honest advice for contention is to restart once the other instance is closed.
+QString storeLockRefusal(const QLockFile& lock, const QString& lock_path) {
+  switch (lock.error()) {
+    case QLockFile::PermissionError:
+      return u"Cannot create the extensions lock file \"%1\": permission denied. Extensions cannot be installed, "
+             u"updated or removed until that is fixed."_s.arg(lock_path);
+    case QLockFile::LockFailedError:
+      return u"Another PlotJuggler instance is managing extensions. Close it and restart PlotJuggler to manage "
+             u"extensions here."_s;
+    case QLockFile::NoError:
+    case QLockFile::UnknownError:
+      break;
+  }
+  return u"Cannot create the extensions lock file \"%1\". Extensions cannot be installed, updated or removed this "
+         u"session."_s.arg(lock_path);
 }
 
 struct DirectoryDiscovery {
@@ -80,7 +133,7 @@ QString makeTransactionRoot(const QString& parent, const QString& id) {
 // crash would be discoverable, loadable content. Same discipline as the bundled
 // seed's ".seed_stage" sibling.
 QString transactionStageRoot(const QString& extensions_dir) {
-  return QDir::cleanPath(extensions_dir) + u".install_stage"_s;
+  return PlatformUtils::canonicalStoreRoot(extensions_dir) + u".install_stage"_s;
 }
 
 QString candidateRoot(const QString& transaction_root, const QString& id) {
@@ -276,13 +329,98 @@ ExtensionManager::ExtensionManager(
   initComponents();
 }
 
+ExtensionManager::~ExtensionManager() {
+  // The whole point of this body is ORDER: store_lock_ is released last, once
+  // nothing can write into the store any more. An extract worker unpacks into a
+  // transaction directory inside the store's staging area, so a lock released
+  // while one is running would let the next process take the store and start its
+  // own cleanup and promotion against a tree this process is still writing.
+  //
+  // Member destruction alone cannot give that order: store_lock_ dies before
+  // ~QObject deletes the child downloader whose destructor drains the workers.
+
+  // Signal wiring first: the completion handlers capture `this` and touch members,
+  // and none of them may run against a half-destroyed manager.
+  disconnectDlConns();
+
+  // Our own operation, whichever phase it is in. cancelAndWait returns only once
+  // the worker has stopped touching the transaction directory.
+  if (pending_op_id_ != -1 && downloader_ != nullptr) {
+    downloader_->cancelAndWait(pending_op_id_);
+    pending_op_id_ = -1;
+    pending_id_.clear();
+  }
+
+  // Retire the scratch of the operation just cancelled instead of leaving it for
+  // the next writer to sweep: this process knows the directory is its own, and the
+  // handler that would normally clean it up was disconnected above.
+  if (hasStoreWriteAccess()) {
+    removeTransactionRoot(pending_extract_dir_);
+  }
+  pending_extract_dir_.clear();
+
+  // An owned downloader is destroyed HERE rather than by ~QObject after this body:
+  // its destructor cancels and drains every worker it still has, and that has to
+  // finish while the lock is still held. A caller-supplied downloader is not ours
+  // to touch beyond the operation cancelled above.
+  if (owns_downloader_) {
+    delete downloader_;
+    downloader_ = nullptr;
+  }
+
+  store_lock_.reset();
+}
+
+bool ExtensionManager::hasStoreWriteAccess() const {
+  return store_lock_ != nullptr;
+}
+
+QString ExtensionManager::storeWriteRefusal() const {
+  return store_lock_refusal_;
+}
+
+void ExtensionManager::acquireStoreLock() {
+  const QString lock_path = storeLockPath(extensions_dir_);
+  auto lock = std::make_unique<QLockFile>(lock_path);
+  // Liveness of the owning PID is the ONLY staleness signal we accept: the age
+  // fallback would let a second instance declare a slow writer (a large download)
+  // dead and steal the store from under it. A crashed writer is still reclaimed,
+  // because its PID is gone.
+  //
+  // That is what makes the startup cleanup safe. It deletes any ".pj_install_*"
+  // transaction directory it finds, with no way to tell whose it is, and every
+  // live writer holds this lock — so the only transactions a drain can meet are
+  // this process's own or those of a process that no longer runs.
+  lock->setStaleLockTime(0);
+  if (!lock->tryLock(kStoreLockTimeoutMs)) {
+    // Classified once, here: this is the only place that can distinguish a live
+    // competitor from a config dir that cannot hold a lock file. Every later
+    // refusal quotes the verdict rather than guessing at one.
+    store_lock_refusal_ = storeLockRefusal(*lock, lock_path);
+    reportDiagnostic(
+        {},
+        u"%1 This session can browse installed extensions but cannot install, update or remove them."_s.arg(
+            store_lock_refusal_),
+        false);
+    return;
+  }
+  store_lock_ = std::move(lock);
+  store_lock_refusal_.clear();
+}
+
 void ExtensionManager::initComponents() {
   if (!downloader_) {
-    downloader_ = new DownloadManager(this);
+    // Not parented to `this`: the destructor deletes it explicitly, before the lock
+    // is released, and a QObject child would instead be destroyed after that.
+    downloader_ = new DownloadManager();
+    owns_downloader_ = true;
   }
   if (!QDir().mkpath(extensions_dir_)) {
     reportDiagnostic({}, QString("Could not create extensions directory \"%1\"").arg(extensions_dir_), true);
   }
+  // Before any cleanup: whether this instance owns the store decides whether the
+  // drains below may delete anything at all.
+  acquireStoreLock();
   // Drain restart-deferred work, THEN snapshot installed state. The order is
   // load-bearing because of a glibc dlopen quirk: once an extension's .so has
   // been opened in this process, dlopen keeps returning that first-loaded image
@@ -303,6 +441,10 @@ void ExtensionManager::initComponents() {
 // ---------------------------------------------------------------------------
 
 void ExtensionManager::install(const Extension& ext) {
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitInstallFailure(ext.id, refusal);
+    return;
+  }
   refreshInstalledFromDisk();
   doInstall(ext, /*staging=*/false);
 }
@@ -406,6 +548,10 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
   // that point are reported against the file name.
   const QString file_label = QFileInfo(zip_path).fileName();
 
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitInstallFailure(file_label, refusal);
+    return;
+  }
   if (!pending_id_.isEmpty()) {
     emitInstallFailure(file_label, QString("Install of \"%1\" is already in progress").arg(pending_id_));
     return;
@@ -428,6 +574,17 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
   // extension id, which is still unknown at this point.
   const QString transaction_root = makeTransactionRoot(transactionStageRoot(extensions_dir_), u"local"_s);
   QDir().mkpath(transaction_root);
+  if (!sameFilesystem(transaction_root, extensions_dir_)) {
+    // Refuse rather than fall back to a cross-device copy: promotion is a rename
+    // precisely so that a half-installed extension is unreachable, and a copy
+    // would trade that guarantee away silently.
+    removeTransactionRoot(transaction_root);
+    emitInstallFailure(
+        file_label,
+        u"Extraction area \"%1\" is on a different filesystem than \"%2\", so the install could not be "
+        u"completed atomically"_s.arg(transactionStageRoot(extensions_dir_), extensions_dir_));
+    return;
+  }
 
   pending_id_ = file_label;
   pending_extract_dir_ = QDir::cleanPath(transaction_root);
@@ -590,6 +747,13 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
 }
 
 void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_existing) {
+  // Backstop for every entry point into the install machinery, including the
+  // testing hook that bypasses install()/update().
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitInstallFailure(ext.id, refusal);
+    return;
+  }
+
   if (const QString id_error = invalidExtensionIdReason(ext.id); !id_error.isEmpty()) {
     emitInstallFailure(ext.id, id_error);
     return;
@@ -642,6 +806,17 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
   // fires during the download window would find no directory to skip and the
   // guard would appear untested even though it is exercised in practice.
   QDir().mkpath(transaction_root);
+  if (!sameFilesystem(transaction_root, dest_dir)) {
+    // Refuse rather than fall back to a cross-device copy: promotion is a rename
+    // precisely so that a half-installed extension is unreachable, and a copy
+    // would trade that guarantee away silently.
+    removeTransactionRoot(transaction_root);
+    emitInstallFailure(
+        ext.id,
+        u"Extraction area \"%1\" is on a different filesystem than \"%2\", so the install could not be "
+        u"completed atomically"_s.arg(transactionStageRoot(extensions_dir_), dest_dir));
+    return;
+  }
 
   pending_id_ = ext.id;
   pending_extract_dir_ = QDir::cleanPath(transaction_root);
@@ -802,6 +977,10 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
 }
 
 void ExtensionManager::uninstall(const QString& extension_id) {
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitUninstallFailure(extension_id, refusal);
+    return;
+  }
   refreshInstalledFromDisk();
 
   if (!installed_.contains(extension_id)) {
@@ -851,6 +1030,10 @@ void ExtensionManager::uninstall(const QString& extension_id) {
 }
 
 void ExtensionManager::downgradeToBundled(const QString& extension_id) {
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitUninstallFailure(extension_id, refusal);
+    return;
+  }
   refreshInstalledFromDisk();
 
   if (!installed_.contains(extension_id)) {
@@ -898,6 +1081,10 @@ void ExtensionManager::downgradeToBundled(const QString& extension_id) {
 }
 
 void ExtensionManager::update(const Extension& ext) {
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    emitInstallFailure(ext.id, refusal);
+    return;
+  }
   refreshInstalledFromDisk();
 
   // Updates defer to restart: the new version is staged in pending_dir_ and
@@ -973,6 +1160,11 @@ void ExtensionManager::replaceConflictingInstallDirs(const QString& id, const QS
 }
 
 void ExtensionManager::applyPendingInstalls() {
+  // Promoting, quarantining and sweeping staged work all rewrite the store, and
+  // the staged directories may belong to the instance that owns it.
+  if (!hasStoreWriteAccess()) {
+    return;
+  }
   const QDir pending(pending_dir_);
   if (!pending.exists()) {
     return;
@@ -1112,6 +1304,9 @@ void ExtensionManager::applyPendingInstalls() {
 }
 
 void ExtensionManager::applyPendingUninstalls() {
+  if (!hasStoreWriteAccess()) {
+    return;
+  }
   const QDir dir(extensions_dir_);
   for (const QFileInfo& entry : dir.entryInfoList(QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot)) {
     if (!QFile::exists(entry.absoluteFilePath() + "/" + kPendingUninstallMarker)) {
@@ -1388,10 +1583,16 @@ void ExtensionManager::refreshInstalledFromDisk() {
   // refuses it while an in-flight transaction is still there); the in-tree pass
   // is the migration path for residue an older build wrote into the scanned dir,
   // which the recursive plugin scan would otherwise keep finding.
-  const QString stage_root = transactionStageRoot(extensions_dir_);
-  sweepTransactionRoots(stage_root);
-  QDir().rmdir(stage_root);
-  sweepTransactionRoots(extensions_dir_);
+  //
+  // Writer-only, both passes. `pending_extract_dir_` recognises this instance's
+  // own live transaction and nothing else, so a read-only session sweeping here
+  // would delete the extraction the lock holder is filling right now.
+  if (hasStoreWriteAccess()) {
+    const QString stage_root = transactionStageRoot(extensions_dir_);
+    sweepTransactionRoots(stage_root);
+    QDir().rmdir(stage_root);
+    sweepTransactionRoots(extensions_dir_);
+  }
 
   // Retire a staged record once its marker is gone — drained by a restart, or
   // cleared because the directory was replaced.
@@ -1418,6 +1619,12 @@ bool ExtensionManager::isEnabled(const QString& id) const {
 }
 
 void ExtensionManager::setEnabled(const QString& id, bool enabled) {
+  // The disabled list is one global QSettings key shared by every instance, so a
+  // read-modify-write from a second one silently discards the writer's edits.
+  if (const QString refusal = storeWriteRefusal(); !refusal.isEmpty()) {
+    reportDiagnostic(id, refusal, true);
+    return;
+  }
   QStringList disabled = disabledExtensionIds();
   const bool currently_disabled = disabled.contains(id);
   if (enabled == !currently_disabled) {

@@ -11,6 +11,7 @@
 #include <QString>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <utility>
 
 #include "pj_base/diagnostic_sink.hpp"
@@ -18,6 +19,8 @@
 #include "pj_marketplace/extension.hpp"
 #include "pj_marketplace/installed_extension.hpp"
 #include "pj_marketplace/platform_utils.hpp"
+
+class QLockFile;
 
 namespace PJ {
 
@@ -31,6 +34,11 @@ struct ExtensionDiagnostic {
 
 // Manages marketplace extension installs, updates, uninstalls, and startup cleanup.
 // Installed metadata is derived from embedded DSO manifests, not local sidecars.
+//
+// A managed store has ONE writer at a time across processes: construction takes an
+// interprocess lock over it, and an instance that does not get the lock runs
+// read-only — it still scans and reports installed state, but every mutating
+// operation refuses with a diagnostic. See hasStoreWriteAccess().
 class ExtensionManager : public QObject {
   Q_OBJECT
 
@@ -44,6 +52,18 @@ class ExtensionManager : public QObject {
   explicit ExtensionManager(
       DownloadManager* downloader, const QString& extensions_dir = PlatformUtils::extensionsDir(),
       const QString& pending_dir = PlatformUtils::pendingDir(), DiagnosticSink sink = {}, QObject* parent = nullptr);
+
+  // Stops all in-flight work and THEN releases the single-writer lock, in that
+  // order: an extraction worker writes into the store, so letting go of the lock
+  // first would hand the store to the next process while this one is still writing
+  // into it. See the definition for what "stops" means per downloader ownership.
+  //
+  // Blocks for as long as cancelling the running extraction takes (milliseconds:
+  // the worker checks for cancellation at every archive entry and data block).
+  //
+  // A downloader passed to the constructor stays the CALLER's to delete, and must
+  // outlive this object; only a downloader this class created is deleted here.
+  ~ExtensionManager() override;
 
   // Starts an async install for the current platform.
   void install(const Extension& ext);
@@ -273,6 +293,12 @@ class ExtensionManager : public QObject {
     return extensions_dir_;
   }
 
+  // True when this instance holds the store's single-writer lock and may therefore
+  // install, update, uninstall, enable/disable, and run the startup cleanup. False
+  // means another live process owns the store: the session is read-only and a UI
+  // should disable those actions rather than let them fail one by one.
+  bool hasStoreWriteAccess() const;
+
 #ifdef PJ_MARKETPLACE_TESTING
   // Test hook for forcing direct or staged install paths.
   void testDoInstall(const Extension& ext, bool staging, bool allow_existing = false) {
@@ -352,6 +378,14 @@ class ExtensionManager : public QObject {
   // Called by both constructors to finish setup after members are assigned.
   void initComponents();
 
+  // Takes the store's single-writer lock, or leaves this instance read-only and
+  // reports why. Must run before any startup cleanup.
+  void acquireStoreLock();
+
+  // Empty when this instance may write to the store; otherwise the user-facing
+  // reason a mutation was refused, for the caller's own failure channel.
+  QString storeWriteRefusal() const;
+
   // Shared install implementation for direct and staged destinations.
   void doInstall(const Extension& ext, bool staging, bool allow_existing = false);
 
@@ -397,10 +431,25 @@ class ExtensionManager : public QObject {
   // Deletes every `.pj_install_*` transaction directory directly under `parent`,
   // except the one a running install is still extracting into. Called for the
   // staging sibling installs actually use, and for the extensions dir itself,
-  // where an older build could have left one inside the scanned tree.
+  // where an older build could have left one inside the scanned tree. Only the
+  // store's writer may call it: a transaction it does not recognise belongs to
+  // the instance holding the lock.
   void sweepTransactionRoots(const QString& parent);
 
+  // Held for this object's lifetime while this instance is the store's writer;
+  // null in a read-only session. Its presence IS the write permission.
+  std::unique_ptr<QLockFile> store_lock_;
+  // Why the lease is not held, classified once at acquisition: contention with a
+  // live instance reads very differently to the user than a lock file that cannot
+  // be created at all, and only the acquisition attempt can tell them apart.
+  // Empty exactly when store_lock_ is held.
+  QString store_lock_refusal_;
+
   DownloadManager* downloader_ = nullptr;
+  // True only for the downloader initComponents() created, which is the only one
+  // this object may destroy (and must, before releasing the lock: ~DownloadManager
+  // is what drains every remaining worker).
+  bool owns_downloader_ = false;
   QString extensions_dir_;
   ReplaceConfirmation replace_confirmation_;
   // Lifetime guard for replace_confirmation_: null once the registrant is gone,
