@@ -332,6 +332,75 @@ ExtensionManager::HostCompatibility ExtensionManager::hostCompatibility(const Ex
   return {true, {}};
 }
 
+void ExtensionManager::dropReplaceConfirmation() {
+  replace_confirmation_ = {};
+  replace_confirmation_context_ = nullptr;
+  ++replace_confirmation_generation_;
+}
+
+void ExtensionManager::setReplaceConfirmation(QObject* context, ReplaceConfirmation confirm) {
+  // A callback with no guard is exactly the hazard this signature exists to
+  // prevent, so an incomplete registration clears instead of half-arming.
+  if (context == nullptr || !confirm) {
+    dropReplaceConfirmation();
+    return;
+  }
+  replace_confirmation_context_ = context;
+  replace_confirmation_ = std::move(confirm);
+  ++replace_confirmation_generation_;
+}
+
+void ExtensionManager::clearReplaceConfirmation(QObject* context) {
+  if (replace_confirmation_context_ != context) {
+    return;
+  }
+  dropReplaceConfirmation();
+}
+
+ExtensionManager::ReplaceDecision ExtensionManager::askReplaceConfirmation(
+    const QString& id, const QString& archive_version) {
+  if (!replace_confirmation_) {
+    return ReplaceDecision::kNoConfirmation;
+  }
+  // Whatever the callback captured died with its context, so it must not run.
+  // Dropping the registration puts the next conflict on the refuse path instead
+  // of asking again through the same dead pointer.
+  if (replace_confirmation_context_.isNull()) {
+    dropReplaceConfirmation();
+    return ReplaceDecision::kOwnerGone;
+  }
+
+  // Snapshot the whole registration before asking. The answer usually comes from a
+  // modal dialog, which spins the event loop, so another window can register or
+  // clear WHILE the callback is on the stack: invoking the member directly would
+  // let that assignment destroy the std::function currently executing. The copied
+  // callable is independent of the slot, and (owner, generation) records which
+  // registration asked.
+  const ReplaceConfirmation confirm = replace_confirmation_;
+  const QPointer<QObject> asked_context = replace_confirmation_context_;
+  const quint64 asked_generation = replace_confirmation_generation_;
+
+  const bool accepted = confirm(id, installedVersion(id), archive_version);
+
+  // The registrant died while its question was up. Its answer belongs to a window
+  // the user no longer has, so decline rather than stage a replacement nobody is
+  // watching for. Only drop the slot when it still holds THIS registration —
+  // clearing a successor's would disarm a live window.
+  if (asked_context.isNull()) {
+    if (replace_confirmation_generation_ == asked_generation) {
+      dropReplaceConfirmation();
+    }
+    return ReplaceDecision::kOwnerGone;
+  }
+  // The slot moved on: this answer came from a registration that has since been
+  // displaced or cleared. Accepting it because the CURRENT registrant happens to
+  // be alive would stage a replacement the live window never approved.
+  if (replace_confirmation_generation_ != asked_generation) {
+    return ReplaceDecision::kSuperseded;
+  }
+  return accepted ? ReplaceDecision::kAccepted : ReplaceDecision::kDeclined;
+}
+
 void ExtensionManager::installFromLocalZip(const QString& zip_path) {
   // Until the manifest is read there is no id to name, so failures raised before
   // that point are reported against the file name.
@@ -413,13 +482,25 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
       return;
     }
     if (isInstalled(ext_id)) {
-      if (!replace_confirmation_) {
-        fail(ext_id, QString("Extension \"%1\" is already installed").arg(ext_id));
-        return;
-      }
-      if (!replace_confirmation_(ext_id, installedVersion(ext_id), discovered.record.version)) {
-        fail(ext_id, QString("Replacing \"%1\" was cancelled").arg(ext_id));
-        return;
+      switch (askReplaceConfirmation(ext_id, discovered.record.version)) {
+        case ReplaceDecision::kNoConfirmation:
+          fail(ext_id, QString("Extension \"%1\" is already installed").arg(ext_id));
+          return;
+        case ReplaceDecision::kOwnerGone:
+          fail(ext_id, QString("Replacing \"%1\" was cancelled: no window is left to confirm it").arg(ext_id));
+          return;
+        case ReplaceDecision::kSuperseded:
+          fail(
+              ext_id, QString(
+                          "Replacing \"%1\" was cancelled: the window that asked was replaced while the question "
+                          "was open")
+                          .arg(ext_id));
+          return;
+        case ReplaceDecision::kDeclined:
+          fail(ext_id, QString("Replacing \"%1\" was cancelled").arg(ext_id));
+          return;
+        case ReplaceDecision::kAccepted:
+          break;
       }
 
       emit installStarted(ext_id);

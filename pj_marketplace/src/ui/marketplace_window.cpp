@@ -218,6 +218,10 @@ void MarketplaceWindow::finishConstruction(const QMap<QString, InstalledExtensio
 }
 
 MarketplaceWindow::~MarketplaceWindow() {
+  // The manager keeps whatever confirmation was registered last, and it outlives
+  // every window; disarm ours so a pending local install cannot put its question
+  // to a destroyed window. A no-op once another window took the registration over.
+  ext_mgr_->clearReplaceConfirmation(this);
   delete ui_;
 }
 
@@ -373,9 +377,11 @@ void MarketplaceWindow::setupUi() {
 void MarketplaceWindow::setupSignals() {
   // A local archive whose id is already installed needs a decision, and the
   // manager cannot take it: this is UI policy. Replacement is staged, so the
-  // wording promises "after restart" rather than an immediate swap.
+  // wording promises "after restart" rather than an immediate swap. Registered
+  // against `this` because the manager outlives this window and asks the question
+  // asynchronously: a window closed mid-extraction must not be dialogged.
   ext_mgr_->setReplaceConfirmation(
-      [this](const QString& id, const QString& installed_version, const QString& archive_version) {
+      this, [this](const QString& id, const QString& installed_version, const QString& archive_version) {
         const QString text = (installed_version == archive_version)
                                  ? tr("\"%1\" is already installed at version %2, the same version the archive "
                                       "carries.\n\nReplace it? The replacement is applied the next time PlotJuggler "

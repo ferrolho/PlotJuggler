@@ -2114,8 +2114,9 @@ TEST_F(ExtensionManagerTest, InstallFromLocalZipStagesConfirmedReplacement) {
   QString asked_id;
   QString asked_installed;
   QString asked_archive;
+  QObject confirmation_owner;
   mgr_->setReplaceConfirmation(
-      [&](const QString& id, const QString& installed_version, const QString& archive_version) {
+      &confirmation_owner, [&](const QString& id, const QString& installed_version, const QString& archive_version) {
         asked_id = id;
         asked_installed = installed_version;
         asked_archive = archive_version;
@@ -2154,7 +2155,8 @@ TEST_F(ExtensionManagerTest, InstallFromLocalZipHonoursDeclinedReplacement) {
   ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
 
   bool asked = false;
-  mgr_->setReplaceConfirmation([&](const QString&, const QString&, const QString&) {
+  QObject confirmation_owner;
+  mgr_->setReplaceConfirmation(&confirmation_owner, [&](const QString&, const QString&, const QString&) {
     asked = true;
     return false;
   });
@@ -2172,6 +2174,152 @@ TEST_F(ExtensionManagerTest, InstallFromLocalZipHonoursDeclinedReplacement) {
   EXPECT_EQ(spy_pending.count(), 0);
   EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source"));
   EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+}
+
+// The question is put long after installFromLocalZip() returns, so the object the
+// callback captured can be gone by then (a marketplace window closed while the
+// archive was still extracting). That must resolve as a decline, and must leave the
+// registration cleared rather than armed for the next archive.
+TEST_F(ExtensionManagerTest, ReplaceConfirmationSurvivesOwnerDestruction) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
+
+  // Heap-allocated so it can die before the answer is needed. The sentinel lives on
+  // the test stack rather than inside the owner, so an unguarded call still reports
+  // itself here: the actual dangling capture is only visible under a sanitizer.
+  auto* confirmation_owner = new QObject;
+  bool confirmation_invoked = false;
+  mgr_->setReplaceConfirmation(
+      confirmation_owner, [&confirmation_invoked](const QString&, const QString&, const QString&) {
+        confirmation_invoked = true;
+        return true;
+      });
+  delete confirmation_owner;
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  EXPECT_FALSE(confirmation_invoked) << "a confirmation whose owner was destroyed must never be invoked";
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("cancelled"));
+  EXPECT_EQ(spy_pending.count(), 0) << "a decision nobody could take must not stage a replacement";
+  EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source"));
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0");
+
+  // The dead registration is dropped, not retried: a second archive now takes the
+  // no-confirmation branch, which is how the cleared state is observable from here.
+  QSignalSpy spy_finished_again(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending_again(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error_again(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished_again, spy_pending_again));
+  ASSERT_EQ(spy_error_again.count(), 1);
+  EXPECT_TRUE(spy_error_again.first().at(1).toString().contains("already installed"))
+      << "the stale registration must be cleared, so the conflict is refused outright";
+  EXPECT_FALSE(confirmation_invoked);
+}
+
+// Two windows can share one manager and the last registration wins, so clearing has
+// to be scoped to the registrant: a displaced window closing must not disarm the
+// live registration.
+TEST_F(ExtensionManagerTest, ClearReplaceConfirmationOnlyRemovesOwnCallback) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
+
+  QObject first_owner;
+  QObject second_owner;
+  bool first_invoked = false;
+  bool second_invoked = false;
+  mgr_->setReplaceConfirmation(&first_owner, [&first_invoked](const QString&, const QString&, const QString&) {
+    first_invoked = true;
+    return true;
+  });
+  mgr_->setReplaceConfirmation(&second_owner, [&second_invoked](const QString&, const QString&, const QString&) {
+    second_invoked = true;
+    return false;
+  });
+
+  // The displaced owner going away: a no-op, since it no longer holds the slot.
+  mgr_->clearReplaceConfirmation(&first_owner);
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  EXPECT_TRUE(second_invoked) << "clearing with a displaced owner must leave the live registration armed";
+  EXPECT_FALSE(first_invoked);
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("cancelled"));
+  EXPECT_FALSE(spy_error.first().at(1).toString().contains("already installed"));
+}
+
+// The answer comes out of a modal dialog, which spins the event loop, so another
+// window can take the registration over WHILE the question is open. A live
+// registrant is then not enough to accept the answer: this one was given by a
+// registration that no longer holds the slot, and honouring it would stage a
+// replacement the window now in charge never approved.
+TEST_F(ExtensionManagerTest, ReentrantReregistrationDiscardsDisplacedOwnersAnswer) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+  ASSERT_TRUE(copyFixturePlugin(ext_dir_.path() + "/mock-data-source", "mock-data-source"));
+
+  QObject first_owner;
+  QObject second_owner;
+  bool second_invoked = false;
+  // Re-registering from inside the callback is what a modal event loop makes
+  // reachable, and it is also the reentrancy that must not touch the std::function
+  // being executed. The displaced owner still answers "yes".
+  mgr_->setReplaceConfirmation(&first_owner, [&](const QString&, const QString&, const QString&) {
+    mgr_->setReplaceConfirmation(&second_owner, [&second_invoked](const QString&, const QString&, const QString&) {
+      second_invoked = true;
+      return true;
+    });
+    return true;
+  });
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+  QSignalSpy spy_error(mgr_, &ExtensionManager::installError);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  EXPECT_EQ(spy_pending.count(), 0) << "an answer from a displaced registration must not stage a replacement";
+  ASSERT_EQ(spy_error.count(), 1);
+  EXPECT_TRUE(spy_error.first().at(1).toString().contains("replaced while the question was open"))
+      << "actual: " << spy_error.first().at(1).toString().toStdString();
+  EXPECT_FALSE(second_invoked) << "the successor must not be asked again for the same conflict";
+  EXPECT_FALSE(mgr_->hasPendingInstall("mock-data-source"));
+  EXPECT_EQ(mgr_->installedExtensions()["mock-data-source"].version, "1.0.0")
+      << "the live install must be left exactly as it was";
+
+  // Discarding the displaced answer must not disarm the successor: the window now
+  // in charge still owns the decision for the next archive.
+  QSignalSpy spy_finished_again(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending_again(mgr_, &ExtensionManager::installPendingRestart);
+
+  mgr_->installFromLocalZip(zip);
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished_again, spy_pending_again));
+  EXPECT_TRUE(second_invoked) << "the successor's registration must survive the discarded answer";
+  EXPECT_EQ(spy_pending_again.count(), 1) << "the successor accepted, so the replacement stages normally";
 }
 
 // The staged replacement is promoted on the next launch, into the same extensions
@@ -2196,7 +2344,9 @@ TEST_F(ExtensionManagerTest, StagedLocalReplacementIsPromotedOnNextLaunch) {
   ASSERT_TRUE(copyFixturePlugin(local_ext_dir.path() + "/mock-data-source", "mock-data-source", "1.0.0"));
   local_mgr.refreshInstalledFromDisk();
 
-  local_mgr.setReplaceConfirmation([](const QString&, const QString&, const QString&) { return true; });
+  QObject confirmation_owner;
+  local_mgr.setReplaceConfirmation(
+      &confirmation_owner, [](const QString&, const QString&, const QString&) { return true; });
   QSignalSpy spy_pending(&local_mgr, &ExtensionManager::installPendingRestart);
   QSignalSpy spy_finished(&local_mgr, &ExtensionManager::installFinished);
   local_mgr.installFromLocalZip(v2);

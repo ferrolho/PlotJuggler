@@ -7,7 +7,9 @@
 #include <QMap>
 #include <QMetaObject>
 #include <QObject>
+#include <QPointer>
 #include <QString>
+#include <cstdint>
 #include <functional>
 #include <utility>
 
@@ -59,9 +61,10 @@ class ExtensionManager : public QObject {
   };
   HostCompatibility hostCompatibility(const Extension& ext) const;
 
-  // Asked by installFromLocalZip when the archive carries an id that is already
-  // installed: return true to replace it, false to abort. Called synchronously on
-  // the calling (GUI) thread, so an implementation may run a modal dialog.
+  // Asked when a local archive carries an id that is already installed: return true
+  // to replace it, false to abort. Invoked on the GUI thread from the handler that
+  // runs once extraction finishes, so an implementation may block on a modal dialog
+  // there, but NOT while installFromLocalZip() itself is on the stack.
   //
   // The manager cannot ask this itself — the decision is UI policy and this module
   // links no widgets — so the host injects it, the same way
@@ -70,9 +73,28 @@ class ExtensionManager : public QObject {
   // standalone harness wants.
   using ReplaceConfirmation =
       std::function<bool(const QString& id, const QString& installed_version, const QString& archive_version)>;
-  void setReplaceConfirmation(ReplaceConfirmation confirm) {
-    replace_confirmation_ = std::move(confirm);
-  }
+
+  // Registers the decision on behalf of `context`, which must be the object whose
+  // lifetime the callback's captures depend on (for a UI host, the widget it opens
+  // its dialog on). Only a QPointer to it is kept, because the question is asked
+  // ASYNCHRONOUSLY, once extraction finishes: the host window can be closed while
+  // the archive is still unpacking, and invoking a lambda that captured it then is
+  // a use-after-free. A confirmation whose context is gone resolves as DECLINED and
+  // is dropped, so a conflicting install can never silently replace a plugin nobody
+  // approved, and never stalls waiting for an answer that cannot come.
+  //
+  // A null `context` or an empty `confirm` clears the registration instead.
+  //
+  // Exactly one confirmation is stored, so a second registration displaces the
+  // first: a host holding two marketplace windows open resolves every pending
+  // decision against the last registrant. That residual quirk is a UX wart, not a
+  // safety hole, since the guard makes a displaced window's disappearance harmless.
+  void setReplaceConfirmation(QObject* context, ReplaceConfirmation confirm);
+
+  // Drops the registration only when `context` is the object that made it, so a
+  // window closing after another has taken over cannot disarm the live one. Call it
+  // from the registrant's destructor.
+  void clearReplaceConfirmation(QObject* context);
 
   // Sideloads a plugin from a local ZIP that the registry does not list.
   //
@@ -298,6 +320,35 @@ class ExtensionManager : public QObject {
   void diagnosticReported(const QString& id, const QString& message, bool is_error);
 
  private:
+  // How a replace conflict was resolved. Everything except kAccepted aborts the
+  // install; they are distinguished only so the user is told which one happened.
+  enum class ReplaceDecision : std::uint8_t {
+    kNoConfirmation,  ///< Nothing registered, so a conflict is refused outright.
+    kOwnerGone,       ///< The registrant died before or during the answer.
+    kSuperseded,      ///< The registration changed while the question was open.
+    kDeclined,
+    kAccepted,
+  };
+
+  // Puts the replace question to the registered confirmation behind its context
+  // guard. A dead guard yields kOwnerGone WITHOUT invoking the callback, and drops
+  // the registration so the next conflict is refused rather than asked again.
+  //
+  // The callback typically blocks on a modal dialog, which spins the event loop, so
+  // a second window can register or clear WHILE it runs. Two consequences are
+  // handled here rather than by the callers: the callable is copied before being
+  // invoked (assigning to the executing std::function would otherwise be undefined
+  // behavior), and the answer is matched to the registration that asked via
+  // (context, replace_confirmation_generation_) — an answer from a registration
+  // that has since been displaced is kSuperseded, never accepted on the strength
+  // of its successor being alive.
+  ReplaceDecision askReplaceConfirmation(const QString& id, const QString& archive_version);
+
+  // Clears the registration and bumps the generation, so an answer still in flight
+  // from it can no longer be accepted. Every drop goes through here to keep the
+  // bump paired with the clear.
+  void dropReplaceConfirmation();
+
   // Called by both constructors to finish setup after members are assigned.
   void initComponents();
 
@@ -352,6 +403,15 @@ class ExtensionManager : public QObject {
   DownloadManager* downloader_ = nullptr;
   QString extensions_dir_;
   ReplaceConfirmation replace_confirmation_;
+  // Lifetime guard for replace_confirmation_: null once the registrant is gone,
+  // which turns a pending decision into a decline instead of a call into freed
+  // memory. See setReplaceConfirmation().
+  QPointer<QObject> replace_confirmation_context_;
+  // Identifies WHICH registration is armed, bumped by every set and every drop.
+  // A live context alone cannot say that: the question is answered inside a modal
+  // event loop, so the slot may hold a DIFFERENT (also live) registration by the
+  // time the answer comes back. See askReplaceConfirmation().
+  quint64 replace_confirmation_generation_ = 0;
   QString pending_dir_;
   DiagnosticSink sink_;
 
