@@ -257,9 +257,13 @@ See `pj_base/include/pj_base/diagnostic_sink.hpp` for the sink contract; the sta
 ### 4.1 Installation Flow
 
 Both the immediate (Linux/macOS) and deferred (Windows) paths extract the
-download into a hidden transaction directory (`.pj_install_<id>_<uuid>/`) on
-the same filesystem as its final destination, so the eventual rename is
-atomic. The DSO is **dlopened and its embedded manifest validated** inside
+download into a hidden transaction directory (`.pj_install_<id>_<uuid>/`) under
+`extensions.install_stage/` — a **sibling** of the extensions dir, so it shares
+that dir's filesystem (the promoting rename stays atomic) while staying outside
+the recursive plugin scan. Inside the scanned tree, a transaction holding an
+unpacked DSO would be discoverable, loadable content, and it survives a crash;
+the scanner applies no exclusion rule of its own. The DSO is **dlopened and its
+embedded manifest validated** inside
 the transaction directory before promotion, then **re-validated at the final
 location** after the rename — this catches DSOs that depend on rpath/relative
 paths that hold in the staging area but break in `extensions/`. On failure
@@ -284,7 +288,7 @@ if (Checksum OK?) then (yes)
   if (Is update?) then (yes)
     :Backup current;
   endif
-  :Extract to .pj_install_<id>_<uuid>/ (transaction dir);
+  :Extract to extensions.install_stage/.pj_install_<id>_<uuid>/;
   :Load DSO manifest;
   :Validate registry id/version;
   :Atomic rename to extensions/<id>/;
@@ -318,7 +322,7 @@ title Windows Staging Flow
 
 start
 :Download ZIP;
-:Extract to .pj_install_<id>_<uuid>/ (transaction dir under .extension_staging/);
+:Extract to extensions.install_stage/.pj_install_<id>_<uuid>/;
 :Load DSO manifest;
 :Validate registry id/version;
 :Atomic rename to .extension_staging/<id>/;
@@ -442,6 +446,11 @@ The root is `QStandardPaths::AppDataLocation` (the `PlotJuggler/PlotJuggler4` or
 ├── extensions.seed_stage/           # Transient: bundled-refresh staging,
 │                                    # sibling of extensions/ so the scan
 │                                    # never sees a half-written payload
+├── extensions.install_stage/        # Transient: every install (registry and
+│   └── .pj_install_<id>_<uuid>/     # sideload alike) extracts here, another
+│                                    # sibling of extensions/ for the same
+│                                    # reason; removed once the transaction
+│                                    # promotes, swept if a crash orphans it
 ├── .extension_staging/      # Staging area: updates land here and are promoted
 │   │                                # on the next startup; a fresh install uses it
 │   │                                # only as the post-promotion validation gate

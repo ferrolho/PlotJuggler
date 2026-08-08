@@ -343,6 +343,12 @@ class ExtensionManager : public QObject {
   // Emits uninstallError + uninstallFinished(false) and records a diagnostic.
   void emitUninstallFailure(const QString& id, const QString& message);
 
+  // Deletes every `.pj_install_*` transaction directory directly under `parent`,
+  // except the one a running install is still extracting into. Called for the
+  // staging sibling installs actually use, and for the extensions dir itself,
+  // where an older build could have left one inside the scanned tree.
+  void sweepTransactionRoots(const QString& parent);
+
   DownloadManager* downloader_ = nullptr;
   QString extensions_dir_;
   ReplaceConfirmation replace_confirmation_;

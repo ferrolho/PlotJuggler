@@ -241,6 +241,20 @@ class ScopedApplicationVersion {
   QString previous_;
 };
 
+// Names of the transaction directories sitting directly under `path`.
+QStringList transactionDirsIn(const QString& path) {
+  return QDir(path).entryList(QStringList{u".pj_install_*"_s}, QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+}
+
+// The staging area every install extracts into. Deliberately spells out the
+// layout ExtensionManager produces rather than asking it: the placement IS what
+// the tests below pin down, and it must stay a sibling of the extensions dir -
+// same filesystem (so the promoting rename is atomic), outside the recursive
+// plugin scan (so scratch is never loadable content).
+QString transactionStageDirFor(const QString& extensions_dir) {
+  return extensions_dir + u".install_stage"_s;
+}
+
 // Builds an Extension whose download artifact for the current platform points to `url`.
 // Checksum is empty by default so DownloadManager skips SHA-256 verification.
 Extension makeExtension(const QString& id, const QString& version, const QUrl& url, const QString& checksum = {}) {
@@ -278,6 +292,10 @@ class ExtensionManagerTest : public ::testing::Test {
   void TearDown() override {
     delete mgr_;
     delete downloader_;
+    // The staging area sits NEXT TO ext_dir_, so QTemporaryDir does not remove it:
+    // a test that abandons an in-flight install (the concurrency guards do, on
+    // purpose) orphans a transaction there, exactly as a crashed session would.
+    QDir(transactionStageDirFor(ext_dir_.path())).removeRecursively();
   }
 
   QTemporaryDir ext_dir_;
@@ -2423,6 +2441,87 @@ TEST_F(ExtensionManagerTest, DowngradeToBundledKeepsInstalledUntilRestart) {
       << "the still-live updated version must keep being reported until the restart promotes the removal";
   EXPECT_TRUE(mgr_->hasPendingUninstall("mock-data-source"))
       << "the pending-uninstall marker drives the 'Needs Restart' badge";
+}
+
+// ---------------------------------------------------------------------------
+// [13] Transaction-root placement
+// ---------------------------------------------------------------------------
+
+// The plugin scanner walks the extensions dir recursively and has no exclusion
+// rule, so a transaction directory holding an extracted DSO is discoverable,
+// loadable content for as long as it exists there - and it survives a crash.
+// A sideload must therefore extract outside that tree.
+TEST_F(ExtensionManagerTest, LocalInstallTransactionRootNeverAppearsInsideTheScannedTree) {
+  QTemporaryDir src;
+  ASSERT_TRUE(src.isValid());
+  const QString zip = writeZipFile(src, dummyPluginZip("mock-data-source"));
+  ASSERT_FALSE(zip.isEmpty());
+
+  const QString stage_dir = transactionStageDirFor(ext_dir_.path());
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  QSignalSpy spy_pending(mgr_, &ExtensionManager::installPendingRestart);
+
+  mgr_->installFromLocalZip(zip);
+
+  // The transaction root is created synchronously before the fetch is handed to
+  // the worker, so this observes the install mid-flight without racing it.
+  EXPECT_TRUE(transactionDirsIn(ext_dir_.path()).isEmpty())
+      << "in-flight transaction dir inside the scanned tree: "
+      << transactionDirsIn(ext_dir_.path()).join(u", "_s).toStdString();
+  EXPECT_FALSE(transactionDirsIn(stage_dir).isEmpty())
+      << "no transaction dir under the staging sibling " << stage_dir.toStdString();
+
+  ASSERT_TRUE(waitForInstallOutcome(spy_finished, spy_pending));
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_TRUE(spy_finished.first().at(1).toBool());
+  EXPECT_TRUE(mgr_->isInstalled("mock-data-source"));
+
+  EXPECT_TRUE(transactionDirsIn(ext_dir_.path()).isEmpty())
+      << "transaction residue left in the scanned tree after the install completed";
+  EXPECT_TRUE(transactionDirsIn(stage_dir).isEmpty()) << "transaction residue left in the staging sibling";
+}
+
+// Same rule for the non-staged registry path: a fresh install promotes
+// immediately, but its extraction window is just as exposed to the scan.
+TEST_F(ExtensionManagerTest, FreshRegistryInstallExtractsOutsideTheScannedTree) {
+  server_.setBody(dummyPluginZip("mock-data-source"));
+  const Extension ext = makeExtension("mock-data-source", "1.0.0", server_.url());
+
+  const QString stage_dir = transactionStageDirFor(ext_dir_.path());
+
+  QSignalSpy spy_finished(mgr_, &ExtensionManager::installFinished);
+  mgr_->install(ext);
+
+  EXPECT_TRUE(transactionDirsIn(ext_dir_.path()).isEmpty())
+      << "in-flight transaction dir inside the scanned tree: "
+      << transactionDirsIn(ext_dir_.path()).join(u", "_s).toStdString();
+  EXPECT_FALSE(transactionDirsIn(stage_dir).isEmpty())
+      << "no transaction dir under the staging sibling " << stage_dir.toStdString();
+
+  ASSERT_TRUE(waitForSignal(spy_finished));
+  ASSERT_EQ(spy_finished.count(), 1);
+  EXPECT_TRUE(spy_finished.first().at(1).toBool());
+  EXPECT_TRUE(mgr_->isInstalled("mock-data-source"));
+
+  EXPECT_TRUE(transactionDirsIn(ext_dir_.path()).isEmpty())
+      << "transaction residue left in the scanned tree after the install completed";
+  EXPECT_TRUE(transactionDirsIn(stage_dir).isEmpty()) << "transaction residue left in the staging sibling";
+}
+
+// Residue written by an older build sits inside the extensions dir, where the
+// scan can still reach it. The name-prefix sweep stays the migration path for
+// those, so a first launch after the upgrade clears them.
+TEST_F(ExtensionManagerTest, LegacyInTreeTransactionResidueIsStillSweptAtStartup) {
+  const QString legacy = QDir(ext_dir_.path()).absoluteFilePath(u".pj_install_legacy_abc"_s);
+  ASSERT_TRUE(copyFixturePlugin(legacy, u"mock-data-source"_s));
+  ASSERT_TRUE(QFile::exists(legacy));
+
+  DownloadManager downloader;
+  ExtensionManager mgr(&downloader, ext_dir_.path(), pending_dir_.path());
+
+  EXPECT_FALSE(QFile::exists(legacy)) << "legacy in-tree transaction residue must still be swept at startup";
+  EXPECT_FALSE(mgr.isInstalled("mock-data-source")) << "residue must never register as an installed extension";
 }
 
 }  // namespace

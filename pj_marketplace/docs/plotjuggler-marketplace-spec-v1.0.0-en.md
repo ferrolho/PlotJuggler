@@ -632,7 +632,7 @@ The solution is a staging system similar to what Windows installers use:
 The flow is:
 
 1. User clicks "Update"
-2. New version downloads to a hidden transaction folder `.pj_install_<id>_<uuid>/` (created under `.extension_staging/` on Windows, under `extensions/` on Linux/macOS)
+2. New version downloads to a hidden transaction folder `.pj_install_<id>_<uuid>/` (created under `extensions.install_stage/`, a sibling of `extensions/` that shares its filesystem but is never walked by the recursive plugin scan)
 3. The staged DSO is loaded and its embedded manifest is validated against the registry id/version
 4. A transient `.pj_pending_install` intent is written with the registry id/version
 5. Message shown: "Update will be applied when PlotJuggler restarts"

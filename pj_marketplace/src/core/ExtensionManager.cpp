@@ -73,6 +73,16 @@ QString makeTransactionRoot(const QString& parent, const QString& id) {
       QString(".pj_install_%1_%2").arg(id, QUuid::createUuid().toString(QUuid::Id128)));
 }
 
+// Where every install extracts: a SIBLING of the extensions dir, so scratch
+// shares that dir's filesystem (the promoting rename stays atomic) while sitting
+// outside the recursive plugin scan. A transaction directory holds an unpacked
+// DSO and the scanner has no exclusion rule, so one left inside the tree by a
+// crash would be discoverable, loadable content. Same discipline as the bundled
+// seed's ".seed_stage" sibling.
+QString transactionStageRoot(const QString& extensions_dir) {
+  return QDir::cleanPath(extensions_dir) + u".install_stage"_s;
+}
+
 QString candidateRoot(const QString& transaction_root, const QString& id) {
   return QDir(transaction_root).absoluteFilePath(id);
 }
@@ -81,6 +91,18 @@ void removeDirectoryIfSet(const QString& path) {
   if (!path.isEmpty()) {
     QDir(path).removeRecursively();
   }
+}
+
+// Retires a finished transaction, and the staging area with it once nothing else
+// occupies it — rmdir refuses a non-empty directory, so a concurrently staged
+// sibling is left alone.
+void removeTransactionRoot(const QString& path) {
+  if (path.isEmpty()) {
+    return;
+  }
+  const QString stage = QFileInfo(path).absolutePath();
+  QDir(path).removeRecursively();
+  QDir().rmdir(stage);
 }
 
 bool isTransactionDirectoryName(const QString& name) {
@@ -331,12 +353,11 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
   refreshInstalledFromDisk();
 
   QDir().mkpath(extensions_dir_);
-  // Extraction lands beside the final destination so the promoting rename is an
-  // atomic same-filesystem move. The transaction directory is named after the
-  // file rather than the extension id, which is still unknown at this point; the
-  // ".pj_install_" prefix is what refreshInstalledFromDisk() recognises, so the
-  // in-progress guard below still protects it.
-  const QString transaction_root = makeTransactionRoot(extensions_dir_, u"local"_s);
+  // Extraction lands in the staging sibling: outside the scanned tree, yet on the
+  // filesystem of the final destination so the promoting rename is an atomic
+  // move. The transaction directory is named after the file rather than the
+  // extension id, which is still unknown at this point.
+  const QString transaction_root = makeTransactionRoot(transactionStageRoot(extensions_dir_), u"local"_s);
   QDir().mkpath(transaction_root);
 
   pending_id_ = file_label;
@@ -351,7 +372,7 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
     pending_op_id_ = -1;
 
     auto fail = [&](const QString& failed_id, const QString& message) {
-      removeDirectoryIfSet(transaction_root);
+      removeTransactionRoot(transaction_root);
       pending_extract_dir_.clear();
       emitInstallFailure(failed_id, message);
     };
@@ -425,7 +446,7 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
         return;
       }
 
-      removeDirectoryIfSet(transaction_root);
+      removeTransactionRoot(transaction_root);
       pending_extract_dir_.clear();
       emit installPendingRestart(ext_id);
       return;
@@ -461,7 +482,7 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
       return;
     }
 
-    removeDirectoryIfSet(transaction_root);
+    removeTransactionRoot(transaction_root);
     pending_extract_dir_.clear();
     registerInstalledExtension(ext_id, dst, final_check.record);
     emit installFinished(ext_id, true);
@@ -477,7 +498,7 @@ void ExtensionManager::installFromLocalZip(const QString& zip_path) {
         pending_id_.clear();
         pending_op_id_ = -1;
         pending_extract_dir_.clear();
-        removeDirectoryIfSet(transaction_root);
+        removeTransactionRoot(transaction_root);
         emitInstallFailure(failed_label, error);
       });
 
@@ -524,17 +545,17 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
   const QString platform = PlatformUtils::currentPlatform();
   const Platform& artifact = ext.platforms[platform];
 
-  // Extraction goes into a hidden transaction directory on the same filesystem
-  // as the final destination, so the eventual rename is atomic. For a deferred
-  // update that's pending_dir_ (promoted at next startup); for an immediate
-  // fresh install we extract beside extensions_dir_ and rename in-place after
-  // validation.
+  // Extraction goes into a hidden transaction directory outside every scanned
+  // root, on the filesystem the final destination lives on, so the eventual
+  // rename is atomic. That destination is pending_dir_ for a deferred update
+  // (promoted at next startup) and extensions_dir_ for an immediate fresh
+  // install.
   // The DSO is dlopened and its embedded manifest verified inside the
   // transaction directory BEFORE the rename, then re-verified at the final
   // location AFTER the rename — see the post-promotion check below.
   const QString dest_dir = staging ? pending_dir_ : extensions_dir_;
   QDir().mkpath(dest_dir);
-  const QString transaction_root = makeTransactionRoot(dest_dir, ext.id);
+  const QString transaction_root = makeTransactionRoot(transactionStageRoot(extensions_dir_), ext.id);
   // Create the transaction root eagerly so the refresh guard has a real path
   // to protect from the moment install() returns — otherwise a Refresh that
   // fires during the download window would find no directory to skip and the
@@ -586,7 +607,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
         pending_op_id_ = -1;
 
         auto fail_after_extraction = [&](const QString& message) {
-          removeDirectoryIfSet(transaction_root);
+          removeTransactionRoot(transaction_root);
           pending_extract_dir_.clear();
           emitInstallFailure(finished_id, message);
         };
@@ -622,7 +643,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
             return;
           }
 
-          removeDirectoryIfSet(transaction_root);
+          removeTransactionRoot(transaction_root);
           pending_extract_dir_.clear();
           pending_backup_path_.clear();
           emit installPendingRestart(finished_id);
@@ -653,7 +674,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
           return;
         }
 
-        removeDirectoryIfSet(transaction_root);
+        removeTransactionRoot(transaction_root);
         pending_extract_dir_.clear();
         pending_backup_path_.clear();
         registerInstalledExtension(ext.id, dst, final_check.record);
@@ -673,7 +694,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
         pending_op_id_ = -1;
         pending_extract_dir_.clear();
 
-        removeDirectoryIfSet(transaction_root);
+        removeTransactionRoot(transaction_root);
         emitInstallFailure(failed_id, error);
       });
 
@@ -689,7 +710,7 @@ void ExtensionManager::doInstall(const Extension& ext, bool staging, bool allow_
     disk_space_checked_ = false;
     pending_extract_dir_.clear();
 
-    removeDirectoryIfSet(transaction_root);
+    removeTransactionRoot(transaction_root);
 
     const QString reason = cancel_reason_.isEmpty() ? "Installation was cancelled" : cancel_reason_;
     cancel_reason_.clear();
@@ -891,6 +912,8 @@ void ExtensionManager::applyPendingInstalls() {
     const QString staged_dir = entry.absoluteFilePath();
     const QString staged_name = entry.fileName();
     if (isTransactionDirectoryName(staged_name)) {
+      // Extraction scratch an older build wrote here rather than into the
+      // staging sibling; it is never a promotable stage.
       removeDirectoryIfSet(staged_dir);
       continue;
     }
@@ -1221,23 +1244,35 @@ void ExtensionManager::registerInstalledExtension(
   setEnabled(id, true);
 }
 
+void ExtensionManager::sweepTransactionRoots(const QString& parent) {
+  const QDir dir(parent);
+  if (!dir.exists()) {
+    return;
+  }
+  for (const QFileInfo& entry : dir.entryInfoList(QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot)) {
+    if (!isTransactionDirectoryName(entry.fileName())) {
+      continue;
+    }
+    // Spare the transaction of an install still in progress: the worker is
+    // writing into it in the background and its completion handler owns the
+    // cleanup. Wiping it here (triggered by Refresh, or by starting an
+    // install/uninstall/update of a different plugin) would race with the worker
+    // and truncate a partial install into a broken final state. Both sides are
+    // normalized so the guard tolerates trailing slashes, `..` segments, and
+    // case-insensitive filesystems.
+    if (QDir::cleanPath(entry.absoluteFilePath()) != pending_extract_dir_) {
+      removeDirectoryIfSet(entry.absoluteFilePath());
+    }
+  }
+}
+
 void ExtensionManager::refreshInstalledFromDisk() {
   QMap<QString, InstalledExtension> discovered;
   const QDir dir(extensions_dir_);
   for (const QFileInfo& entry : dir.entryInfoList(QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot)) {
     const QString root = entry.absoluteFilePath();
     if (isTransactionDirectoryName(entry.fileName())) {
-      // Skip the transaction dir of an install that is still in progress —
-      // the worker is writing into it in the background, and its completion
-      // handler owns cleanup. Wiping it here (triggered by Refresh, or by
-      // starting an install/uninstall/update of a different plugin) would
-      // race with the worker and truncate a partial install into a broken
-      // final state. Both sides are normalized so the guard tolerates
-      // trailing slashes, `..` segments, and case-insensitive filesystems.
-      if (QDir::cleanPath(root) != pending_extract_dir_) {
-        removeDirectoryIfSet(root);
-      }
-      continue;
+      continue;  // extraction scratch, never an install — swept after the loop
     }
     if (QFile::exists(root + "/" + kPendingUninstallMarker)) {
       continue;
@@ -1266,6 +1301,17 @@ void ExtensionManager::refreshInstalledFromDisk() {
     discovered[item.record.id] = item.record;
   }
   installed_ = std::move(discovered);
+
+  // Clear scratch a crashed or abandoned install left behind. The staging
+  // sibling is where transactions live and it goes with the last of them (rmdir
+  // refuses it while an in-flight transaction is still there); the in-tree pass
+  // is the migration path for residue an older build wrote into the scanned dir,
+  // which the recursive plugin scan would otherwise keep finding.
+  const QString stage_root = transactionStageRoot(extensions_dir_);
+  sweepTransactionRoots(stage_root);
+  QDir().rmdir(stage_root);
+  sweepTransactionRoots(extensions_dir_);
+
   // Retire a staged record once its marker is gone — drained by a restart, or
   // cleared because the directory was replaced.
   // Checked against the record's own path rather than through
