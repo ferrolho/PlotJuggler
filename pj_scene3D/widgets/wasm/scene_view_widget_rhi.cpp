@@ -3071,13 +3071,8 @@ void SceneViewWidget::render(QRhiCommandBuffer* command_buffer) {
     colormap_upload_pending_ = false;
   }
   if (cube_upload_pending_ && cube_vertex_buffer_ != nullptr && cube_index_buffer_ != nullptr) {
-    static const std::array<std::uint16_t, kCubeIndices.size()> cube_indices = [] {
-      std::array<std::uint16_t, kCubeIndices.size()> indices{};
-      std::copy(kCubeIndices.cbegin(), kCubeIndices.cend(), indices.begin());
-      return indices;
-    }();
     updates->uploadStaticBuffer(cube_vertex_buffer_, kCubeVertices.data());
-    updates->uploadStaticBuffer(cube_index_buffer_, cube_indices.data());
+    updates->uploadStaticBuffer(cube_index_buffer_, kCubeIndices.data());  // already uint16, as QRhi wants
     cube_upload_pending_ = false;
   }
   if (pose_mesh_upload_pending_ && pose_vertex_buffer_ != nullptr && pose_index_buffer_ != nullptr) {

@@ -1,0 +1,24 @@
+// The darker outline along each cube/voxel face edge, so adjacent same-coloured solids
+// stay legible. See cube_lighting.glslinc for how this file reaches both backends.
+//
+// `local` is the interpolated unit-cube corner in [-0.5, 0.5]^3. On a face the
+// normal-axis distance to its plane is ~0; the nearest face EDGE is where the SECOND
+// distance is also small, so the middle of the three distance-to-plane values is the
+// distance to the nearest edge. Returns ~1 on an edge and 0 in the face interior — scale
+// the fill by (1 - kCubeEdgeDarken * factor). The width is a fixed fraction of the cube,
+// so edges scale with it on screen.
+//
+// Both constants are NAMED because kCubeEdgeMeanScale — the LOD sprite's brightness match
+// — is derived from them plus the sRGB gamma. Editing either silently invalidates it;
+// cube_mesh_test re-derives the integral and checks it against this source.
+
+const float kCubeEdgeWidth = 0.06;   // band half-width, in unit-cube coordinates
+const float kCubeEdgeDarken = 0.6;   // how far the band scales the colour down
+
+float cubeEdgeFactor(vec3 local) {
+  vec3 d = vec3(0.5) - abs(local);
+  float dmin = min(d.x, min(d.y, d.z));
+  float dmax = max(d.x, max(d.y, d.z));
+  float dmid = (d.x + d.y + d.z) - dmin - dmax;  // middle value = distance to nearest edge
+  return 1.0 - smoothstep(0.0, kCubeEdgeWidth, dmid);
+}

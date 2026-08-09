@@ -2,15 +2,40 @@
 // SPDX-License-Identifier: MPL-2.0
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <string_view>
 
-// Shared unit-cube geometry + a single-pass edge helper for every instanced-cube
+// kCubeLightingGlsl / kCubeEdgeGlsl, generated from shaders/cube/*.glslinc — the same
+// files the browser's .vert/.frag #include, so the two backends cannot describe a solid
+// differently. Edit the .glslinc, never the generated header.
+#include "pj_scene3d_widgets/cube_shader_sources.h"
+
+// Shared unit-cube geometry + single-pass GLSL helpers for every instanced-cube
 // pass (the point-cloud "cube" shape and the voxel grid). Keeping the mesh and its
 // vertex-attrib contract (location 0 = position, location 1 = outward normal) in
 // one place means the two passes can't drift, and both draw an identically-edged
 // cube ("unify the cube").
+//
+// Two geometries live here, for two different cost profiles:
+//
+//   kCubeVertices/kCubeIndices — the full 24-vertex solid. Use it when a pass must
+//     survive the camera being INSIDE a cube, or when instances are few enough
+//     that the geometry cost is irrelevant (voxel grids: one instance per voxel,
+//     but the shader discards most of them before the corner math).
+//
+//   kCubeFanIndices + cubeFanGlsl() — an attributeless 7-vertex hexagon fan
+//     covering only the 3 camera-facing faces. A closed opaque cube never shows
+//     the other three, so this is pixel-equivalent at 1/3.4 the vertex
+//     invocations and half the triangles. Use it for high-instance-count passes
+//     (point clouds).
+//
+// Below a couple of pixels even the fan is more geometry than the result can show,
+// so kCubeSpriteGlsl degrades a cube to a single area- and brightness-matched point
+// sprite. Its constants are tied to kCubeLightingGlsl / kCubeEdgeGlsl on purpose —
+// the whole point is that crossing the threshold changes nothing on screen.
 
 namespace pj::scene3d {
 
@@ -21,41 +46,49 @@ struct CubeVertex {
 };
 
 // 24-vertex unit cube (4 verts per face x 6 faces), each carrying its outward face
-// normal. Winding is CCW viewed from outside the face (OpenGL default front face).
+// normal.
+//
+// WINDING INVARIANT: each face is CCW viewed from OUTSIDE, so GL's default front
+// face (GL_CCW) selects the outward side and GL_BACK culling keeps what the camera
+// can see. Passes that enable culling — and the QRhi pipelines that set
+// CullMode::Back — depend on this; verify any edit with the cross product of the
+// first two edges, not by eye.
 inline constexpr std::array<CubeVertex, 24> kCubeVertices = {{
     // +X face, normal (1, 0, 0)
     {0.5f, -0.5f, -0.5f, 1.0f, 0.0f, 0.0f},
-    {0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f},
-    {0.5f, 0.5f, 0.5f, 1.0f, 0.0f, 0.0f},
     {0.5f, 0.5f, -0.5f, 1.0f, 0.0f, 0.0f},
+    {0.5f, 0.5f, 0.5f, 1.0f, 0.0f, 0.0f},
+    {0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f},
     // -X face, normal (-1, 0, 0)
     {-0.5f, -0.5f, 0.5f, -1.0f, 0.0f, 0.0f},
-    {-0.5f, -0.5f, -0.5f, -1.0f, 0.0f, 0.0f},
-    {-0.5f, 0.5f, -0.5f, -1.0f, 0.0f, 0.0f},
     {-0.5f, 0.5f, 0.5f, -1.0f, 0.0f, 0.0f},
+    {-0.5f, 0.5f, -0.5f, -1.0f, 0.0f, 0.0f},
+    {-0.5f, -0.5f, -0.5f, -1.0f, 0.0f, 0.0f},
     // +Y face, normal (0, 1, 0)
     {-0.5f, 0.5f, -0.5f, 0.0f, 1.0f, 0.0f},
-    {0.5f, 0.5f, -0.5f, 0.0f, 1.0f, 0.0f},
-    {0.5f, 0.5f, 0.5f, 0.0f, 1.0f, 0.0f},
     {-0.5f, 0.5f, 0.5f, 0.0f, 1.0f, 0.0f},
+    {0.5f, 0.5f, 0.5f, 0.0f, 1.0f, 0.0f},
+    {0.5f, 0.5f, -0.5f, 0.0f, 1.0f, 0.0f},
     // -Y face, normal (0, -1, 0)
     {-0.5f, -0.5f, 0.5f, 0.0f, -1.0f, 0.0f},
-    {0.5f, -0.5f, 0.5f, 0.0f, -1.0f, 0.0f},
-    {0.5f, -0.5f, -0.5f, 0.0f, -1.0f, 0.0f},
     {-0.5f, -0.5f, -0.5f, 0.0f, -1.0f, 0.0f},
+    {0.5f, -0.5f, -0.5f, 0.0f, -1.0f, 0.0f},
+    {0.5f, -0.5f, 0.5f, 0.0f, -1.0f, 0.0f},
     // +Z face, normal (0, 0, 1)
     {-0.5f, -0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
-    {-0.5f, 0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
-    {0.5f, 0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
     {0.5f, -0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
+    {0.5f, 0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
+    {-0.5f, 0.5f, 0.5f, 0.0f, 0.0f, 1.0f},
     // -Z face, normal (0, 0, -1)
     {0.5f, -0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
-    {0.5f, 0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
-    {-0.5f, 0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
     {-0.5f, -0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
+    {-0.5f, 0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
+    {0.5f, 0.5f, -0.5f, 0.0f, 0.0f, -1.0f},
 }};
 
-inline constexpr std::array<uint8_t, 36> kCubeIndices = {{
+// uint16 rather than uint8: several drivers have no native 8-bit index path and
+// silently convert the buffer on every draw.
+inline constexpr std::array<uint16_t, 36> kCubeIndices = {{
     0,  1,  2,  0,  2,  3,   // +X
     4,  5,  6,  4,  6,  7,   // -X
     8,  9,  10, 8,  10, 11,  // +Y
@@ -64,22 +97,60 @@ inline constexpr std::array<uint8_t, 36> kCubeIndices = {{
     20, 21, 22, 20, 22, 23,  // -Z
 }};
 
-// GLSL helper: a single-pass darker-edge factor for the unit cube. `local` is the
-// interpolated cube-corner position in [-0.5, 0.5]^3 (pass `in_corner_pos`
-// straight through to the fragment shader). On a face the normal-axis distance to
-// its plane is ~0; the nearest face EDGE is where the SECOND distance is also
-// small, so the middle of the three distance-to-plane values is the distance to
-// the nearest edge. Returns ~1 on an edge, 0 in the face interior — mix the fill
-// toward a darker shade (e.g. base * 0.4) to outline each cube. The width is a
-// fixed fraction of the cube, so edges scale with the cube on screen.
-inline constexpr std::string_view kCubeEdgeGlsl = R"(
-float cubeEdgeFactor(vec3 local) {
-  vec3 d = vec3(0.5) - abs(local);
-  float dmin = min(d.x, min(d.y, d.z));
-  float dmax = max(d.x, max(d.y, d.z));
-  float dmid = (d.x + d.y + d.z) - dmin - dmax;  // middle value = distance to nearest edge
-  return 1.0 - smoothstep(0.0, 0.06, dmid);
+// Hexagon fan over the 3 camera-facing faces: 6 triangles sharing the near corner
+// (logical vertex 0) around the 6-vertex silhouette ring (1..6). No vertex buffer
+// — the corner positions come from cubeFanGlsl()'s cubeFanCorner(gl_VertexID, s).
+// Draw with glDrawElementsInstanced(GL_TRIANGLES, 18, GL_UNSIGNED_SHORT, ...).
+// Consecutive pairs of triangles tile one face each; which face a pair lands on
+// depends on the per-instance sign vector, so don't annotate them by axis.
+inline constexpr std::array<uint16_t, 18> kCubeFanIndices = {{
+    0,
+    1,
+    2,
+    0,
+    2,
+    3,  // first visible face
+    0,
+    3,
+    4,
+    0,
+    4,
+    5,  // second visible face
+    0,
+    5,
+    6,
+    0,
+    6,
+    1,  // third visible face
+}};
+
+// C++ mirrors of the numbers the edge band is built from, so kCubeEdgeMeanScale can be
+// RE-DERIVED in a headless test instead of trusted. The GL test that measures it end to
+// end self-skips below GL 4.5 — which is every Windows CI run — so without this the
+// constant would be unguarded on one of the two shipped targets.
+inline constexpr float kCubeEdgeWidth = 0.06f;
+inline constexpr float kCubeEdgeDarken = 0.6f;
+inline constexpr float kCubeSrgbGamma = 2.2f;
+
+// Mean of pow(1 - kCubeEdgeDarken * cubeEdgeFactor(local), kCubeSrgbGamma) over one
+// face: how much darker the edge band makes a cube on average, in the LINEAR space the
+// LOD sprite writes. Integrated in closed-ish form over the face's distance-to-edge
+// distribution — for a unit face the distance t = min(0.5-|u|, 0.5-|v|) has density
+// 4(1-2t) on [0, 0.5], and the band only bites below kCubeEdgeWidth.
+[[nodiscard]] inline double cubeEdgeMeanScale(int samples = 100000) {
+  double total = 0.0;
+  for (int i = 0; i < samples; ++i) {
+    const double t = 0.5 * (static_cast<double>(i) + 0.5) / samples;
+    const double s = std::clamp(t / kCubeEdgeWidth, 0.0, 1.0);
+    const double smoothstep = s * s * (3.0 - 2.0 * s);
+    const double edge_factor = 1.0 - smoothstep;
+    const double density = 4.0 * (1.0 - 2.0 * t);
+    total += std::pow(1.0 - kCubeEdgeDarken * edge_factor, kCubeSrgbGamma) * density * (0.5 / samples);
+  }
+  return total;
 }
-)";
+
+// The value kCubeSpriteGlsl hard-codes, mirrored for the test that checks the two agree.
+inline constexpr float kCubeEdgeMeanScale = 0.887f;
 
 }  // namespace pj::scene3d

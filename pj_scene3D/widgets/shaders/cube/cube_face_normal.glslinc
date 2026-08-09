@@ -1,0 +1,15 @@
+// GLSL: outward face normal in VIEW space for an interpolated unit-cube corner.
+// Every fan triangle lies in one face, so the axis whose |component| reaches 0.5
+// names that face. An axis-aligned normal transforms to a single column of the
+// view rotation, so this costs a select instead of a mat3 multiply — and it frees
+// the vertex stage from carrying a normal attribute at all. Pass `mat3(u_view)`.
+vec3 cubeFaceNormalView(vec3 local, mat3 view_rot) {
+  vec3 a = abs(local);
+  if (a.x >= a.y && a.x >= a.z) {
+    return sign(local.x) * view_rot[0];
+  }
+  if (a.y >= a.z) {
+    return sign(local.y) * view_rot[1];
+  }
+  return sign(local.z) * view_rot[2];
+}

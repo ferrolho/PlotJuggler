@@ -109,6 +109,8 @@ if(PJ_BUILD_TESTS)
     ../tests/scene_entities_budget_test.cpp
     ../tests/scene_entities_decode_test.cpp
     ../tests/scene_entities_model_state_test.cpp
+    ../tests/frustum_cull_test.cpp
+    ../tests/cube_draw_policy_test.cpp
     ../tests/shadow_camera_test.cpp
     ../tests/tf_buffer_test.cpp
     ../tests/tf_buffer_hierarchy_test.cpp

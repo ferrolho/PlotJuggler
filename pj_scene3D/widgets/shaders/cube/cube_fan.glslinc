@@ -1,0 +1,35 @@
+// GLSL for the hexagon-fan cube. Concatenate into a vertex shader that draws
+// kCubeFanIndices.
+//
+// `cubeFaceSigns(to_camera)` picks, per axis, the side the camera is on; the three
+// faces with those outward normals are exactly the ones a closed cube shows.
+// `cubeFanCorner(gl_VertexID, s)` then generates that fan's corners, ordered so the
+// triangles stay CCW-viewed-from-outside for either handedness (mirroring the cube
+// an odd number of times reverses the ring, hence the parity flip).
+//
+// PITFALL: the face choice compares the camera against the cube's CENTRE, so it is
+// exact only while the camera is at least half a cube outside it. A camera inside
+// (or straddling a face plane of) a cube gets the wrong three faces — irrelevant
+// for point-cloud-sized cubes, but a reason to keep the 24-vertex mesh for passes
+// whose cubes can swallow the viewpoint.
+vec3 cubeFaceSigns(vec3 to_camera) {
+  return mix(vec3(-1.0), vec3(1.0), greaterThanEqual(to_camera, vec3(0.0)));
+}
+
+vec3 cubeFanCorner(int vertex_id, vec3 face_signs) {
+  // Ring order walks the silhouette hexagon: near corner, then alternating
+  // one-axis and two-axis flips of it.
+  const vec3 kFanFlip[7] = vec3[7](
+      vec3( 1.0,  1.0,  1.0),
+      vec3(-1.0,  1.0,  1.0),
+      vec3(-1.0, -1.0,  1.0),
+      vec3( 1.0, -1.0,  1.0),
+      vec3( 1.0, -1.0, -1.0),
+      vec3( 1.0,  1.0, -1.0),
+      vec3(-1.0,  1.0, -1.0));
+  int ring = vertex_id;
+  if (ring > 0 && face_signs.x * face_signs.y * face_signs.z < 0.0) {
+    ring = 7 - ring;  // odd mirror: reverse the ring so the winding stays CCW-outward
+  }
+  return 0.5 * face_signs * kFanFlip[ring];
+}

@@ -66,6 +66,20 @@ struct ViewParams {
   float shadow_world_units_per_texel = 0.0f;
 };
 
+// Eye position in RENDER space, or empty under an ORTHOGRAPHIC camera, which has none.
+// The view rotation is rigid, so its inverse is its transpose.
+//
+// Read the projection's [3][3] to tell the two apart, never a folded view-projection:
+// folding view into proj puts the eye's view-axis distance in that slot instead of zero,
+// so the usual test silently reports "orthographic" for every perspective camera.
+[[nodiscard]] inline std::optional<glm::vec3> eyeInRenderSpace(const ViewParams& view_params) {
+  if (view_params.proj[3][3] != 0.0f) {
+    return std::nullopt;
+  }
+  const glm::mat3 inverse_rotation = glm::transpose(glm::mat3(view_params.view));
+  return -inverse_rotation * glm::vec3(view_params.view[3]);
+}
+
 // The TF-resolution triple a pass needs to place frame-relative data into the
 // scene: the buffer, the fixed frame to resolve into, and the query time. They
 // always travel together, so they live in one struct passed alongside (not

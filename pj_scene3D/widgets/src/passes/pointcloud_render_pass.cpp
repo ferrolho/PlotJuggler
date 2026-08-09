@@ -15,9 +15,10 @@
 #include <variant>
 #include <vector>
 
+#include "pj_scene3d_core/cube_draw_policy.h"
 #include "pj_scene3d_core/pointcloud.h"
 #include "pj_scene3d_core/tf/tf_buffer.h"
-#include "pj_scene3d_widgets/cube_mesh.h"  // shared CubeVertex / kCubeVertices / kCubeIndices / kCubeEdgeGlsl
+#include "pj_scene3d_widgets/cube_mesh.h"  // kCubeFanIndices + the fan / face-normal / edge GLSL
 #include "pj_scene3d_widgets/gl/gl_functions.h"
 
 namespace pj::scene3d {
@@ -30,13 +31,21 @@ static_assert(
 
 namespace {
 
-constexpr std::string_view kPointcloudVertSrc = R"(#version 450 core
+constexpr std::string_view kPointcloudVertHead = R"(#version 450 core
 layout(location = 0) in vec3 in_pos;
 // Integer attribs bound with normalized=GL_FALSE are widened to float by GL,
 // matching readScalarAt (signed types sign-extend).
 layout(location = 1) in float in_scalar;
 layout(location = 2) in vec4 in_color;  // per-point RGBA in [0,1] (kRgb mode)
-out vec4 v_color;
+uniform int  u_color_mode;     // 0 = field-from-LUT, 1 = solid, 2 = per-point rgb
+uniform vec3 u_solid_color;
+uniform int  u_colormap_id;    // 0=turbo, 1=viridis, 2=plasma, 3=grayscale
+uniform bool u_invert;
+// Colour is constant over a point, so the colormap and the sRGB->linear conversion run in
+// the VERTEX stage instead of once per covered fragment. A point sprite has a single
+// vertex, so here that really is once per point (the cube fan runs its vertex stage 7
+// times, so there it is 7x — still far below the fragment count it replaces).
+flat out vec3 v_base_linear;
 uniform mat4 u_view_model;
 uniform mat4 u_proj;
 uniform mat4 u_model;          // source-frame -> fixed-frame (RENDER space); only for fixed-frame axis colour
@@ -62,8 +71,10 @@ uniform bool u_use_perspective_size;
 // vanishing into a 1-pixel dot. The two branches meet continuously at
 // depth = u_depth_threshold. An orthographic projection has no perspective divide.
 uniform float u_depth_threshold;  // metres
-out float v_normalized;
 out float v_outside;  // 1.0 when the point's scalar is outside [range_min, range_max]
+)";
+
+constexpr std::string_view kPointcloudVertTail = R"(
 void main() {
   vec4 view_pos = u_view_model * vec4(in_pos, 1.0);
   gl_Position = u_proj * view_pos;
@@ -87,26 +98,59 @@ void main() {
   } else {
     gl_PointSize = clamp(u_pixel_size, u_min_size_px, u_max_size_px);
   }
-  v_color = in_color;
   // Fixed-frame axis colouring: derive the colormap input from the GPU-transformed
   // position (u_model * in_pos) so sensors at different mounts agree on world height.
   // u_model is render-relative, so add the origin back along the axis to colour by the
   // absolute world coordinate (stable as the camera moves; matches the colormap range).
   float scalar = u_scalar_axis < 0 ? in_scalar
                                    : (u_model * vec4(in_pos, 1.0))[u_scalar_axis] + u_color_axis_offset[u_scalar_axis];
-  float span = max(u_range_max - u_range_min, 1e-9);
-  v_normalized = clamp((scalar - u_range_min) / span, 0.0, 1.0);
-  // Outside-range de-emphasis: flag points whose colour scalar leaves [min,max] so
-  // the fragment shader fades them to u_outside_range_alpha. Cull (degenerate the
-  // vertex outside the clip volume, zero its size) when fully hidden (alpha 0) OR
-  // when this pass excludes our partition — faded points draw in a second pass with
-  // depth writes off so they don't occlude in-range data (1 = in-range, 2 = outside).
-  v_outside = (scalar >= u_range_min && scalar <= u_range_max) ? 0.0 : 1.0;  // NaN -> outside
-  bool cull = (v_outside > 0.5 && (u_outside_range_alpha <= 0.0 || u_partition == 1)) || (v_outside < 0.5 && u_partition == 2);
-  if (cull) {
+  // Cull BEFORE the colormap: a culled point should not pay for a LUT and three pow()s.
+  bool outside;
+  if (pointcloudCulled(scalar, u_range_min, u_range_max, u_outside_range_alpha, u_partition, outside)) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     gl_PointSize = 0.0;
+    return;
   }
+  v_outside = outside ? 1.0 : 0.0;  // drives the fragment stage's fade
+  v_base_linear = resolveBaseLinear(
+      u_color_mode, u_solid_color, in_color.rgb, u_colormap_id, u_invert, scalar, u_range_min, u_range_max);
+}
+)";
+
+// The colour and outside-range blocks all three programs need, in one place. Each was
+// copy-pasted per program before, which is how the point shader's cull threshold drifted
+// away from the cube's. Both take the already-resolved `scalar` because how a shape gets
+// one differs (vertex attribute vs per-instance attribute vs fixed-frame axis), while
+// everything downstream of it does not.
+constexpr std::string_view kPointcloudColorGlsl = R"(
+// Resolve a point's colour and convert to the LINEAR space the scene FBO holds. The
+// colormap LUTs are display-referred sRGB (Phase 0B: the composite present re-encodes),
+// hence the gamma here rather than at the fragment stage.
+vec3 resolveBaseLinear(int color_mode, vec3 solid_color, vec3 per_point_rgb, int colormap_id, bool invert,
+                       float scalar, float range_min, float range_max) {
+  float span = max(range_max - range_min, 1e-9);
+  float normalized = clamp((scalar - range_min) / span, 0.0, 1.0);
+  vec3 base;
+  if (color_mode == 1) {
+    base = solid_color;
+  } else if (color_mode == 2) {
+    base = per_point_rgb;  // per-point colour used directly (no colormap)
+  } else {
+    base = sampleColormap(colormap_id, invert ? 1.0 - normalized : normalized);
+  }
+  return pow(max(base, vec3(0.0)), vec3(2.2));
+}
+
+// True when this draw must not emit the point at all: either the fade would leave nothing
+// visible, or the point belongs to the other half of the opaque/translucent two-pass
+// (u_partition 1 = in-range only, 2 = outside only). Callers degenerate the vertex.
+// `outside` also drives the fragment fade, so it is an out-parameter rather than local.
+// `partition` is a GLSL reserved word, hence partition_mode.
+bool pointcloudCulled(float scalar, float range_min, float range_max, float outside_range_alpha, int partition_mode,
+                      out bool outside) {
+  outside = !(scalar >= range_min && scalar <= range_max);  // NaN -> outside
+  bool invisible = outside_range_alpha <= 0.003;
+  return (outside && (invisible || partition_mode == 1)) || (!outside && partition_mode == 2);
 }
 )";
 
@@ -119,15 +163,10 @@ void main() {
 // The point/sphere fragment shader split around the colormap GLSL: head declares the
 // inputs/uniforms, the LUTs slot in, then this tail's main() consumes them.
 constexpr std::string_view kPointcloudFragHead = R"(#version 450 core
-in float v_normalized;
+flat in vec3 v_base_linear;    // per-point colour, colormapped and linearized already
 in float v_outside;            // 1.0 when the point's scalar is outside [min,max]
-in vec4 v_color;               // per-point RGBA (kRgb mode)
 out vec4 frag_color;
 
-uniform int  u_color_mode;     // 0 = field-from-LUT, 1 = solid, 2 = per-point rgb
-uniform vec3 u_solid_color;
-uniform int  u_colormap_id;    // 0=turbo, 1=viridis, 2=plasma, 3=grayscale
-uniform bool u_invert;
 uniform bool u_shape_is_sphere;  // sphere imposter shading vs flat point
 uniform float u_outside_range_alpha;  // opacity applied where v_outside == 1.0
 )";
@@ -150,48 +189,41 @@ void main() {
     // Sphere normal in eye space. gl_PointCoord.y runs top-to-bottom by
     // default, so we negate the y component.
     vec3 normal = vec3(coord.x, -coord.y, sqrt(1.0 - r2));
-    // Fixed head-light from upper-right-front. Cheap, no extra uniforms.
-    vec3 light_dir = normalize(vec3(0.4, 0.5, 0.8));
-    shading = 0.35 + 0.65 * max(dot(normal, light_dir), 0.0);
+    // Same key light as every other point-cloud solid (cube_mesh.h), so a topic keeps
+    // its apparent lighting when the user switches shape.
+    shading = cubeLambert(normal);
   }
 
-  vec3 base;
-  if (u_color_mode == 1) {
-    base = u_solid_color;
-  } else if (u_color_mode == 2) {
-    base = v_color.rgb;  // per-point colour used directly (no colormap)
-  } else {
-    float t = v_normalized;
-    if (u_invert) {
-      t = 1.0 - t;
-    }
-    base = sampleColormap(u_colormap_id, t);
-  }
-  // Colormaps/solid/per-point colors are display-referred sRGB; the scene FBO is
-  // linear (Phase 0B: the composite present re-encodes to sRGB). Linearize on write.
-  base = pow(max(base, vec3(0.0)), vec3(2.2));
   // Points outside [min,max] fade to u_outside_range_alpha; drop the fully
   // transparent ones so they neither shade nor write depth.
   float alpha = v_outside > 0.5 ? u_outside_range_alpha : 1.0;
   if (alpha <= 0.003) {
     discard;
   }
-  frag_color = vec4(base * shading, alpha);
+  frag_color = vec4(v_base_linear * shading, alpha);
 }
 )";
 
-constexpr std::string_view kCubeVertSrc = R"(#version 450 core
-layout(location = 0) in vec3 in_corner_pos;       // per-vertex (24)
-layout(location = 1) in vec3 in_corner_normal;    // per-vertex (24)
-layout(location = 2) in vec3 in_instance_pos;     // per-instance, divisor=1
+// Cube vertex shader — the hexagon-fan geometry from cube_mesh.h. The cloud VBO is
+// bound with divisor 1 at the SAME attribute locations the point shader uses, so
+// both VAOs share one wiring routine; the cube corners are generated from
+// gl_VertexID instead of read from a vertex buffer.
+constexpr std::string_view kCubeVertHead = R"(#version 450 core
+layout(location = 0) in vec3 in_instance_pos;     // per-instance, divisor=1
 // Integer attribs bound with normalized=GL_FALSE are widened to float by GL,
 // matching readScalarAt (signed types sign-extend).
-layout(location = 3) in float in_instance_scalar; // per-instance, divisor=1
-layout(location = 4) in vec4 in_instance_color;   // per-instance RGBA, divisor=1 (kRgb mode)
+layout(location = 1) in float in_instance_scalar; // per-instance, divisor=1
+layout(location = 2) in vec4 in_instance_color;   // per-instance RGBA, divisor=1 (kRgb mode)
 
 uniform mat4 u_model;          // source-frame -> fixed-frame (RENDER space)
-uniform mat4 u_view;           // fixed-frame (RENDER space) -> view space
-uniform mat4 u_proj;
+uniform mat4 u_viewproj;       // proj * view, folded on the CPU
+// Camera reference for choosing the 3 visible faces, in homogeneous form so one
+// expression covers both projections: a perspective camera passes its eye POSITION
+// in render space (w = 1) and each cube compares its own centre against it; an
+// orthographic camera has no meaningful eye position — the visible faces depend on
+// the view DIRECTION alone — so it passes the scene->camera direction as a point at
+// infinity (w = 0), which drops the per-instance term below.
+uniform vec4 u_face_pick_eye;
 uniform float u_size_meters;
 uniform float u_range_min;
 uniform float u_range_max;
@@ -199,106 +231,219 @@ uniform float u_outside_range_alpha;  // opacity for cubes whose scalar leaves [
 uniform int u_partition;  // 0=all, 1=in-range only, 2=outside only (opaque/translucent two-pass)
 uniform int u_scalar_axis;     // -1 = colour by in_instance_scalar; 0/1/2 = fixed-frame x/y/z
 // Render origin added back along the coloured axis to recover the ABSOLUTE world
-// coordinate (u_model/u_view are render-relative for float precision); see point shader.
+// coordinate (u_model is render-relative for float precision); see point shader.
 uniform vec3 u_color_axis_offset;
+uniform int  u_color_mode;     // 0 = field-from-LUT, 1 = solid, 2 = per-point rgb
+uniform vec3 u_solid_color;
+uniform int  u_colormap_id;    // 0=turbo, 1=viridis, 2=plasma, 3=grayscale
+uniform bool u_invert;
 
-out vec3 v_view_normal;
-out float v_normalized;
-out vec3 v_local;  // unit-cube corner, for the fragment-shader edge outline
-out vec4 v_color;
+// The cube's colour is constant over the whole cube, so the colormap and the sRGB->linear
+// conversion move to the vertex stage. That is 7 evaluations per cube, not one — the fan
+// runs every vertex — but a covered cube spans far more fragments than that. flat:
+// every vertex of an instance computes the same value, so the provoking vertex
+// cannot matter (unlike the face normal, which is why THAT one is derived from
+// v_local instead).
+flat out vec3 v_base_linear;
+// CENTROID, and it matters: the fragment stage derives the face normal from this by
+// asking which component reached the cube surface. Default (pixel-centre) sampling
+// extrapolates outside the triangle on partially covered MSAA pixels, which can push
+// a NON-face component past 0.5 and pick the wrong face — invisible on a large cube,
+// but on cubes a few pixels across nearly every pixel is a silhouette pixel, so whole
+// clouds shade wrong. Centroid sampling keeps the sample inside the primitive.
+centroid out vec3 v_local;  // unit-cube corner: drives both the face normal and the edge outline
 out float v_outside;  // 1.0 when the cube's scalar is outside [range_min, range_max]
+)";
 
+constexpr std::string_view kCubeVertTail = R"(
 void main() {
-  v_local = in_corner_pos;
   // Cubes are axis-aligned in the fixed frame: transform the instance
   // position into fixed-frame coordinates, then add the corner offset
   // unchanged. No per-instance rotation matrix is needed.
   vec3 instance_in_fixed = (u_model * vec4(in_instance_pos, 1.0)).xyz;
-  vec3 vertex_in_fixed = instance_in_fixed + in_corner_pos * u_size_meters;
-  gl_Position = u_proj * u_view * vec4(vertex_in_fixed, 1.0);
-  // Corner normals are in fixed-frame axes; bring them into view space for
-  // the camera-relative key light in the fragment shader.
-  v_view_normal = mat3(u_view) * in_corner_normal;
-  // Fixed-frame axis colouring reuses instance_in_fixed (already computed above).
-  // instance_in_fixed is render-relative, so add the origin back to colour by the
-  // absolute world coordinate (stable as the camera moves; matches the range).
+  // Fixed-frame axis colouring reuses instance_in_fixed. It is render-relative, so add
+  // the origin back to colour by the absolute world coordinate (stable as the camera
+  // moves; matches the range).
   float scalar = u_scalar_axis < 0 ? in_instance_scalar
                                    : instance_in_fixed[u_scalar_axis] + u_color_axis_offset[u_scalar_axis];
-  float span = max(u_range_max - u_range_min, 1e-9);
-  v_normalized = clamp((scalar - u_range_min) / span, 0.0, 1.0);
-  v_color = in_instance_color;
-  // Outside-range de-emphasis: flag out-of-range cubes for the fragment fade;
-  // degenerate-clip when fully hidden (alpha 0) or when this pass excludes our
-  // partition (1 = in-range only, 2 = outside only) — the translucent two-pass.
-  v_outside = (scalar >= u_range_min && scalar <= u_range_max) ? 0.0 : 1.0;  // NaN -> outside
-  bool cull = (v_outside > 0.5 && (u_outside_range_alpha <= 0.0 || u_partition == 1)) || (v_outside < 0.5 && u_partition == 2);
-  if (cull) {
+  // Culling HERE rather than discarding per fragment is what keeps the cube FRAGMENT
+  // shader discard-free, and with it the GPU's early-Z depth writes: cube clouds overdraw
+  // heavily, and late-Z would shade every hidden fragment. Doing it before the corner and
+  // colour work below also means a culled cube costs almost nothing — and it runs 7 times
+  // per cube, so that is 7x the saving of the same move in the point shader.
+  bool outside;
+  if (pointcloudCulled(scalar, u_range_min, u_range_max, u_outside_range_alpha, u_partition, outside)) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
   }
+  v_outside = outside ? 1.0 : 0.0;
+  vec3 to_camera = u_face_pick_eye.xyz - u_face_pick_eye.w * instance_in_fixed;
+  v_local = cubeFanCorner(gl_VertexID, cubeFaceSigns(to_camera));
+  gl_Position = u_viewproj * vec4(instance_in_fixed + v_local * u_size_meters, 1.0);
+  v_base_linear = resolveBaseLinear(
+      u_color_mode, u_solid_color, in_instance_color.rgb, u_colormap_id, u_invert, scalar, u_range_min, u_range_max);
 }
 )";
 
 // The cube fragment shader split around the colormap GLSL (same shared source as
 // the point shader). Head declares inputs/uniforms; tail's main() shades.
 constexpr std::string_view kCubeFragHead = R"(#version 450 core
-in vec3 v_view_normal;
-in float v_normalized;
-in vec3 v_local;
-in vec4 v_color;               // per-instance RGBA (kRgb mode)
+flat in vec3 v_base_linear;    // per-cube colour, colormapped and linearized already
+centroid in vec3 v_local;      // must match the vertex stage — see the note there
 in float v_outside;            // 1.0 when the cube's scalar is outside [min,max]
 out vec4 frag_color;
 
-uniform int  u_color_mode;     // 0 = field-from-LUT, 1 = solid, 2 = per-point rgb
-uniform vec3 u_solid_color;
-uniform int  u_colormap_id;    // 0=turbo, 1=viridis, 2=plasma, 3=grayscale
-uniform bool u_invert;
+uniform mat4 u_view;           // only its rotation is used, to orient the face normal
 uniform float u_outside_range_alpha;  // opacity applied where v_outside == 1.0
 )";
 
+// No `discard` anywhere in this shader, by design — see the vertex-stage cull.
 constexpr std::string_view kCubeFragTail = R"(
 void main() {
-  // View-space Lambertian. Light direction in view space — fixed
-  // upper-right-front, same recipe as the sphere imposter for consistency.
-  vec3 n = normalize(v_view_normal);
-  vec3 light_dir = normalize(vec3(0.4, 0.5, 0.8));
-  float shading = 0.35 + 0.65 * max(dot(n, light_dir), 0.0);
+  // View-space Lambertian against the shared key light (cube_mesh.h), which the LOD
+  // sprite averages — keep them reading the same constants. The normal is recovered
+  // from the interpolated corner rather than interpolated itself, which is what lets
+  // the vertex stage drop its normal attribute.
+  float shading = cubeLambert(cubeFaceNormalView(v_local, mat3(u_view)));
 
-  vec3 base;
-  if (u_color_mode == 1) {
-    base = u_solid_color;
-  } else if (u_color_mode == 2) {
-    base = v_color.rgb;  // per-point colour used directly (no colormap)
-  } else {
-    float t = v_normalized;
-    if (u_invert) {
-      t = 1.0 - t;
-    }
-    base = sampleColormap(u_colormap_id, t);
-  }
   // Darker outline on each cube's faces (same hue), so adjacent cubes stay legible.
-  base = mix(base, base * 0.4, cubeEdgeFactor(v_local));
-  // Colormaps/solid/per-point colors are display-referred sRGB; the scene FBO is
-  // linear (Phase 0B: the composite present re-encodes to sRGB). Linearize on write.
-  base = pow(max(base, vec3(0.0)), vec3(2.2));
-  // Cubes outside [min,max] fade to u_outside_range_alpha; drop fully transparent ones.
+  // The outline SCALES the colour — mix(b, b*0.4, e) == b * (1 - 0.6*e) — so it
+  // commutes with the sRGB->linear conversion the vertex stage already applied:
+  // pow(b*k, 2.2) == pow(b, 2.2) * pow(k, 2.2). Hoisting the colour left exactly this
+  // one scalar pow per fragment in place of a colormap plus three vector pows.
+  float edge_scale = 1.0 - kCubeEdgeDarken * cubeEdgeFactor(v_local);
+  vec3 base = v_base_linear * pow(edge_scale, 2.2);
+  // Cubes outside [min,max] fade to u_outside_range_alpha; the vertex stage already
+  // culled the ones that would fade to nothing.
   float alpha = v_outside > 0.5 ? u_outside_range_alpha : 1.0;
-  if (alpha <= 0.003) {
-    discard;
-  }
   frag_color = vec4(base * shading, alpha);
+}
+)";
+
+// Cube LOD sprite vertex shader — the cube shape's far-field form, drawn INSTEAD of the
+// fan (never alongside it) once render() has established that no cube in the cloud
+// reaches the threshold. It runs over the SAME cloud VBO through the point VAO, so it
+// costs one vertex per point and needs no buffers, and it draws unconditionally: the
+// pass either owns the whole cloud or does not run. Everything the fragment stage needs
+// is constant over a sprite, so the shading collapses into one flat varying here and the
+// fragment shader is a single store — no colormap, no normal, no discard.
+constexpr std::string_view kCubeSpriteVertHead = R"(#version 450 core
+layout(location = 0) in vec3 in_pos;
+layout(location = 1) in float in_scalar;
+layout(location = 2) in vec4 in_color;
+
+uniform mat4 u_model;          // source-frame -> fixed-frame (RENDER space)
+uniform mat4 u_view;           // supplies the face foreshortening AND the key-light dots
+uniform mat4 u_clip_from_source;   // proj * view * model, folded on the CPU
+uniform vec4 u_face_pick_eye;  // as the fan: eye position (w=1) or view direction (w=0)
+uniform float u_size_px_scale; // projected pixels per cube at clip w == 1
+uniform float u_range_min;
+uniform float u_range_max;
+uniform float u_outside_range_alpha;
+uniform int u_partition;       // 0=all, 1=in-range only, 2=outside only
+uniform int u_scalar_axis;
+uniform vec3 u_color_axis_offset;
+uniform int  u_color_mode;
+uniform vec3 u_solid_color;
+uniform int  u_colormap_id;
+uniform bool u_invert;
+
+flat out vec4 v_color_linear;  // rgb already shaded and linearized, a = coverage-scaled alpha
+)";
+
+constexpr std::string_view kCubeSpriteVertTail = R"(
+void main() {
+  gl_Position = u_clip_from_source * vec4(in_pos, 1.0);
+  gl_PointSize = 0.0;
+  vec3 instance_in_fixed = (u_model * vec4(in_pos, 1.0)).xyz;
+
+  float scalar = u_scalar_axis < 0 ? in_scalar
+                                   : instance_in_fixed[u_scalar_axis] + u_color_axis_offset[u_scalar_axis];
+  bool outside;
+  if (pointcloudCulled(scalar, u_range_min, u_range_max, u_outside_range_alpha, u_partition, outside)) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
+  // A square of the cube's projected AREA. Where the driver refuses to go that small,
+  // widen it and dim it by the area we overshot, so a cloud receding into the distance
+  // loses brightness at the rate its cubes lose area instead of plateauing at one pixel.
+  vec3 to_camera = u_face_pick_eye.xyz - u_face_pick_eye.w * instance_in_fixed;
+  vec3 face_weights = cubeProjectedFaceWeights(to_camera);
+  // Under perspective (w == 1) to_camera is the eye ray, so its length against the
+  // view-axis depth gives the off-axis cosine. Ortho passes a direction and has no
+  // off-axis tilt at all, hence the 1.
+  float cos_view_angle =
+      u_face_pick_eye.w > 0.5 ? clamp(gl_Position.w / max(length(to_camera), 1e-6), 1e-3, 1.0) : 1.0;
+  float side_px = cubeSpriteSidePx(face_weights, u_size_px_scale / max(gl_Position.w, 1e-4), cos_view_angle);
+  if (side_px <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);  // a zero-size cube must draw nothing, not a min-size dot
+    return;
+  }
+  // Floor at ONE DEVICE PIXEL and draw at FULL colour, however far out the camera goes.
+  // That is the same contract kPoint and kSphere already have, and what a viewer expects:
+  // a distant point stays visible, in its own colour, instead of fading out or vanishing.
+  // The floor is an explicit 1.0 rather than the driver's GL_POINT_SIZE_RANGE minimum,
+  // which some drivers report below 1 — the guarantee here is a product requirement, not
+  // whatever the hardware happens to permit.
+  //
+  // Dimming by the area overshoot instead would conserve the cube's total light, which is
+  // exact only against a BLACK background: this pass writes alpha 1 with blending off, so
+  // a heavily dimmed sprite replaces the background rather than blending into it, and a
+  // zoomed-out cloud turns black on a light one. Flooring costs exactness in the other
+  // direction — a clamped sprite is brighter than the cube it stands in for — but that is
+  // the same, expected, floor every other shape here has, and it only begins once the
+  // sprite is already sub-pixel. At the LOD threshold itself side_px is ~1.2 px, above the
+  // floor, so the switch is still an exact area match and does not pop.
+  gl_PointSize = max(side_px, 1.0);
+
+  float shading = cubeSpriteShading(cubeFaceSigns(to_camera), face_weights, u_view);
+
+  vec3 base_linear = resolveBaseLinear(
+      u_color_mode, u_solid_color, in_color.rgb, u_colormap_id, u_invert, scalar, u_range_min, u_range_max);
+  v_color_linear = vec4(base_linear * shading, outside ? u_outside_range_alpha : 1.0);
+}
+)";
+
+constexpr std::string_view kCubeSpriteFragSrc = R"(#version 450 core
+flat in vec4 v_color_linear;
+out vec4 frag_color;
+
+void main() {
+  frag_color = v_color_linear;
 }
 )";
 
 // Compose each fragment source once (head + shared LUTs + tail). string_view
 // concatenation needs std::string; fromSources takes string_view so the static
 // strings convert implicitly. function-local statics build them on first use.
+// Every vertex program is head + the shared colormap LUTs + the shared colour/cull
+// helpers (which call into those LUTs, so order matters) + its own main().
+std::string makePointcloudVertSrc() {
+  return std::string(kPointcloudVertHead) + std::string(PJ::colormapGlsl()) + std::string(kPointcloudColorGlsl) +
+         std::string(kPointcloudVertTail);
+}
+
 std::string makePointcloudFragSrc() {
-  return std::string(kPointcloudFragHead) + std::string(PJ::colormapGlsl()) + std::string(kPointcloudFragTail);
+  return std::string(kPointcloudFragHead) + std::string(kCubeLightingGlsl) + std::string(kPointcloudFragTail);
+}
+
+// The colormap LUTs now live in the VERTEX stage of both programs — the colour is
+// per point, so evaluating it per fragment was work proportional to coverage.
+std::string makeCubeVertSrc() {
+  return std::string(kCubeVertHead) + std::string(PJ::colormapGlsl()) + std::string(kPointcloudColorGlsl) +
+         std::string(kCubeFanGlsl) + std::string(kCubeVertTail);
 }
 
 std::string makeCubeFragSrc() {
-  return std::string(kCubeFragHead) + std::string(PJ::colormapGlsl()) + std::string(kCubeEdgeGlsl) +
-         std::string(kCubeFragTail);
+  return std::string(kCubeFragHead) + std::string(kCubeFaceNormalGlsl) + std::string(kCubeLightingGlsl) +
+         std::string(kCubeEdgeGlsl) + std::string(kCubeFragTail);
+}
+
+std::string makeCubeSpriteVertSrc() {
+  return std::string(kCubeSpriteVertHead) + std::string(PJ::colormapGlsl()) + std::string(kPointcloudColorGlsl) +
+         std::string(kCubeFanGlsl) + std::string(kCubeLightingGlsl) + std::string(kCubeSpriteGlsl) +
+         std::string(kCubeSpriteVertTail);
 }
 
 struct CloudVertex {
@@ -308,6 +453,106 @@ struct CloudVertex {
   float scalar;
   uint32_t rgba;  // packed per-point color (byte0=R..byte3=A); uploaded as 4 normalized bytes
 };
+
+// The CloudVertex fallback described as an AttribLayout, so the wiring below has a
+// single code path for it and for the zero-copy wire buffer.
+constexpr AttribLayout kFallbackLayout{/*stride=*/static_cast<uint32_t>(sizeof(CloudVertex)),
+                                       /*xyz_offset=*/0U,
+                                       /*scalar_offset=*/12U,
+                                       /*scalar_gl_type=*/kGlFloat,
+                                       /*has_scalar=*/true,
+                                       /*color_offset=*/16U,
+                                       /*has_color=*/true};
+
+// Wire the currently bound cloud VBO at locations 0/1/2 (position, scalar, packed
+// RGBA) into the currently bound VAO. The point and cube programs declare exactly
+// these three inputs, so their VAOs differ only in `divisor`: 0 draws one vertex
+// per point, 1 makes each point one instance of the cube fan.
+template <typename Functions>
+void bindCloudAttribs(Functions& functions, const AttribLayout& layout, GLuint divisor) {
+  const auto offset_ptr = [](uint32_t offset) {
+    return reinterpret_cast<const void*>(static_cast<std::uintptr_t>(offset));
+  };
+  const auto stride = static_cast<GLsizei>(layout.stride);
+  functions.glEnableVertexAttribArray(0U);
+  functions.glVertexAttribPointer(0U, 3, GL_FLOAT, GL_FALSE, stride, offset_ptr(layout.xyz_offset));
+  functions.glVertexAttribDivisor(0U, divisor);
+  if (layout.has_scalar) {
+    functions.glEnableVertexAttribArray(1U);
+    functions.glVertexAttribPointer(
+        1U, 1, static_cast<GLenum>(layout.scalar_gl_type), GL_FALSE, stride, offset_ptr(layout.scalar_offset));
+    functions.glVertexAttribDivisor(1U, divisor);
+  } else {
+    functions.glDisableVertexAttribArray(1U);
+    functions.glVertexAttrib1f(1U, 0.0f);
+  }
+  if (layout.has_color) {
+    // Packed RGBA straight from the buffer: 4 normalized bytes -> vec4 in [0,1]
+    // (the shader paints .rgb), pixel-identical to the CPU rgba extraction.
+    functions.glEnableVertexAttribArray(2U);
+    functions.glVertexAttribPointer(2U, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, offset_ptr(layout.color_offset));
+    functions.glVertexAttribDivisor(2U, divisor);
+  } else {
+    functions.glDisableVertexAttribArray(2U);
+  }
+}
+
+// The layout the active cloud is bound with — the wire layout on the fast path,
+// the converted CloudVertex layout otherwise.
+const AttribLayout& activeLayout(
+    const std::variant<std::monostate, FastCloudData, std::shared_ptr<const DecodedPointCloud>>& cloud) {
+  if (const auto* fast = std::get_if<FastCloudData>(&cloud); fast != nullptr) {
+    return fast->layout;
+  }
+  return kFallbackLayout;
+}
+
+// What the cube shader's u_face_pick_eye carries, in homogeneous form: the eye
+// POSITION in render space (w = 1) for a perspective camera, or the scene->camera
+// DIRECTION as a point at infinity (w = 0) for an orthographic one, where which
+// faces a cube shows depends on the view direction and not on where along it the eye
+// sits. proj[3][3] is 0 only for perspective — the same discriminator the point
+// shader applies in GLSL, but it must be read off the PROJECTION: folding view into
+// it leaves the eye's view-axis distance in that slot, not zero.
+glm::vec4 facePickReference(const ViewParams& view_params) {
+  // The view rotation is rigid, so its inverse is its transpose.
+  const glm::mat3 inverse_rotation = glm::transpose(glm::mat3(view_params.view));
+  if (view_params.proj[3][3] == 0.0f) {
+    return glm::vec4(-inverse_rotation * glm::vec3(view_params.view[3]), 1.0f);
+  }
+  // View space looks down -Z, so +Z points back at the camera.
+  return glm::vec4(inverse_rotation * glm::vec3(0.0f, 0.0f, 1.0f), 0.0f);
+}
+
+// Out-of-range geometry draws in a SECOND pass, blended and with depth writes off, so it
+// tints without occluding the crisp in-range data behind it (the opaque/translucent split
+// the mesh passes use).
+void beginFadedPass() {
+  withGlFunctions([](auto& functions) {
+    functions.glEnable(GL_BLEND);
+    functions.glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    functions.glDepthMask(GL_FALSE);
+  });
+}
+
+void endFadedPass() {
+  withGlFunctions([](auto& functions) { functions.glDepthMask(GL_TRUE); });
+}
+
+// The partition schedule every program in this pass shares: one opaque draw, then the
+// faded out-of-range draw when there is one. `u_partition` selects which half the vertex
+// stage keeps (0 = all, 1 = in-range only, 2 = outside only).
+template <typename Draw>
+void drawInPartitions(gl::Program& program, bool blend_outside, const Draw& draw) {
+  program.setInt("u_partition", blend_outside ? 1 : 0);
+  draw();
+  if (blend_outside) {
+    program.setInt("u_partition", 2);
+    beginFadedPass();
+    draw();
+    endFadedPass();
+  }
+}
 
 // Shader u_color_mode selector: 0 = colormap-from-scalar, 1 = solid, 2 = per-point rgb.
 int colorModeUniform(PointcloudRenderPass::ColorType type) {
@@ -359,10 +604,10 @@ void PointcloudRenderPass::releaseGL() {
   // forces the cube path to rebind too.
   program_.reset();
   cube_program_.reset();
+  cube_sprite_program_.reset();
   vao_ = gl::VertexArray{};
   vbo_ = gl::Buffer{};
   cube_vao_ = gl::VertexArray{};
-  cube_vbo_ = gl::Buffer{};
   cube_ebo_ = gl::Buffer{};
   aabb_reducer_.releaseGL();  // re-probes lazily on the next dispatch in the new context
   vbo_point_count_ = 0U;
@@ -382,8 +627,9 @@ void PointcloudRenderPass::initializeGL() {
   if (initialized_) {
     return;
   }
+  static const std::string k_pointcloud_vert_src = makePointcloudVertSrc();
   static const std::string k_pointcloud_frag_src = makePointcloudFragSrc();
-  auto result = gl::Program::fromSources(kPointcloudVertSrc, k_pointcloud_frag_src);
+  auto result = gl::Program::fromSources(k_pointcloud_vert_src, k_pointcloud_frag_src);
   if (auto* program = std::get_if<gl::Program>(&result); program != nullptr) {
     program_ = std::make_unique<gl::Program>(std::move(*program));
   } else {
@@ -392,8 +638,9 @@ void PointcloudRenderPass::initializeGL() {
     return;
   }
 
+  static const std::string k_cube_vert_src = makeCubeVertSrc();
   static const std::string k_cube_frag_src = makeCubeFragSrc();
-  auto cube_result = gl::Program::fromSources(kCubeVertSrc, k_cube_frag_src);
+  auto cube_result = gl::Program::fromSources(k_cube_vert_src, k_cube_frag_src);
   if (auto* program = std::get_if<gl::Program>(&cube_result); program != nullptr) {
     cube_program_ = std::make_unique<gl::Program>(std::move(*program));
   } else {
@@ -403,16 +650,48 @@ void PointcloudRenderPass::initializeGL() {
     // check in render().
   }
 
-  // Upload the static cube mesh once. Per-instance attribs in cube_vao_
-  // are wired up lazily on first cube draw (vbo_ must have a real ID by
-  // then), so don't touch cube_vao_ here.
-  cube_vbo_.uploadStatic(
-      GL_ARRAY_BUFFER, kCubeVertices.data(), static_cast<GLsizeiptr>(kCubeVertices.size() * sizeof(CubeVertex)));
+  static const std::string k_cube_sprite_vert_src = makeCubeSpriteVertSrc();
+  auto sprite_result = gl::Program::fromSources(k_cube_sprite_vert_src, kCubeSpriteFragSrc);
+  if (auto* program = std::get_if<gl::Program>(&sprite_result); program != nullptr) {
+    cube_sprite_program_ = std::make_unique<gl::Program>(std::move(*program));
+  } else {
+    fmt::print(stderr, "PointcloudRenderPass cube sprite shader error: {}\n", std::get<std::string>(sprite_result));
+    // The fan alone still draws every cube correctly, just without the LOD — render()
+    // withholds the split when this program is missing.
+    cube_sprite_program_.reset();
+  }
+
+  // The fan cube has no vertex buffer — the corners come out of gl_VertexID — so
+  // only its index buffer is uploaded, inside cube_vao_ (an element-buffer binding
+  // is captured by the bound VAO). The per-instance attribs are wired lazily on the
+  // first cube draw, once vbo_ has a real name.
+  cube_vao_.bind();
   cube_ebo_.uploadStatic(
-      GL_ELEMENT_ARRAY_BUFFER, kCubeIndices.data(), static_cast<GLsizeiptr>(kCubeIndices.size() * sizeof(uint8_t)));
+      GL_ELEMENT_ARRAY_BUFFER, kCubeFanIndices.data(),
+      static_cast<GLsizeiptr>(kCubeFanIndices.size() * sizeof(uint16_t)));
+  cube_vao_.unbind();
   cube_instance_bindings_dirty_ = true;
 
-  withGlFunctions([](auto& functions) { functions.glEnable(GL_PROGRAM_POINT_SIZE); });
+  withGlFunctions([](auto& functions) {
+    functions.glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // A COMPATIBILITY-profile context rasterizes multisampled points as CIRCLES unless
+    // point sprites are on, and a circle covers pi/4 of the square everything here
+    // assumes: the LOD sprite lands 21% dim (measured 0.773 against the fan), and
+    // gl_PointCoord — which the sphere imposter needs — is not even defined. Enabling
+    // GL_POINT_SPRITE restores the core-profile semantics both rely on.
+    //
+    // The profile has to come from GL. Qt reports CoreProfile in QSurfaceFormat on
+    // contexts whose GL_VERSION says Compatibility (reproducible under
+    // QT_QPA_PLATFORM=offscreen), so trusting the format silently misses this. Enabling
+    // it on a real core context would be GL_INVALID_ENUM, hence the gate.
+    constexpr GLenum kPointSprite = 0x8861;  // compatibility-only, absent from core headers
+    GLint profile_mask = 0;
+    functions.glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profile_mask);
+    if ((static_cast<GLuint>(profile_mask) & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0U) {
+      functions.glEnable(kPointSprite);
+    }
+  });
 
   initialized_ = true;
   cloud_dirty_ = true;
@@ -430,8 +709,20 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
   // draw, so spatial_auto_bounds_ (set by the callback in spatial-axis modes) and
   // the camera see the fresh extent this frame. Non-blocking — nullopt until the
   // fence signals. Always polled (even if disabled now) so a late result drains.
-  if (auto box = aabb_reducer_.poll(); box.has_value() && bounds_callback_) {
-    bounds_callback_(*box);
+  if (auto box = aabb_reducer_.poll(); box.has_value()) {
+    // The reducer keeps one fence, and a dispatch always immediately follows an upload,
+    // so a completed result describes the cloud currently in the VBO — as long as THIS
+    // cloud dispatched one. A cloud swapped in while a PRIOR cloud's reduction was still
+    // in flight leaves the flag clear, and the result that lands then belongs to a cloud
+    // nobody is drawing: publishing it would hand the layer an extent for the wrong data,
+    // which now feeds the frustum reject and the LOD gate as well as the camera fit. Drop
+    // it and wait for this cloud's own reduction.
+    if (gpu_bounds_current_) {
+      geometry_bounds_ = box->valid ? box : std::nullopt;
+      if (bounds_callback_) {
+        bounds_callback_(*box);
+      }
+    }
   }
 
   if (cloud_dirty_) {
@@ -451,32 +742,7 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
       const GLsizeiptr bytes = static_cast<GLsizeiptr>(fast->point_count) * fast->layout.stride;
       vbo_.uploadStatic(GL_ARRAY_BUFFER, fast->wire.data.data(), bytes);
       vao_.bind();
-      withGlFunctions([&](auto& functions) {
-        functions.glEnableVertexAttribArray(0U);
-        functions.glVertexAttribPointer(
-            0U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(fast->layout.stride),
-            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.xyz_offset)));
-        if (fast->layout.has_scalar) {
-          functions.glEnableVertexAttribArray(1U);
-          functions.glVertexAttribPointer(
-              1U, 1, static_cast<GLenum>(fast->layout.scalar_gl_type), GL_FALSE,
-              static_cast<GLsizei>(fast->layout.stride),
-              reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.scalar_offset)));
-        } else {
-          functions.glDisableVertexAttribArray(1U);
-          functions.glVertexAttrib1f(1U, 0.0f);
-        }
-        if (fast->layout.has_color) {
-          // Packed RGBA straight from the wire buffer: 4 normalized bytes -> vec4 in [0,1]
-          // (the shader paints .rgb), pixel-identical to the CPU rgba extraction.
-          functions.glEnableVertexAttribArray(2U);
-          functions.glVertexAttribPointer(
-              2U, 4, GL_UNSIGNED_BYTE, GL_TRUE, static_cast<GLsizei>(fast->layout.stride),
-              reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.color_offset)));
-        } else {
-          functions.glDisableVertexAttribArray(2U);
-        }
-      });
+      withGlFunctions([&](auto& functions) { bindCloudAttribs(functions, fast->layout, 0U); });
       vao_.unbind();
 
       vbo_point_count_ = fast->point_count;
@@ -486,6 +752,7 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
       // guaranteed by the layer before it enables this.
       if (gpu_aabb_enabled_ && fast->point_count > 0U) {
         aabb_reducer_.dispatch(vbo_.id(), fast->point_count, fast->layout.stride, fast->layout.xyz_offset);
+        gpu_bounds_current_ = true;
       }
     } else if (
         const auto* fallback = std::get_if<std::shared_ptr<const DecodedPointCloud>>(&cloud_);
@@ -505,19 +772,7 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
       vbo_.uploadStatic(
           GL_ARRAY_BUFFER, vertices.data(), static_cast<GLsizeiptr>(vertices.size() * sizeof(CloudVertex)));
       vao_.bind();
-      withGlFunctions([](auto& functions) {
-        functions.glEnableVertexAttribArray(0U);
-        functions.glVertexAttribPointer(0U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CloudVertex)), nullptr);
-        functions.glEnableVertexAttribArray(1U);
-        functions.glVertexAttribPointer(
-            1U, 1, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CloudVertex)), reinterpret_cast<const void*>(12));
-        // Packed RGBA at byte offset 16, fed as 4 normalized unsigned bytes -> vec4 in [0,1],
-        // with .r = byte0 = Red (matches the canonical 'rgba' little-endian layout).
-        functions.glEnableVertexAttribArray(2U);
-        functions.glVertexAttribPointer(
-            2U, 4, GL_UNSIGNED_BYTE, GL_TRUE, static_cast<GLsizei>(sizeof(CloudVertex)),
-            reinterpret_cast<const void*>(16));
-      });
+      withGlFunctions([](auto& functions) { bindCloudAttribs(functions, kFallbackLayout, 0U); });
       vao_.unbind();
 
       vbo_point_count_ = decoded.positions.size();
@@ -534,6 +789,44 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
     return;
   }
 
+  // Camera-relative model (frame_ctx.lookup already subtracted render_origin in
+  // double): geometry is placed in render space, so the eye→point delta survives
+  // float32 even when following a frame at large world coordinates. The colour axis
+  // is lifted back to absolute world below; positions stay relative.
+  const glm::mat4 model = glm::mat4(transform->matrix());
+  const glm::mat4 view_proj = view_params.proj * view_params.view;
+
+  // One shared decision for every shape: skip / sprite / fan. chooseCubeDrawMode lives in
+  // pj_scene3d_core so the voxel-grid pass reaches the same verdict from the same code —
+  // it owns the frustum reject (against the box inflated to cover the GEOMETRY, not just
+  // the point centres), the camera-inside fallback, and the LOD threshold.
+  const int policy_device_height =
+      view_params.device_height_px > 0 ? view_params.device_height_px : view_params.viewport_height_px;
+  const float pixels_per_metre = view_params.proj[1][1] * static_cast<float>(std::max(policy_device_height, 1)) * 0.5f;
+  const bool cube_shape = shape_ == Shape::kCube && cube_program_ != nullptr;
+
+  CubeCloudView cloud_view;
+  cloud_view.centre_bounds = geometry_bounds_.value_or(AABB{});
+  cloud_view.clip_from_cloud = view_proj * model;
+  // The policy wants the eye in the CLOUD's frame; model is render-relative, so invert it.
+  if (const auto eye_render = eyeInRenderSpace(view_params); eye_render.has_value()) {
+    cloud_view.eye_in_cloud = glm::vec3(glm::inverse(model) * glm::vec4(*eye_render, 1.0f));
+  }
+  // kPoint is sized in PIXELS, so it adds no world extent to inflate by.
+  cloud_view.cube_size_m = shape_ == Shape::kPoint ? 0.0f : size_meters_;
+  cloud_view.pixels_per_metre = pixels_per_metre;
+  cloud_view.lod_threshold_px = cube_shape ? cube_lod_threshold_px_ : 0.0f;
+
+  // No 24-vertex solid on this path: at point-cloud cube sizes the camera cannot get
+  // inside one, so kSolid degrades to the fan rather than earning a third geometry. The
+  // voxel pass, whose cubes can swallow the viewpoint, is the one that owns that case.
+  const CubeDrawCapabilities capabilities{/*sprite=*/cube_shape && cube_sprite_program_ != nullptr, /*fan=*/true,
+                                          /*solid=*/false};
+  const CubeDrawMode draw_mode = chooseCubeDrawMode(cloud_view, capabilities);
+  if (draw_mode == CubeDrawMode::kSkip) {
+    return;
+  }
+
   // Outside-range opacity: points/cubes whose scalar leaves [range_min, range_max]
   // render at outside_alpha instead of clamped-opaque. Only in kField mode (solid/
   // rgb have no scalar to test); 0 fully hides them (the vertex shader culls them),
@@ -546,20 +839,7 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
   // "grade me" instead of inheriting alpha=0 from TF/HUD annotations drawn earlier.
   const bool blend_outside = outside_alpha > 0.0f && outside_alpha < 1.0f;
   withGlFunctions([](auto& functions) { functions.glDisable(GL_BLEND); });
-  const auto begin_faded_pass = []() {
-    withGlFunctions([](auto& functions) {
-      functions.glEnable(GL_BLEND);
-      functions.glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-      functions.glDepthMask(GL_FALSE);
-    });
-  };
-  const auto end_faded_pass = []() { withGlFunctions([](auto& functions) { functions.glDepthMask(GL_TRUE); }); };
 
-  // Camera-relative model (frame_ctx.lookup already subtracted render_origin in
-  // double): geometry is placed in render space, so the eye→point delta survives
-  // float32 even when following a frame at large world coordinates. The colour axis
-  // is lifted back to absolute world below; positions stay relative.
-  const glm::mat4 model = glm::mat4(transform->matrix());
   const glm::vec3 color_axis_offset(frame_ctx.render_origin);
 
   // Fixed-frame axis auto-range: derive the colormap [min,max] from the source
@@ -577,166 +857,129 @@ void PointcloudRenderPass::render(const ViewParams& view_params, const FrameCont
     effective_range_max = axis_max + axis_offset;
   }
 
+  const FrameDraw frame_draw{model,         view_proj,     color_axis_offset, effective_range_min, effective_range_max,
+                             outside_alpha, blend_outside, draw_mode};
   if (shape_ == Shape::kCube && cube_program_ != nullptr) {
-    // Lazy re-wiring of the cube VAO's per-instance attribs to vbo_. The
-    // buffer ID is stable across cloud swaps, but stride/offset/type can vary.
-    if (cube_instance_bindings_dirty_) {
-      cube_vao_.bind();
-      cube_vbo_.bind(GL_ARRAY_BUFFER);
-      withGlFunctions([](auto& functions) {
-        functions.glEnableVertexAttribArray(0U);
-        functions.glVertexAttribPointer(0U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CubeVertex)), nullptr);
-        functions.glEnableVertexAttribArray(1U);
-        functions.glVertexAttribPointer(
-            1U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CubeVertex)), reinterpret_cast<const void*>(12));
-      });
-      vbo_.bind(GL_ARRAY_BUFFER);
-      if (const auto* fast = std::get_if<FastCloudData>(&cloud_); fast != nullptr) {
-        withGlFunctions([&](auto& functions) {
-          functions.glEnableVertexAttribArray(2U);
-          functions.glVertexAttribPointer(
-              2U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(fast->layout.stride),
-              reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.xyz_offset)));
-          functions.glVertexAttribDivisor(2U, 1U);
-          if (fast->layout.has_scalar) {
-            functions.glEnableVertexAttribArray(3U);
-            functions.glVertexAttribPointer(
-                3U, 1, static_cast<GLenum>(fast->layout.scalar_gl_type), GL_FALSE,
-                static_cast<GLsizei>(fast->layout.stride),
-                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.scalar_offset)));
-            functions.glVertexAttribDivisor(3U, 1U);
-          } else {
-            functions.glDisableVertexAttribArray(3U);
-            functions.glVertexAttrib1f(3U, 0.0f);
-          }
-          if (fast->layout.has_color) {
-            functions.glEnableVertexAttribArray(4U);
-            functions.glVertexAttribPointer(
-                4U, 4, GL_UNSIGNED_BYTE, GL_TRUE, static_cast<GLsizei>(fast->layout.stride),
-                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(fast->layout.color_offset)));
-            functions.glVertexAttribDivisor(4U, 1U);
-          } else {
-            functions.glDisableVertexAttribArray(4U);
-          }
-        });
-      } else {
-        withGlFunctions([](auto& functions) {
-          functions.glEnableVertexAttribArray(2U);
-          functions.glVertexAttribPointer(
-              2U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CloudVertex)), nullptr);
-          functions.glVertexAttribDivisor(2U, 1U);
-          functions.glEnableVertexAttribArray(3U);
-          functions.glVertexAttribPointer(
-              3U, 1, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CloudVertex)), reinterpret_cast<const void*>(12));
-          functions.glVertexAttribDivisor(3U, 1U);
-          // Per-instance packed RGBA (4 normalized bytes -> vec4), same layout as the point path.
-          functions.glEnableVertexAttribArray(4U);
-          functions.glVertexAttribPointer(
-              4U, 4, GL_UNSIGNED_BYTE, GL_TRUE, static_cast<GLsizei>(sizeof(CloudVertex)),
-              reinterpret_cast<const void*>(16));
-          functions.glVertexAttribDivisor(4U, 1U);
-        });
-      }
-      cube_ebo_.bind(GL_ELEMENT_ARRAY_BUFFER);
-      cube_vao_.unbind();
-      cube_instance_bindings_dirty_ = false;
-    }
+    renderCubeShape(view_params, frame_draw);
+  } else {
+    // The cube setter falls back here while cube_program_ is unavailable (shader
+    // compile failure), which is why this is an else and not a kCube-excluding test.
+    renderSpriteShape(view_params, frame_draw);
+  }
+  unuseProgram();
+  withGlFunctions([](auto& functions) { functions.glEnable(GL_BLEND); });
+}
 
-    cube_program_->use();
-    cube_program_->setMat4("u_model", model);
-    cube_program_->setMat4("u_view", view_params.view);
-    cube_program_->setMat4("u_proj", view_params.proj);
-    cube_program_->setFloat("u_size_meters", size_meters_);
-    cube_program_->setFloat("u_range_min", effective_range_min);
-    cube_program_->setFloat("u_range_max", effective_range_max);
-    cube_program_->setInt("u_scalar_axis", scalar_axis_);
-    cube_program_->setVec3("u_color_axis_offset", color_axis_offset);
-    cube_program_->setInt("u_color_mode", colorModeUniform(color_type_));
-    cube_program_->setVec3("u_solid_color", solid_color_);
-    cube_program_->setInt("u_colormap_id", static_cast<int>(colormap_));
-    cube_program_->setInt("u_invert", invert_lut_ ? 1 : 0);
-    cube_program_->setFloat("u_outside_range_alpha", outside_alpha);
-    cube_vao_.bind();
-    const auto draw_cubes = [this]() {
-      withGlFunctions([this](auto& functions) {
-        functions.glDrawElementsInstanced(
-            GL_TRIANGLES, static_cast<GLsizei>(kCubeIndices.size()), GL_UNSIGNED_BYTE, nullptr,
-            static_cast<GLsizei>(vbo_point_count_));
-      });
-    };
-    // Pass 1: opaque (all, or in-range only when a faded second pass follows).
-    cube_program_->setInt("u_partition", blend_outside ? 1 : 0);
-    draw_cubes();
-    if (blend_outside) {
-      // Pass 2: outside-range only, blended, depth writes off.
-      cube_program_->setInt("u_partition", 2);
-      begin_faded_pass();
-      draw_cubes();
-      end_faded_pass();
-    }
-    cube_vao_.unbind();
-    unuseProgram();
-    withGlFunctions([](auto& functions) { functions.glEnable(GL_BLEND); });
+void PointcloudRenderPass::setSharedColorUniforms(gl::Program& program, const FrameDraw& frame_draw) const {
+  program.setMat4("u_model", frame_draw.model);
+  program.setFloat("u_range_min", frame_draw.range_min);
+  program.setFloat("u_range_max", frame_draw.range_max);
+  program.setInt("u_scalar_axis", scalar_axis_);
+  program.setVec3("u_color_axis_offset", frame_draw.color_axis_offset);
+  program.setInt("u_color_mode", colorModeUniform(color_type_));
+  program.setVec3("u_solid_color", solid_color_);
+  program.setInt("u_colormap_id", static_cast<int>(colormap_));
+  program.setInt("u_invert", invert_lut_ ? 1 : 0);
+  program.setFloat("u_outside_range_alpha", frame_draw.outside_alpha);
+}
+
+void PointcloudRenderPass::renderCubeShape(const ViewParams& view_params, const FrameDraw& frame_draw) {
+  // Screen-space LOD. A cube's projected size in device pixels is
+  //   size_px = size_px_scale / clip_w,
+  // because clip w is the view-axis depth under perspective and 1 under ortho, which is
+  // exactly the difference between the two projections' world->pixel scale. So one scale
+  // factor covers both cameras with no branch.
+  const int device_height =
+      view_params.device_height_px > 0 ? view_params.device_height_px : view_params.viewport_height_px;
+  const float size_px_scale =
+      size_meters_ * view_params.proj[1][1] * static_cast<float>(std::max(device_height, 1)) * 0.5f;
+  const glm::mat4 clip_from_source = frame_draw.view_proj * frame_draw.model;
+  const bool draw_sprites = frame_draw.mode == CubeDrawMode::kSprite;
+
+  if (draw_sprites) {
+    cube_sprite_program_->use();
+    setSharedColorUniforms(*cube_sprite_program_, frame_draw);
+    cube_sprite_program_->setMat4("u_view", view_params.view);
+    cube_sprite_program_->setMat4("u_clip_from_source", clip_from_source);
+    cube_sprite_program_->setVec4("u_face_pick_eye", facePickReference(view_params));
+    cube_sprite_program_->setFloat("u_size_px_scale", size_px_scale);
+    // The point VAO already binds this cloud at divisor 0 — one sprite per point.
+    vao_.bind();
+    drawInPartitions(*cube_sprite_program_, frame_draw.blend_outside, [this]() {
+      withGlFunctions(
+          [this](auto& functions) { functions.glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(vbo_point_count_)); });
+    });
+    vao_.unbind();
     return;
   }
 
-  // Sphere / point path (the cube setter falls back here while cube_program_
-  // is unavailable, e.g. shader compile failure).
-  const glm::mat4 view_model = view_params.view * model;
-  const bool shape_is_sphere = shape_ != Shape::kPoint;
+  // Lazy re-wiring of the cube VAO's per-instance attribs to vbo_. The buffer ID is
+  // stable across cloud swaps, but stride/offset/type can vary. Same locations and same
+  // routine as the point VAO — only the divisor differs.
+  if (cube_instance_bindings_dirty_) {
+    cube_vao_.bind();
+    vbo_.bind(GL_ARRAY_BUFFER);
+    const AttribLayout& layout = activeLayout(cloud_);
+    withGlFunctions([&layout](auto& functions) { bindCloudAttribs(functions, layout, 1U); });
+    cube_vao_.unbind();
+    cube_instance_bindings_dirty_ = false;
+  }
+
+  cube_program_->use();
+  setSharedColorUniforms(*cube_program_, frame_draw);
+  cube_program_->setMat4("u_view", view_params.view);
+  // proj*view folded here rather than multiplied per vertex: written as `u_proj * u_view
+  // * pos` in GLSL it is a mat4xmat4 the driver is not obliged to hoist, and the fan
+  // still runs it 7 times per cube.
+  cube_program_->setMat4("u_viewproj", frame_draw.view_proj);
+  cube_program_->setVec4("u_face_pick_eye", facePickReference(view_params));
+  cube_program_->setFloat("u_size_meters", size_meters_);
+
+  cube_vao_.bind();
+  drawInPartitions(*cube_program_, frame_draw.blend_outside, [this]() {
+    withGlFunctions([this](auto& functions) {
+      functions.glDrawElementsInstanced(
+          GL_TRIANGLES, static_cast<GLsizei>(kCubeFanIndices.size()), GL_UNSIGNED_SHORT, nullptr,
+          static_cast<GLsizei>(vbo_point_count_));
+    });
+  });
+  cube_vao_.unbind();
+}
+
+void PointcloudRenderPass::renderSpriteShape(const ViewParams& view_params, const FrameDraw& frame_draw) {
   const bool use_perspective_size = shape_ != Shape::kPoint;
   program_->use();
-  program_->setMat4("u_view_model", view_model);
-  program_->setMat4("u_model", model);                          // for fixed-frame axis colour (u_scalar_axis >= 0)
-  program_->setVec3("u_color_axis_offset", color_axis_offset);  // lifts axis colour back to absolute world
+  setSharedColorUniforms(*program_, frame_draw);
+  program_->setMat4("u_view_model", view_params.view * frame_draw.model);
   program_->setMat4("u_proj", view_params.proj);
-  program_->setFloat("u_range_min", effective_range_min);
-  program_->setFloat("u_range_max", effective_range_max);
-  // size_meters_ is user-facing as the sphere DIAMETER; the shader formula
-  // is parameterised on radius (gl_PointSize ≈ 2*R*focal/depth). Halve here
-  // so a "0.01 m" input renders as a 1 cm sphere, not a 2 cm one.
+  // size_meters_ is user-facing as the sphere DIAMETER; the shader formula is
+  // parameterised on radius (gl_PointSize ~= 2*R*focal/depth). Halve here so a "0.01 m"
+  // input renders as a 1 cm sphere, not a 2 cm one.
   program_->setFloat("u_world_radius", size_meters_ * 0.5f);
   program_->setFloat("u_pixel_size", size_pixels_);
-  // gl_PointSize rasterizes in DEVICE (framebuffer) pixels, so the world-radius
-  // formula needs the device viewport height — on HiDPI the logical height would
-  // shrink every perspective-sized point by 1/DPR (M.32). Fall back to the
-  // logical height when ViewParams carries no device size (hand-built callers).
+  // gl_PointSize rasterizes in DEVICE (framebuffer) pixels, so the world-radius formula
+  // needs the device viewport height — on HiDPI the logical height would shrink every
+  // perspective-sized point by 1/DPR (M.32). Fall back to the logical height when
+  // ViewParams carries no device size (hand-built callers).
   const int device_height =
       view_params.device_height_px > 0 ? view_params.device_height_px : view_params.viewport_height_px;
   program_->setFloat("u_viewport_height", static_cast<float>(std::max(device_height, 1)));
-  // The min/max clamps are physical pixel sizes; scale them by DPR so 0.5/32 keep
-  // the same on-screen meaning at any DPR. Derive DPR from device/logical height.
+  // The min/max clamps are physical pixel sizes; scale them by DPR so 0.5/32 keep the
+  // same on-screen meaning at any DPR. Derive DPR from device/logical height.
   const float dpr = std::max(
       static_cast<float>(device_height) / static_cast<float>(std::max(view_params.viewport_height_px, 1)), 1.0f);
   program_->setFloat("u_min_size_px", 0.5f * dpr);
   program_->setFloat("u_max_size_px", 32.0f * dpr);
   program_->setFloat("u_depth_threshold", 5.0f);
   program_->setInt("u_use_perspective_size", use_perspective_size ? 1 : 0);
-  program_->setInt("u_scalar_axis", scalar_axis_);
-  program_->setInt("u_color_mode", colorModeUniform(color_type_));
-  program_->setVec3("u_solid_color", solid_color_);
-  program_->setInt("u_colormap_id", static_cast<int>(colormap_));
-  program_->setInt("u_invert", invert_lut_ ? 1 : 0);
-  program_->setFloat("u_outside_range_alpha", outside_alpha);
-  program_->setInt("u_shape_is_sphere", shape_is_sphere ? 1 : 0);
+  program_->setInt("u_shape_is_sphere", shape_ != Shape::kPoint ? 1 : 0);
+
   vao_.bind();
-  const auto draw_points = [this]() {
+  drawInPartitions(*program_, frame_draw.blend_outside, [this]() {
     withGlFunctions(
         [this](auto& functions) { functions.glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(vbo_point_count_)); });
-  };
-  // Pass 1: opaque (all, or in-range only when a faded second pass follows).
-  program_->setInt("u_partition", blend_outside ? 1 : 0);
-  draw_points();
-  if (blend_outside) {
-    // Pass 2: outside-range only, blended, depth writes off.
-    program_->setInt("u_partition", 2);
-    begin_faded_pass();
-    draw_points();
-    end_faded_pass();
-  }
+  });
   vao_.unbind();
-  unuseProgram();
-  withGlFunctions([](auto& functions) { functions.glEnable(GL_BLEND); });
 }
 
 void PointcloudRenderPass::setActiveCloud(std::shared_ptr<const DecodedPointCloud> cloud) {
@@ -747,12 +990,16 @@ void PointcloudRenderPass::setActiveCloud(std::shared_ptr<const DecodedPointClou
   }
   cloud_dirty_ = true;
   cube_instance_bindings_dirty_ = true;
+  geometry_bounds_.reset();
+  gpu_bounds_current_ = false;
 }
 
 void PointcloudRenderPass::setActiveFastCloud(FastCloudData cloud) {
   cloud_ = std::move(cloud);
   cloud_dirty_ = true;
   cube_instance_bindings_dirty_ = true;
+  geometry_bounds_.reset();
+  gpu_bounds_current_ = false;
 }
 
 void PointcloudRenderPass::setColormapRange(float min_value, float max_value) {
@@ -768,6 +1015,10 @@ void PointcloudRenderPass::setSpatialAutoBounds(std::optional<AABB> source_bound
   spatial_auto_bounds_ = std::move(source_bounds);
 }
 
+void PointcloudRenderPass::setGeometryBounds(std::optional<AABB> source_bounds) {
+  geometry_bounds_ = std::move(source_bounds);
+}
+
 void PointcloudRenderPass::setSizeMeters(float meters) {
   size_meters_ = std::max(0.0f, meters);
 }
@@ -778,6 +1029,10 @@ void PointcloudRenderPass::setSizePixels(float pixels) {
 
 void PointcloudRenderPass::setShape(Shape shape) {
   shape_ = shape;
+}
+
+void PointcloudRenderPass::setCubeLodThresholdPx(float pixels) {
+  cube_lod_threshold_px_ = std::max(0.0f, pixels);
 }
 
 void PointcloudRenderPass::setColorType(ColorType type) {

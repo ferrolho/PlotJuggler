@@ -152,6 +152,46 @@ TEST_F(VoxelGridRenderPassGlTest, DrawnVoxelRasterizesFragments) {
   EXPECT_GT(litPixels(img), 200) << "a drawn voxel produced no fragments";
 }
 
+// The whole-grid frustum reject, new with the shared chooseCubeDrawMode(): this pass had
+// no such gate and drew every lattice cell regardless of where the grid was.
+//
+// Only ONE direction of it is worth a render test. "An off-screen grid draws nothing"
+// passes whether or not the reject exists — off-screen geometry rasterizes nothing either
+// way — so that assertion cannot fail and is not written here; the skip itself is a
+// performance property, covered by cube_draw_policy_test without a context.
+//
+// The direction that CAN go wrong is over-culling, which makes a grid silently vanish.
+// A voxel whose CENTRE sits outside the view volume while its cell still overlaps must
+// survive: the bounds handed to the policy describe centres, so this is the case that
+// catches an extent computed half a cell wrong. Verified to fail when the inflation is
+// removed.
+TEST_F(VoxelGridRenderPassGlTest, GridOverhangingTheViewEdgeStillDraws) {
+  ctx_->functions()->glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+  VoxelGridRenderPass pass;
+  pass.setColormap(PJ::Colormap::kGrayscale);
+  pass.setDrawMode(VoxelDrawMode::kAll);
+  pass.setAutoRange(false);
+  pass.setManualRange(0.0f, 1.0f);
+  pass.initializeGL();
+  pass.setGrid(oneVoxel(1.0f));
+
+  // The ortho box spans +/-1 around the look-at point. Aim it 1.4 cells to the side so the
+  // single voxel's centre (0.5, 0.5, 0.5) is outside, while the cell it occupies is not.
+  ViewParams vp = cameraFramingUnitCell();
+  vp.view = glm::lookAt(glm::vec3(1.9f, 0.5f, 5.0f), glm::vec3(1.9f, 0.5f, 0.5f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+  const TransformBuffer tf(TransformBuffer::kKeepAll);
+  const std::string fixed = "map";
+  const FrameContext fc{tf, fixed, PJ::fromRaw(0)};
+  pass.render(vp, fc);
+  ctx_->functions()->glFlush();
+
+  EXPECT_GT(litPixels(fbo_->toImage()), 0)
+      << "the voxel overhangs the view edge but nothing drew — the reject is testing voxel "
+         "CENTRES instead of the cells they occupy";
+}
+
 TEST_F(VoxelGridRenderPassGlTest, CulledVoxelRasterizesNothing) {
   ctx_->functions()->glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 

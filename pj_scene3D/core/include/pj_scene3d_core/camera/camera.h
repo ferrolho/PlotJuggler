@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <limits>
@@ -88,6 +89,67 @@ inline AABB unionAABB(const AABB& a, const AABB& b) {
     hi = std::max(hi, value);
   }
   return {lo, hi};
+}
+
+// One ROW of a 4x4, which glm's column-major storage does not give you directly: row i
+// gathers component i across the four columns. Both frustum helpers below read the
+// matrix by rows, so this is the shared idiom rather than two hand-indexed copies.
+[[nodiscard]] inline glm::vec4 matrixRow(const glm::mat4& matrix, int index) {
+  return glm::vec4(matrix[0][index], matrix[1][index], matrix[2][index], matrix[3][index]);
+}
+
+// The corner of `box` furthest along `direction` (an AABB support function). Both
+// helpers below need the extreme of a linear functional over the box, which is attained
+// at a corner, and each axis picks its end independently.
+[[nodiscard]] inline glm::vec3 aabbSupport(const AABB& box, const glm::vec3& direction) {
+  return glm::vec3{
+      direction.x >= 0.0f ? box.max.x : box.min.x, direction.y >= 0.0f ? box.max.y : box.min.y,
+      direction.z >= 0.0f ? box.max.z : box.min.z};
+}
+
+// True when `box` lies entirely outside the frustum of `clip_from_box` — the
+// combined matrix taking the box's OWN frame all the way to clip space (e.g.
+// proj * view * model), so a caller never has to transform the box first.
+//
+// Extracts the six clip planes from that matrix (Gribb-Hartmann) and rejects the
+// box when the corner furthest along a plane's normal is still on its outside.
+// Conservative in the usual way: it never culls something visible, but a box
+// wedged into the corner between two planes can survive the test. An invalid box
+// is never culled — an unknown extent must mean "draw it".
+[[nodiscard]] inline bool aabbOutsideFrustum(const AABB& box, const glm::mat4& clip_from_box) {
+  if (!box.valid) {
+    return false;
+  }
+  const glm::vec4 w = matrixRow(clip_from_box, 3);
+  const std::array<glm::vec4, 6> planes = {w + matrixRow(clip_from_box, 0), w - matrixRow(clip_from_box, 0),
+                                           w + matrixRow(clip_from_box, 1), w - matrixRow(clip_from_box, 1),
+                                           w + matrixRow(clip_from_box, 2), w - matrixRow(clip_from_box, 2)};
+  for (const glm::vec4& plane : planes) {
+    const glm::vec3 normal(plane);
+    if (glm::dot(normal, aabbSupport(box, normal)) + plane.w < 0.0f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// [min, max] of the clip-space w coordinate over `box`, under the matrix taking the
+// box's OWN frame to clip space (the same `clip_from_box` aabbOutsideFrustum takes).
+//
+// Under a perspective projection that w IS the view-axis depth, so this is how far the
+// nearest and furthest of a cloud's points can be — enough to answer "is EVERY point of
+// this cloud closer/further than X" without touching the points. Under an orthographic
+// projection w is 1 everywhere and the range collapses, which is the correct answer
+// there: a parallel projection gives every point the same scale.
+//
+// An invalid box has no range.
+[[nodiscard]] inline std::pair<float, float> aabbClipWRange(const AABB& box, const glm::mat4& clip_from_box) {
+  if (!box.valid) {
+    return {0.0f, 0.0f};
+  }
+  const glm::vec4 w_row = matrixRow(clip_from_box, 3);
+  const glm::vec3 normal(w_row);
+  return {glm::dot(normal, aabbSupport(box, -normal)) + w_row.w, glm::dot(normal, aabbSupport(box, normal)) + w_row.w};
 }
 
 // Smallest axis-aligned box that encloses `local` after transforming it by

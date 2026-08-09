@@ -1,4 +1,7 @@
 #version 440
+#extension GL_GOOGLE_include_directive : require
+#include "../../shaders/cube/cube_lighting.glslinc"
+#include "../../shaders/cube/cube_edge.glslinc"
 
 layout(std140, binding = 0) uniform PointUniforms {
     mat4 view_projection;
@@ -24,15 +27,6 @@ layout(location = 3) in float outside_range;
 layout(location = 4) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 
-float cubeEdgeFactor(vec3 local) {
-    vec3 distance_to_plane = vec3(0.5) - abs(local);
-    float minimum_distance = min(distance_to_plane.x, min(distance_to_plane.y, distance_to_plane.z));
-    float maximum_distance = max(distance_to_plane.x, max(distance_to_plane.y, distance_to_plane.z));
-    float middle_distance = distance_to_plane.x + distance_to_plane.y + distance_to_plane.z
-                            - minimum_distance - maximum_distance;
-    return 1.0 - smoothstep(0.0, 0.06, middle_distance);
-}
-
 void main() {
     vec4 base;
     if (modes.x == 1) {
@@ -51,10 +45,8 @@ void main() {
         discard;
     }
 
-    vec3 normal = normalize(view_normal);
-    vec3 light_direction = normalize(vec3(0.4, 0.5, 0.8));
-    float shading = 0.35 + (0.65 * max(dot(normal, light_direction), 0.0));
-    vec3 outlined = mix(base.rgb, base.rgb * 0.4, cubeEdgeFactor(local_position));
+    float shading = cubeLambert(normalize(view_normal));
+    vec3 outlined = base.rgb * (1.0 - kCubeEdgeDarken * cubeEdgeFactor(local_position));
     vec3 color = render_mode.x != 0 ? pow(max(outlined, vec3(0.0)), vec3(2.2)) : outlined;
     fragment_color = vec4(color * shading, base.a);
 }

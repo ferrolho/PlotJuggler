@@ -12,7 +12,8 @@
 #include <variant>
 
 #include "pj_base/builtin/point_cloud.hpp"
-#include "pj_scene3d_core/camera/camera.h"  // AABB
+#include "pj_scene3d_core/camera/camera.h"     // AABB
+#include "pj_scene3d_core/cube_draw_policy.h"  // CubeDrawMode
 #include "pj_scene3d_core/pointcloud_convert.h"
 #include "pj_scene3d_widgets/gl/buffer.h"
 #include "pj_scene3d_widgets/gl/program.h"
@@ -35,15 +36,24 @@ struct FastCloudData {
   AttribLayout layout;
 };
 
+// Default cube LOD threshold, in device pixels — see setCubeLodThresholdPx(). One pixel
+// is the
+// conservative choice on both counts: cosmetically a cube keeps its real geometry until it
+// is genuinely sub-pixel, and a threshold sweep on the benchmark showed the speedup is
+// already at its maximum by 1 px (it comes from dropping the fan draw for the whole cloud,
+// not from how many cubes convert), so raising it buys nothing.
+inline constexpr float kDefaultCubeLodThresholdPx = 1.0f;
+
 class PointcloudRenderPass : public IRenderPass {
  public:
   // Shape mode for each point.
   //   kSphere  — world-radius sphere imposter; foreshortens with depth under a
   //              perspective camera, fixed on-screen size under an orthographic one.
   //   kPoint   — flat 1-pixel-fixed sprite (no perspective).
-  //   kCube    — instanced 3D cube, fixed-frame-axis-aligned. Wired in
-  //              Stage 6; the setter is accepted today but the draw call
-  //              falls back to sphere until the cube program lands.
+  //   kCube    — instanced 3D cube, fixed-frame-axis-aligned. Drawn as the
+  //              3-camera-facing-faces hexagon fan (cube_mesh.h), so it costs
+  //              7 vertices and 6 triangles per point rather than 24 and 12.
+  //              Falls back to kSphere if the cube program fails to compile.
   enum class Shape { kSphere, kPoint, kCube };
 
   // Color sourcing mode.
@@ -116,9 +126,15 @@ class PointcloudRenderPass : public IRenderPass {
   // (manual range, or a non-spatial field's scalar range).
   void setSpatialAutoBounds(std::optional<AABB> source_bounds);
 
-  // World-coordinate radius for sphere shape (and side length for cube once
-  // Stage 6 lands). Default 0.01 m = 1 cm — chosen to match the pre-Stage-5
-  // visuals exactly. Stage 7's UI will surface a larger default.
+  // SOURCE-frame bounds of the active cloud, used only to skip the whole draw when
+  // the cloud falls outside the view frustum. Distinct from setSpatialAutoBounds()
+  // (which is about colour), because the frustum test must stay available in every
+  // colour mode. Both setActiveCloud overloads CLEAR this: bounds that describe the
+  // previous cloud could cull the new one for the frame or two an async GPU
+  // reduction takes to land, so an unknown extent must mean "draw it".
+  void setGeometryBounds(std::optional<AABB> source_bounds);
+
+  // World-coordinate size: sphere DIAMETER, or cube side length. Default 0.01 m.
   void setSizeMeters(float meters);
 
   // Pixel size for kPoint shape (ignored in sphere/cube). Fractional sizes are
@@ -127,6 +143,15 @@ class PointcloudRenderPass : public IRenderPass {
 
   // Shape selector — see enum above. Default kSphere.
   void setShape(Shape shape);
+
+  // kCube only: projected size, in device pixels, below which a cube is drawn as one
+  // area- and brightness-matched point sprite instead of the 7-vertex fan. The default
+  // is deliberately small — a cube that covers a couple of pixels has no visible
+  // structure left to lose, and the common wide shot puts an ENTIRE cloud under the
+  // threshold, where the fan draw is then skipped outright and a cube costs one vertex.
+  // 0 disables the LOD and forces the fan at every size (what the A/B benchmark and the
+  // equivalence tests use).
+  void setCubeLodThresholdPx(float pixels);
 
   // Color-sourcing selector — see enum above. Default kField.
   void setColorType(ColorType type);
@@ -176,8 +201,33 @@ class PointcloudRenderPass : public IRenderPass {
 #endif
 
  private:
+  // What render() derives once per frame and both shape paths then consume. Grouping it
+  // keeps those paths to two arguments instead of eight, and makes it obvious that
+  // nothing below recomputes any of it.
+  struct FrameDraw {
+    glm::mat4 model{1.0f};              // source frame -> fixed frame, in RENDER space
+    glm::mat4 view_proj{1.0f};          // proj * view, folded on the CPU
+    glm::vec3 color_axis_offset{0.0f};  // render origin; lifts axis colour to absolute world
+    float range_min{0.0f};              // colormap range AFTER the spatial-axis auto-range
+    float range_max{1.0f};
+    float outside_alpha{1.0f};  // opacity for out-of-range geometry; 1 = everything opaque
+    bool blend_outside{false};  // out-of-range geometry needs a second, blended, depth-read-only pass
+    // What render()'s shared chooseCubeDrawMode() decided. Never kSkip — render() returns
+    // on that before dispatching to a shape.
+    CubeDrawMode mode{CubeDrawMode::kFan};
+  };
+
   [[nodiscard]] const std::string& activeFrameId() const;
   [[nodiscard]] bool hasRetainedCloud() const;
+
+  // The two shape families. Each owns its programs, VAO and draw schedule; render()
+  // owns everything before the branch (upload, frustum reject, colour range).
+  void renderCubeShape(const ViewParams& view_params, const FrameDraw& frame_draw);
+  void renderSpriteShape(const ViewParams& view_params, const FrameDraw& frame_draw);
+
+  // The colour/range/partition uniforms every one of the three programs declares
+  // identically — set them in one place so a new program cannot silently miss one.
+  void setSharedColorUniforms(gl::Program& program, const FrameDraw& frame_draw) const;
 
   std::variant<std::monostate, FastCloudData, std::shared_ptr<const DecodedPointCloud>> cloud_;
   bool cloud_dirty_{false};
@@ -188,6 +238,8 @@ class PointcloudRenderPass : public IRenderPass {
   // Engaged only with scalar_axis_ >= 0: source-frame bounds whose transformed
   // axis extent becomes the auto colormap range, recomputed per frame.
   std::optional<AABB> spatial_auto_bounds_;
+  // Source-frame bounds for the whole-cloud frustum early-out; see setGeometryBounds.
+  std::optional<AABB> geometry_bounds_;
   float size_meters_{0.01f};
   float size_pixels_{2.0f};
   bool initialized_{false};
@@ -208,19 +260,28 @@ class PointcloudRenderPass : public IRenderPass {
   // GPU AABB reduction over vbo_ (fast path only) — see setGpuAabbEnabled().
   PointcloudAabbReducer aabb_reducer_;
   bool gpu_aabb_enabled_{false};
+  // Set when a reduction was dispatched for the cloud now in the VBO, so a completed
+  // result may be adopted as geometry_bounds_. Cleared by every cloud swap.
+  bool gpu_bounds_current_{false};
   std::function<void(std::optional<AABB>)> bounds_callback_;
 
-  // Cube path — separate program + static cube mesh. The same cloud VBO
-  // (vbo_) is bound as a per-instance attribute buffer; no per-frame
-  // upload changes versus the points/sphere path.
+  // Cube path — separate program, no vertex buffer of its own (the hexagon-fan
+  // corners come from gl_VertexID), just the shared index buffer. The same cloud
+  // VBO (vbo_) is bound as a per-instance attribute buffer; no per-frame upload
+  // changes versus the points/sphere path.
   std::unique_ptr<gl::Program> cube_program_;
   gl::VertexArray cube_vao_;
-  gl::Buffer cube_vbo_;
   gl::Buffer cube_ebo_;
   // The per-instance attribs in cube_vao_ reference vbo_'s stable buffer ID,
   // but the active cloud can change stride/offset/type, so re-specify the VAO
   // format whenever the retained cloud variant is swapped.
   bool cube_instance_bindings_dirty_{true};
+
+  // Cube LOD — the sub-threshold half of the cube shape, drawn over the point VAO
+  // (divisor 0, one sprite per point) so it needs no buffers of its own. The two
+  // programs partition the cloud by projected size and never draw the same point.
+  std::unique_ptr<gl::Program> cube_sprite_program_;
+  float cube_lod_threshold_px_{kDefaultCubeLodThresholdPx};
 };
 
 }  // namespace pj::scene3d

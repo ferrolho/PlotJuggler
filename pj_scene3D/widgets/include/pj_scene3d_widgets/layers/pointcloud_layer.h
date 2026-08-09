@@ -230,6 +230,11 @@ class PointCloudLayer : public Scene3DLayer {
   // camera scene-fit picks up the new extent. Wired as the pass bounds callback.
   void onGpuAabb(std::optional<AABB> box);
 
+  // The single writer of world_bounds_: it also hands the extent to the render pass,
+  // which frustum-culls the whole cloud with it. Assigning the member directly would
+  // leave the pass testing a stale box, so don't.
+  void setWorldBounds(std::optional<AABB> bounds);
+
   // Track a (possibly changing) source frame_id; notify the dock/panel on change.
   void updateSourceFrame(const std::string& frame_id);
 

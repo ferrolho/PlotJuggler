@@ -1,4 +1,6 @@
 #version 440
+#extension GL_GOOGLE_include_directive : require
+#include "../../shaders/cube/cube_lighting.glslinc"
 
 layout(std140, binding = 0) uniform PointUniforms {
     mat4 view_projection;
@@ -31,8 +33,7 @@ void main() {
             discard;
         }
         vec3 normal = vec3(coordinate.x, -coordinate.y, sqrt(max(0.0, 1.0 - radius_squared)));
-        vec3 light_direction = normalize(vec3(0.4, 0.5, 0.8));
-        shading = 0.35 + (0.65 * max(dot(normal, light_direction), 0.0));
+        shading = cubeLambert(normal);
     }
 
     vec4 base;

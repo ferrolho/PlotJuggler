@@ -13,6 +13,7 @@
 #include <string_view>
 #include <utility>
 
+#include "pj_scene3d_core/cube_draw_policy.h"
 #include "pj_scene3d_core/scene_entities_decode.h"  // poseToMat4
 #include "pj_scene3d_core/tf/transform.h"
 #include "pj_scene3d_widgets/cube_mesh.h"  // shared CubeVertex / kCubeVertices / kCubeIndices / kCubeEdgeGlsl
@@ -32,8 +33,11 @@ layout(location = 0) in vec3 in_corner_pos;     // unit cube corner (+/-0.5)
 layout(location = 1) in vec3 in_corner_normal;   // outward face normal (grid-local axes)
 
 uniform mat4 u_model;       // grid-local -> fixed-frame (TF * poseToMat4(origin))
-uniform mat4 u_view;
-uniform mat4 u_proj;
+// Folded on the CPU. Written as `u_proj * u_view * world` these are mat4xmat4
+// products the driver is not obliged to hoist out of a shader that runs once per
+// voxel CORNER — 24 times per voxel, for every voxel in the lattice.
+uniform mat4 u_viewproj;         // proj * view
+uniform mat3 u_normal_to_view;   // mat3(view * model), for the corner normals
 uniform vec3 u_cell_size;   // metric voxel size (x,y,z)
 uniform ivec3 u_dims;       // column_count, row_count, slice_count
 uniform sampler3D u_volume; // R32F (scalar) or RGBA8 (rgba) — float sampler either way
@@ -89,8 +93,8 @@ void main() {
   vec3 local_center = (vec3(cx, ry, sz) + 0.5) * u_cell_size;
   vec3 local_vertex = local_center + in_corner_pos * u_cell_size;
   vec4 world = u_model * vec4(local_vertex, 1.0);
-  gl_Position = u_proj * u_view * world;
-  v_view_normal = mat3(u_view * u_model) * in_corner_normal;
+  gl_Position = u_viewproj * world;
+  v_view_normal = u_normal_to_view * in_corner_normal;
 }
 )";
 
@@ -112,10 +116,9 @@ uniform float u_opacity;
 
 constexpr std::string_view kFragTail = R"(
 void main() {
-  // View-space Lambertian, same recipe/light as the pointcloud cube pass.
-  vec3 n = normalize(v_view_normal);
-  vec3 light_dir = normalize(vec3(0.4, 0.5, 0.8));
-  float shading = 0.35 + 0.65 * max(dot(n, light_dir), 0.0);
+  // The shared key light from cube_mesh.h, not a copy of it: a voxel and a point-cloud
+  // cube sitting side by side have to be lit identically.
+  float shading = cubeLambert(normalize(v_view_normal));
 
   vec3 base;
   if (u_value_kind == 1) {
@@ -124,9 +127,10 @@ void main() {
     float t = u_invert ? 1.0 - v_normalized : v_normalized;
     base = sampleColormap(u_colormap_id, t);
   }
-  // Darker outline on each voxel's faces: blend the fill toward a darker shade of
-  // the SAME hue near the cube edges, so adjacent same-coloured voxels stay legible.
-  base = mix(base, base * 0.4, cubeEdgeFactor(v_local));
+  // Darker outline on each voxel's faces, so adjacent same-coloured voxels stay legible.
+  // Written as a SCALE (the same form the cube pass uses) against the shared strength
+  // constant — mix(b, b*0.4, e) is exactly b*(1 - 0.6*e).
+  base *= 1.0 - kCubeEdgeDarken * cubeEdgeFactor(v_local);
   // Colormaps/colours are display-referred sRGB; the scene FBO is linear. Linearize.
   base = pow(max(base, vec3(0.0)), vec3(2.2));
   frag_color = vec4(base * shading, u_opacity);
@@ -134,7 +138,8 @@ void main() {
 )";
 
 std::string makeFragSrc() {
-  return std::string(kFragHead) + std::string(PJ::colormapGlsl()) + std::string(kCubeEdgeGlsl) + std::string(kFragTail);
+  return std::string(kFragHead) + std::string(PJ::colormapGlsl()) + std::string(kCubeLightingGlsl) +
+         std::string(kCubeEdgeGlsl) + std::string(kFragTail);
 }
 
 }  // namespace
@@ -168,7 +173,7 @@ void VoxelGridRenderPass::initializeGL() {
         1U, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(CubeVertex)), reinterpret_cast<const void*>(12));
     // The element buffer binding is captured into the bound VAO's state.
     cube_ebo_.uploadStatic(
-        GL_ELEMENT_ARRAY_BUFFER, kCubeIndices.data(), static_cast<GLsizeiptr>(kCubeIndices.size() * sizeof(uint8_t)));
+        GL_ELEMENT_ARRAY_BUFFER, kCubeIndices.data(), static_cast<GLsizeiptr>(kCubeIndices.size() * sizeof(uint16_t)));
     vao_.unbind();
   });
 }
@@ -263,14 +268,38 @@ void VoxelGridRenderPass::render(const ViewParams& view_params, const FrameConte
   }
   const glm::mat4 model = glm::mat4(transform->matrix()) * poseToMat4(origin_);
 
+  // The same whole-cloud decision the point-cloud pass makes, from the same code in
+  // pj_scene3d_core. Today this pass can only draw the 24-vertex solid, so what it gains
+  // is the FRUSTUM REJECT — which it had none of, while paying 24 vertex invocations per
+  // lattice cell for every cell in the grid, on screen or not. When the fan and the sprite
+  // land here the capability flags are the only thing that changes.
+  const glm::vec3 grid_extent(
+      static_cast<float>(cols_) * cell_size_.x, static_cast<float>(rows_) * cell_size_.y,
+      static_cast<float>(slices_) * cell_size_.z);
+  const glm::vec3 half_cell = cell_size_ * 0.5f;
+
+  CubeCloudView cloud_view;
+  // Voxel CENTRES, matching the vertex shader's (index + 0.5) * cell_size placement.
+  cloud_view.centre_bounds = AABB{half_cell, grid_extent - half_cell, true};
+  cloud_view.clip_from_cloud = view_params.proj * view_params.view * model;
+  if (const auto eye_render = eyeInRenderSpace(view_params); eye_render.has_value()) {
+    cloud_view.eye_in_cloud = glm::vec3(glm::inverse(model) * glm::vec4(*eye_render, 1.0f));
+  }
+  // Cells may be non-cubic; the largest axis is the conservative inflation.
+  cloud_view.cube_size_m = std::max({cell_size_.x, cell_size_.y, cell_size_.z});
+  constexpr CubeDrawCapabilities kSolidOnly{/*sprite=*/false, /*fan=*/false, /*solid=*/true};
+  if (chooseCubeDrawMode(cloud_view, kSolidOnly) == CubeDrawMode::kSkip) {
+    return;
+  }
+
   const float color_lo = auto_range_ ? auto_lo_ : manual_lo_;
   const float color_hi = auto_range_ ? auto_hi_ : manual_hi_;
   const bool opaque = opacity_ >= 0.999f;
 
   program_->use();
   program_->setMat4("u_model", model);
-  program_->setMat4("u_view", view_params.view);
-  program_->setMat4("u_proj", view_params.proj);
+  program_->setMat4("u_viewproj", view_params.proj * view_params.view);
+  program_->setMat3("u_normal_to_view", glm::mat3(view_params.view * model));
   program_->setVec3("u_cell_size", cell_size_);
   program_->setInt("u_value_kind", kind_ == VoxelValueKind::kRgba ? 1 : 0);
   program_->setInt("u_draw_mode", static_cast<int>(draw_mode_));
@@ -302,8 +331,16 @@ void VoxelGridRenderPass::render(const ViewParams& view_params, const FrameConte
     } else {
       set_coverage_blend();
     }
+    // The shared cube is a closed CCW-outward solid, so its back faces can never be
+    // seen: culling them halves the rasterization and fragment work for a dense
+    // grid. Paired with a disable — the engine's ambient state has culling off (the
+    // same contract the marker pass keeps).
+    functions.glEnable(GL_CULL_FACE);
+    functions.glCullFace(GL_BACK);
+    functions.glFrontFace(GL_CCW);
     functions.glDrawElementsInstanced(
-        GL_TRIANGLES, static_cast<GLsizei>(kCubeIndices.size()), GL_UNSIGNED_BYTE, nullptr, instance_count);
+        GL_TRIANGLES, static_cast<GLsizei>(kCubeIndices.size()), GL_UNSIGNED_SHORT, nullptr, instance_count);
+    functions.glDisable(GL_CULL_FACE);
     set_coverage_blend();
   });
   vao_.unbind();

@@ -94,7 +94,15 @@ still holds for everything else.
 `PointCloudLayer` has a zero-copy fast path (verbatim wire upload for contiguous-float32
 xyz, plus a packed-`rgba` RGB-direct variant) beside the `convertCanonical`/`CloudVertex`
 fallback, still consuming `sdk::PointCloud` (canonical-in / render-structs-out boundary
-intact — no wire decode added). On the bounds-only paths the geometry AABB that fits the
+intact — no wire decode added). Its `kCube` shape draws only the three camera-facing faces,
+as an attributeless 7-vertex / 18-index hexagon fan around each cube's near corner
+(`cube_mesh.h`) — pixel-equivalent to the full solid for opaque cubes at a third of the
+vertex invocations and half the triangles — and degrades a cloud whose cubes are all
+sub-pixel to area- and brightness-matched point sprites (a whole-cloud switch gated on the
+AABB, because a *per-instance* split measures slower than no LOD at all). The face-choice,
+face-normal, MSAA and LOD-matching pitfalls that shape has are spelled out in
+`docs/ARCHITECTURE.md` → "Cube shape: the hexagon fan"; read it before touching that
+shader. On the bounds-only paths the geometry AABB that fits the
 camera is computed by an **async GPU compute reduction** (`PointcloudAabbReducer`: the CPU
 seeds the first sample, then drops the scan once the pass reports `gpuAabbAvailable()`),
 so the per-sample bounds cost leaves the GUI thread — see `docs/ARCHITECTURE.md` for the

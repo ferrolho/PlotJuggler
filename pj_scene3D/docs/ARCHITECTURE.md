@@ -599,6 +599,208 @@ bytes upload verbatim and bind as a normalized `vec4` straight at the field offs
 pixel-identical to the CPU `convertCanonical(extract_rgba)` path, with no extraction.
 Scattered separate `red`/`green`/`blue` channels fall back to the CPU packer.
 
+### Cube shape: the hexagon fan
+
+The `kCube` shape is far more expensive per point than the sprite shapes — it is a solid,
+not a billboard — so its geometry is cut to the minimum that is still pixel-equivalent.
+A closed opaque cube never shows more than the three faces whose outward normal points at
+the camera, so `PointcloudRenderPass` draws exactly those, as a **6-triangle fan around the
+cube's near corner**: `glDrawElementsInstanced(GL_TRIANGLES, 18, GL_UNSIGNED_SHORT, …)` over
+7 logical vertices, versus the 24-vertex / 36-index full solid. There is no cube vertex
+buffer at all — `cubeFanCorner(gl_VertexID, cubeFaceSigns(...))` in `cube_mesh.h` generates
+the corners, and the cloud VBO binds at the same attribute locations the point program uses
+(divisor 1), so both VAOs share one wiring routine.
+
+Consequences worth knowing before editing this path:
+
+- **Face choice is per instance.** The sign vector comes from each cube's own centre versus
+  `u_face_pick_eye`, which is homogeneous: the eye POSITION (w = 1) under perspective, the
+  scene→camera DIRECTION (w = 0) under ortho, where the visible faces depend on the view
+  direction alone. It must be derived from the PROJECTION matrix, not from `u_viewproj` —
+  folding view into proj leaves the eye's view-axis distance in the `[3][3]` slot, so the
+  usual `proj[3][3] == 0` perspective test silently fails there. Getting this wrong gives
+  every cube in the cloud the same face triple and drops a face from half of them.
+- **The face normal is recovered in the fragment shader** from the interpolated corner
+  (`cubeFaceNormalView`, the axis whose |component| reaches the surface), which is why the
+  vertex stage carries no normal attribute. `v_local` must be interpolated `centroid`: at
+  the default pixel-centre sampling, partially covered MSAA pixels extrapolate outside the
+  triangle and can push a non-face component past 0.5, mis-picking the face.
+- **No `discard`.** The outside-range fade's "invisible anyway" case is culled in the vertex
+  stage instead, so the fragment shader stays discard-free and the GPU keeps early-Z depth
+  writes — cube clouds overdraw heavily and late-Z would shade every hidden fragment.
+- **Colour is evaluated per point, not per fragment.** A point's colour (colormap lookup,
+  solid, or per-point RGB) plus the sRGB→linear conversion is constant over the whole cube,
+  so BOTH the cube and the point/sphere vertex shaders now compute it once into a `flat`
+  varying; the shared `colormapGlsl()` LUTs moved to the vertex stage with it. The cube's
+  edge outline survives this because it SCALES the colour — `mix(b, b*0.4, e) == b*(1-0.6e)`
+  — and scaling commutes with the gamma: `pow(b*k, 2.2) == pow(b,2.2) * pow(k,2.2)`. So the
+  fragment stage keeps one scalar `pow` in place of a colormap and three vector ones, and
+  the result is algebraically identical (measured: max 1/255 on 0.02% of pixels, pure float
+  reassociation). Applying the outline in linear space instead would drop that last `pow`
+  entirely, but it was measured at 3% and is not exact — don't.
+- **Camera inside a cube** is the one case the fan gets wrong (the centre-vs-eye comparison
+  needs the camera at least half a cube away). Irrelevant at point-cloud cube sizes; it is
+  why `VoxelGridLayer` keeps the full 24-vertex solid.
+
+#### Screen-space LOD: sub-pixel cubes become matched sprites
+
+Below about a pixel even the fan is more geometry than the result can show, so
+`PointcloudRenderPass` swaps the whole cloud for one point sprite per cube, drawn over the
+existing point VAO (divisor 0 — no new buffers) by a third, deliberately minimal program:
+no colormap in the fragment stage, no normal, no `discard`, one flat varying and a single
+store. `setCubeLodThresholdPx()` exposes the threshold in device pixels; 0 disables it.
+
+**It is a whole-cloud switch, decided on the CPU, and that is a measured choice.** The
+obvious design — test each instance in the vertex shader and let the two programs split
+the cloud — is *slower* than not doing it. A degenerate-clipped fan instance still runs
+its 7 vertex invocations, and on real hardware those cost about what drawing them does, so
+splitting a cloud pays for both programs and saves neither. Measured on an RTX 4070 at
+500k points with the camera inside the cloud, a per-instance split ran 0.91x (and fell to
+0.70x as more cubes converted), while the whole-cloud form is exactly 1.00x there and
+1.7-2.2x in the wide shot. The win comes from **dropping a draw**, not from converting
+cubes. So `render()` asks one question — does the cloud's AABB prove that no cube reaches
+the threshold? — via `aabbClipWRange()` (clip w is affine, so the box bounds every point),
+and runs one program or the other. A stale extent can therefore only draw near cubes as
+sprites; it can never make points vanish, which a shader-side cull could.
+
+**It is currently OFF by default** (`cube_lod_threshold_px_` is 0; `setCubeLodThresholdPx()`
+enables it, which the equivalence tests and the A/B benchmark do). The appearance match
+below is exact in every respect except one, and that one is disqualifying in the product:
+see "Why the LOD is disabled". Each piece is otherwise an exact property of the cube, not a
+fudge (`kCubeSpriteGlsl`):
+
+- **Area, not side.** The three visible faces cover `(|r.x|+|r.y|+|r.z|) * side²` where `r`
+  is the view rotation's third row, so the sprite is a square of that area. (Cauchy's 1.5
+  is the mean over all orientations; this is the exact value for the current one, for the
+  same cost.) Matching the side instead is ~37% too bright.
+- **Area-weighted Lambert.** The faces' `cubeLambert()` terms weighted by those same
+  projected areas. Which face an axis shows is per instance, but the weight is not
+  (`+n` and `-n` foreshorten alike), so it is three dot products and no CPU uniforms — the
+  light direction stays defined once, in `kCubeLightingGlsl`, shared with the cube's own
+  fragment shader so the two cannot drift apart.
+- **`kCubeEdgeMeanScale`.** The dark edge band covers a fixed fraction of every face;
+  dropping it leaves sprites reading 13% brighter than the cubes beside them.
+- **Energy conservation below the driver's minimum point size.** Where `GL_POINT_SIZE_RANGE`
+  refuses to go as small as the cube, the sprite is widened and dimmed by the area
+  overshoot, so a receding cloud keeps losing brightness instead of plateauing at one pixel.
+
+`pointcloud_cube_lod_gl_test` measures all of it against the fan: total emitted light
+agrees within 3.4% from 0.67 px down to 0.125 px (the test allows 8%), which is also the
+no-popping guarantee, since the fan's brightness is continuous in distance. Near and
+straddling clouds must come out bit-identical, pinning the gate as whole-cloud.
+
+#### What the browser gets, and what it would take to port
+
+None of the above runs in the browser. `scene_view_widget_rhi.cpp` never includes
+`PointcloudRenderPass`; it draws `WasmPointShape::kCube` from its own `.qsb` pipelines over
+the 24-vertex solid. The one change it does inherit is the **winding fix**, which is a
+browser-specific bug fix: those pipelines set `CullMode::Back`, so a CW-outward
+`kCubeVertices` had them culling front faces and drawing each solid's far side.
+
+Five of the six optimizations are portable to WebGL 2 whenever someone builds it; only the
+compute-compaction follow-up is not (WebGL 2 has no compute shaders, SSBOs or indirect
+draw). Two mechanics matter when doing it:
+
+- `gl_VertexID` becomes `gl_VertexIndex` under qsb's Vulkan semantics. This costs nothing
+  because every helper in `cube_mesh.h` takes the vertex id as an **argument** rather than
+  reading the builtin — keep it that way.
+- The colour hoist cannot be shared. The browser samples a `color_lut` **texture** where
+  the desktop evaluates colormap polynomials in-shader, so that one is a parallel
+  implementation, not a reuse. (Vertex texture fetch is guaranteed in GLES 3.0, so it is
+  still possible.)
+
+**Shared shader source (in place).** qsb honours `GL_GOOGLE_include_directive`, resolving
+includes against the including file's directory, so the appearance helpers live once in
+`pj_scene3D/widgets/shaders/cube/*.glslinc`: the browser `.frag` files `#include` them
+directly, and `pj_scene3D/widgets/CMakeLists.txt` embeds the same files into a generated
+`cube_shader_sources.h` of `constexpr std::string_view`s that the desktop concatenates at
+runtime. Those files must stay free of uniforms, builtins and version-specific syntax —
+the two backends differ completely on all three, which is exactly why only pure functions
+and constants can be shared.
+
+Two mechanics to respect when adding one: the `.glslinc` list joins
+`CMAKE_CONFIGURE_DEPENDS`, because the `.qsb` staleness check runs at *configure* time and
+would otherwise not see the edit; and the browser sources are Vulkan-style `#version 440`
+qsb *inputs* — the GLSL ES 300 the browser actually runs is what qsb emits from them.
+`wasm_shader_constants_test` guards that the browser shaders keep including the shared
+files rather than re-inlining a literal.
+
+**Ported so far:** the winding fix (a browser-only *bug* fix — those pipelines set
+`CullMode::Back`, so a CW-outward `kCubeVertices` had them culling front faces and drawing
+each solid's far side) and the shared shader source above. Both are appearance-neutral or
+appearance-correcting, and the shared-source change was verified byte-for-byte equivalent
+by diffing the compiled ES 300 output.
+
+**Nothing else has been ported, deliberately.** The browser Scene3D path is built with
+`PJ_WASM_WITH_SCENE3D=OFF` in CI, so no automated check ever renders a browser cube; any
+behaviour change there has to be paired with a visual check on a real browser build, and
+that has not happened. The remaining items, in the order they should land, each with the
+mechanic that makes them non-trivial:
+
+1. **Drop the `discard` from `cube.frag`.** The largest single win on the desktop, and the
+   cheapest of these — it is provably dead code there (`buildColormapLut` writes alpha 255
+   and `cube.vert` already culls the only path to a transparent fragment), so it is purely
+   a matter of confirming it on screen.
+2. **Colour hoist.** Binding 1 (`color_lut`) is fragment-only in the shader-resource
+   bindings and must become vertex-visible. Vertex texture fetch is guaranteed in GLES 3.0.
+   This one cannot share code with the desktop: the browser samples a LUT texture where the
+   desktop evaluates colormap polynomials in-shader.
+3. **Hexagon fan.** Needs `face_pick_eye` in `PointUniforms` (272 → 288 bytes, touching
+   every shader that declares the block), an 18-entry index buffer, and a per-instance-only
+   vertex layout for the point-cloud cube pipeline *alone* — voxels and markers keep the
+   full solid. `cubeFanCorner` already takes the vertex id as an argument, so the shared
+   GLSL works unchanged despite qsb spelling the builtin `gl_VertexIndex`.
+4. **Sprite LOD.** A second `Points` pipeline plus its HDR clone and depth-replay entries.
+   `chooseCubeDrawMode()` already makes the decision and is backend-agnostic, so the CPU
+   half is done; only the pipeline is missing.
+
+Compute compaction is the one item that cannot be ported at all — WebGL 2 has no compute
+shaders, SSBOs or indirect draw.
+
+#### Why the LOD is disabled
+
+**Coverage is applied as brightness, and that is wrong on a light background.** Where the
+driver's minimum point size exceeds the cube, the sprite is widened and its colour scaled
+by the area overshoot — at 0.1 px that factor is 0.01. Total light is conserved, which is
+exact against a *black* background. But the opaque pass writes alpha 1 with blending
+disabled, so the widened sprite REPLACES the background over the whole minimum-sized point
+rather than blending into it: on PJ's light 3D background a zoomed-out cloud turns black,
+and flips between black and coloured as streaming moves the cloud's extent across the
+whole-cloud gate. Observed in the app; that is why `cube_lod_threshold_px_` defaults to 0.
+
+Note the LOD's own GL test cannot see this — it clears to black, the one background where
+conserving energy and conserving coverage look identical. Re-enabling the LOD means fixing
+the compositing AND rendering that test against a non-black background so it can fail.
+
+The fix is coverage, not brightness: write `gl_SampleMask` from the coverage fraction so
+the sprite lights a FRACTION of the MSAA samples, exactly as the fan's sub-pixel triangles
+do. That composites correctly against any background and gets depth right too, at the cost
+of early-Z on the sprite path — acceptable, since sub-pixel sprites barely overdraw.
+
+#### Other known limits of the sprite LOD
+- **A camera inside an individual cube** still gets the wrong three faces — the fan picks
+  them from the cube's centre. Unreachable at point-cloud cube sizes and already the
+  reason `VoxelGridLayer` keeps the 24-vertex solid, but `setSizeMeters` does not stop a
+  user from making cubes large enough to swallow the viewpoint.
+- **A compatibility-profile context rasterizes multisampled points as circles**, π/4 of the
+  square the sprite's area match assumes. `initializeGL()` enables `GL_POINT_SPRITE` when
+  `GL_CONTEXT_PROFILE_MASK` reports compatibility, which restores core semantics — and also
+  defines the `gl_PointCoord` the sphere imposter needs. Read the profile from GL, not from
+  `QSurfaceFormat`: Qt reports CoreProfile on contexts whose `GL_VERSION` says otherwise.
+
+`cube_mesh_test` pins the fan's coverage in all eight sign octants and the CCW-outward
+winding of the shared solid; `pointcloud_cube_faces_gl_test` renders two mirrored cubes and
+asserts equal area (per-instance face choice) plus three distinct face shades.
+`demos/pointcloud_shape_benchmark` times all three shapes against the scene's MSAA level,
+with a `cube+LOD` column and a `--lod PX` sweep that re-derives the default threshold.
+
+Whole-cloud **frustum reject**: `render()` skips the draw when the cloud's source-frame AABB,
+tested through `proj * view * model` by `aabbOutsideFrustum`, lies outside the view volume.
+The box is plumbed separately from the colour-range bounds (`setGeometryBounds`) and is
+CLEARED by every cloud swap, because bounds describing the previous cloud could cull the new
+one; the async GPU reduction below re-establishes it, and only when it ran for the cloud
+currently in the VBO.
+
 The geometry AABB (`world_bounds_`) feeds the camera scene-fit every frame, so it must refresh
 on every sample. On the bounds-only cases (RGB-direct, solid, spatial-axis, auto-off, non-dirty —
 i.e. when no colormap scalar pass is needed) with a 4-byte-aligned fast-path layout, that
@@ -684,6 +886,12 @@ volumetric data.
   voxels. So the **CPU / draw-call** cost is independent of voxel count (one draw),
   and a re-scrub to a cached grid re-uploads nothing — though the GPU vertex shader
   still runs once per voxel.
+  It keeps the **full 24-vertex solid** rather than the pointcloud layer's hexagon fan,
+  because a voxel is large enough to swallow the viewpoint and the fan's centre-vs-eye
+  face choice is only exact while the camera stays outside the cube. Back faces are
+  culled around the draw instead (`GL_BACK` / `GL_CCW`, paired with a disable — the
+  engine's ambient state has culling off), which halves rasterization for free now that
+  `kCubeVertices` is genuinely CCW-outward.
 - **Qt-free core.** The coordinate/value math (`core/voxel_grid_view.{h,cpp}`,
   `core/voxel_grid_value.{h,cpp}`) is headless unit-tested.
 - **WASM backend.** `WasmVoxelGridLayer` resolves the same canonical object and

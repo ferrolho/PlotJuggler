@@ -1,0 +1,50 @@
+// GLSL for the sprite the LOD degrades a sub-threshold cube into. Everything here exists
+// to make that swap invisible, so each piece is a MATCH to a property of the solid, not
+// an approximation of one:
+//
+//   cubeProjectedFaceWeights — |view-space z| of each fixed-frame axis, i.e. the three
+//     visible faces' foreshortening. Their sum is the cube's projected area in units of
+//     side^2: 1 when the camera looks down an axis, sqrt(3) corner-on. (Cauchy's 1.5 is
+//     the mean over ALL orientations; this is the exact value for the current one, and
+//     costs the same.)
+//   cubeSpriteSidePx — a square of equal projected AREA, since at these sizes what the
+//     eye integrates is total energy, not silhouette shape.
+//   cubeSpriteShading — the faces' Lambert terms weighted by those same projected areas.
+//     Which face an axis shows still depends on the per-instance sign vector, but the
+//     WEIGHT does not (+n and -n foreshorten alike), so the whole thing is three CPU-free
+//     dot products.
+//   kCubeEdgeMeanScale — the cube's dark edge band covers a fixed fraction of every face,
+//     so dropping it would make sprites read brighter than the cubes beside them. See
+//     cubeEdgeMeanScale() below, which re-derives it from the band's own constants.
+const float kCubeEdgeMeanScale = 0.887;
+
+// Foreshortening of the three visible faces, from the direction the cube is actually
+// SEEN from — `to_camera` need not be normalized. Under an orthographic camera that is
+// the optical axis for every cube, and this reduces exactly to |third row of mat3(view)|;
+// under perspective it is the per-instance eye ray, which the optical axis is only a good
+// stand-in for near the centre of the screen. At the corner of a 60-degree-fovy 16:9 view
+// the ray is ~50 degrees off axis, where using the axis instead picks the wrong faces
+// entirely and the sprite lands up to a third too dark.
+vec3 cubeProjectedFaceWeights(vec3 to_camera) {
+  return abs(normalize(to_camera));
+}
+
+// Side of the equal-area square, in pixels. `cos_view_angle` is the cosine of the angle
+// between the eye ray and the optical axis (1 on axis, and 1 always under ortho): the face
+// weights measure area perpendicular to the RAY, but it is rasterized onto the image
+// plane, which is tilted by exactly that angle. Omitting it costs cos(theta) of the
+// brightness — 11% measured at 0.85 of the frustum half-width, i.e. a visible dimming
+// gradient towards the edges of a far cloud.
+float cubeSpriteSidePx(vec3 face_weights, float size_px, float cos_view_angle) {
+  float area = (face_weights.x + face_weights.y + face_weights.z) / max(cos_view_angle, 1.0e-3);
+  return sqrt(area) * size_px;
+}
+
+float cubeSpriteShading(vec3 face_signs, vec3 face_weights, mat4 view) {
+  // Component i is dot(view-space image of fixed axis i, light) — `v * M` reads M's
+  // columns, and column i of mat3(view) is exactly that image.
+  vec3 axis_light_dots = normalize(kCubeKeyLightView) * mat3(view);
+  vec3 lambert = vec3(kCubeAmbient) + kCubeDiffuse * max(face_signs * axis_light_dots, vec3(0.0));
+  float area = face_weights.x + face_weights.y + face_weights.z;
+  return kCubeEdgeMeanScale * dot(face_weights, lambert) / max(area, 1e-6);
+}

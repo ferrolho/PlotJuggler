@@ -416,7 +416,7 @@ void PointCloudLayer::detach() {
   last_pushed_color_field_.clear();
   ctx_ = {};
   cloud_pass_.setActiveCloud(nullptr);
-  world_bounds_.reset();
+  setWorldBounds(std::nullopt);
 }
 
 void PointCloudLayer::setFixedFrame(const QString& frame) {
@@ -1180,6 +1180,8 @@ void PointCloudLayer::pushCloud(const PointCloud& cloud, SampleId id) {
   std::optional<AttribLayout> layout =
       rgb_mode ? checkFastPath(cloud, std::string_view{}, /*want_rgba=*/true) : checkFastPath(cloud, scalar_sv);
 
+  // Whether world_bounds_ ends up describing THIS cloud (see the publish at the end).
+  bool bounds_describe_this_cloud = true;
   if (layout.has_value()) {
     cloud_pass_.setScalarAxis(axis);
     // The per-point SCALAR min/max (a kField auto-range colormap's range) is needed only for a
@@ -1201,10 +1203,14 @@ void PointCloudLayer::pushCloud(const PointCloud& cloud, SampleId id) {
         sf == nullptr && gpuAabbAligned(*layout) && world_bounds_.has_value() && !gpu_unavailable;
     cloud_pass_.setGpuAabbEnabled(gpu_candidate);
     const bool gpu_authoritative = gpu_candidate && cloud_pass_.gpuAabbAvailable();
+    // On the GPU-authoritative path world_bounds_ still describes the PREVIOUS sample
+    // until the async reduction lands, so this push must not hand it to the frustum
+    // cull; the pass adopts the reduction's own result instead.
+    bounds_describe_this_cloud = !gpu_authoritative;
 
     if (!gpu_authoritative) {
       const BoundsScanResult scan = scanBoundsAndScalarRange(cloud, *layout, sf);
-      world_bounds_ = scan.bounds.valid ? std::optional<AABB>{scan.bounds} : std::nullopt;
+      setWorldBounds(scan.bounds.valid ? std::optional<AABB>{scan.bounds} : std::nullopt);
       if (axis >= 0) {
         cloud_pass_.setSpatialAutoBounds(auto_range_ ? world_bounds_ : std::optional<AABB>{});
         if (!auto_range_) {
@@ -1253,7 +1259,7 @@ void PointCloudLayer::pushCloud(const PointCloud& cloud, SampleId id) {
     // convertCanonical accumulates the finite-point AABB in its single decode pass, so the
     // source-frame bounds come back for free (TF is applied per-render in the shader, so the
     // decoded positions stay in the cloud's own frame).
-    world_bounds_ = converted.bounds.valid ? std::optional<AABB>{converted.bounds} : std::nullopt;
+    setWorldBounds(converted.bounds.valid ? std::optional<AABB>{converted.bounds} : std::nullopt);
 
     cloud_pass_.setScalarAxis(axis);
     if (axis >= 0) {
@@ -1280,11 +1286,24 @@ void PointCloudLayer::pushCloud(const PointCloud& cloud, SampleId id) {
 
     cloud_pass_.setActiveCloud(std::make_shared<DecodedPointCloud>(std::move(decoded)));
   }
+  // Re-publish the extent AFTER the cloud swap: setActiveCloud/setActiveFastCloud clear
+  // the pass's frustum-cull box on purpose (bounds from the previous cloud must never
+  // cull the new one), so the value this push computed has to be handed over again.
+  if (bounds_describe_this_cloud) {
+    cloud_pass_.setGeometryBounds(world_bounds_);
+  }
   last_pushed_id_ = id;
   last_pushed_color_field_ = color_field_;
   last_pushed_rgb_ = rgb_mode;
   last_pushed_axis_ = axis;
   emit repaintRequested();
+}
+
+void PointCloudLayer::setWorldBounds(std::optional<AABB> bounds) {
+  world_bounds_ = bounds;
+  // The pass frustum-culls the whole draw against this, so it has to track every
+  // update — including the resets that mean "extent unknown, draw it regardless".
+  cloud_pass_.setGeometryBounds(std::move(bounds));
 }
 
 void PointCloudLayer::onGpuAabb(std::optional<AABB> box) {
@@ -1294,7 +1313,7 @@ void PointCloudLayer::onGpuAabb(std::optional<AABB> box) {
   if (aabbEqual(new_bounds, world_bounds_)) {
     return;  // unchanged extent (stable streaming cloud) — no spurious repaint
   }
-  world_bounds_ = new_bounds;
+  setWorldBounds(new_bounds);
   if (last_pushed_axis_ >= 0 && auto_range_) {
     // For spatial-axis auto colouring the pass derives the colormap range from these source
     // bounds each frame, so the GPU result must refresh them too (the CPU path did this inline).
@@ -1453,7 +1472,7 @@ void PointCloudLayer::onDecodeFinished() {
       // clear the view rather than leaving the previous sample's points painted
       // at the wrong tracker time.
       cloud_pass_.setActiveCloud(std::make_shared<DecodedPointCloud>());
-      world_bounds_.reset();
+      setWorldBounds(std::nullopt);
       last_pushed_id_ = {};
       last_pushed_color_field_.clear();
       emit repaintRequested();
