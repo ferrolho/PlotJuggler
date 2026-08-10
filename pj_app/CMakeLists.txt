@@ -356,6 +356,12 @@ if(PJ_BUILD_TESTS)
 
     add_pj_app_gui_test(slider_states_test SliderStates tests/slider_states_test.cpp)
 
+    # MR !261 depth guard: a source added while streaming is paused must write
+    # into the secondary tail buffer, not the frozen primary. Exercises the
+    # extracted pause-target seam (applyWriteTargetsForCurrentPauseState) headlessly.
+    add_pj_app_gui_test(streaming_pause_target_test StreamingPauseTargetTest
+        tests/streaming_pause_target_test.cpp)
+
     # Curve-list drag policy: an object topic no view can display (CameraInfo,
     # ...) must be drag-inert with a "why" tooltip; displayable ones keep
     # dragging.

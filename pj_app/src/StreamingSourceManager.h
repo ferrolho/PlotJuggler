@@ -22,6 +22,7 @@ namespace PJ {
 struct AdvertisedTopic;
 class CatalogModel;
 class DataEngine;
+class DataSourceRuntimeHost;
 class ExtensionCatalogService;
 class ObjectStore;
 class SessionManager;
@@ -37,6 +38,7 @@ class TopicDemandTracker;
 // Lives in pj_app because it talks to dialog_presenter and owns Qt threads.
 class StreamingSourceManager : public QObject {
   Q_OBJECT
+
  public:
   StreamingSourceManager(
       SessionManager& session, ExtensionCatalogService& extensions, CatalogModel& catalog,
@@ -67,6 +69,15 @@ class StreamingSourceManager : public QObject {
   // Stop-and-join every live session, preserving streamStopped emissions per
   // dataset. Used by remove-all paths before erasing the whole datastore.
   void stopAllAndWait(const QString& reason);
+
+  // Point `host`'s write targets at the primary or the secondary tail buffer
+  // according to the current pause state. Single source of truth for the
+  // decision, shared by onPauseToggled (both branches) and startSession.
+  void applyWriteTargetsForCurrentPauseState(DataSourceRuntimeHost& host);
+
+  // Test seams for the secondary tail buffers (the pause-target endpoints).
+  DataEngine& secondaryEngineForTests();
+  ObjectStore& secondaryStoreForTests();
 
  public slots:
   // Wired from LeftPanel::streamingStartRequested. Starts a session for the

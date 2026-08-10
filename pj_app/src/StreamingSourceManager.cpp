@@ -120,6 +120,14 @@ bool StreamingSourceManager::hasActiveSession() const {
   return !sessions_.empty();
 }
 
+DataEngine& StreamingSourceManager::secondaryEngineForTests() {
+  return *secondary_data_engine_;
+}
+
+ObjectStore& StreamingSourceManager::secondaryStoreForTests() {
+  return *secondary_object_store_;
+}
+
 bool StreamingSourceManager::stopDatasetAndWait(DatasetId dataset_id, const QString& reason) {
   auto it = sessions_.find(dataset_id);
   if (it == sessions_.end()) {
@@ -194,26 +202,31 @@ void StreamingSourceManager::onStartRequested() {
   startSession(selected_plugin_);
 }
 
+void StreamingSourceManager::applyWriteTargetsForCurrentPauseState(DataSourceRuntimeHost& host) {
+  if (paused_) {
+    // Secondary tail buffer while paused: the primary stays frozen by absence
+    // of writes — that's what consumers (Scene2DDockWidget, PlotWidget) read.
+    host.setObjectStoreTarget(secondary_object_store_.get());
+    host.setDataEngineTarget(secondary_data_engine_.get());
+  } else {
+    host.setObjectStoreTarget(&session_manager_.objectStore());
+    host.setDataEngineTarget(&session_manager_.dataEngine());
+  }
+}
+
 void StreamingSourceManager::onPauseToggled(bool paused) {
   paused_ = paused;
   if (paused) {
-    // Pause: target swap onto the secondary store / engine for both
-    // families. The primary stays frozen by absence of writes — that's
-    // what consumers (Scene2DDockWidget, PlotWidget) read while paused.
     for (auto& [_id, sess] : sessions_) {
-      sess->runtime_host->setObjectStoreTarget(secondary_object_store_.get());
-      sess->runtime_host->setDataEngineTarget(secondary_data_engine_.get());
+      applyWriteTargetsForCurrentPauseState(*sess->runtime_host);
     }
     return;
   }
   // Resume. Swap targets BEFORE flushing so any push already in flight
   // finishes on the secondary and the NEXT push goes to primary; otherwise
   // the flush would race against new arrivals.
-  auto& primary_store = session_manager_.objectStore();
-  auto& primary_engine = session_manager_.dataEngine();
   for (auto& [_id, sess] : sessions_) {
-    sess->runtime_host->setObjectStoreTarget(&primary_store);
-    sess->runtime_host->setDataEngineTarget(&primary_engine);
+    applyWriteTargetsForCurrentPauseState(*sess->runtime_host);
   }
   flushSecondaryIntoPrimary();
   flushSecondaryDataEngineIntoPrimary();
@@ -455,6 +468,17 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
   }
   persisted_settings.setValue(config_key, QString::fromStdString(config));
 
+  // Apply the current pause state to this session's write hosts BEFORE start(),
+  // so a source added mid-pause writes into the secondary tail buffer from its
+  // very first sample. This is the latest safe seam: the modal source dialog
+  // above runs a nested event loop where the user could toggle pause, so we read
+  // paused_ AFTER it returns; and start() is the plugin's "go" signal, so setting
+  // the target before it closes the window for a push-model plugin that delivers
+  // from its own thread inside start(). From here on, startSession runs
+  // synchronously (no event loop), so paused_ cannot change before the worker
+  // starts; onPauseToggled keeps every live session in step thereafter.
+  applyWriteTargetsForCurrentPauseState(*session->runtime_host);
+
   if (auto status = session->handle.start(); !status) {
     emit streamError(
         dataset_id, tr("Plugin '%1': start failed: %2").arg(source_name, QString::fromStdString(status.error())));
@@ -476,18 +500,6 @@ void StreamingSourceManager::startSession(const QString& plugin_id) {
   // QThread::create runs the lambda as the thread's run(); no Qt event loop
   // needed in the worker — we only post back via QueuedConnection.
   session->worker.reset(QThread::create([this, dataset_id]() { workerLoop(dataset_id); }));
-
-  // If the user added this source while streaming is paused, honour the pause
-  // for it too: onPauseToggled only redirected the sessions that existed when
-  // pause was pressed, so a session created afterwards would otherwise write
-  // into the frozen primary store (mutating the paused snapshot) while its
-  // retention trim targets the secondary (leaving the primary tail unbounded).
-  // Mirror the pause branch here so its writes land on the secondary tail buffer
-  // and merge into the primary on resume, exactly like every other session.
-  if (paused_) {
-    session->runtime_host->setObjectStoreTarget(secondary_object_store_.get());
-    session->runtime_host->setDataEngineTarget(secondary_data_engine_.get());
-  }
 
   QThread* worker_ptr = session->worker.get();
   sessions_.emplace(dataset_id, std::move(session));

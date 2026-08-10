@@ -219,6 +219,36 @@ TEST_F(StreamEngineSwapTest, CachedSourceHandlesResolveAcrossPauseAndResumeSwap)
   EXPECT_EQ(rowCount(secondary_engine_, topic.id), 1U);
 }
 
+// Source-level (non-parser) analogue of the mid-pause new-topic case — the path
+// data_stream_dummy uses. Here the write host is a SINGLE shared host retargeted
+// at pause (not a fresh per-binding host), and WriteCore always creates the
+// topic on the active engine AND mirrors it to the other, so this path is
+// expected to already be safe: a topic first ensured mid-pause should land its
+// sample on the secondary and leave the frozen primary empty. This pins that
+// second, independent case so the fix is not argued from the parser path alone.
+TEST_F(StreamEngineSwapTest, SourceTopicCreatedWhilePausedWritesToSecondaryEngine) {
+  SourceWriteHostView writer = sourceWriter();
+
+  // Enter the pause window BEFORE the topic has ever been ensured.
+  host_->setDataEngineTarget(&secondary_engine_);
+
+  const auto topic = *writer.ensureTopic("late_imu");
+  const auto field = *writer.ensureField(topic, "ax", PrimitiveType::kFloat32);
+  ASSERT_TRUE(writer.appendBoundRecord(topic, 20, {{.field = field, .value = 3.0F}}).has_value());
+  host_->flushPending();
+
+  EXPECT_EQ(rowCount(secondary_engine_, topic.id), 1U)
+      << "a mid-pause source topic's sample must land on the secondary engine";
+  EXPECT_EQ(rowCount(primary_engine_, topic.id), 0U)
+      << "the frozen primary gained a row during pause — the timeline would advance";
+
+  // Resume: the mirrored topic is on the primary, so the tail flushes cleanly.
+  host_->setDataEngineTarget(&primary_engine_);
+  ASSERT_TRUE(secondary_engine_.flushTo(primary_engine_).has_value())
+      << "resume flush failed — the mid-pause topic was not mirrored onto the primary";
+  EXPECT_EQ(rowCount(primary_engine_, topic.id), 1U) << "the paused tail did not flush back on resume";
+}
+
 // Two lockstep engines + a DataSourceRuntimeHost driving the PARSER write path:
 // a real parser plugin (streaming_caching_parser_plugin) that caches a
 // FieldHandle on its first parse and reuses it — the parser_protobuf pattern.
