@@ -356,6 +356,11 @@ void MarketplaceWindow::setupUi() {
     }
     ext_mgr_->setEnabled(footer_ext_id_, checked);
     installations_changed_ = true;
+    // Clear any sticky error first (e.g. a "Failed to load registry" from an
+    // offline start): setStatus() suppresses a non-error message while an error
+    // is latched, so without this the toggle's confirmation would never show and
+    // the stale error would stay on screen. Every other user action clears it too.
+    clearStickyStatus();
     setStatus(
         (checked ? tr("Extension %1 will be enabled after restart") : tr("Extension %1 will be disabled after restart"))
             .arg(footer_ext_id_));
